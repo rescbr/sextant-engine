@@ -245,26 +245,19 @@ std::vector<Candidate> VamanaCore::beam_search(
 
     // -----------------------------------------------------------------------
     // DynamicWidth (PipeANN OSDI 2025, OctopusANN VLDB 2026): two-phase beam
-    // search. Start with a small width during the approach phase (rapid
-    // navigation toward the query region — large L wastes I/O on far-away
-    // nodes) and widen to the full L once the search converges (near the
-    // query region — most visited nodes are genuine candidates).
+    // search. During the approach phase (navigating toward the query region),
+    // a large beam width wastes reads/distance computations on nodes that are
+    // never expanded (N_rbu — "read-but-unexplored"). A smaller L suppresses
+    // these. During the converge phase (near the target), more retrieved nodes
+    // are genuinely useful, so L is widened to improve recall.
     //
-    // Only active on the paged (SSD) search path. When the graph is flat in
-    // RAM or fully cached in MemGraph, there's no I/O waste to reduce.
-    //
-    // Convergence heuristic: if the best distance hasn't improved by more
-    // than 1% for 5 consecutive pops, we've entered the converge phase.
+    // Convergence heuristic: track the best distance in the working set W.
+    // If it hasn't improved by more than 1% for several pops, we've entered
+    // the converge phase.
     // -----------------------------------------------------------------------
     constexpr uint32_t kConvergePatience = 5;     // pops w/o improvement
     constexpr float kConvergeImprovRatio = 0.99f; // <1% improvement
-    // DynamicWidth (PipeANN/OctopusANN): controls the I/O pipeline width —
-    // small during approach phase, large during converge phase. This requires
-    // async I/O (the Pipeline). With synchronous reads, there is no pipeline
-    // width to adjust, so we use the fixed L throughout.
-    //
-    // TODO: activate when the async I/O pipeline is implemented.
-    const bool use_dynamic_width = false;
+    const bool use_dynamic_width = true;
     uint32_t L_current = use_dynamic_width
         ? std::min(L, std::max(static_cast<uint32_t>(params_.R), L / 4))
         : L;
@@ -321,6 +314,11 @@ std::vector<Candidate> VamanaCore::beam_search(
 
         // DynamicWidth: track convergence and widen the beam when it stalls.
         if (!converged) {
+            // Track convergence using W's best distance (the closest candidate
+            // found so far), not the popped node's distance. W.top() is the
+            // FARTHEST in the max-heap (worst of the top-L). The best is the
+            // minimum in the frontier. We approximate by checking if the popped
+            // node (which is the closest unexpanded) is improving.
             if (best.dist < prev_best_dist * kConvergeImprovRatio) {
                 no_improvement_count = 0;
             } else {
