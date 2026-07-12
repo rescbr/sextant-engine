@@ -154,12 +154,11 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     if (!codes_buffer_ || !nodes_buffer_) {
         throw Error(ErrorCode::OutOfMemory, "Engine::build: buffer alloc failed");
     }
-    spdlog::info("[sextant] flat buffers: codes={:.1}MB nodes={:.1}MB total={:.1}MB "
-                 "(per_vec={}B, budget={:.1}MB)",
+    spdlog::info("[sextant] allocating flat build buffers: codes={:.1f}MB "
+                 "nodes={:.1f}MB total={:.1f}MB (per_vec={}B)",
                  codes_bytes / 1e6, nodes_bytes / 1e6,
                  (codes_bytes + nodes_bytes) / 1e6,
-                 code_size_ + node_size_,
-                 params.build_ram_budget / 1e6);
+                 code_size_ + node_size_);
 
     core_->set_build_codes(codes_buffer_, static_cast<uint32_t>(count_));
     core_->set_build_nodes(nodes_buffer_);
@@ -443,7 +442,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
             spdlog::warn("[sextant] shard {} empty, skipping", k);
             continue;
         }
-        spdlog::info("[sextant] building shard {}/{} ({} vectors, RAM≈{:.1}MB, "
+        spdlog::info("[sextant] building shard {}/{} ({} vectors, RAM≈{:.1f}MB, "
                      "{} threads)",
                      k, K, shard_n,
                      (static_cast<double>(shard_n) *

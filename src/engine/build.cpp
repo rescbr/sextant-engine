@@ -154,8 +154,9 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
         uint64_t ram = physical_ram_bytes();
         p.build_ram_budget = ram > 0 ? ram / 2 : 0;
     }
-    spdlog::info("[sextant] build_ram_budget = {} bytes [{}]",
-                 p.build_ram_budget,
+    spdlog::info("[sextant] build_ram_budget = {} bytes ({:.1f}MB) [{}] — "
+                 "max RAM per shard, not total allocation",
+                 p.build_ram_budget, p.build_ram_budget / 1e6,
                  overrides.build_ram_budget != 0 ? "override" : "auto");
 
     // --- closure_factor (Issue 24: ~15% replication) ---
@@ -179,8 +180,9 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
             ((16u + static_cast<uint32_t>(p.R) * 4u + 7u) & ~7u);
         const uint64_t per_vec = code_sz + node_sz;
         uint32_t k = 1;
+        uint64_t max_per_partition = 0;
         if (per_vec > 0 && p.build_ram_budget > 0) {
-            const uint64_t max_per_partition = p.build_ram_budget / per_vec;
+            max_per_partition = p.build_ram_budget / per_vec;
             if (max_per_partition > 0) {
                 k = static_cast<uint32_t>(
                     (n_vectors + max_per_partition - 1) / max_per_partition);
@@ -188,8 +190,18 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
             }
         }
         p.K = k;
-        spdlog::info("[sextant] K (partitions) = {} [per_vec={} bytes]", p.K,
-                     per_vec);
+        const uint64_t monolithic_ram = n_vectors * per_vec;
+        if (k == 1) {
+            spdlog::info("[sextant] K (partitions) = 1 [monolithic, "
+                         "flat RAM = {:.1f}MB ≤ budget {:.1f}MB]",
+                         monolithic_ram / 1e6,
+                         p.build_ram_budget / 1e6);
+        } else {
+            spdlog::info("[sextant] K (partitions) = {} [flat RAM {:.1f}MB > "
+                         "budget {:.1f}MB → {} shards of ≤{} vectors each]",
+                         p.K, monolithic_ram / 1e6,
+                         p.build_ram_budget / 1e6, p.K, max_per_partition);
+        }
     }
 
     return p;
