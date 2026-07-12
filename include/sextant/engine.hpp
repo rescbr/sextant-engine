@@ -20,6 +20,7 @@ class VamanaCore;
 class NodeStore;
 class FlatNodeStore;
 class PagedNodeStore;
+class MemGraph;
 
 /// Adaptive parameters resolved from dataset/machine properties (Issue 37).
 struct ResolvedParams {
@@ -84,6 +85,8 @@ public:
     /// Cache diagnostics (only valid when is_paged()).
     uint64_t cache_graph_reads() const;
     uint64_t cache_code_reads() const;
+    /// Number of nodes held in the MemGraph neighborhood cache (0 if none).
+    uint32_t memgraph_cached_count() const;
     /// True when flat buffers are resident in RAM (build or post-insert).
     bool has_flat_buffers() const { return nodes_buffer_ != nullptr; }
 
@@ -104,9 +107,12 @@ private:
 
     // NodeStore backings. flat_store_ wraps the flat buffers (build + insert).
     // paged_store_ is the SSD-resident search backend. At most one is active
-    // on the core at a time.
+    // on the core at a time. memgraph_ sits atop paged_store_ when paged search
+    // is active — it caches the entry-point BFS neighborhood in RAM and
+    // delegates cold nodes to paged_store_.
     std::unique_ptr<FlatNodeStore> flat_store_;
     std::unique_ptr<PagedNodeStore> paged_store_;
+    std::unique_ptr<MemGraph> memgraph_;
     uint64_t cache_size_override_ = 0;  ///< 0 = auto
 
     /// Params loaded by open() (used by flush() to persist post-insert state).

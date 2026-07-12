@@ -14,6 +14,7 @@
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "storage/direct_io.hpp"
+#include "storage/memgraph.hpp"
 #include "storage/node_store.hpp"
 #include "storage/sidecar_header.hpp"
 
@@ -77,6 +78,7 @@ void Engine::open(const std::string& index_path) {
     if (nodes_buffer_) { aligned_free(nodes_buffer_); nodes_buffer_ = nullptr; }
     flat_store_.reset();
     paged_store_.reset();
+    memgraph_.reset();
     core_.reset();
     quantizer_.reset();
     params_loaded_ = false;
@@ -279,7 +281,29 @@ void Engine::load_sidecars() {
             std::max(1u, std::thread::hardware_concurrency()),
             cache_bytes);
     }
-    core_->set_store(paged_store_.get());
+
+    // Build a MemGraph over the sidecar files: cache the entry-point BFS
+    // neighborhood (default 3 hops) in RAM, delegate cold nodes to the
+    // PagedNodeStore. The entry points were read from .meta above.
+    {
+        // Fall back to a deterministic single entry point if .meta had none.
+        std::vector<uint32_t> eps = entry_points;
+        if (eps.empty() && count_ > 0) {
+            eps.push_back(0);
+        }
+        memgraph_ = std::make_unique<MemGraph>(
+            index_path_ + ".graph", index_path_ + ".codes",
+            node_size_, static_cast<uint8_t>(code_size_),
+            static_cast<uint32_t>(count_), eps, /*num_hops=*/3);
+        memgraph_->set_backing(paged_store_.get());
+
+        const uint64_t cached_bytes =
+            static_cast<uint64_t>(memgraph_->cached_count()) *
+            (node_size_ + code_size_);
+        spdlog::info("[sextant] MemGraph: {} nodes cached ({:.1f}MB), 3 hops",
+                     memgraph_->cached_count(), cached_bytes / 1e6);
+    }
+    core_->set_store(memgraph_.get());
 
     // Restore entry points. entry_points_ has no public setter, so we call
     // compute_entry_points() to get the same evenly-spread set (deterministic
@@ -293,6 +317,10 @@ uint64_t Engine::cache_graph_reads() const {
 
 uint64_t Engine::cache_code_reads() const {
     return paged_store_ ? paged_store_->code_reads() : 0;
+}
+
+uint32_t Engine::memgraph_cached_count() const {
+    return memgraph_ ? memgraph_->cached_count() : 0;
 }
 
 }  // namespace sextant

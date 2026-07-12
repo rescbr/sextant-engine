@@ -23,6 +23,7 @@
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "storage/direct_io.hpp"
+#include "storage/memgraph.hpp"
 #include "storage/node_store.hpp"
 #include "storage/sidecar_header.hpp"
 

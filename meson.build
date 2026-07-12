@@ -67,6 +67,7 @@ engine_sources = [
     'src/storage/block_allocator.cpp',
     'src/storage/sharded_lru.cpp',
     'src/storage/node_store.cpp',
+    'src/storage/memgraph.cpp',
     'src/quant/pq_quantizer.cpp',
     'src/algo/vamana_core.cpp',
     'src/engine/build.cpp',
