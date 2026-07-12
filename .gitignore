@@ -1,0 +1,37 @@
+# Build directories
+build/
+builddir/
+.build/
+
+# WrapDB downloaded subproject sources (fetched by meson setup)
+subprojects/spdlog-*/
+subprojects/googletest-*/
+subprojects/packagecache/
+
+# IDE / editor
+.cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.dylib
+
+# Test datasets and benchmark artifacts
+datasets/
+*.fbin
+*.bvec
+*.fvec
+*.gt
+
+# Profiler output
+*.profraw
+profile_results/
+subprojects/.wraplock
+subprojects/packagecache/

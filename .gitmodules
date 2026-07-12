@@ -1,0 +1,6 @@
+[submodule "third_party/nsync"]
+	path = third_party/nsync
+	url = https://github.com/google/nsync.git
+[submodule "third_party/numkong"]
+	path = third_party/numkong
+	url = https://github.com/ashvardanian/NumKong.git
