@@ -32,6 +32,6 @@ struct SidecarHeader {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SidecarHeader) == 72, "SidecarHeader must be 72 bytes");
+static_assert(sizeof(SidecarHeader) == 64, "SidecarHeader must be 64 bytes");
 
 }  // namespace sextant

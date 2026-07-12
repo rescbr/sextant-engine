@@ -70,6 +70,8 @@ engine_sources = [
     'src/algo/vamana_core.cpp',
     'src/engine/build.cpp',
     'src/engine/search.cpp',
+    'src/engine/engine.cpp',
+    'src/engine/fbin_source.cpp',
     'src/logging.cpp',
 ]
 

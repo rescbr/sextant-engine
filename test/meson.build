@@ -9,6 +9,8 @@ test_sources = [
     'test_sharded_lru.cpp',
     'test_pq_quantizer.cpp',
     'test_vamana_core.cpp',
+    'test_fbin_source.cpp',
+    'test_engine.cpp',
 ]
 
 foreach src : test_sources
