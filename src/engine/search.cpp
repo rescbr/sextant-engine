@@ -70,6 +70,7 @@ void Engine::open(const std::string& index_path) {
     if (nodes_buffer_) { aligned_free(nodes_buffer_); nodes_buffer_ = nullptr; }
     core_.reset();
     quantizer_.reset();
+    params_loaded_ = false;
 
     load_sidecars();
     opened_ = true;
@@ -167,6 +168,10 @@ void Engine::load_sidecars() {
         }
         std::memcpy(&params, p, sizeof(params));
     }
+
+    // Remember the loaded params so flush() can persist post-insert state.
+    loaded_params_ = params;
+    params_loaded_ = true;
 
     // --- .codes ---
     {

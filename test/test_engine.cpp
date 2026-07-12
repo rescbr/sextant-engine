@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
 #include <random>
 #include <string>
@@ -173,6 +174,209 @@ TEST(Engine, SearchBeforeOpenThrows) {
     std::vector<float> q(16, 0.0f);
     SearchConfig scfg;
     EXPECT_THROW(engine.search(q.data(), 10, scfg), Error);
+}
+
+// ---------------------------------------------------------------------------
+// insert(): after build+open, insert a new vector and verify it is findable.
+//
+// We insert a near-duplicate of an existing base vector (same distribution so
+// the PQ code is accurate), then search for it — the inserted row must appear
+// among the top results alongside the original.
+// ---------------------------------------------------------------------------
+TEST(Engine, InsertAfterBuildIsFindable) {
+    const uint32_t n = 800;
+    const uint32_t dim = 64;
+    const std::string fbin =
+        write_random_fbin("engine_insert_data.fbin", n, dim);
+    const std::string index_path =
+        (std::filesystem::temp_directory_path() / "engine_insert_idx").string();
+    remove_sidecars(index_path);
+
+    {
+        Engine engine;
+        FbinSource source(fbin);
+        BuildConfig cfg;
+        engine.build(source, index_path, cfg);
+    }
+
+    // Read base vector #0 to build an in-distribution inserted near-duplicate.
+    std::vector<float> base0(dim);
+    {
+        FILE* fp = std::fopen(fbin.c_str(), "rb");
+        ASSERT_NE(fp, nullptr);
+        uint32_t hn, hd;
+        std::fread(&hn, sizeof(hn), 1, fp);
+        std::fread(&hd, sizeof(hd), 1, fp);
+        std::fseek(fp, static_cast<long>(8 + 0 * dim * sizeof(float)), SEEK_SET);
+        std::fread(base0.data(), sizeof(float), dim, fp);
+        std::fclose(fp);
+    }
+    std::vector<float> new_vec(dim);
+    for (uint32_t d = 0; d < dim; d++) new_vec[d] = base0[d] + 1e-5f;
+
+    const RowId new_row_id = 123456;
+    {
+        Engine engine;
+        engine.open(index_path);
+        EXPECT_EQ(static_cast<uint64_t>(n), engine.count());
+
+        engine.insert(new_vec.data(), dim, new_row_id);
+        EXPECT_EQ(static_cast<uint64_t>(n) + 1, engine.count());
+
+        // Searching for the inserted vector must find it in the top results.
+        SearchConfig scfg;
+        scfg.k = 20;
+        scfg.L_search = 150;
+        auto results = engine.search(new_vec.data(), scfg.k, scfg);
+        ASSERT_FALSE(results.empty());
+        bool found = false;
+        for (const auto& c : results) {
+            if (c.row_id == new_row_id) { found = true; break; }
+        }
+        EXPECT_TRUE(found) << "inserted row_id not in search results";
+
+        engine.flush();
+    }
+
+    // Reopen: the inserted vector must still be present and findable.
+    {
+        Engine engine;
+        engine.open(index_path);
+        EXPECT_EQ(static_cast<uint64_t>(n) + 1, engine.count());
+
+        SearchConfig scfg;
+        scfg.k = 20;
+        scfg.L_search = 150;
+        auto results = engine.search(new_vec.data(), scfg.k, scfg);
+        ASSERT_FALSE(results.empty());
+        bool found = false;
+        for (const auto& c : results) {
+            if (c.row_id == new_row_id) { found = true; break; }
+        }
+        EXPECT_TRUE(found) << "inserted row_id not found after reopen";
+    }
+
+    remove_sidecars(index_path);
+    std::remove(fbin.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// insert() before open() throws.
+// ---------------------------------------------------------------------------
+TEST(Engine, InsertBeforeOpenThrows) {
+    Engine engine;
+    std::vector<float> v(16, 0.0f);
+    EXPECT_THROW(engine.insert(v.data(), 16, 1), Error);
+}
+
+// ---------------------------------------------------------------------------
+// insert() with a dimension mismatch throws.
+// ---------------------------------------------------------------------------
+TEST(Engine, InsertDimMismatchThrows) {
+    const uint32_t n = 200;
+    const uint32_t dim = 32;
+    const std::string fbin =
+        write_random_fbin("engine_insert_dim_data.fbin", n, dim);
+    const std::string index_path =
+        (std::filesystem::temp_directory_path() / "engine_insert_dim_idx")
+            .string();
+    remove_sidecars(index_path);
+
+    {
+        Engine engine;
+        FbinSource source(fbin);
+        engine.build(source, index_path, BuildConfig{});
+    }
+
+    {
+        Engine engine;
+        engine.open(index_path);
+        std::vector<float> bad(dim + 1, 0.0f);
+        EXPECT_THROW(engine.insert(bad.data(), dim + 1, 7), Error);
+    }
+
+    remove_sidecars(index_path);
+    std::remove(fbin.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Rerank: when the caller recomputes exact distances from the base vectors,
+// the true (exact) nearest neighbor must rank first.
+// ---------------------------------------------------------------------------
+TEST(Engine, SearchRerankFindsExactNN) {
+    const uint32_t n = 600;
+    const uint32_t dim = 32;
+    const std::string fbin =
+        write_random_fbin("engine_rerank_data.fbin", n, dim);
+    const std::string index_path =
+        (std::filesystem::temp_directory_path() / "engine_rerank_idx")
+            .string();
+    remove_sidecars(index_path);
+
+    {
+        Engine engine;
+        FbinSource source(fbin);
+        engine.build(source, index_path, BuildConfig{});
+    }
+
+    // Read all base vectors so we can compute exact distances for rerank and
+    // determine the ground-truth NN.
+    std::vector<float> base(static_cast<size_t>(n) * dim);
+    {
+        FILE* fp = std::fopen(fbin.c_str(), "rb");
+        ASSERT_NE(fp, nullptr);
+        uint32_t hdr_n = 0, hdr_dim = 0;
+        std::fread(&hdr_n, sizeof(hdr_n), 1, fp);
+        std::fread(&hdr_dim, sizeof(hdr_dim), 1, fp);
+        ASSERT_EQ(hdr_n, n);
+        ASSERT_EQ(hdr_dim, dim);
+        std::fread(base.data(), sizeof(float),
+                   static_cast<size_t>(n) * dim, fp);
+        std::fclose(fp);
+    }
+
+    Engine engine;
+    engine.open(index_path);
+
+    // Query = base vector #42 + tiny noise → its exact NN is row 42.
+    std::vector<float> query(dim);
+    for (uint32_t d = 0; d < dim; d++) {
+        query[d] = base[static_cast<size_t>(42) * dim + d] + 1e-4f;
+    }
+
+    // Over-fetch candidates for rerank.
+    const uint32_t k = 5;
+    const uint32_t rerank_factor = 10;
+    SearchConfig scfg;
+    scfg.k = k * rerank_factor;
+    scfg.L_search = 150;
+    auto cands = engine.search(query.data(), scfg.k, scfg);
+    ASSERT_FALSE(cands.empty());
+
+    // Rerank by exact L2-sq distance against the base vectors.
+    std::vector<std::pair<float, RowId>> scored;
+    scored.reserve(cands.size());
+    for (const auto& c : cands) {
+        if (c.row_id < 0 || static_cast<uint64_t>(c.row_id) >= n) continue;
+        const float* bv = &base[static_cast<size_t>(c.row_id) * dim];
+        float dist = 0.0f;
+        for (uint32_t d = 0; d < dim; d++) {
+            const float diff = query[d] - bv[d];
+            dist += diff * diff;
+        }
+        scored.emplace_back(dist, c.row_id);
+    }
+    std::sort(scored.begin(), scored.end());
+
+    // The rerank top-1 must be the exact nearest neighbor (row 42).
+    ASSERT_FALSE(scored.empty());
+    EXPECT_EQ(scored.front().second, static_cast<RowId>(42));
+
+    // Sanity: the exact NN distance is ~ (dim * (1e-4)^2) ≈ 3.2e-7.
+    EXPECT_NEAR(scored.front().first, 0.0f, 1e-3f);
+
+    remove_sidecars(index_path);
+    std::remove(fbin.c_str());
 }
 
 }  // namespace

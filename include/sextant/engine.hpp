@@ -83,6 +83,11 @@ private:
     uint32_t code_size_ = 0;
     uint32_t node_size_ = 0;
 
+    /// Params loaded by open() (used by flush() to persist post-insert state).
+    /// Only meaningful when opened_ && params_loaded_.
+    ResolvedParams loaded_params_;
+    bool params_loaded_ = false;
+
     /// Build helpers.
     void pass1_sample_and_train(VectorSource& source,
                                  const ResolvedParams& params);

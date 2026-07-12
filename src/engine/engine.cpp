@@ -503,22 +503,205 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
 }
 
 // ===========================================================================
-// insert / flush (Phase 1 stubs)
+// insert / flush
+//
+// Live insert = "build one node". We grow the flat codes/nodes buffers by one
+// slot, encode the vector, then drive the Vamana insert flow (beam_search →
+// robust_prune → connect_and_prune) via VamanaCore::insert_build.
+//
+// LIMITATION (Phase 1): the realloc strategy is O(N) per insert (copy the whole
+// codes + nodes buffers). This is acceptable because live insert is NOT the hot
+// path — batch build is. For high-throughput live ingest, a slab/arena growth
+// strategy is deferred to a later phase.
 // ===========================================================================
 
-void Engine::insert(const float* /*vec*/, Dim dim, RowId /*row_id*/) {
+void Engine::insert(const float* vec, Dim dim, RowId row_id) {
+    if (!opened_) {
+        throw Error(ErrorCode::InvalidParam,
+                    "Engine::insert: index not opened");
+    }
+    if (!quantizer_ || !core_) {
+        throw Error(ErrorCode::InvalidParam,
+                    "Engine::insert: quantizer/core not initialized");
+    }
+    if (vec == nullptr) {
+        throw Error(ErrorCode::InvalidParam,
+                    "Engine::insert: null vector");
+    }
     if (dim != dim_) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::insert: dim mismatch");
     }
-    // Live insert is a Phase 2 feature. The index can still be built and
-    // searched in Phase 1.
-    throw Error(ErrorCode::NotImplemented,
-                "Engine::insert: live insert not implemented in Phase 1");
+    if (code_size_ == 0 || node_size_ == 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "Engine::insert: code/node size not initialized");
+    }
+
+    const uint32_t new_internal = static_cast<uint32_t>(count_);
+    const uint64_t new_count = count_ + 1;
+
+    // --- 1. Grow the codes buffer by one code (O(N) copy). ---
+    {
+        const size_t old_bytes = static_cast<size_t>(count_) * code_size_;
+        const size_t new_bytes = static_cast<size_t>(new_count) * code_size_;
+        const size_t alloc_bytes = (new_bytes + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
+        uint8_t* nb =
+            static_cast<uint8_t*>(aligned_alloc(kDiskAlign, alloc_bytes));
+        if (!nb) {
+            throw Error(ErrorCode::OutOfMemory,
+                        "Engine::insert: codes realloc failed");
+        }
+        std::memcpy(nb, codes_buffer_, old_bytes);
+        // Encode the new vector into the appended slot.
+        quantizer_->encode(vec, nb + old_bytes);
+        aligned_free(codes_buffer_);
+        codes_buffer_ = nb;
+    }
+
+    // --- 2. Grow the nodes buffer by one node (O(N) copy). ---
+    {
+        const size_t old_bytes = static_cast<size_t>(count_) * node_size_;
+        const size_t new_bytes = static_cast<size_t>(new_count) * node_size_;
+        const size_t alloc_bytes = (new_bytes + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
+        uint8_t* nb =
+            static_cast<uint8_t*>(aligned_alloc(kDiskAlign, alloc_bytes));
+        if (!nb) {
+            throw Error(ErrorCode::OutOfMemory,
+                        "Engine::insert: nodes realloc failed");
+        }
+        std::memcpy(nb, nodes_buffer_, old_bytes);
+        std::memset(nb + old_bytes, 0, node_size_);
+        aligned_free(nodes_buffer_);
+        nodes_buffer_ = nb;
+    }
+
+    // --- 3. Publish the grown buffers + new count to the core. ---
+    count_ = new_count;
+    core_->set_build_codes(codes_buffer_, static_cast<uint32_t>(count_));
+    core_->set_build_nodes(nodes_buffer_);
+
+    // --- 4. Drive the Vamana insert flow (single-thread). ---
+    //    insert_build handles the first-node case (becomes an entry point)
+    //    and the general case (beam_search → robust_prune → connect_and_prune).
+    //    It also bumps core_->count_ to internal_id + 1.
+    VamanaTLS tls;
+    tls.resize(static_cast<uint32_t>(count_));
+    core_->insert_build(new_internal, row_id, vec, tls);
+
+    spdlog::info("[sextant] insert: row_id={} internal_id={} (count now {})",
+                 row_id, new_internal, count_);
 }
 
 void Engine::flush() {
-    // All writes are flushed synchronously during build. Nothing pending.
+    // After build(), all sidecars are already written synchronously.
+    // flush() is meaningful after open() + insert(): it rewrites the sidecars
+    // with the grown buffers (already in final layout, so no reformatting).
+    if (!opened_ || !params_loaded_) {
+        return;  // nothing pending
+    }
+    if (count_ == 0) {
+        return;
+    }
+    if (!quantizer_ || !core_) {
+        throw Error(ErrorCode::InvalidParam,
+                    "Engine::flush: quantizer/core not initialized");
+    }
+
+    const auto uuid = make_uuid();
+    const ResolvedParams& params = loaded_params_;
+    const uint32_t n = static_cast<uint32_t>(count_);
+
+    // After open(), nodes_buffer_ is already in final layout (node_size_
+    // includes inline_pq_count), so we write it verbatim — no reformat pass.
+    spdlog::info("[sextant] flush: persisting {} vectors to '{}'", n,
+                 index_path_);
+
+    // ----- .codes -----
+    {
+        const std::string path = index_path_ + ".codes";
+        DirectFile f(path, true);
+        SidecarHeader h;
+        fill_header(h, kMagicCodes, count_, dim_, uuid);
+        write_padded(f, &h, sizeof(h), 0);
+        const size_t codes_bytes = static_cast<size_t>(n) * code_size_;
+        write_padded(f, codes_buffer_, codes_bytes, sizeof(h));
+        f.sync();
+    }
+
+    // ----- .graph (verbatim — buffers already in final layout) -----
+    {
+        const std::string path = index_path_ + ".graph";
+        DirectFile f(path, true);
+        SidecarHeader h;
+        fill_header(h, kMagicGraph, count_, dim_, uuid);
+        write_padded(f, &h, sizeof(h), 0);
+        const size_t nodes_bytes = static_cast<size_t>(n) * node_size_;
+        write_padded(f, nodes_buffer_, nodes_bytes, sizeof(h));
+        f.sync();
+    }
+
+    // ----- .meta (quantizer + entry points + params) -----
+    {
+        const std::string path = index_path_ + ".meta";
+        DirectFile f(path, true);
+        SidecarHeader h;
+        fill_header(h, kMagicMeta, count_, dim_, uuid);
+        write_padded(f, &h, sizeof(h), 0);
+
+        std::vector<uint8_t> qblob;
+        quantizer_->serialize(qblob);
+        uint64_t qsize = qblob.size();
+        std::vector<uint8_t> payload;
+        payload.insert(payload.end(),
+                       reinterpret_cast<uint8_t*>(&qsize),
+                       reinterpret_cast<uint8_t*>(&qsize) + sizeof(qsize));
+        payload.insert(payload.end(), qblob.begin(), qblob.end());
+
+        const auto& eps = core_->entry_points();
+        uint16_t ep_count = static_cast<uint16_t>(eps.size());
+        payload.insert(payload.end(),
+                       reinterpret_cast<uint8_t*>(&ep_count),
+                       reinterpret_cast<uint8_t*>(&ep_count) + sizeof(ep_count));
+        for (uint32_t ep : eps) {
+            payload.insert(payload.end(),
+                           reinterpret_cast<uint8_t*>(&ep),
+                           reinterpret_cast<uint8_t*>(&ep) + sizeof(ep));
+        }
+        ResolvedParams p = params;
+        payload.insert(payload.end(),
+                       reinterpret_cast<uint8_t*>(&p),
+                       reinterpret_cast<uint8_t*>(&p) + sizeof(p));
+        write_padded(f, payload.data(), payload.size(), sizeof(h));
+        f.sync();
+    }
+
+    // ----- .manifest (atomic commit) -----
+    {
+        const std::string path = index_path_ + ".manifest";
+        const std::string tmp = path + ".tmp";
+        {
+            DirectFile f(tmp, true);
+            SidecarHeader h;
+            fill_header(h, kMagicManifest, count_, dim_, uuid);
+            write_padded(f, &h, sizeof(h), 0);
+            std::string commit =
+                std::string("ready\n") +
+                std::to_string(count_) + "\n" +
+                std::to_string(dim_) + "\n" +
+                std::to_string(params.R) + "\n" +
+                std::to_string(params.pq_m) + "\n";
+            write_padded(f, commit.data(), commit.size(), sizeof(h));
+            f.sync();
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            throw Error(ErrorCode::IoError,
+                        "Engine::flush: manifest rename failed: " + ec.message());
+        }
+    }
+
+    spdlog::info("[sextant] flush: sidecars rewritten (count={})", count_);
 }
 
 }  // namespace sextant
