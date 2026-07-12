@@ -5,7 +5,7 @@
 #   ./scripts/download_datasets.sh sift1m [output_dir]
 #
 # If a local copy of the .fvecs/.ivecs files is already present under
-# $LOCAL_SIFT_DIR (or the default duckdb-vector-index path), the script skips
+# $LOCAL_SIFT_DIR (default: a sibling datasets directory), the script skips
 # the download and just converts. This keeps CI fast when datasets are cached.
 #
 # Requirements: curl (or wget), tar, and a built `fvecs_to_fbin` tool.
@@ -20,7 +20,7 @@ TEXMEX_URL="ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"
 # A mirror over HTTPS is more reliable in CI; fall back to it if ftp fails.
 TEXMEX_HTTP_MIRROR="http://corpus-texmex.irisa.fr/ftp/sift.tar.gz"
 
-DEFAULT_LOCAL_DIR="/Users/rescbr/Projects/duckdb-vector-index/test/bench/datasets/sift"
+DEFAULT_LOCAL_DIR="../datasets/sift"
 LOCAL_SIFT_DIR="${LOCAL_SIFT_DIR:-$DEFAULT_LOCAL_DIR}"
 
 usage() {

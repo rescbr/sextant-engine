@@ -1,6 +1,6 @@
 // PQ quantizer — full implementation.
-// Ported from duckdb-vector-index/src/quant/pq/pq_quantizer.cpp with
-// simsimd → NumKong adaptation. DuckDB dependencies stripped.
+// Evolved from Sextant's exploratory phase; DuckDB dependencies stripped,
+// simsimd → NumKong adaptation.
 
 #include "pq_quantizer.hpp"
 #include "sextant/error.hpp"

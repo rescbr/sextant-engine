@@ -3,9 +3,7 @@
 /// @file pq_quantizer.hpp
 /// Product Quantization (PQ) for vector compression.
 ///
-/// Ported from duckdb-vector-index/src/quant/pq/pq_quantizer.cpp with
-/// simsimd → NumKong adaptation. This is our own prior code from the
-/// exploratory extension phase.
+/// Evolved from Sextant's exploratory phase with simsimd → NumKong adaptation.
 
 #include <sextant/types.hpp>
 #include <vector>

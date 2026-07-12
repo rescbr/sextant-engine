@@ -1,6 +1,6 @@
 // Vamana core — algorithm implementation.
 //
-// Ported from duckdb-vector-index/src/algo/aisaq/aisaq_core.cpp with:
+// Evolved from Sextant's exploratory phase:
 //  - DuckDB dependencies stripped (stdlib + sextant::Error only)
 //  - Per-node spinlocks replaced with the sextant::Mutex sharded lock pool
 //  - LabelFilter machinery stripped (Phase 1 is label-less)
@@ -23,7 +23,7 @@
 
 namespace sextant {
 
-// Node layout offsets (matching duckdb-vector-index aisaq_core.hpp:382-386).
+// Node layout offsets.
 // offset 0:   row_id          (8 bytes)
 // offset 8:   internal_id     (4 bytes)
 // offset 12:  neighbor_count  (2 bytes)
@@ -183,7 +183,7 @@ void VamanaCore::set_neighbor(uint8_t* node, uint32_t i, uint32_t val) {
 }
 
 // ===========================================================================
-// beam_search — port of BeamSearch (aisaq_core.cpp:163-283).
+// beam_search — graph traversal with frontier + working set.
 //
 // Stripped: LabelFilter parameter, row_id_map, expanded_pool_out.
 // The internal candidate type carries internal_id in Candidate::row_id; the
@@ -323,7 +323,7 @@ std::vector<Candidate> VamanaCore::beam_search(
 }
 
 // ===========================================================================
-// robust_prune — port of RobustPrune (aisaq_core.cpp:290-381).
+// robust_prune — occlusion-filtered neighbor selection.
 //
 // Stripped: the query_lut parameter (unused; occlusion uses candidate-candidate
 // distances). The flat build buffer is always active, so we index build_codes_
@@ -405,7 +405,7 @@ std::vector<Candidate> VamanaCore::robust_prune(
 }
 
 // ===========================================================================
-// connect_and_prune — port of ConnectAndPrune (aisaq_core.cpp:417-498).
+// connect_and_prune — wire reciprocal edges with re-pruning.
 //
 // Forward edges on the new node are written without a lock (each
 // new_internal_id is exclusive to one build task). Reciprocal edges each
@@ -480,7 +480,7 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
 }
 
 // ===========================================================================
-// insert_build_from_code — port of InsertBuildFromCode (aisaq_core.cpp:732-754).
+// insert_build_from_code — SDC build path (LUT from own PQ code).
 // SDC build mode: build the query LUT from the node's own PQ code.
 // ===========================================================================
 
@@ -546,7 +546,7 @@ void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
 }
 
 // ===========================================================================
-// insert_build — port of InsertBuild (aisaq_core.cpp:701-730).
+// insert_build — ADC build path (LUT from raw vector).
 // ADC build mode: build the query LUT from the raw vector.
 // ===========================================================================
 
@@ -599,7 +599,7 @@ void VamanaCore::insert_build(uint32_t internal_id, RowId row_id,
 }
 
 // ===========================================================================
-// finalize_inline_codes — port of FinalizeInlineCodes (aisaq_core.cpp:786-807).
+// finalize_inline_codes — copy neighbor PQ codes into inline region.
 // Serial sweep; parallelism is orchestrated at the engine level if desired.
 //
 // After all nodes are built, copy each neighbor's PQ code into the inline
@@ -634,7 +634,7 @@ void VamanaCore::finalize_inline_codes() {
 }
 
 // ===========================================================================
-// compute_entry_points — port of ComputeEntryPoints (aisaq_core.cpp:819-833).
+// compute_entry_points — select entry points via evenly-spaced node IDs.
 //
 // Selects up to n_entry_points evenly-spread nodes. The original caches each
 // entry point's PQ code inline; here beam_search reads codes from the flat
@@ -658,7 +658,7 @@ void VamanaCore::compute_entry_points() {
 }
 
 // ===========================================================================
-// search — port of Search (aisaq_core.cpp:973-1033). Stripped LabelFilter.
+// search — top-k retrieval. LabelFilter stripped.
 //
 // The internal candidates from beam_search carry internal_id in row_id; we
 // resolve each to its table row_id here.

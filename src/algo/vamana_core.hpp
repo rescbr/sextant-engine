@@ -3,7 +3,7 @@
 /// @file vamana_core.hpp
 /// Vamana graph algorithm core: BeamSearch, RobustPrune, ConnectAndPrune.
 ///
-/// Ported from duckdb-vector-index/src/algo/aisaq/aisaq_core.cpp with:
+/// Evolved from Sextant's exploratory phase:
 /// - Storage backend replaced (flat-in-RAM buffers + ShardedLRUCache)
 /// - Per-node spinlocks replaced with nsync sharded lock pool
 /// - DuckDB dependencies stripped (stdlib + CTPL only)
