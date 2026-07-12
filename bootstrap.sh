@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # bootstrap.sh — pre-build setup for sextant-engine.
-# Initializes git submodules (nsync, NumKong).
-# spdlog and googletest are fetched by Meson via WrapDB (see subprojects/*.wrap).
 #
-# NOTE: CTPL and cmdline are committed directly in third_party/ — not fetched
-# here. They are static vendored headers.
+# Initializes the nsync and NumKong git submodules. spdlog and googletest
+# are fetched automatically by Meson via WrapDB (see subprojects/*.wrap).
+#
+# CTPL and cmdline are committed directly in third_party/ — not fetched here.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,7 +18,7 @@ check_cmd() {
 
 log "checking prerequisites..."
 check_cmd git    "Install from https://git-scm.com/"
-check_cmd cmake  "Required for building nsync and spdlog."
+check_cmd cmake  "Required for building nsync."
 check_cmd meson  "Install with 'pip install meson' or your package manager."
 check_cmd clang++ "Required compiler. Install Xcode (macOS) or LLVM (Linux)."
 
@@ -37,7 +37,8 @@ setup_submodule() {
     fi
 }
 
-setup_submodule "nsync"   "https://github.com/google/nsync.git"      "third_party/nsync"
-setup_submodule "numkong" "https://github.com/ashvardanian/NumKong.git" "third_party/numkong"
+setup_submodule "nsync"   "https://github.com/google/nsync.git"         "third_party/nsync"
+setup_submodule "numkong" "https://github.com/ashvardanian/NumKong.git"  "third_party/numkong"
 
 log "done. next step: meson setup build"
+log "  (spdlog and googletest are fetched automatically from Meson WrapDB)"
