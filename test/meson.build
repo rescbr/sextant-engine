@@ -12,6 +12,7 @@ test_sources = [
     'test_fbin_source.cpp',
     'test_engine.cpp',
     'test_cli.cpp',
+    'test_partition.cpp',
 ]
 
 foreach src : test_sources

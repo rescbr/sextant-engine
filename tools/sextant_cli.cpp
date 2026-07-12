@@ -87,6 +87,9 @@ int cmd_build(int argc, char* argv[]) {
     p.add<uint8_t>("pq-bits", 0, "PQ bits", false, 8);
     p.add<std::string>("metric", 0, "l2sq or ip", false, "l2sq");
     p.add<uint32_t>("threads", 0, "Build threads (auto if 0)", false, 0);
+    p.add<uint64_t>("build-ram", 0,
+                     "Build RAM budget in bytes (forces partitioning if small)",
+                     false, 0);
     p.add("explain", 0, "Print resolved params and exit (dry-run)");
     p.parse_check(argc, argv);
 
@@ -109,6 +112,7 @@ int cmd_build(int argc, char* argv[]) {
     cfg.pq_m = p.get<uint8_t>("pq-m");
     cfg.pq_bits = p.get<uint8_t>("pq-bits");
     cfg.num_threads = p.get<uint32_t>("threads");
+    cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     const std::string metric = p.get<std::string>("metric");
     cfg.metric = (metric == "ip") ? sextant::MetricKind::InnerProduct
                                   : sextant::MetricKind::L2Sq;
@@ -127,6 +131,9 @@ int cmd_build(int argc, char* argv[]) {
                   << "pq_bits:    " << static_cast<int>(resolved.pq_bits) << "\n"
                   << "inline_pq:  " << resolved.inline_pq_count << "\n"
                   << "threads:    " << resolved.num_threads << "\n"
+                  << "build_ram:  " << resolved.build_ram_budget
+                  << " bytes\n"
+                  << "K:          " << resolved.K << "\n"
                   << "metric:     " << metric << "\n";
         return 0;
     }

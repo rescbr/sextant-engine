@@ -31,6 +31,8 @@ struct ResolvedParams {
     MetricKind metric = MetricKind::L2Sq;
     uint64_t build_ram_budget = 0;
     uint32_t num_threads = 0;
+    uint32_t K = 1;             ///< Partition count (K>1 → partitioned build)
+    float closure_factor = 1.033f;  ///< Shard overlap radius ratio
 };
 
 /// Auto-resolve parameters from dataset properties + machine properties.
@@ -94,6 +96,11 @@ private:
     void pass2_encode(VectorSource& source, const ResolvedParams& params);
     void parallel_construct(const ResolvedParams& params);
     void finalize_and_flush(const ResolvedParams& params);
+
+    /// Partitioned build (K>1): partition → per-shard build → merge → flush.
+    BuildResult build_partitioned(VectorSource& source,
+                                   const std::string& index_path,
+                                   const ResolvedParams& params);
 
     /// Flush sidecar files (Issue 32: ring-buffered).
     void flush_sidecars(const ResolvedParams& params);

@@ -8,6 +8,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cmath>
 #include <thread>
 
 #if defined(__APPLE__)
@@ -156,6 +157,40 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     spdlog::info("[sextant] build_ram_budget = {} bytes [{}]",
                  p.build_ram_budget,
                  overrides.build_ram_budget != 0 ? "override" : "auto");
+
+    // --- closure_factor (Issue 24: ~15% replication) ---
+    // c = (1 - f_target)^{-1/d_eff}, clamped to [1.0, 1.2].
+    {
+        constexpr float f_target = 0.15f;
+        constexpr float d_eff = 5.0f;
+        float c = std::pow(1.0f - f_target, -1.0f / d_eff);
+        if (c < 1.0f) c = 1.0f;
+        if (c > 1.2f) c = 1.2f;
+        p.closure_factor = c;
+        spdlog::info("[sextant] closure_factor = {:.4f} [auto]", p.closure_factor);
+    }
+
+    // --- K (partition count) ---
+    // per_vec = code_size + node_size(R, inline_pq=0, code_size).
+    // code_size = pq_m (for pq_bits=8, 1 byte per segment).
+    {
+        const uint32_t code_sz = static_cast<uint32_t>(p.pq_m);
+        const uint32_t node_sz =
+            ((16u + static_cast<uint32_t>(p.R) * 4u + 7u) & ~7u);
+        const uint64_t per_vec = code_sz + node_sz;
+        uint32_t k = 1;
+        if (per_vec > 0 && p.build_ram_budget > 0) {
+            const uint64_t max_per_partition = p.build_ram_budget / per_vec;
+            if (max_per_partition > 0) {
+                k = static_cast<uint32_t>(
+                    (n_vectors + max_per_partition - 1) / max_per_partition);
+                if (k < 1) k = 1;
+            }
+        }
+        p.K = k;
+        spdlog::info("[sextant] K (partitions) = {} [per_vec={} bytes]", p.K,
+                     per_vec);
+    }
 
     return p;
 }
