@@ -10,6 +10,7 @@
 #include <sextant/types.hpp>
 #include <unordered_map>
 #include <vector>
+#include <memory>
 #include <cstdint>
 
 namespace sextant {
@@ -17,6 +18,19 @@ namespace sextant {
 struct DirectFile;
 
 /// A single LRU shard. ShardedLRUCache owns N of these.
+///
+/// Locking contract (Phase 1): the caller MUST hold the shard's write lock
+/// (`ScopedWriteLock lock(shard.mutex())`) around every call to lookup(),
+/// insert(), and mark_dirty(). Phase 1 deliberately uses a single write lock
+/// for both reads and writes rather than a read-lock lookup + lock-upgrade on
+/// miss. The rationale:
+///   - Correctness is trivial (no upgrade race, no torn linked-list updates).
+///   - Sharding by `block_idx % N_SHARDS` (N = hardware_concurrency) already
+///     spreads contention thinly, so the coarser lock is not a bottleneck at
+///     Phase 1 scale.
+/// A future perf pass can introduce read-lock lookup with upgrade-to-write on
+/// miss if profiling shows contention. The external API (mutex() accessor +
+/// Scoped locks) won't change.
 struct LRUEntry {
     uint64_t block_idx;
     uint8_t* data;

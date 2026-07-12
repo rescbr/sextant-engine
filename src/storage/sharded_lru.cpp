@@ -41,17 +41,25 @@ void LRUShard::evict_lru() {
     if (!tail_) return;
 
     LRUEntry* victim = tail_;
-    // TODO: writeback if dirty (needs DirectFile reference).
-    // For now, dirty blocks in search (read-only) cache are never dirty.
 
-    // Unlink tail
+    // Phase 1: the search cache is strictly read-only — blocks are loaded from
+    // sidecar files and never mutated in memory, so `dirty` is always false
+    // here and writeback is unnecessary. We intentionally keep the dirty flag
+    // + mark_dirty() plumbing so a future write path can flush `victim->data`
+    // back to its DirectFile before eviction, without restructuring this code:
+    //
+    //   if (victim->dirty) { file->pwrite_aligned(victim->data, size, off); }
+    (void)victim->dirty;
+
+    // Unlink tail from the LRU list.
     tail_ = victim->prev;
     if (tail_) tail_->next = nullptr;
-    if (head_ == victim) head_ = nullptr;
+    else head_ = nullptr;  // victim was the only entry
 
     auto it = map_.find(victim->block_idx);
     if (it != map_.end()) {
         aligned_free(it->second.data);
+        it->second.data = nullptr;
         map_.erase(it);
     }
 }
@@ -73,7 +81,9 @@ uint8_t* LRUShard::insert(uint64_t block_idx, const uint8_t* data,
         return it->second.data;
     }
 
-    // Evict if at capacity
+    // Evict if at capacity. capacity_ == 0 means the shard holds nothing;
+    // guard against an infinite loop by bailing out early.
+    if (capacity_ == 0) return nullptr;
     while (map_.size() >= capacity_) {
         evict_lru();
     }
