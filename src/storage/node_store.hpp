@@ -59,6 +59,11 @@ public:
     /// PagedNodeStore throws Error(NotImplemented).
     virtual uint8_t* mutable_node(uint32_t internal_id) = 0;
     virtual uint8_t* mutable_code(uint32_t internal_id) = 0;
+
+    /// True if this store reads from disk in blocks (PagedNodeStore).
+    /// PageSearch only pays off when a block I/O brings co-located nodes into
+    /// the cache; for RAM-resident flat stores it is skipped.
+    virtual bool is_paged() const = 0;
 };
 
 /// Flat buffer backing. Used during build and for small indices at search.
@@ -75,6 +80,7 @@ public:
     void unpin_code(uint32_t) override {}
     uint8_t* mutable_node(uint32_t id) override;
     uint8_t* mutable_code(uint32_t id) override;
+    bool is_paged() const override { return false; }
 
 private:
     uint8_t* nodes_;
@@ -107,6 +113,7 @@ public:
     void unpin_code(uint32_t) override;  // Phase 1: no-op
     uint8_t* mutable_node(uint32_t) override;
     uint8_t* mutable_code(uint32_t) override;
+    bool is_paged() const override { return true; }
 
     /// Read counters for testing/diagnostics.
     uint64_t graph_reads() const { return graph_reads_; }

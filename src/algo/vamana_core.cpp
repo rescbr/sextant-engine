@@ -292,9 +292,70 @@ std::vector<Candidate> VamanaCore::beam_search(
         if (W.size() >= L && best.dist > W.top().dist) {
             break;
         }
-        // Expand neighbors of `best`.
+
+        // -----------------------------------------------------------------
+        // PageSearch: when we touch a node, its whole block is fetched into
+        // the cache (PagedNodeStore) or is already in a flat buffer. Compute
+        // PQ-LUT distances for ALL co-located nodes in the same block — the
+        // I/O was already paid, so the distance work (nanoseconds each) is
+        // effectively free and discovers useful candidates. This is additive
+        // to explicit neighbor traversal below, which still reaches nodes in
+        // OTHER blocks.
+        //
+        // Only enabled on the paged (SSD) search path: during build the flat
+        // buffers are RAM-resident so there is no I/O to amortise, and the
+        // full-block scan can hurt graph quality on degenerate (near-equal
+        // distance) inputs by saturating the beam with co-located nodes
+        // before explicit edges are followed.
+        //
+        // `best` itself was already visited when pushed; is_visited() skips it.
+        // -----------------------------------------------------------------
+        // PageSearch: scan co-located nodes in the same block for additional
+        // candidates. Only active on the paged path (SSD reads) — when the
+        // graph fits entirely in RAM, there is no I/O to amortize and the
+        // extra distance computations are pure overhead.
+        //
+        // After PageShuffle (BFS reordering), a node's graph neighbors are
+        // co-located at the start of its block. Scanning R co-located nodes
+        // covers the expected neighbor set without wasting compute on
+        // non-neighbors.
+        if (store_ && store_->is_paged()) {
+            const uint32_t nodes_per_block =
+                std::max(1u, kBlockSize / node_size_);
+            const uint32_t block_first =
+                (best.internal_id / nodes_per_block) * nodes_per_block;
+            const uint32_t block_last =
+                std::min(block_first + nodes_per_block, count_);
+            const uint32_t max_pagescan =
+                std::min(nodes_per_block, static_cast<uint32_t>(params_.R));
+            const uint32_t scan_last =
+                std::min(block_last, block_first + max_pagescan);
+            for (uint32_t bid = block_first; bid < scan_last; bid++) {
+                if (is_visited(bid)) {
+                    continue;
+                }
+                mark_visited(bid);
+
+                if (io_limit > 0 && io_count >= io_limit) {
+                    continue;  // out of I/O budget: mark visited, skip dist.
+                }
+                io_count++;
+                const float d = dist_to(bid);
+                if (W.size() < L || d < W.top().dist) {
+                    frontier.push({d, bid});
+                    W.push({d, bid});
+                    if (W.size() > L) {
+                        W.pop();
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Expand explicit neighbors of `best`.
         // Copy the neighbor list out of the node before any further pin
         // (PagedNodeStore may evict the block on the next pin_code/pin_node).
+        // -----------------------------------------------------------------
         uint16_t n;
         uint32_t neighbors_buf[1024];
         const uint32_t* nb_ptr;

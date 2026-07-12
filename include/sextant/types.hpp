@@ -42,6 +42,10 @@ struct Chunk {
 };
 
 /// Block size for sidecar file I/O (256 KB).
+///
+/// This is the unit of caching and I/O for the paged search path. Each block
+/// read brings in ~1260 nodes (at node_size=208B), enabling PageSearch to
+/// compute distances for co-located neighbors at no extra I/O cost.
 inline constexpr uint32_t kBlockSize = 256 * 1024;
 
 /// Disk alignment for O_DIRECT / posix_memalign.
