@@ -120,7 +120,7 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
     // here; if an eviction occurs during this call the epoch changes and the
     // L1 entry (if any) is treated as stale.
     TLBlockCache& l1 = tl_cache();
-    const uint64_t epoch = g_global_epoch.load(std::memory_order_relaxed);
+    const uint64_t epoch = cache_.shard_epoch(key_base);
     if (const uint8_t* hit = l1.lookup(key_base, epoch)) {
         ++l1.hits;
         tl_hits_.fetch_add(1, std::memory_order_relaxed);
@@ -140,7 +140,7 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
             // itself cannot evict, but a concurrent shard op on another
             // thread could have).
             const uint64_t post_epoch =
-                g_global_epoch.load(std::memory_order_relaxed);
+                cache_.shard_epoch(key_base);
             l1.insert(key_base, hit, post_epoch);
             return {hit, false};  // LRU hit — served from RAM
         }
@@ -190,7 +190,7 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
             // Cache the L2-OWNED pointer (`stored`), NOT g_staging.data (which
             // is a thread-local scratch buffer overwritten on the next miss).
             const uint64_t post_epoch =
-                g_global_epoch.load(std::memory_order_relaxed);
+                cache_.shard_epoch(key_base);
             l1.insert(key_base, stored, post_epoch);
             return {stored, true};
         }
@@ -199,7 +199,7 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
         stored = shard.insert(key_base, g_staging.data, block_size);
         if (stored != nullptr) {
             const uint64_t post_epoch =
-                g_global_epoch.load(std::memory_order_relaxed);
+                cache_.shard_epoch(key_base);
             l1.insert(key_base, stored, post_epoch);
         }
         return {stored, true};

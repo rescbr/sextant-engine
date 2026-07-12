@@ -11,8 +11,9 @@ namespace sextant {
 // --- CacheShard -------------------------------------------------------------
 
 CacheShard::CacheShard(uint32_t capacity_blocks, uint32_t block_size,
-                       BlockCache* cache)
+                       BlockCache* cache, uint32_t shard_index)
     : cache_(cache),
+      shard_index_(shard_index),
       pool_(block_size),
       capacity_(capacity_blocks),
       max_window_(std::max(1u, capacity_ * 1 / 100)),
@@ -26,10 +27,9 @@ CacheShard::CacheShard(uint32_t capacity_blocks, uint32_t block_size,
 CacheShard::~CacheShard() {
     for (auto& [idx, entry] : map_) {
         pool_.release(entry.data);
-        // Bump the global epoch: any L1 cache holding a pointer into this
-        // shard's now-freed memory must treat it as stale. We bump once per
-        // entry rather than once per shard to match free_entry() semantics.
-        g_global_epoch.fetch_add(1, std::memory_order_relaxed);
+        // No epoch bump here: the cache is being torn down, so no L1 will
+        // consult this shard's epoch again. Bumping would also be unsafe if
+        // shard_epochs_ has already been destroyed.
     }
 }
 
@@ -42,10 +42,14 @@ void CacheShard::free_entry(LRUEntry* e) {
     }
     pool_.release(e->data);
     e->data = nullptr;
-    // Signal the thread-local L1 caches that an eviction occurred: any pointer
-    // they hold into L2 memory MAY now be stale. Coarse-grained (invalidates
-    // the entire L1) but cheap (relaxed atomic) and correct.
-    g_global_epoch.fetch_add(1, std::memory_order_relaxed);
+    // Signal the thread-local L1 caches that an eviction occurred in THIS
+    // shard: any pointer they hold into this shard's memory MAY now be
+    // stale. Per-shard (not global): an eviction in shard K only invalidates
+    // L1 entries from shard K.
+    if (cache_) {
+        cache_->shard_epochs_[shard_index_].fetch_add(1,
+            std::memory_order_relaxed);
+    }
     auto it = map_.find(e->block_idx);
     if (it != map_.end()) {
         map_.erase(it);
@@ -272,10 +276,11 @@ BlockCache::BlockCache(uint32_t num_shards,
       hc_capacity_(static_cast<uint64_t>(blocks_per_shard) * num_shards),
       hc_sample_size_(10u * hc_capacity_),
       hc_step_size_(std::max(2.0, hc_per_shard_capacity_ * 0.0625)) {
+    shard_epochs_ = std::make_unique<std::atomic<uint64_t>[]>(num_shards);
     shards_.reserve(num_shards);
     for (uint32_t i = 0; i < num_shards; ++i) {
         shards_.push_back(
-            std::make_unique<CacheShard>(blocks_per_shard, block_size, this));
+            std::make_unique<CacheShard>(blocks_per_shard, block_size, this, i));
     }
 }
 

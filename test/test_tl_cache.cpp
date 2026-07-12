@@ -29,17 +29,6 @@
 namespace sextant {
 namespace {
 
-/// Helper: snapshot the global epoch so a test can restore it on exit. The
-/// epoch is a process-global counter shared across all tests; bumping it in
-/// one test (to exercise staleness) must not poison later tests.
-struct EpochGuard {
-    uint64_t saved;
-    EpochGuard() : saved(g_global_epoch.load(std::memory_order_relaxed)) {}
-    ~EpochGuard() {
-        g_global_epoch.store(saved, std::memory_order_relaxed);
-    }
-};
-
 /// Write n×dim random float vectors to a .fbin file. Returns the path.
 static std::string write_random_fbin(const std::string& name, uint32_t n,
                                        uint32_t dim, uint64_t seed = 42) {
@@ -71,14 +60,13 @@ static void remove_sidecars(const std::string& base) {
 // Unit: basic insert + lookup hit (pointer-based, epoch-valid).
 // ---------------------------------------------------------------------------
 TEST(TLBlockCache, InsertAndLookupHit) {
-    EpochGuard eg;
     TLBlockCache cache;
     // Backing storage the pointer references (the L1 does NOT copy it).
     std::array<uint8_t, kBlockSize> backing{};
     for (size_t i = 0; i < kBlockSize; i++)
         backing[i] = static_cast<uint8_t>(i & 0xFF);
 
-    const uint64_t epoch = g_global_epoch.load(std::memory_order_relaxed);
+    const uint64_t epoch = 0;
     cache.insert(42, backing.data(), epoch);
     const uint8_t* hit = cache.lookup(42, epoch);
     ASSERT_NE(hit, nullptr);
@@ -90,9 +78,8 @@ TEST(TLBlockCache, InsertAndLookupHit) {
 // Unit: lookup miss for an unknown key.
 // ---------------------------------------------------------------------------
 TEST(TLBlockCache, LookupMiss) {
-    EpochGuard eg;
     TLBlockCache cache;
-    const uint64_t epoch = g_global_epoch.load(std::memory_order_relaxed);
+    const uint64_t epoch = 0;
     EXPECT_EQ(cache.lookup(999, epoch), nullptr);
 
     // Insert one key; an unrelated key still misses.
@@ -106,10 +93,9 @@ TEST(TLBlockCache, LookupMiss) {
 // evicted (miss) and the newest is still present (hit).
 // ---------------------------------------------------------------------------
 TEST(TLBlockCache, FIFOReplacement) {
-    EpochGuard eg;
     TLBlockCache cache;
     std::array<uint8_t, kBlockSize> backing{};
-    const uint64_t epoch = g_global_epoch.load(std::memory_order_relaxed);
+    const uint64_t epoch = 0;
 
     // Fill all slots with distinct keys 0..kCapacity-1.
     for (uint32_t i = 0; i < TLBlockCache::kCapacity; i++) {
@@ -131,10 +117,9 @@ TEST(TLBlockCache, FIFOReplacement) {
 // Unit: lookup is exact-match (no false positives from partial keys).
 // ---------------------------------------------------------------------------
 TEST(TLBlockCache, NoFalsePositiveOnAdjacentKeys) {
-    EpochGuard eg;
     TLBlockCache cache;
     std::array<uint8_t, kBlockSize> backing{};
-    const uint64_t epoch = g_global_epoch.load(std::memory_order_relaxed);
+    const uint64_t epoch = 0;
     cache.insert(100, backing.data(), epoch);
     // Adjacent keys must not spuriously match.
     EXPECT_EQ(cache.lookup(99, epoch), nullptr);
@@ -148,22 +133,20 @@ TEST(TLBlockCache, NoFalsePositiveOnAdjacentKeys) {
 // advances (simulating an L2 eviction that would invalidate the pointer).
 // ---------------------------------------------------------------------------
 TEST(TLBlockCache, EpochStalenessInvalidatesPointer) {
-    EpochGuard eg;
     TLBlockCache cache;
     std::array<uint8_t, kBlockSize> backing{};
 
-    // Insert at the current epoch.
-    g_global_epoch.store(1, std::memory_order_relaxed);
+    // Insert at epoch 1.
     cache.insert(7, backing.data(), /*epoch=*/1);
 
     // Same epoch → hit.
-    EXPECT_NE(cache.lookup(7, /*current_epoch=*/1), nullptr);
+    EXPECT_NE(cache.lookup(7, /*shard_epoch=*/1), nullptr);
 
-    // Simulate an eviction: the global epoch advances. The L1 entry's stored
-    // epoch (1) no longer matches the current epoch (2) → miss, even though
-    // the key is present. This is the use-after-free guard.
-    g_global_epoch.store(2, std::memory_order_relaxed);
-    EXPECT_EQ(cache.lookup(7, /*current_epoch=*/2), nullptr)
+    // Simulate an eviction in this shard: the shard epoch advances. The L1
+    // entry's stored epoch (1) no longer matches the current shard epoch (2)
+    // → miss, even though the key is present. This is the use-after-free
+    // guard. (A different shard's epoch would NOT invalidate this entry.)
+    EXPECT_EQ(cache.lookup(7, /*shard_epoch=*/2), nullptr)
         << "stale entry (epoch mismatch) must be treated as a miss";
 }
 

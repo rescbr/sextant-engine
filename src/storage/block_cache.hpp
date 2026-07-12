@@ -33,15 +33,6 @@
 
 namespace sextant {
 
-/// Global epoch counter, incremented on every block eviction (data free).
-/// Used by the thread-local L1 cache to detect stale pointers: the L1 stores
-/// pointers into L2's memory, and if L2 evicts a block (bumping the epoch),
-/// the L1's stored epoch no longer matches → treat the pointer as stale.
-///
-/// Coarse-grained by design (one eviction anywhere invalidates the whole L1),
-/// but the L1 is tiny (8 entries) and the epoch check is a single relaxed load.
-static inline std::atomic<uint64_t> g_global_epoch{0};
-
 struct DirectFile;
 class BlockCache;
 
@@ -128,7 +119,7 @@ public:
     /// is 1% of capacity (matching Caffeine); the owning cache's hill-climber
     /// adjusts it at runtime by writing the atomic limits.
     explicit CacheShard(uint32_t capacity_blocks, uint32_t block_size,
-                        BlockCache* cache = nullptr);
+                        BlockCache* cache = nullptr, uint32_t shard_index = 0);
     ~CacheShard();
 
     CacheShard(const CacheShard&) = delete;
@@ -192,9 +183,13 @@ private:
     }
 
     /// Back-pointer to the owning cache (set at construction). Used to feed
-    /// hit/miss samples into the cache-level hill-climber. Nullptr in tests
-    /// that construct a bare shard.
+    /// hit/miss samples into the cache-level hill-climber, and to bump this
+    /// shard's epoch on eviction. Nullptr in tests that construct a bare shard.
     BlockCache* cache_ = nullptr;
+
+    /// Index of this shard within the owning BlockCache (0..N-1). Used to
+    /// bump the correct per-shard epoch counter on eviction.
+    uint32_t shard_index_ = 0;
 
     /// Per-shard buffer pool. Declared BEFORE map_ (and every other member
     /// that holds block buffers) because ~CacheShard() iterates map_ and calls
@@ -245,6 +240,15 @@ public:
     uint32_t num_shards() const { return shards_.size(); }
     uint32_t block_size() const { return block_size_; }
 
+    /// Read the epoch for the shard owning `block_key`. Used by the L1 to
+    /// validate pointers: an eviction in shard K only bumps `shard_epochs_[K]`,
+    /// so L1 entries from other shards remain valid.
+    uint64_t shard_epoch(uint64_t block_key) const {
+        return shard_epochs_[block_key % shards_.size()].load(
+            std::memory_order_relaxed);
+    }
+
+
     CacheShard& shard(uint64_t block_idx) {
         return *shards_[block_idx % shards_.size()];
     }
@@ -264,6 +268,8 @@ public:
     void record_access(bool hit);
 
 private:
+    friend class CacheShard;
+
     /// Compute a new window ratio from the accumulated sample and write it to
     /// every shard's atomic limits (no shard locks acquired).
     void climb();
@@ -272,6 +278,14 @@ private:
     void maybe_climb();
 
     uint32_t block_size_;
+
+    /// Per-shard epoch counters. Incremented when a block is evicted from
+    /// that specific shard. The L1 checks only the shard that owns the block
+    /// being looked up — an eviction in shard 3 doesn't invalidate L1 entries
+    /// from shard 7. Declared BEFORE shards_ so epochs outlive the shards
+    /// during destruction. (unique_ptr<atomic[]> because std::vector<atomic>
+    /// is not MoveInsertable.)
+    std::unique_ptr<std::atomic<uint64_t>[]> shard_epochs_;
 
     std::vector<std::unique_ptr<CacheShard>> shards_;
 

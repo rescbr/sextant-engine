@@ -62,14 +62,14 @@ Pointer-based TLBlockCache with epoch validation. Each search thread gets
 its own 8-slot private cache that stores pointers into L2's memory. A global
 epoch counter detects stale pointers when L2 evicts blocks.
 
-- **69% hit rate** on SIFT-1M (32MB L2).
-- **Lock-free** lookup (linear scan of 8 key entries, one cache line).
+- **86% hit rate** on SIFT-1M (32MB L2, 1 thread).
+- **Lock-free** lookup (linear scan of 32 key entries, ~4 cache lines).
 - **No data copy** — stores pointers, not 256KB block copies (copy-based
   design was tried and abandoned: it thrashed the CPU L2/L3 cache).
-
-**Limitation:** The global epoch is coarse — one eviction anywhere
-invalidates all L1 entries. Per-shard epoch would allow larger L1 capacity
-(future work).
+- **Per-shard epoch validation** — an eviction in shard K only invalidates
+  L1 entries from shard K (not all entries). This allows a larger L1
+  capacity (32 slots) without the false-invalidation churn that crippled
+  the global-epoch design.
 
 ### L2: BlockCache with W-TinyLFU eviction ✅ DONE
 
@@ -149,19 +149,14 @@ the cache from passive storage into an active source of candidates.
 
 | Threads | Original (plain LRU) | After all fixes |
 |---|---|---|
-| 1 | 191 QPS | 306 QPS (+60%) |
-| 4 | 133 QPS (thrashing) | 300 QPS (+125%) |
+| 1 | 191 QPS | 322 QPS (+68%) |
+| 4 | 133 QPS (thrashing) | 339 QPS (+154%) |
 | Recall | 0.9970 | 0.9970 |
 
 ## Open questions / future work
 
-1. **Per-shard epoch:** The global epoch invalidates all L1 entries on any L2
-   eviction. Per-shard epoch would reduce false invalidation by N× and allow
-   larger L1 capacity (>8 slots).
-
-2. **L1 capacity tuning:** 8 slots gives 69% hit rate. More slots would help
-   but the global epoch causes excessive invalidation at higher capacities
-   (32 slots → 93% hit rate but catastrophic slowdown from epoch churn).
+1. ~~**Per-shard epoch:**~~ ✅ DONE. Per-shard epoch implemented. L1 capacity
+   increased from 8→32 slots. Hit rate improved 69%→86% (1 thread).
 
 3. **Sync PageHeap:** Worth re-evaluating after per-shard epoch, to see if
    active vertex extraction reduces I/O enough to justify the compute cost.

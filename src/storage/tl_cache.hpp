@@ -16,16 +16,16 @@
 /// ~40 misses/query = 10 MB of copies thrashing L2/L3 per query).
 ///
 /// The risk of storing raw pointers into L2 is use-after-free: L2 can evict a
-/// block (freeing its memory) while L1 still references it. Mitigated by the
-/// global epoch counter (`g_global_epoch` in block_cache.hpp): every eviction
-/// increments it. On L1 lookup, if the stored epoch differs from the current
-/// global epoch, SOME eviction happened since insertion → the pointer MAY be
-/// stale → treat as a miss (fall through to L2).
+/// block (freeing its memory) while L1 still references it. Mitigated by
+/// per-shard epoch counters (`BlockCache::shard_epochs_`): every eviction in
+/// shard K increments `shard_epochs_[K]`. On L1 lookup, the caller passes the
+/// epoch for the block's owning shard; if the stored epoch differs from the
+/// current shard epoch, an eviction in that shard happened since insertion →
+/// the pointer MAY be stale → treat as a miss (fall through to L2).
 ///
-/// This is deliberately coarse-grained: one eviction anywhere invalidates the
-/// entire L1 (at most 8 entries). The cost is a few extra L1 misses on the
-/// next pass; the benefit is a single relaxed atomic load on the hot path
-/// (~1 ns) and no per-block generation bookkeeping.
+/// This is fine-grained: an eviction in shard K only invalidates L1 entries
+/// whose blocks live in shard K — entries from other shards stay valid. The
+/// cost is a single relaxed atomic load on the hot path (~1 ns).
 ///
 /// Memory cost: ~200 bytes per thread (8 entries × ~24 bytes) vs 2 MB for the
 /// copy-based design.
@@ -40,10 +40,10 @@
 ///
 /// TLBlockCache is intended for thread-local storage only. A single instance
 /// is accessed by exactly one thread, so no locking is required on lookup or
-/// insert. The epoch reads use relaxed atomics (the epoch is a shared global
-/// counter updated by L2 eviction on other threads). The hits/misses counters
-/// use non-atomic increments; they are aggregated per-store via relaxed
-/// atomics by the owning PagedNodeStore.
+/// insert. The shard-epoch reads use relaxed atomics (the epoch is a shared
+/// per-shard counter updated by L2 eviction on other threads). The
+/// hits/misses counters use non-atomic increments; they are aggregated
+/// per-store via relaxed atomics by the owning PagedNodeStore.
 
 #include <sextant/types.hpp>
 
@@ -55,7 +55,7 @@ namespace sextant {
 /// Thread-local L1 block cache. One instance per search thread.
 struct TLBlockCache {
     /// Number of blocks cached per thread.
-    static constexpr uint32_t kCapacity = 8;
+    static constexpr uint32_t kCapacity = 32;
 
     /// Sentinel key marking an unused slot. Real keys are always < this
     /// (block indices, possibly OR'd with kCodeKeyBit, are well below 2^63-1).
@@ -64,10 +64,11 @@ struct TLBlockCache {
     struct Entry {
         uint64_t block_key = kInvalidKey;
         /// Pointer into L2's memory. Valid only while `epoch` matches the
-        /// current global epoch.
+        /// owning shard's current epoch.
         const uint8_t* data_ptr = nullptr;
-        /// Value of g_global_epoch at insertion time. If it no longer matches
-        /// the current epoch, an eviction occurred → the pointer may be stale.
+        /// Value of the owning shard's epoch at insertion time. If it no
+        /// longer matches the current shard epoch, an eviction occurred in
+        /// that shard → the pointer may be stale.
         uint64_t epoch = 0;
     };
 
@@ -78,12 +79,14 @@ struct TLBlockCache {
     /// (no eviction has occurred since insertion). Returns nullptr on a miss
     /// or when the entry is stale (epoch mismatch → pointer may dangle).
     ///
-    /// `current_epoch` is the value of g_global_epoch read by the caller at
-    /// the top of batched_read (passed in to avoid a redundant load).
-    const uint8_t* lookup(uint64_t block_key, uint64_t current_epoch) const {
+    /// `shard_epoch` is the per-shard epoch for the block's owning shard,
+    /// read by the caller at the top of batched_read (passed in to avoid a
+    /// redundant load). An eviction in a different shard does NOT change this
+    /// value, so L1 entries from other shards stay valid.
+    const uint8_t* lookup(uint64_t block_key, uint64_t shard_epoch) const {
         for (uint32_t i = 0; i < kCapacity; ++i) {
             if (slots_[i].block_key == block_key) {
-                if (slots_[i].epoch == current_epoch) {
+                if (slots_[i].epoch == shard_epoch) {
                     return slots_[i].data_ptr;
                 }
                 return nullptr;  // stale — an eviction happened since insertion
@@ -92,10 +95,11 @@ struct TLBlockCache {
         return nullptr;  // not in L1
     }
 
-    /// Inserts a POINTER to block data (NO COPY). `epoch` should be the value
-    /// of g_global_epoch captured AFTER the L2 operation that produced `ptr`,
-    /// so the entry is valid for at least as long as no further eviction occurs.
-    /// FIFO replacement: round-robin over slots 0..kCapacity-1.
+    /// Inserts a POINTER to block data (NO COPY). `epoch` should be the
+    /// owning shard's epoch captured AFTER the L2 operation that produced
+    /// `ptr`, so the entry is valid for at least as long as no further
+    /// eviction occurs in that shard. FIFO replacement: round-robin over
+    /// slots 0..kCapacity-1.
     void insert(uint64_t block_key, const uint8_t* ptr, uint64_t epoch) {
         slots_[next_slot_].block_key = block_key;
         slots_[next_slot_].data_ptr = ptr;
