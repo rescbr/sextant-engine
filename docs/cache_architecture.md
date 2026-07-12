@@ -1,10 +1,11 @@
 # Search Cache Architecture
 
-> Design doc — 2026-07-12. Synthesizes DiskANN++ PageHeap, W-TinyLFU
-> eviction, and our existing MemGraph/PageShuffle/batched-pread stack.
+> Design doc — 2026-07-12. Synthesizes W-TinyLFU eviction, thread-local
+> L1 caching, and our existing MemGraph/PageShuffle/batched-pread stack.
 >
 > Status: Phase 1 (W-TinyLFU) and Phase 2 (TL-L1 + allocation fixes) are
-> implemented. Phase 3 (async overlap / PageHeap) is deferred.
+> implemented. Phase 3 (DiskANN++ PageHeap) was investigated, prototyped,
+> profiled, and **abandoned** — see below.
 
 ## The problems
 
@@ -16,7 +17,9 @@
 2. **Low page utilization** — DiskANN++ showed plain caching gets only 10-20%
    hit rate because cached pages are "unused for node expansion." The bottleneck
    isn't how many pages you cache, it's how many *useful vertices* each cached
-   page delivers to the search frontier. (Not yet addressed — Phase 3.)
+   page delivers to the search frontier. **Addressed by PageSearch + PageShuffle**
+   (co-located nodes are scanned at fetch time). The DiskANN++ PageHeap approach
+   was investigated and abandoned — see Phase 3 below.
 
 ## Architecture
 
@@ -130,20 +133,60 @@ Reads 4 blocks (1MB) per miss. PageShuffle ensures BFS co-location. No change.
 **Files:** `src/storage/tl_cache.hpp`, `src/storage/block_buffer_pool.hpp/.cpp`,
 `src/algo/vamana_core.cpp` (SearchScratch + thread_local TLS)
 
-### Phase 3: Sync PageHeap + async I/O overlap (DEFERRED)
+### Phase 3: DiskANN++ PageHeap — INVESTIGATED & ABANDONED
 
 **What it is:** DiskANN++'s PageHeap — actively extract useful vertices from
-cached pages and feed them into the search candidate set via `Pop()`. Turns
-the cache from passive storage into an active source of candidates.
+ cached pages and feed them into the search candidate set via `Pop()`. Turns
+ the cache from passive storage into an active source of candidates.
 
-**Why deferred:**
-- Sync PageHeap adds O(vertices_per_page ≈ 940) distance computations per
-  cache miss. Without async I/O overlap, this is pure serial overhead.
-- macOS page cache makes I/O ~9% of latency — overlap saves <0.5ms.
-- Linux with O_DIRECT would see I/O dominate (~13ms vs ~4ms compute), making
-  overlap worthwhile (~22% latency reduction).
+**Status: Fully prototyped, profiled, and abandoned (2026-07-12). Code reverted.**
 
-**Revisit when:** Linux validation infrastructure exists.
+The investigation proceeded in three phases, each revealing a distinct issue:
+
+**Phase 3a — QPS dropped 50%:**
+The initial implementation registered *code blocks* (8192 nodes each, since
+`codes_per_block = kBlockSize / code_size = 262144 / 32 = 8192`). The plan had
+assumed ~940 nodes/block, but that was *graph* blocks (`node_size = 208B`).
+Result: 122M `lut_distance` calls, 99.97% unused. Fixed by registering
+graph-block nodes capped at `params_.R`, but this revealed the deeper issue.
+
+**Phase 3b — PageHeap became a no-op:**
+After the fix, PageHeap pushed 0 candidates. Reason: PageSearch (which fires on
+`from_ssd=true` blocks) already scans the same graph-block co-located nodes and
+marks them visited. PageHeap and PageSearch scan the *same* nodes — PageHeap is
+redundant.
+
+**Phase 3c — Simulation proved no ceiling exists:**
+A `--page-heap sim` mode was added (disable PageSearch, register ALL touched
+blocks including cached ones, track candidate competitiveness without
+injecting). Results (SIFT-1M, 32MB cache, 1000 queries):
+
+| Mode | recall  | QPS   | graph_reads |
+|------|---------|-------|-------------|
+| off  | 0.9967  | 311.9 | 33311       |
+| all  | 0.9971  | 264.8 | 36045 (+8%) |
+
+- Only **3.5%** of popped candidates were competitive (closer than W's L-th).
+- `graph_reads` **never decreased** — they increased or stayed flat.
+- Recall differences were within noise.
+
+**Why it's architecturally redundant:**
+
+It's PageShuffle, not the dataset or macOS page cache. PageShuffle co-locates
+graph neighbors in disk blocks, which means:
+1. When a block is fetched (`from_ssd=true`), PageSearch immediately scans its
+   co-located nodes — which ARE the graph neighbors.
+2. By the time the block is cached (`from_ssd=false`), all useful nodes are
+   already visited. Nothing remains for PageHeap to surface.
+
+**Skewed datasets don't change this.** Popularity skew helps MemGraph (the
+hot path is already in RAM). Distributional skew (tight clusters) doesn't
+create a "warm but not hot" tier — if a node is accessed enough to stay cached,
+it's either in MemGraph or was a one-off cold read that PageSearch handled.
+
+**The three-tier design is complete:** MemGraph (hot path) → L1/L2 + PageSearch
+(cold path with locality exploitation) → SSD. PageHeap sat in a gap that doesn't
+exist. See `memory/pageheap-impl.md` for the full investigation notes.
 
 ## Performance summary (SIFT-1M, 32MB cache)
 
@@ -158,9 +201,10 @@ the cache from passive storage into an active source of candidates.
 1. ~~**Per-shard epoch:**~~ ✅ DONE. Per-shard epoch implemented. L1 capacity
    increased from 8→32 slots. Hit rate improved 69%→86% (1 thread).
 
-3. **Sync PageHeap:** Worth re-evaluating after per-shard epoch, to see if
-   active vertex extraction reduces I/O enough to justify the compute cost.
+2. ~~**Sync PageHeap:**~~ ❌ ABANDONED. Fully investigated, prototyped, and
+   profiled. Architecturally redundant with PageShuffle + PageSearch — see
+   Phase 3 above. Do not re-implement.
 
-4. **W-TinyLFU window ratio at scale:** The hill-climber adapts, but the
+3. **W-TinyLFU window ratio at scale:** The hill-climber adapts, but the
    optimal ratio may differ at 100M/1B scale where the cache-to-graph ratio
    is much smaller.

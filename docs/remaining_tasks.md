@@ -203,7 +203,7 @@ profiles. Integrate into CI.
 | T4 | Crash recovery / orphan detection | MEDIUM | Small | ✅ Done (manifest + orphan checks in `Engine::open`) |
 | T5 | ADC build mode CLI flag | MEDIUM | Medium | ✅ Done (`--alpha 1.5` triggers ADC, raw vectors loaded for construct) |
 | T6 | Entry point persistence | MEDIUM | Small | ✅ Done (`set_entry_points` + end-to-end test) |
-| T7 | Async I/O pipeline (PipeSearch) | LOW | Large | 🔶 Design done (`docs/cache_architecture.md`); sync PageHeap deferred, async needs Linux |
+| T7 | Async I/O pipeline (PipeSearch) | LOW | Large | ❌ PageHeap abandoned — architecturally redundant with PageShuffle+PageSearch (see `docs/cache_architecture.md` Phase 3). Async overlap not worth pursuing |
 | T8 | BIGANN-100M validation | LOW | Large | Not started (blocked on T2) |
 | T9 | samply profiling scripts | LOW | Small | ✅ Done (`scripts/profile_build.sh`, `profile_search.sh`, `scripts/analyze_profile.py`) |
 
