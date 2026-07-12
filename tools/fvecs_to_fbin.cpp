@@ -1,0 +1,230 @@
+// fvecs_to_fbin — convert .fvecs/.ivecs (Texmex format) to Sextant formats.
+//
+// .fvecs format (per vector):  [int32 dim][dim × float32 values]
+// .ivecs format (per vector):  [int32 k][k × int32 values]
+//
+// .fbin format (global header): [uint32 n][uint32 dim][n × dim × float32]
+// .gt   format (ground truth):  [uint32 n_queries][uint32 k]
+//                              [n × k × uint32 neighbor IDs]
+//                              [n × k × float32 distances]  (zero-filled)
+//
+// Usage:
+//   fvecs_to_fbin --input file.fvecs --output file.fbin
+//   fvecs_to_fbin --input file.ivecs --output file.gt --gt
+
+#include "sextant/error.hpp"
+#include "sextant/logging.hpp"
+
+#include <cmdline/cmdline.h>
+
+#include <spdlog/spdlog.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace {
+
+using sextant::Error;
+using sextant::ErrorCode;
+
+/// Read a whole file into a buffer. Throws sextant::Error on failure.
+std::vector<char> read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        throw Error(ErrorCode::IoError,
+                    "cannot open input '" + path + "'");
+    }
+    const std::streamoff size = f.tellg();
+    if (size <= 0) {
+        throw Error(ErrorCode::IoError,
+                    "input '" + path + "' is empty or unreadable");
+    }
+    f.seekg(0, std::ios::beg);
+    std::vector<char> buf(static_cast<size_t>(size));
+    f.read(buf.data(), size);
+    if (!f && !f.eof()) {
+        throw Error(ErrorCode::IoError,
+                    "short read on '" + path + "'");
+    }
+    return buf;
+}
+
+/// Convert .fvecs → .fbin.
+/// Each record: [int32 dim][dim × float32]. We strip the per-vector dim prefix
+/// and emit a global [uint32 n][uint32 dim] header + raw float32 payload.
+void convert_fvecs(const std::string& input, const std::string& output) {
+    auto buf = read_file(input);
+    const char* p = buf.data();
+    const char* end = buf.data() + buf.size();
+
+    // Peek the first record to learn dim.
+    if (end - p < static_cast<std::ptrdiff_t>(sizeof(int32_t))) {
+        throw Error(ErrorCode::InvalidParam,
+                    "fvecs file '" + input + "' too small for a record");
+    }
+    int32_t dim0 = 0;
+    std::memcpy(&dim0, p, sizeof(int32_t));
+    if (dim0 <= 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "fvecs file '" + input + "' has non-positive dim");
+    }
+    const uint32_t dim = static_cast<uint32_t>(dim0);
+    const size_t record_bytes =
+        sizeof(int32_t) + static_cast<size_t>(dim) * sizeof(float);
+
+    // Count records and sanity-check each one.
+    uint32_t n = 0;
+    const char* q = p;
+    while (q + record_bytes <= end) {
+        int32_t d = 0;
+        std::memcpy(&d, q, sizeof(int32_t));
+        if (static_cast<uint32_t>(d) != dim) {
+            throw Error(ErrorCode::InvalidParam,
+                        "fvecs file '" + input +
+                            "' has inconsistent dim in record " +
+                            std::to_string(n));
+        }
+        ++n;
+        q += record_bytes;
+    }
+    if (n == 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "fvecs file '" + input + "' contains no complete records");
+    }
+    spdlog::info("fvecs_to_fbin: {} vectors, dim {}", n, dim);
+
+    // Write .fbin: header + raw floats (skip each 4-byte dim prefix).
+    std::ofstream out(output, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw Error(ErrorCode::IoError,
+                    "cannot open output '" + output + "'");
+    }
+    out.write(reinterpret_cast<const char*>(&n), sizeof(uint32_t));
+    out.write(reinterpret_cast<const char*>(&dim), sizeof(uint32_t));
+
+    const std::vector<char> zeros(sizeof(float) * dim, 0);  // unused
+    (void)zeros;
+    std::vector<float> row(dim);
+    for (uint32_t i = 0; i < n; i++) {
+        const char* rec = p + i * record_bytes + sizeof(int32_t);
+        std::memcpy(row.data(), rec, static_cast<size_t>(dim) * sizeof(float));
+        out.write(reinterpret_cast<const char*>(row.data()),
+                  static_cast<std::streamsize>(dim * sizeof(float)));
+    }
+    if (!out) {
+        throw Error(ErrorCode::IoError,
+                    "write failed on '" + output + "'");
+    }
+    std::cout << "wrote " << n << " × " << dim << " → " << output << "\n";
+}
+
+/// Convert .ivecs → .gt ground-truth file.
+/// Each record: [int32 k][k × int32 neighbor IDs].
+/// Output: [uint32 n][uint32 k][n×k uint32 ids][n×k float32 distances=0].
+void convert_ivecs(const std::string& input, const std::string& output) {
+    auto buf = read_file(input);
+    const char* p = buf.data();
+    const char* end = buf.data() + buf.size();
+
+    // Collect all records. k may vary per query in principle; we require a
+    // uniform k for the .gt format and take it from the first record.
+    std::vector<std::vector<uint32_t>> records;
+    uint32_t k = 0;
+    const char* q = p;
+    while (q + static_cast<std::ptrdiff_t>(sizeof(int32_t)) <= end) {
+        int32_t kk = 0;
+        std::memcpy(&kk, q, sizeof(int32_t));
+        q += sizeof(int32_t);
+        if (kk <= 0) {
+            throw Error(ErrorCode::InvalidParam,
+                        "ivecs file '" + input +
+                            "' has non-positive k in record " +
+                            std::to_string(records.size()));
+        }
+        const size_t want = static_cast<size_t>(kk) * sizeof(int32_t);
+        if (q + static_cast<std::ptrdiff_t>(want) > end) {
+            throw Error(ErrorCode::CorruptIndex,
+                        "ivecs file '" + input +
+                            "' truncated in record " +
+                            std::to_string(records.size()));
+        }
+        if (records.empty()) {
+            k = static_cast<uint32_t>(kk);
+        } else if (static_cast<uint32_t>(kk) != k) {
+            throw Error(ErrorCode::InvalidParam,
+                        "ivecs file '" + input +
+                            "' has inconsistent k in record " +
+                            std::to_string(records.size()));
+        }
+        std::vector<uint32_t> ids(static_cast<size_t>(kk));
+        std::memcpy(ids.data(), q, want);
+        q += want;
+        records.push_back(std::move(ids));
+    }
+    const uint32_t n = static_cast<uint32_t>(records.size());
+    if (n == 0 || k == 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "ivecs file '" + input + "' contains no records");
+    }
+    spdlog::info("fvecs_to_fbin: {} queries, k={}", n, k);
+
+    std::ofstream out(output, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw Error(ErrorCode::IoError,
+                    "cannot open output '" + output + "'");
+    }
+    out.write(reinterpret_cast<const char*>(&n), sizeof(uint32_t));
+    out.write(reinterpret_cast<const char*>(&k), sizeof(uint32_t));
+    for (const auto& r : records) {
+        out.write(reinterpret_cast<const char*>(r.data()),
+                  static_cast<std::streamsize>(k * sizeof(uint32_t)));
+    }
+    // Zero-filled distances.
+    std::vector<float> zeros(k, 0.0f);
+    for (uint32_t i = 0; i < n; i++) {
+        out.write(reinterpret_cast<const char*>(zeros.data()),
+                  static_cast<std::streamsize>(k * sizeof(float)));
+    }
+    if (!out) {
+        throw Error(ErrorCode::IoError,
+                    "write failed on '" + output + "'");
+    }
+    std::cout << "wrote " << n << " × " << k << " → " << output << "\n";
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    sextant::init_logging();
+
+    cmdline::parser p;
+    p.add<std::string>("input", 0, "Input .fvecs or .ivecs file", true);
+    p.add<std::string>("output", 0, "Output .fbin or .gt file", true);
+    p.add("gt", 0, "Ground-truth mode (.ivecs → .gt)");
+    p.parse_check(argc, argv);
+
+    const std::string input = p.get<std::string>("input");
+    const std::string output = p.get<std::string>("output");
+    const bool gt_mode = p.exist("gt");
+
+    try {
+        if (gt_mode) {
+            convert_ivecs(input, output);
+        } else {
+            convert_fvecs(input, output);
+        }
+    } catch (const Error& e) {
+        std::cerr << "fvecs_to_fbin: " << e.what() << "\n";
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "fvecs_to_fbin: " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
+}

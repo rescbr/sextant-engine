@@ -37,7 +37,7 @@ struct SearchConfig {
     uint32_t k = 10;
     uint32_t L_search = 200;
     uint32_t rerank_factor = 10;
-    uint32_t io_limit = 64;
+    uint32_t io_limit = 0;  ///< 0 = unlimited (visit as many nodes as L_search allows)
 };
 
 }  // namespace sextant

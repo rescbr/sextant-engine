@@ -4,3 +4,17 @@ sextant_cli = executable('sextant',
     include_directories: [engine_inc, third_party_inc],
     install: false,
 )
+
+fvecs_to_fbin = executable('fvecs_to_fbin',
+    'fvecs_to_fbin.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, third_party_inc],
+    install: false,
+)
+
+sextant_bench = executable('sextant_bench',
+    'benchmark.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, third_party_inc],
+    install: false,
+)
