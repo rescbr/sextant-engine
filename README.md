@@ -31,17 +31,20 @@ Sextant makes three contributions over native AiSAQ:
 
 ## Performance targets
 
-| Metric | Native AiSAQ (SE 105M) | Sextant target |
-|---|---|---|
-| Build time | 9.3 min | < 15 min (8-core workstation) |
-| Index size | 4.9 GB | ~5–10 GB |
-| Idle RAM | 22 MB | < 100 MB |
-| Recall@10 | 85% | ≥ 85% |
+| Metric | Native AiSAQ (SE 105M) | Sextant target | SIFT-1M validated |
+|---|---|---|---|
+| Build time | 9.3 min | < 15 min (8-core) | ~190s ⚠️ (optimization in progress) |
+| Index size | 4.9 GB | ~5–10 GB | 208 MB (inline_pq=0) |
+| Recall@10 | 85% | ≥ 85% | **0.9957** ✅ |
+| Search QPS (full cache) | — | hardware-dependent | **~2500** (single-threaded) |
+| Search p50 latency | — | hardware-dependent | **0.45 ms** |
 
-**Validated on SIFT-1M:** Recall@10 = 0.9956, QPS = 2084, p50 latency = 0.48 ms.
-
-> Performance targets (build time, idle RAM) are claimed on **Linux only** —
-> see [macOS limitation](#macos-limitation).
+> The `< 100 MB idle RAM` target is deferred until performance work is
+> complete. MemGraph caches the entry-point neighborhood in RAM for search
+> performance. The final RAM budget will balance caching vs. idle footprint.
+>
+> Performance targets (build time, QPS under cache pressure) are claimed on
+> **Linux only** — see [macOS limitation](#macos-limitation).
 
 ## Build modes
 
@@ -116,6 +119,47 @@ individual dimensions, so a columnar format buys nothing here and would break
 O(1) range `pread` into the sidecar files. Phase 2's DuckDB layer handles
 columnar data natively upstream of the engine. Use `tools/fvecs_to_fbin` to
 convert `.fvecs`/`.ivecs` corpora.
+
+## Search architecture
+
+Sextant's search path uses a multi-tier architecture informed by DiskANN,
+PipeANN (OSDI 2025), and OctopusANN (VLDB 2026):
+
+```
+┌─────────────────────────────────────────────┐
+│                VamanaCore                    │
+│         beam_search / search                │
+│   (DynamicWidth, PageSearch, PinResult)     │
+└──────────────────┬──────────────────────────┘
+                   │ NodeStore interface
+                   ▼
+┌─────────────────────────────────────────────┐
+│              MemGraph                        │
+│  BFS neighborhood (3 hops) in RAM            │
+│  Lock-free O(1) array lookup                 │
+│  ~34.5% of nodes for SIFT-1M (83 MB)        │
+└──────────┬──────────────┬───────────────────┘
+           │ hit          │ miss
+           ▼              ▼
+     (RAM pointer)  ┌─────────────────────┐
+                    │  PagedNodeStore      │
+                    │  ShardedLRUCache     │
+                    │  DirectFile (pread)  │
+                    └─────────────────────┘
+```
+
+- **PageShuffle:** graph nodes are BFS-reordered at flush time so neighbors
+  are co-located on disk. Halves I/O on SIFT-1M.
+- **MemGraph:** caches the entry-point BFS neighborhood in RAM. These
+  "highway" nodes are touched by every query. Lock-free O(1) lookup.
+- **PageSearch:** on a cache miss (actual SSD read), computes distances for
+  R co-located nodes in the same block — amortizes the I/O cost.
+- **DynamicWidth:** two-phase beam width — small during approach phase
+  (navigating toward query region), large during converge phase.
+- **PinResult:** `pin_node` returns `{data, from_ssd}` — PageSearch fires
+  only when `from_ssd=true` (actual I/O), never on MemGraph/LRU hits.
+
+See `docs/design_decisions.md` Issues 40-45 for the full rationale.
 
 ## Storage layout
 
@@ -210,13 +254,17 @@ gracefully as K rises — SIFT-1M K-sweep: `K=1 → 0.9956`, `K=4 → 0.9933`,
 sextant-engine/
 ├── include/sextant/     # public API (C++17-compatible)
 ├── src/
-│   ├── storage/         # DirectFile (O_DIRECT), BlockAllocator, ShardedLRUCache
-│   ├── quant/           # PQ quantizer
-│   ├── algo/            # Vamana core (BeamSearch, RobustPrune)
-│   ├── engine/          # build/search pipelines, partitioning, FbinSource
+│   ├── storage/         # DirectFile, BlockAllocator, ShardedLRUCache,
+│   │                    # NodeStore (Flat/Paged/MemGraph), PinResult
+│   ├── quant/           # PQ quantizer (NumKong distance kernels)
+│   ├── algo/            # Vamana core (BeamSearch, RobustPrune, DynamicWidth,
+│   │                    # PageSearch)
+│   ├── engine/          # build/search pipelines, partitioning, FbinSource,
+│   │                    # PageShuffle (BFS reordering at flush)
 │   └── logging.cpp
-├── test/                # 56 tests across 8 suites
+├── test/                # 71 tests across 10 suites
 ├── tools/               # sextant CLI, sextant_bench, fvecs_to_fbin
+├── docs/                # design_decisions.md, remaining_tasks.md
 ├── third_party/         # nsync, NumKong (submodules); CTPL, cmdline (committed)
 ├── scripts/             # download_datasets.sh
 ├── bootstrap.sh         # submodule init
