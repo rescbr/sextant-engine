@@ -90,8 +90,22 @@ int cmd_build(int argc, char* argv[]) {
     p.add<uint64_t>("build-ram", 0,
                      "Build RAM budget in bytes (forces partitioning if small)",
                      false, 0);
+    p.add<uint32_t>("inline-pq", 0,
+                     "Neighbor PQ codes inlined per node (0=compact, R=all, auto)",
+                     false, 0xFFFF);
+    p.add<std::string>("log-level", 0,
+                       "Log level: debug, info, warn, error",
+                       false, "info");
     p.add("explain", 0, "Print resolved params and exit (dry-run)");
     p.parse_check(argc, argv);
+
+    // Set log level.
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") sextant::set_log_level(sextant::LogLevel::Debug);
+        else if (lvl == "warn") sextant::set_log_level(sextant::LogLevel::Warn);
+        else if (lvl == "error") sextant::set_log_level(sextant::LogLevel::Error);
+    }
 
     const std::string input = p.get<std::string>("input");
     const std::string index = p.get<std::string>("index");
@@ -113,6 +127,7 @@ int cmd_build(int argc, char* argv[]) {
     cfg.pq_bits = p.get<uint8_t>("pq-bits");
     cfg.num_threads = p.get<uint32_t>("threads");
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
+    cfg.inline_pq_count = p.get<uint32_t>("inline-pq");
     const std::string metric = p.get<std::string>("metric");
     cfg.metric = (metric == "ip") ? sextant::MetricKind::InnerProduct
                                   : sextant::MetricKind::L2Sq;
@@ -160,7 +175,18 @@ int cmd_search(int argc, char* argv[]) {
     p.add<std::string>(
         "base-data", 0,
         "Original base .fbin for rerank (defaults to none)", false, "");
+    p.add<uint64_t>("cache-size", 0,
+                     "Search LRU cache size in bytes (0 = auto)", false, 0);
+    p.add<std::string>("log-level", 0,
+                       "Log level: debug, info, warn, error", false, "info");
     p.parse_check(argc, argv);
+
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") sextant::set_log_level(sextant::LogLevel::Debug);
+        else if (lvl == "warn") sextant::set_log_level(sextant::LogLevel::Warn);
+        else if (lvl == "error") sextant::set_log_level(sextant::LogLevel::Error);
+    }
 
     const std::string index = p.get<std::string>("index");
     const std::string query_path = p.get<std::string>("query");
@@ -171,6 +197,7 @@ int cmd_search(int argc, char* argv[]) {
     const std::string base_data = p.get<std::string>("base-data");
 
     sextant::Engine engine;
+    engine.set_cache_size(p.get<uint64_t>("cache-size"));
     engine.open(index);
 
     // Read the query file header.

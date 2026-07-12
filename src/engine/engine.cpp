@@ -23,6 +23,7 @@
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "storage/direct_io.hpp"
+#include "storage/node_store.hpp"
 #include "storage/sidecar_header.hpp"
 
 #include <ctpl/ctpl_stl_tls.h>
@@ -35,6 +36,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <queue>
 #include <random>
 #include <thread>
 #include <unordered_map>
@@ -60,6 +62,56 @@ std::pair<uint64_t, uint64_t> make_uuid() {
     std::random_device rd;
     std::uniform_int_distribution<uint64_t> dist;
     return {dist(rd), dist(rd)};
+}
+
+/// PageShuffle (Issue: graph node reordering at flush time).
+///
+/// Computes a BFS ordering of the build graph starting from the entry points.
+/// Returns `bfs_order` where `bfs_order[new_pos] = old_id` (i.e. the inverse
+/// remap). Placing frequently-traversed nodes near the front and clustering
+/// neighbors together improves paged-search cache hit rates.
+///
+/// `build_node_size` is the stride between consecutive nodes in `nodes_buffer`
+/// (the inline_pq=0 build layout). `n` is the node count.
+std::vector<uint32_t> compute_bfs_order(
+    const uint8_t* nodes_buffer, uint32_t n, uint32_t build_node_size,
+    const std::vector<uint32_t>& entry_points) {
+
+    std::vector<uint32_t> bfs_order;
+    bfs_order.reserve(n);
+    std::vector<bool> visited(n, false);
+    std::queue<uint32_t> queue;
+
+    // Seed BFS with all entry points.
+    for (uint32_t ep : entry_points) {
+        if (ep < n && !visited[ep]) {
+            visited[ep] = true;
+            queue.push(ep);
+        }
+    }
+
+    while (!queue.empty()) {
+        uint32_t node = queue.front();
+        queue.pop();
+        bfs_order.push_back(node);
+
+        const uint8_t* np = nodes_buffer + static_cast<size_t>(node) * build_node_size;
+        uint16_t ncount = VamanaCore::get_neighbor_count(np);
+        for (uint16_t i = 0; i < ncount; i++) {
+            uint32_t nb = VamanaCore::get_neighbor(np, i);
+            if (nb < n && !visited[nb]) {
+                visited[nb] = true;
+                queue.push(nb);
+            }
+        }
+    }
+
+    // Append any unreachable nodes (shouldn't happen in a connected graph).
+    for (uint32_t i = 0; i < n; i++) {
+        if (!visited[i]) bfs_order.push_back(i);
+    }
+
+    return bfs_order;  // bfs_order[new_pos] = old_id
 }
 
 }  // namespace
@@ -164,11 +216,37 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     core_->set_build_nodes(nodes_buffer_);
     core_->prepare_for_build(static_cast<uint32_t>(count_));
 
+    // Install a FlatNodeStore over the flat buffers so beam_search (used in
+    // insert_build) goes through the store interface.
+    flat_store_ = std::make_unique<FlatNodeStore>(
+        nodes_buffer_, codes_buffer_,
+        node_size_, static_cast<uint8_t>(code_size_));
+    core_->set_store(flat_store_.get());
+
     // 3-6. The pipeline passes.
     pass1_sample_and_train(source, params);
     pass2_encode(source, params);
     parallel_construct(params);
     finalize_and_flush(params);
+
+    // After flush, the sidecars hold the FINAL-layout graph (node_size includes
+    // inline_pq_count). Free the flat build buffers and switch the core to a
+    // PagedNodeStore so post-build search is SSD-resident.
+    const uint32_t final_node_size = VamanaCore::static_node_size(
+        params.R, params.inline_pq_count,
+        static_cast<uint8_t>(code_size_));
+    node_size_ = final_node_size;
+    flat_store_.reset();  // disconnect store before freeing buffers
+    core_->set_store(nullptr);
+    if (codes_buffer_) { aligned_free(codes_buffer_); codes_buffer_ = nullptr; }
+    if (nodes_buffer_) { aligned_free(nodes_buffer_); nodes_buffer_ = nullptr; }
+
+    paged_store_ = std::make_unique<PagedNodeStore>(
+        index_path_ + ".graph", index_path_ + ".codes",
+        final_node_size, static_cast<uint8_t>(code_size_),
+        std::max(1u, std::thread::hardware_concurrency()),
+        /*cache_size_bytes=*/64ull * 1024 * 1024);  // 64MB default cache
+    core_->set_store(paged_store_.get());
 
     const auto t1 = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(t1 - t0).count();
@@ -798,17 +876,36 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
         params.R, params.inline_pq_count, static_cast<uint8_t>(code_size_));
     const uint32_t build_node_size = node_size_;  // inline_pq=0 layout
 
-    // ----- .codes -----
+    // ----- PageShuffle: compute BFS reordering from entry points -----
+    // bfs_order[new_pos] = old_id. remap[old_id] = new_pos.
+    const auto& raw_entry_points = core_->entry_points();
+    const std::vector<uint32_t> bfs_order = compute_bfs_order(
+        nodes_buffer_, n, build_node_size, raw_entry_points);
+    std::vector<uint32_t> remap(n);
+    for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
+        remap[bfs_order[new_pos]] = new_pos;
+    }
+
+    // ----- .codes (reordered to BFS order) -----
     {
         const std::string path = index_path_ + ".codes";
         DirectFile f(path, true);
         SidecarHeader h;
         fill_header(h, kMagicCodes, count_, dim_, uuid);
         write_padded(f, &h, sizeof(h), 0);
+        // Stage reordered codes so a single write_padded emits them contiguously.
         const size_t codes_bytes = static_cast<size_t>(n) * code_size_;
-        write_padded(f, codes_buffer_, codes_bytes, sizeof(h));
+        std::vector<uint8_t> shuffled(codes_bytes);
+        for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
+            const uint32_t old_id = bfs_order[new_pos];
+            std::memcpy(shuffled.data() + static_cast<size_t>(new_pos) * code_size_,
+                        codes_buffer_ + static_cast<size_t>(old_id) * code_size_,
+                        code_size_);
+        }
+        write_padded(f, shuffled.data(), codes_bytes, sizeof(h));
         f.sync();
-        spdlog::info("[sextant] wrote {} ({} bytes)", path, codes_bytes);
+        spdlog::info("[sextant] wrote {} ({} bytes, BFS-reordered)", path,
+                     codes_bytes);
     }
 
     // ----- .graph (reformat to final layout, inline neighbor PQ codes) -----
@@ -837,9 +934,12 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
 
         uint64_t write_off = sizeof(h);
         uint32_t in_block = 0;
-        for (uint32_t id = 0; id < n; id++) {
+        for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
+            // PageShuffle: emit nodes in BFS order. The node at disk position
+            // new_pos is the build node whose old_id = bfs_order[new_pos].
+            const uint32_t old_id = bfs_order[new_pos];
             const uint8_t* src = nodes_buffer_ +
-                                 static_cast<size_t>(id) * build_node_size;
+                                 static_cast<size_t>(old_id) * build_node_size;
             uint8_t* dst = ring + static_cast<size_t>(in_block) * final_node_size;
 
             // Copy the fixed header + neighbor array (identical in both layouts
@@ -847,10 +947,21 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
             const uint32_t copy_len = (neighbor_region_end + 7u) & ~7u;
             std::memcpy(dst, src, copy_len);
 
-            // Inline the first inline_pq_count neighbors' PQ codes.
+            // PageShuffle: remap this node's internal_id and every neighbor ID
+            // from build (old) IDs to BFS (new) IDs.
+            VamanaCore::set_internal_id(dst, new_pos);
+            const uint16_t ndeg = VamanaCore::get_neighbor_count(dst);
+            for (uint16_t i = 0; i < ndeg; i++) {
+                const uint32_t old_nb = VamanaCore::get_neighbor(dst, i);
+                if (old_nb < n) {
+                    VamanaCore::set_neighbor(dst, i, remap[old_nb]);
+                }
+            }
+
+            // Inline the first inline_pq_count neighbors' PQ codes. The code
+            // bytes belong to the (old) vector; neighbor labels are remapped
+            // above, but code contents are order-independent.
             if (params.inline_pq_count > 0) {
-                const uint16_t ndeg =
-                    VamanaCore::get_neighbor_count(src);
                 const uint16_t nin = std::min<uint16_t>(
                     ndeg, params.inline_pq_count);
                 for (uint16_t i = 0; i < nin; i++) {
@@ -907,11 +1018,18 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
         payload.insert(payload.end(), qblob.begin(), qblob.end());
 
         const auto& eps = core_->entry_points();
-        uint16_t ep_count = static_cast<uint16_t>(eps.size());
+        // PageShuffle: remap entry points from build (old) IDs to BFS (new)
+        // IDs so the search path starts at the correct disk positions.
+        std::vector<uint32_t> remapped_eps;
+        remapped_eps.reserve(eps.size());
+        for (uint32_t ep : eps) {
+            remapped_eps.push_back(ep < n ? remap[ep] : ep);
+        }
+        uint16_t ep_count = static_cast<uint16_t>(remapped_eps.size());
         payload.insert(payload.end(),
                        reinterpret_cast<uint8_t*>(&ep_count),
                        reinterpret_cast<uint8_t*>(&ep_count) + sizeof(ep_count));
-        for (uint32_t ep : eps) {
+        for (uint32_t ep : remapped_eps) {
             payload.insert(payload.end(),
                            reinterpret_cast<uint8_t*>(&ep),
                            reinterpret_cast<uint8_t*>(&ep) + sizeof(ep));
@@ -927,7 +1045,7 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
         write_padded(f, payload.data(), payload.size(), sizeof(h));
         f.sync();
         spdlog::info("[sextant] wrote {} ({} bytes payload, {} entry points)",
-                     path, payload.size(), eps.size());
+                     path, payload.size(), remapped_eps.size());
     }
 
     // ----- .manifest (atomic commit — written LAST via temp + rename) -----
@@ -969,10 +1087,11 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
 // slot, encode the vector, then drive the Vamana insert flow (beam_search →
 // robust_prune → connect_and_prune) via VamanaCore::insert_build.
 //
-// LIMITATION (Phase 1): the realloc strategy is O(N) per insert (copy the whole
-// codes + nodes buffers). This is acceptable because live insert is NOT the hot
-// path — batch build is. For high-throughput live ingest, a slab/arena growth
-// strategy is deferred to a later phase.
+// PHASE 1: insert requires mutable flat buffers. After open() the engine is
+// in SSD-resident (paged) mode; the first insert materializes the flat
+// buffers from the sidecar files (O(N) I/O), then switches the core to
+// FlatNodeStore. This is acceptable because insert is NOT the hot path.
+// The realloc strategy is O(N) per insert (copy the whole buffers).
 // ===========================================================================
 
 void Engine::insert(const float* vec, Dim dim, RowId row_id) {
@@ -995,6 +1114,40 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
     if (code_size_ == 0 || node_size_ == 0) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::insert: code/node size not initialized");
+    }
+
+    // Phase 1: insert requires mutable flat buffers. If we're in paged
+    // (SSD-resident) mode after open(), materialize the flat buffers from the
+    // sidecar files on first insert. The FlatNodeStore is (re)created after the
+    // reallocs below so it always points at the live buffers.
+    // This is O(N) I/O but acceptable because insert is NOT the hot path.
+    if (paged_store_ && !codes_buffer_) {
+        spdlog::info("[sextant] insert: materializing flat buffers from sidecars "
+                     "for mutable insert");
+        // Codes.
+        {
+            const std::string path = index_path_ + ".codes";
+            DirectFile f(path, false);
+            const size_t codes_bytes =
+                static_cast<size_t>(count_) * code_size_;
+            codes_buffer_ = static_cast<uint8_t*>(
+                aligned_alloc(kDiskAlign, codes_bytes));
+            std::memset(codes_buffer_, 0, codes_bytes);
+            read_exact(f, codes_buffer_, codes_bytes, sizeof(SidecarHeader));
+        }
+        // Nodes.
+        {
+            const std::string path = index_path_ + ".graph";
+            DirectFile f(path, false);
+            const size_t nodes_bytes =
+                static_cast<size_t>(count_) * node_size_;
+            nodes_buffer_ = static_cast<uint8_t*>(
+                aligned_alloc(kDiskAlign, nodes_bytes));
+            std::memset(nodes_buffer_, 0, nodes_bytes);
+            read_exact(f, nodes_buffer_, nodes_bytes, sizeof(SidecarHeader));
+        }
+        paged_store_.reset();
+        core_->set_store(nullptr);  // cleared; recreated below
     }
 
     const uint32_t new_internal = static_cast<uint32_t>(count_);
@@ -1039,6 +1192,13 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
     count_ = new_count;
     core_->set_build_codes(codes_buffer_, static_cast<uint32_t>(count_));
     core_->set_build_nodes(nodes_buffer_);
+
+    // (Re)create the FlatNodeStore over the (possibly realloc'd) live buffers
+    // so beam_search inside insert_build reads current data.
+    flat_store_ = std::make_unique<FlatNodeStore>(
+        nodes_buffer_, codes_buffer_,
+        node_size_, static_cast<uint8_t>(code_size_));
+    core_->set_store(flat_store_.get());
 
     // --- 4. Drive the Vamana insert flow (single-thread). ---
     //    insert_build handles the first-node case (becomes an entry point)

@@ -17,6 +17,9 @@ namespace sextant {
 
 class PqQuantizer;
 class VamanaCore;
+class NodeStore;
+class FlatNodeStore;
+class PagedNodeStore;
 
 /// Adaptive parameters resolved from dataset/machine properties (Issue 37).
 struct ResolvedParams {
@@ -67,8 +70,22 @@ public:
     void flush();
 
     bool is_open() const { return opened_; }
+
+    /// Set the search cache size override (0 = auto from graph_size/RAM).
+    /// Must be called before open().
+    void set_cache_size(uint64_t bytes) { cache_size_override_ = bytes; }
     uint64_t count() const { return count_; }
     Dim dim() const { return dim_; }
+
+    /// True when the engine is in SSD-resident (paged) mode — flat RAM buffers
+    /// are NOT loaded. Used by tests to verify the low-idle-RAM invariant.
+    bool is_paged() const { return paged_store_ != nullptr; }
+
+    /// Cache diagnostics (only valid when is_paged()).
+    uint64_t cache_graph_reads() const;
+    uint64_t cache_code_reads() const;
+    /// True when flat buffers are resident in RAM (build or post-insert).
+    bool has_flat_buffers() const { return nodes_buffer_ != nullptr; }
 
 private:
     bool opened_ = false;
@@ -84,6 +101,13 @@ private:
     uint8_t* nodes_buffer_ = nullptr;   // count × node_size
     uint32_t code_size_ = 0;
     uint32_t node_size_ = 0;
+
+    // NodeStore backings. flat_store_ wraps the flat buffers (build + insert).
+    // paged_store_ is the SSD-resident search backend. At most one is active
+    // on the core at a time.
+    std::unique_ptr<FlatNodeStore> flat_store_;
+    std::unique_ptr<PagedNodeStore> paged_store_;
+    uint64_t cache_size_override_ = 0;  ///< 0 = auto
 
     /// Params loaded by open() (used by flush() to persist post-insert state).
     /// Only meaningful when opened_ && params_loaded_.

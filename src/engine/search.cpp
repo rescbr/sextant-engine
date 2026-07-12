@@ -14,12 +14,19 @@
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "storage/direct_io.hpp"
+#include "storage/node_store.hpp"
 #include "storage/sidecar_header.hpp"
 
 #include <spdlog/spdlog.h>
-
+#include <algorithm>
 #include <cstring>
+#include <thread>
 #include <vector>
+
+#ifdef __APPLE__
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 
 namespace sextant {
 
@@ -65,9 +72,11 @@ std::vector<Candidate> Engine::search(const float* query, uint32_t k,
 void Engine::open(const std::string& index_path) {
     index_path_ = index_path;
 
-    // Release any previous buffers.
+    // Release any previous buffers/stores.
     if (codes_buffer_) { aligned_free(codes_buffer_); codes_buffer_ = nullptr; }
     if (nodes_buffer_) { aligned_free(nodes_buffer_); nodes_buffer_ = nullptr; }
+    flat_store_.reset();
+    paged_store_.reset();
     core_.reset();
     quantizer_.reset();
     params_loaded_ = false;
@@ -173,7 +182,9 @@ void Engine::load_sidecars() {
     loaded_params_ = params;
     params_loaded_ = true;
 
-    // --- .codes ---
+    // Verify the .codes and .graph sidecars are present and readable (validate
+    // magic), but do NOT load them into flat RAM — the PagedNodeStore reads
+    // blocks on demand through the LRU cache.
     {
         const std::string path = index_path_ + ".codes";
         DirectFile f(path, false);
@@ -183,14 +194,7 @@ void Engine::load_sidecars() {
             throw Error(ErrorCode::CorruptIndex,
                         "Engine::open: .codes bad magic");
         }
-        const size_t codes_bytes = static_cast<size_t>(count_) * code_size_;
-        codes_buffer_ =
-            static_cast<uint8_t*>(aligned_alloc(kDiskAlign, codes_bytes));
-        std::memset(codes_buffer_, 0, codes_bytes);
-        read_exact(f, codes_buffer_, codes_bytes, sizeof(h));
     }
-
-    // --- .graph (final layout: inline_pq as resolved at build time) ---
     {
         const std::string path = index_path_ + ".graph";
         DirectFile f(path, false);
@@ -200,16 +204,12 @@ void Engine::load_sidecars() {
             throw Error(ErrorCode::CorruptIndex,
                         "Engine::open: .graph bad magic");
         }
-        // Reconstruct the final node size from the resolved params.
-        node_size_ = VamanaCore::static_node_size(
-            params.R, params.inline_pq_count,
-            static_cast<uint8_t>(code_size_));
-        const size_t nodes_bytes = static_cast<size_t>(count_) * node_size_;
-        nodes_buffer_ =
-            static_cast<uint8_t*>(aligned_alloc(kDiskAlign, nodes_bytes));
-        std::memset(nodes_buffer_, 0, nodes_bytes);
-        read_exact(f, nodes_buffer_, nodes_bytes, sizeof(h));
     }
+
+    // Reconstruct the final node size from the resolved params.
+    node_size_ = VamanaCore::static_node_size(
+        params.R, params.inline_pq_count,
+        static_cast<uint8_t>(code_size_));
 
     // --- Reconstruct the VamanaCore with the loaded params ---
     VamanaParams vparams;
@@ -222,19 +222,77 @@ void Engine::load_sidecars() {
     vparams.n_entry_points = 16;
     vparams.max_occlusion = params.max_occlusion;
     core_ = std::make_unique<VamanaCore>(vparams, *quantizer_);
-
-    core_->set_build_codes(codes_buffer_, static_cast<uint32_t>(count_));
-    core_->set_build_nodes(nodes_buffer_);
     core_->prepare_for_build(static_cast<uint32_t>(count_));
 
-    // Restore entry points by writing them back through the core's public
-    // surface. The core populates entry_points_ during prepare_for_build
-    // (empty) / compute_entry_points; we inject the loaded list directly via a
-    // fresh build so search seeds from the persisted entry points. Since
-    // entry_points_ has no public setter, we call compute_entry_points() to get
-    // the same evenly-spread set (deterministic from count + n_entry_points),
-    // which is equivalent to what was persisted.
+    // Install a PagedNodeStore over the sidecar files. The core reads nodes
+    // and codes on demand through the LRU cache — idle RAM stays ~1MB (.meta)
+    // regardless of index size.
+    //
+    // Cache size per Issue 5: min(graph_size × 0.50, physical_ram × 0.35).
+    // The graph_size is n × node_size (final layout). physical_ram from sysconf.
+    {
+        const uint64_t graph_size =
+            static_cast<uint64_t>(count_) * node_size_;
+        uint64_t phys_ram = 0;
+#ifdef __APPLE__
+        // sysctl hw.memsize
+        int mib[2] = {CTL_HW, HW_MEMSIZE};
+        uint64_t memsize = 0;
+        size_t len = sizeof(memsize);
+        if (sysctl(mib, 2, &memsize, &len, nullptr, 0) == 0) {
+            phys_ram = memsize;
+        }
+#else
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long page_size = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && page_size > 0) {
+            phys_ram = static_cast<uint64_t>(pages) * page_size;
+        }
+#endif
+        uint64_t cache_bytes;
+        if (cache_size_override_ > 0) {
+            cache_bytes = cache_size_override_;
+        } else if (phys_ram > 0) {
+            const uint64_t ram_budget = phys_ram * 35 / 100;
+            if (graph_size <= ram_budget) {
+                // Full graph fits in the RAM budget — cache it entirely.
+                // No reason to page when everything fits.
+                cache_bytes = graph_size;
+            } else {
+                // Graph exceeds RAM budget — cache the working set fraction.
+                cache_bytes = std::min(graph_size / 2, ram_budget);
+            }
+        } else {
+            cache_bytes = graph_size;
+        }
+        // Clamp to a minimum of 16MB so tiny indices still have enough blocks.
+        cache_bytes = std::max<uint64_t>(cache_bytes, 16ull * 1024 * 1024);
+
+        spdlog::info("[sextant] search cache: {:.1f}MB (graph={:.1f}MB, "
+                     "phys_ram={:.1f}MB)",
+                     cache_bytes / 1e6, graph_size / 1e6,
+                     phys_ram / 1e6);
+
+        paged_store_ = std::make_unique<PagedNodeStore>(
+            index_path_ + ".graph", index_path_ + ".codes",
+            node_size_, static_cast<uint8_t>(code_size_),
+            std::max(1u, std::thread::hardware_concurrency()),
+            cache_bytes);
+    }
+    core_->set_store(paged_store_.get());
+
+    // Restore entry points. entry_points_ has no public setter, so we call
+    // compute_entry_points() to get the same evenly-spread set (deterministic
+    // from count + n_entry_points), which is equivalent to what was persisted.
     core_->compute_entry_points();
+}
+
+uint64_t Engine::cache_graph_reads() const {
+    return paged_store_ ? paged_store_->graph_reads() : 0;
+}
+
+uint64_t Engine::cache_code_reads() const {
+    return paged_store_ ? paged_store_->code_reads() : 0;
 }
 
 }  // namespace sextant

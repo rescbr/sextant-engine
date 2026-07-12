@@ -11,6 +11,7 @@ test_sources = [
     'test_vamana_core.cpp',
     'test_fbin_source.cpp',
     'test_engine.cpp',
+    'test_paged_search.cpp',
     'test_cli.cpp',
     'test_partition.cpp',
 ]

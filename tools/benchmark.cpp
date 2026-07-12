@@ -147,6 +147,8 @@ int main(int argc, char* argv[]) {
     p.add<uint32_t>("rerank", 0, "Rerank factor (0/1 = no rerank)", false, 10);
     p.add<uint32_t>("io-limit", 0, "Search I/O budget (0 = unlimited)", false, 0);
     p.add<uint32_t>("limit", 0, "Max queries to run (0 = all)", false, 0);
+    p.add<uint64_t>("cache-size", 0,
+                     "Search LRU cache size in bytes (0 = auto)", false, 0);
     p.parse_check(argc, argv);
 
     const std::string index = p.get<std::string>("index");
@@ -161,6 +163,7 @@ int main(int argc, char* argv[]) {
 
     try {
         sextant::Engine engine;
+        engine.set_cache_size(p.get<uint64_t>("cache-size"));
         engine.open(index);
         const uint32_t dim = engine.dim();
         const uint64_t n_base = engine.count();
@@ -357,8 +360,13 @@ int main(int argc, char* argv[]) {
                   << p99_us / 1000.0 << "ms\n";
         std::cout << "[benchmark] total search time: " << std::fixed
                   << std::setprecision(3) << total_sec << "s\n";
-        std::cout << "[benchmark] QPS: " << std::fixed
-                  << std::setprecision(1) << qps << "\n";
+         std::cout << "[benchmark] QPS: " << std::fixed
+                   << std::setprecision(1) << qps << "\n";
+         if (engine.is_paged()) {
+             std::cout << "[benchmark] cache: graph_reads="
+                       << engine.cache_graph_reads()
+                       << " code_reads=" << engine.cache_code_reads() << "\n";
+         }
     } catch (const Error& e) {
         std::cerr << "benchmark: " << e.what() << "\n";
         return 1;

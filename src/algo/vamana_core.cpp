@@ -227,6 +227,12 @@ std::vector<Candidate> VamanaCore::beam_search(
     };
 
     auto dist_to = [&](uint32_t id) {
+        if (store_) {
+            const uint8_t* code = store_->pin_code(id);
+            const float d = quantizer_.lut_distance(code, query_lut);
+            store_->unpin_code(id);
+            return d;
+        }
         return quantizer_.lut_distance(
             build_codes_ + static_cast<size_t>(id) * code_size_, query_lut);
     };
@@ -287,10 +293,48 @@ std::vector<Candidate> VamanaCore::beam_search(
             break;
         }
         // Expand neighbors of `best`.
-        const uint8_t* node = node_ptr(best.internal_id);
-        const uint16_t n = get_neighbor_count(node);
+        // Copy the neighbor list out of the node before any further pin
+        // (PagedNodeStore may evict the block on the next pin_code/pin_node).
+        uint16_t n;
+        uint32_t neighbors_buf[1024];
+        const uint32_t* nb_ptr;
+        if (store_) {
+            const uint8_t* node = store_->pin_node(best.internal_id);
+            n = get_neighbor_count(node);
+            nb_ptr = (n <= 1024) ? neighbors_buf : nullptr;
+            // For pathological R > 1024 we read neighbor-by-neighbor below
+            // via a second pin; typical R ≤ 128 so neighbors_buf suffices.
+            if (nb_ptr) {
+                std::memcpy(neighbors_buf,
+                            node + kNeighborArrayOffset,
+                            n * sizeof(uint32_t));
+            }
+            store_->unpin_node(best.internal_id);
+        } else {
+            const uint8_t* node = node_ptr(best.internal_id);
+            n = get_neighbor_count(node);
+            if (n <= 1024) {
+                std::memcpy(neighbors_buf,
+                            node + kNeighborArrayOffset,
+                            n * sizeof(uint32_t));
+                nb_ptr = neighbors_buf;
+            } else {
+                nb_ptr = nullptr;
+            }
+        }
+
         for (uint16_t i = 0; i < n; i++) {
-            const uint32_t nb_internal = get_neighbor(node, i);
+            const uint32_t nb_internal =
+                nb_ptr ? nb_ptr[i]
+                       : (store_
+                              ? get_neighbor(store_->pin_node(
+                                                 best.internal_id),
+                                             i)
+                              : get_neighbor(
+                                  node_ptr(best.internal_id), i));
+            if (store_ && !nb_ptr) {
+                store_->unpin_node(best.internal_id);
+            }
             if (is_visited(nb_internal)) {
                 continue;
             }
@@ -688,7 +732,14 @@ std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
     for (auto& c : cands) {
         const uint32_t iid = static_cast<uint32_t>(c.row_id);
         if (iid < count_) {
-            c.row_id = get_row_id(node_ptr(iid));
+            if (store_) {
+                const uint8_t* node = store_->pin_node(iid);
+                const RowId rid = get_row_id(node);
+                store_->unpin_node(iid);
+                c.row_id = rid;
+            } else {
+                c.row_id = get_row_id(node_ptr(iid));
+            }
         }
     }
     return cands;

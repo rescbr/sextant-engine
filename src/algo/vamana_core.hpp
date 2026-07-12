@@ -11,6 +11,7 @@
 
 #include <sextant/types.hpp>
 #include <sextant/sync.hpp>
+#include "storage/node_store.hpp"
 #include <vector>
 #include <cstdint>
 #include <cstddef>
@@ -111,6 +112,13 @@ public:
     void set_build_nodes(uint8_t* nodes);
     void clear_build_buffers();
 
+    /// Install a NodeStore for read access (search path). When set, beam_search
+    /// goes through store_->pin_node/pin_code. During build, Engine installs a
+    /// FlatNodeStore over the flat buffers so the same code path is exercised.
+    /// `store` is non-owning; the caller must keep it alive.
+    void set_store(NodeStore* store) { store_ = store; }
+    NodeStore* store() const { return store_; }
+
     uint32_t size() const { return count_; }
     const std::vector<uint32_t>& entry_points() const { return entry_points_; }
 
@@ -125,6 +133,10 @@ private:
     // Flat-in-RAM build buffers (Issue 13).
     const uint8_t* build_codes_ = nullptr;  // count × code_size
     uint8_t* build_nodes_ = nullptr;        // count × node_size
+
+    // NodeStore for read access (search + build both go through this). When
+    // null, beam_search falls back to the flat buffers directly.
+    NodeStore* store_ = nullptr;
 
     // Sharded lock pool (Issue 11) — protects node neighbor-list mutations.
     std::unique_ptr<Mutex[]> node_locks_;
