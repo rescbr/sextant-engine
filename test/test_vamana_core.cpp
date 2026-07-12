@@ -312,5 +312,37 @@ TEST(VamanaCore, FinalizeInlineCodes) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DynamicWidth: beam_search with the two-phase width logic must still return
+// valid results. The stub quantizer (all-zero distances) exercises the early
+// convergence path — after 5 pops with no improvement, the beam widens to L.
+// Verifies the search doesn't crash and returns candidates within degree/R.
+// ---------------------------------------------------------------------------
+
+TEST(VamanaCore, BeamSearchDynamicWidth) {
+    const uint32_t N = 30;
+    const uint16_t R = 6;
+    TestGraph g(N, R, /*L=*/16);
+    VamanaTLS tls;
+    tls.resize(N);
+    for (uint32_t i = 0; i < N; i++) {
+        g.core->insert_build_from_code(i, static_cast<RowId>(i), tls);
+    }
+
+    const uint32_t lut_sz = g.quant.lut_size();
+    std::vector<float> lut(lut_sz, 0.0f);
+    // L larger than R so DynamicWidth's L_current starts at max(R, L/4)=R.
+    auto results = g.core->beam_search(lut.data(), /*L=*/32, /*io_limit=*/0, tls);
+    ASSERT_GE(results.size(), 1u);
+    // All returned candidates must be valid internal ids.
+    for (const auto& c : results) {
+        EXPECT_GE(c.row_id, 0);
+        EXPECT_LT(static_cast<uint32_t>(c.row_id), N);
+    }
+    // With the stub quantizer (all distances 0), candidates are unsorted-by-
+    // distance but structurally valid. Result count must not exceed L.
+    EXPECT_LE(results.size(), 32u);
+}
+
 }  // namespace
 }  // namespace sextant

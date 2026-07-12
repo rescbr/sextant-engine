@@ -435,5 +435,117 @@ TEST(PagedSearch, PageSearchMaintainsRecall) {
     std::remove(fbin.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// DynamicWidth (PipeANN OSDI 2025 / OctopusANN VLDB 2026): two-phase beam
+// search starts with a small width and widens once the search converges.
+//
+// This test verifies that DynamicWidth maintains recall comparable to the
+// fixed-width search. We build a dataset, open it on the paged path, and
+// issue queries that are base vectors + small noise. We assert the exact NN
+// is found and recall@10 is high — confirming the two-phase logic doesn't
+// hurt search quality.
+// ---------------------------------------------------------------------------
+TEST(PagedSearch, DynamicWidthMaintainsRecall) {
+    const uint32_t n = 800;
+    const uint32_t dim = 32;
+    const std::string fbin =
+        write_random_fbin("paged_search_dynwidth.fbin", n, dim, /*seed=*/99);
+    const std::string index_path =
+        (std::filesystem::temp_directory_path() / "paged_search_dynwidth_idx")
+            .string();
+    remove_sidecars(index_path);
+
+    // Read back the base vectors for ground-truth computation.
+    std::vector<float> base(static_cast<size_t>(n) * dim);
+    {
+        FILE* fp = std::fopen(fbin.c_str(), "rb");
+        ASSERT_NE(fp, nullptr);
+        uint32_t hn, hd;
+        std::fread(&hn, sizeof(hn), 1, fp);
+        std::fread(&hd, sizeof(hd), 1, fp);
+        std::fread(base.data(), sizeof(float), base.size(), fp);
+        std::fclose(fp);
+    }
+
+    {
+        Engine engine;
+        FbinSource source(fbin);
+        engine.build(source, index_path, BuildConfig{});
+    }
+
+    Engine engine;
+    engine.open(index_path);
+
+    const uint32_t n_queries = 25;
+    uint32_t exact_nn_hits = 0;
+    uint32_t recall_hits = 0;
+    uint32_t recall_total = 0;
+    for (uint32_t q = 0; q < n_queries; q++) {
+        const uint32_t qi = (q * 37 + 3) % n;
+        std::vector<float> query(dim);
+        for (uint32_t d = 0; d < dim; d++) {
+            query[d] = base[static_cast<size_t>(qi) * dim + d] + 1e-4f;
+        }
+
+        SearchConfig scfg;
+        scfg.k = 10;
+        scfg.L_search = 150;
+        auto cands = engine.search(query.data(), scfg.k, scfg);
+        if (cands.empty()) continue;
+
+        std::vector<std::pair<float, RowId>> scored;
+        scored.reserve(cands.size());
+        for (const auto& c : cands) {
+            if (c.row_id < 0 || static_cast<uint64_t>(c.row_id) >= n) continue;
+            const float* bv = &base[static_cast<size_t>(c.row_id) * dim];
+            float dist = 0.0f;
+            for (uint32_t d = 0; d < dim; d++) {
+                const float diff = query[d] - bv[d];
+                dist += diff * diff;
+            }
+            scored.emplace_back(dist, c.row_id);
+        }
+        if (scored.empty()) continue;
+        std::sort(scored.begin(), scored.end());
+
+        if (scored.front().second == static_cast<RowId>(qi)) {
+            exact_nn_hits++;
+        }
+
+        // Compute true top-10 over the full dataset.
+        std::vector<std::pair<float, RowId>> truth;
+        truth.reserve(n);
+        for (uint32_t i = 0; i < n; i++) {
+            const float* bv = &base[static_cast<size_t>(i) * dim];
+            float dist = 0.0f;
+            for (uint32_t d = 0; d < dim; d++) {
+                const float diff = query[d] - bv[d];
+                dist += diff * diff;
+            }
+            truth.emplace_back(dist, static_cast<RowId>(i));
+        }
+        std::sort(truth.begin(), truth.end());
+        std::unordered_set<RowId> truth_topk;
+        for (size_t i = 0; i < std::min<size_t>(10, truth.size()); i++) {
+            truth_topk.insert(truth[i].second);
+        }
+        for (const auto& s : scored) {
+            recall_total++;
+            if (truth_topk.count(s.second)) recall_hits++;
+        }
+    }
+
+    // DynamicWidth must find the exact NN for most queries.
+    EXPECT_GE(exact_nn_hits, n_queries * 3 / 4);
+    // Recall@10 should be high (≥ 70%) — same threshold as the fixed-width
+    // PageSearchMaintainsRecall test.
+    ASSERT_GT(recall_total, 0u);
+    const float recall = static_cast<float>(recall_hits) / recall_total;
+    EXPECT_GE(recall, 0.70f);
+
+    remove_sidecars(index_path);
+    std::remove(fbin.c_str());
+}
+
 }  // namespace
 }  // namespace sextant

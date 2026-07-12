@@ -243,6 +243,29 @@ std::vector<Candidate> VamanaCore::beam_search(
 
     uint32_t io_count = 0;
 
+    // -----------------------------------------------------------------------
+    // DynamicWidth (PipeANN OSDI 2025, OctopusANN VLDB 2026): two-phase beam
+    // search. Start with a small width during the approach phase (rapid
+    // navigation toward the query region — large L wastes I/O on far-away
+    // nodes) and widen to the full L once the search converges (near the
+    // query region — most visited nodes are genuine candidates).
+    //
+    // Only active on the paged (SSD) search path. When the graph is flat in
+    // RAM or fully cached in MemGraph, there's no I/O waste to reduce.
+    //
+    // Convergence heuristic: if the best distance hasn't improved by more
+    // than 1% for 5 consecutive pops, we've entered the converge phase.
+    // -----------------------------------------------------------------------
+    constexpr uint32_t kConvergePatience = 5;     // pops w/o improvement
+    constexpr float kConvergeImprovRatio = 0.99f; // <1% improvement
+    const bool use_dynamic_width = (store_ && store_->is_paged());
+    uint32_t L_current = use_dynamic_width
+        ? std::min(L, std::max(static_cast<uint32_t>(params_.R), L / 4))
+        : L;
+    bool converged = !use_dynamic_width;
+    uint32_t no_improvement_count = 0;
+    float prev_best_dist = std::numeric_limits<float>::max();
+
     // Seed entry points.
     if (forced_entry_points && !forced_entry_points->empty()) {
         for (uint32_t ep_id : *forced_entry_points) {
@@ -254,7 +277,7 @@ std::vector<Candidate> VamanaCore::beam_search(
             const float d = dist_to(ep_id);
             frontier.push({d, ep_id});
             W.push({d, ep_id});
-            if (W.size() > L) {
+            if (W.size() > L_current) {
                 W.pop();
             }
         }
@@ -289,7 +312,22 @@ std::vector<Candidate> VamanaCore::beam_search(
     while (!frontier.empty()) {
         const auto best = frontier.top();
         frontier.pop();
-        if (W.size() >= L && best.dist > W.top().dist) {
+
+        // DynamicWidth: track convergence and widen the beam when it stalls.
+        if (!converged) {
+            if (best.dist < prev_best_dist * kConvergeImprovRatio) {
+                no_improvement_count = 0;
+            } else {
+                no_improvement_count++;
+            }
+            prev_best_dist = best.dist;
+            if (no_improvement_count >= kConvergePatience) {
+                converged = true;
+                L_current = L;
+            }
+        }
+
+        if (W.size() >= L_current && best.dist > W.top().dist) {
             break;
         }
 
@@ -341,10 +379,10 @@ std::vector<Candidate> VamanaCore::beam_search(
                 }
                 io_count++;
                 const float d = dist_to(bid);
-                if (W.size() < L || d < W.top().dist) {
+                if (W.size() < L_current || d < W.top().dist) {
                     frontier.push({d, bid});
                     W.push({d, bid});
-                    if (W.size() > L) {
+                    if (W.size() > L_current) {
                         W.pop();
                     }
                 }
@@ -406,10 +444,10 @@ std::vector<Candidate> VamanaCore::beam_search(
             }
             io_count++;
             const float d = dist_to(nb_internal);
-            if (W.size() < L || d < W.top().dist) {
+            if (W.size() < L_current || d < W.top().dist) {
                 frontier.push({d, nb_internal});
                 W.push({d, nb_internal});
-                if (W.size() > L) {
+                if (W.size() > L_current) {
                     W.pop();
                 }
             }

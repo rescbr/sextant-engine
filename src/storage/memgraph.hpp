@@ -55,7 +55,12 @@ public:
     void unpin_code(uint32_t) override;
     uint8_t* mutable_node(uint32_t) override;   // throws
     uint8_t* mutable_code(uint32_t) override;   // throws
-    bool is_paged() const override { return true; }
+    /// Returns false because MemGraph serves the hot path from RAM.
+    /// PageSearch and DynamicWidth are skipped — the approach phase is
+    /// RAM-speed, and the overhead of those techniques hurts when there
+    /// are few cache misses. Cold-node misses still go to the backing
+    /// PagedNodeStore transparently.
+    bool is_paged() const override { return false; }
 
     /// Set the backing store for nodes NOT in the MemGraph.
     /// pin_node/pin_code check MemGraph first, fall through to backing store.
