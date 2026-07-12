@@ -547,5 +547,76 @@ TEST(PagedSearch, DynamicWidthMaintainsRecall) {
     std::remove(fbin.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Batched pre-read: on a cache miss, PagedNodeStore reads up to
+// kBlocksPerRead contiguous blocks in one pread and populates the LRU with all
+// of them. So pinning a node in block 0 (miss) and then a node in block 1
+// (which was pre-read) costs only ONE graph read, not two.
+//
+// We build a large-enough index (n=5000, dim=32) so the graph file spans
+// multiple 256KB blocks (nodes_per_block ≈ 940 at R=64 → ~6 blocks).
+// ---------------------------------------------------------------------------
+TEST(PagedSearch, BatchedPreReadPopulatesCache) {
+    const uint32_t n = 5000;
+    const uint32_t dim = 32;
+    const std::string fbin =
+        write_random_fbin("paged_search_batch.fbin", n, dim);
+    const std::string index_path =
+        (std::filesystem::temp_directory_path() / "paged_search_batch_idx")
+            .string();
+    remove_sidecars(index_path);
+
+    {
+        Engine engine;
+        FbinSource source(fbin);
+        engine.build(source, index_path, BuildConfig{});
+    }
+
+    // Derive node_size from the .graph file so we can compute nodes_per_block.
+    uint32_t node_size = 0;
+    {
+        std::error_code ec;
+        const uint64_t gsize =
+            std::filesystem::file_size(index_path + ".graph", ec);
+        ASSERT_FALSE(ec);
+        node_size = static_cast<uint32_t>((gsize - 64) / n);
+        ASSERT_GT(node_size, 0u);
+    }
+
+    // Large cache so nothing evicts between the two pins.
+    PagedNodeStore store(index_path + ".graph", index_path + ".codes",
+                         node_size, /*code_size=*/1,
+                         /*num_shards=*/4,
+                         /*cache_size_bytes=*/64ull * 256 * 1024);
+
+    const uint32_t nodes_per_block = kBlockSize / node_size;
+    ASSERT_GE(nodes_per_block, 2u)
+        << "test requires multiple nodes per block";
+
+    // Pin a node in block 0 → cache miss → batched read (1 syscall).
+    store.pin_node(0);
+    store.unpin_node(0);
+    EXPECT_EQ(store.graph_reads(), 1u);
+
+    // Pin a node in block 1. With kBlocksPerRead=4 this block was pre-read
+    // into the cache by the previous miss, so it must be a cache HIT and
+    // graph_reads must NOT increase.
+    const uint32_t node_in_block_1 = nodes_per_block;  // first node of block 1
+    store.pin_node(node_in_block_1);
+    store.unpin_node(node_in_block_1);
+    EXPECT_EQ(store.graph_reads(), 1u)
+        << "block 1 should have been pre-read by the batched miss for block 0";
+
+    // A block well beyond the batch window (e.g. block 10) must miss again.
+    const uint32_t node_in_block_10 = 10 * nodes_per_block;
+    store.pin_node(node_in_block_10);
+    store.unpin_node(node_in_block_10);
+    EXPECT_EQ(store.graph_reads(), 2u)
+        << "block 10 is outside the batch window and must trigger a new read";
+
+    remove_sidecars(index_path);
+    std::remove(fbin.c_str());
+}
+
 }  // namespace
 }  // namespace sextant

@@ -18,6 +18,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +28,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -82,7 +84,7 @@ int cmd_build(int argc, char* argv[]) {
     p.add<std::string>("index", 0, "Index name/path prefix", true);
     p.add<uint16_t>("R", 0, "Graph degree (auto if 0)", false, 0);
     p.add<uint16_t>("L", 0, "Beam width (auto if 0)", false, 0);
-    p.add<float>("alpha", 0, "Prune threshold", false, 1.2f);
+    p.add<float>("alpha", 0, "Prune threshold (1.2=SDC, 1.5=ADC build mode)", false, 1.2f);
     p.add<uint8_t>("pq-m", 0, "PQ segments (auto from dim if 0)", false, 0);
     p.add<uint8_t>("pq-bits", 0, "PQ bits", false, 8);
     p.add<std::string>("metric", 0, "l2sq or ip", false, "l2sq");
@@ -141,7 +143,8 @@ int cmd_build(int argc, char* argv[]) {
                   << "R:          " << resolved.R << "\n"
                   << "L:          " << resolved.L << "\n"
                   << "L_build:    " << resolved.L_build << "\n"
-                  << "alpha:      " << resolved.alpha << "\n"
+                  << "alpha:      " << resolved.alpha
+                  << (resolved.alpha == 1.5f ? "  [ADC build mode]\n" : "\n")
                   << "pq_m:       " << static_cast<int>(resolved.pq_m) << "\n"
                   << "pq_bits:    " << static_cast<int>(resolved.pq_bits) << "\n"
                   << "inline_pq:  " << resolved.inline_pq_count << "\n"
@@ -171,6 +174,7 @@ int cmd_search(int argc, char* argv[]) {
     p.add<uint32_t>("k", 0, "Number of results", false, 10);
     p.add<uint32_t>("L", 0, "Search beam width", false, 200);
     p.add<uint32_t>("rerank", 0, "Rerank factor", false, 10);
+    p.add<uint32_t>("threads", 0, "Search threads (0 = 1, serial)", false, 1);
     p.add<std::string>("output", 0, "Output file (default: stdout)", false, "");
     p.add<std::string>(
         "base-data", 0,
@@ -195,6 +199,7 @@ int cmd_search(int argc, char* argv[]) {
     const uint32_t rerank = p.get<uint32_t>("rerank");
     const std::string output = p.get<std::string>("output");
     const std::string base_data = p.get<std::string>("base-data");
+    const uint32_t num_threads = p.get<uint32_t>("threads");
 
     sextant::Engine engine;
     engine.set_cache_size(p.get<uint64_t>("cache-size"));
@@ -240,59 +245,151 @@ int cmd_search(int argc, char* argv[]) {
     const uint32_t fetch_k =
         rerank_ok ? std::min<uint32_t>(k * rerank, engine.count()) : k;
 
-    std::ifstream qf(query_path, std::ios::binary);
-    qf.seekg(8);  // skip header
-    std::vector<float> qvec(dim);
+    if (num_threads <= 1) {
+        // Serial path (unchanged): stream queries one at a time.
+        std::ifstream qf(query_path, std::ios::binary);
+        qf.seekg(8);  // skip header
+        std::vector<float> qvec(dim);
 
-    for (uint32_t qi = 0; qi < qh.n; qi++) {
-        qf.read(reinterpret_cast<char*>(qvec.data()),
-                static_cast<std::streamsize>(dim * sizeof(float)));
-        if (!qf.good()) {
-            std::cerr << "sextant search: short read on query " << qi << "\n";
-            break;
+        for (uint32_t qi = 0; qi < qh.n; qi++) {
+            qf.read(reinterpret_cast<char*>(qvec.data()),
+                    static_cast<std::streamsize>(dim * sizeof(float)));
+            if (!qf.good()) {
+                std::cerr << "sextant search: short read on query " << qi << "\n";
+                break;
+            }
+
+            sextant::SearchConfig scfg;
+            scfg.k = fetch_k;
+            scfg.L_search = L;
+            scfg.rerank_factor = rerank;
+            auto results = engine.search(qvec.data(), scfg.k, scfg);
+
+            if (rerank_ok && !results.empty()) {
+                // Fetch actual vectors and re-sort by exact L2-sq distance.
+                std::vector<std::pair<float, sextant::RowId>> scored;
+                scored.reserve(results.size());
+                std::vector<float> base_vec(dim);
+                for (const auto& c : results) {
+                    if (c.row_id < 0 ||
+                        static_cast<uint64_t>(c.row_id) >= bh.n) {
+                        continue;
+                    }
+                    if (!read_fbin_vector(base_data, dim,
+                                          static_cast<uint64_t>(c.row_id),
+                                          base_vec)) {
+                        scored.emplace_back(c.dist, c.row_id);
+                        continue;
+                    }
+                    scored.emplace_back(
+                        l2sq_distance(qvec.data(), base_vec.data(), dim),
+                        c.row_id);
+                }
+                std::sort(scored.begin(), scored.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.first < b.first;
+                          });
+                const uint32_t topk = std::min<uint32_t>(k, scored.size());
+                for (uint32_t i = 0; i < topk; i++) {
+                    (*out) << qi << "\t" << scored[i].second << "\t"
+                           << scored[i].first << "\n";
+                }
+            } else {
+                const uint32_t topk = std::min<uint32_t>(k, results.size());
+                for (uint32_t i = 0; i < topk; i++) {
+                    (*out) << qi << "\t" << results[i].row_id << "\t"
+                           << results[i].dist << "\n";
+                }
+            }
+        }
+    } else {
+        // Parallel path: read all queries into RAM, dispatch across threads.
+        std::vector<float> queries(static_cast<size_t>(qh.n) * dim);
+        {
+            std::ifstream qf(query_path, std::ios::binary);
+            qf.seekg(8);
+            qf.read(reinterpret_cast<char*>(queries.data()),
+                    static_cast<std::streamsize>(queries.size() *
+                                                 sizeof(float)));
+            if (!qf) {
+                std::cerr << "sextant search: short read on query file\n";
+                return 1;
+            }
         }
 
-        sextant::SearchConfig scfg;
-        scfg.k = fetch_k;
-        scfg.L_search = L;
-        scfg.rerank_factor = rerank;
-        auto results = engine.search(qvec.data(), scfg.k, scfg);
+        const uint32_t n_threads =
+            std::max(1u, std::min(num_threads, qh.n));
+        std::vector<std::string> formatted_results(qh.n);
+        std::atomic<uint32_t> next{0};
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
 
-        if (rerank_ok && !results.empty()) {
-            // Fetch actual vectors and re-sort by exact L2-sq distance.
-            std::vector<std::pair<float, sextant::RowId>> scored;
-            scored.reserve(results.size());
-            std::vector<float> base_vec(dim);
-            for (const auto& c : results) {
-                if (c.row_id < 0 ||
-                    static_cast<uint64_t>(c.row_id) >= bh.n) {
-                    continue;
+        for (uint32_t t = 0; t < n_threads; t++) {
+            workers.emplace_back([&]() {
+                // Thread-local scratch.
+                std::vector<float> base_vec(dim);
+                uint32_t qi;
+                while ((qi = next.fetch_add(1, std::memory_order_relaxed)) < qh.n) {
+                    const float* q = &queries[static_cast<size_t>(qi) * dim];
+
+                    sextant::SearchConfig scfg;
+                    scfg.k = fetch_k;
+                    scfg.L_search = L;
+                    scfg.rerank_factor = rerank;
+                    auto results = engine.search(q, scfg.k, scfg);
+
+                    std::string buf;
+                    if (rerank_ok && !results.empty()) {
+                        std::vector<std::pair<float, sextant::RowId>> scored;
+                        scored.reserve(results.size());
+                        for (const auto& c : results) {
+                            if (c.row_id < 0 ||
+                                static_cast<uint64_t>(c.row_id) >= bh.n) {
+                                continue;
+                            }
+                            if (!read_fbin_vector(base_data, dim,
+                                                  static_cast<uint64_t>(c.row_id),
+                                                  base_vec)) {
+                                scored.emplace_back(c.dist, c.row_id);
+                                continue;
+                            }
+                            scored.emplace_back(
+                                l2sq_distance(q, base_vec.data(), dim),
+                                c.row_id);
+                        }
+                        std::sort(scored.begin(), scored.end(),
+                                  [](const auto& a, const auto& b) {
+                                      return a.first < b.first;
+                                  });
+                        const uint32_t topk = std::min<uint32_t>(k, scored.size());
+                        for (uint32_t i = 0; i < topk; i++) {
+                            buf += std::to_string(qi);
+                            buf += "\t";
+                            buf += std::to_string(scored[i].second);
+                            buf += "\t";
+                            buf += std::to_string(scored[i].first);
+                            buf += "\n";
+                        }
+                    } else {
+                        const uint32_t topk = std::min<uint32_t>(k, results.size());
+                        for (uint32_t i = 0; i < topk; i++) {
+                            buf += std::to_string(qi);
+                            buf += "\t";
+                            buf += std::to_string(results[i].row_id);
+                            buf += "\t";
+                            buf += std::to_string(results[i].dist);
+                            buf += "\n";
+                        }
+                    }
+                    formatted_results[qi] = std::move(buf);
                 }
-                if (!read_fbin_vector(base_data, dim,
-                                      static_cast<uint64_t>(c.row_id),
-                                      base_vec)) {
-                    scored.emplace_back(c.dist, c.row_id);
-                    continue;
-                }
-                scored.emplace_back(
-                    l2sq_distance(qvec.data(), base_vec.data(), dim),
-                    c.row_id);
-            }
-            std::sort(scored.begin(), scored.end(),
-                      [](const auto& a, const auto& b) {
-                          return a.first < b.first;
-                      });
-            const uint32_t topk = std::min<uint32_t>(k, scored.size());
-            for (uint32_t i = 0; i < topk; i++) {
-                (*out) << qi << "\t" << scored[i].second << "\t"
-                       << scored[i].first << "\n";
-            }
-        } else {
-            const uint32_t topk = std::min<uint32_t>(k, results.size());
-            for (uint32_t i = 0; i < topk; i++) {
-                (*out) << qi << "\t" << results[i].row_id << "\t"
-                       << results[i].dist << "\n";
-            }
+            });
+        }
+        for (auto& w : workers) w.join();
+
+        // Emit in query order.
+        for (uint32_t qi = 0; qi < qh.n; qi++) {
+            (*out) << formatted_results[qi];
         }
     }
 

@@ -21,6 +21,7 @@
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <thread>
 #include <vector>
 
@@ -72,6 +73,35 @@ std::vector<Candidate> Engine::search(const float* query, uint32_t k,
 
 void Engine::open(const std::string& index_path) {
     index_path_ = index_path;
+
+    // Validate the atomic commit point: the .manifest is written LAST via
+    // temp+rename, so its presence means a build completed. If it's absent
+    // but sidecar files linger, the index is corrupted (e.g. crashed build).
+    std::error_code ec;
+    const bool manifest_exists =
+        std::filesystem::exists(index_path + ".manifest", ec);
+    if (!manifest_exists) {
+        std::vector<std::string> orphans;
+        for (const char* suf : {".graph", ".codes", ".meta"}) {
+            if (std::filesystem::exists(index_path + suf, ec)) {
+                orphans.emplace_back(suf);
+            }
+        }
+        if (!orphans.empty()) {
+            std::string list = orphans[0];
+            for (size_t i = 1; i < orphans.size(); ++i) {
+                list += ", " + orphans[i];
+            }
+            throw Error(ErrorCode::CorruptIndex,
+                        "Engine::open: index '" + index_path +
+                            "' is corrupted — manifest missing but "
+                            "orphaned sidecar files found: " +
+                            list);
+        }
+        throw Error(ErrorCode::CorruptIndex,
+                    "Engine::open: index '" + index_path +
+                        "' not found (no .manifest or sidecar files)");
+    }
 
     // Release any previous buffers/stores.
     if (codes_buffer_) { aligned_free(codes_buffer_); codes_buffer_ = nullptr; }
@@ -305,10 +335,15 @@ void Engine::load_sidecars() {
     }
     core_->set_store(memgraph_.get());
 
-    // Restore entry points. entry_points_ has no public setter, so we call
-    // compute_entry_points() to get the same evenly-spread set (deterministic
-    // from count + n_entry_points), which is equivalent to what was persisted.
-    core_->compute_entry_points();
+    // Restore entry points from .meta if present; otherwise compute a
+    // deterministic fallback set. `entry_points` is moved into the core here;
+    // it must not be used after this point (its last prior use was the
+    // MemGraph fallback copy above).
+    if (!entry_points.empty()) {
+        core_->set_entry_points(std::move(entry_points));
+    } else {
+        core_->compute_entry_points();
+    }
 }
 
 uint64_t Engine::cache_graph_reads() const {
@@ -319,8 +354,25 @@ uint64_t Engine::cache_code_reads() const {
     return paged_store_ ? paged_store_->code_reads() : 0;
 }
 
+Engine::AdmissionStats Engine::cache_admission_stats() const {
+    if (!paged_store_) return {};
+    const auto& s = paged_store_->cache_stats();
+    return {
+        s.hits_window, s.hits_probation, s.hits_protected,
+        s.misses, s.evictions_admitted, s.evictions_rejected
+    };
+}
+
 uint32_t Engine::memgraph_cached_count() const {
     return memgraph_ ? memgraph_->cached_count() : 0;
+}
+
+uint64_t Engine::tl_hits() const {
+    return paged_store_ ? paged_store_->tl_hits() : 0;
+}
+
+uint64_t Engine::tl_misses() const {
+    return paged_store_ ? paged_store_->tl_misses() : 0;
 }
 
 }  // namespace sextant

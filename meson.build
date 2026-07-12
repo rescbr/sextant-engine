@@ -65,7 +65,8 @@ src_inc = include_directories('src')
 engine_sources = [
     'src/storage/direct_io.cpp',
     'src/storage/block_allocator.cpp',
-    'src/storage/sharded_lru.cpp',
+    'src/storage/block_buffer_pool.cpp',
+    'src/storage/block_cache.cpp',
     'src/storage/node_store.cpp',
     'src/storage/memgraph.cpp',
     'src/quant/pq_quantizer.cpp',

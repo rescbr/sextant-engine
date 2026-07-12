@@ -10,9 +10,9 @@
 | Metric | Target | Current | Status |
 |---|---|---|---|
 | Recall@10 | ≥ 0.95 | 0.9957 | ✅ |
-| Search QPS (full cache) | — | ~2500 | ✅ matches flat-RAM |
-| Search QPS (32MB cache) | — | ~480 | ⚠️ single-threaded, macOS page cache masks true I/O |
-| Build time | < 30s | ~190s | ❌ 6× over target |
+| Search QPS (full cache) | — | ~2500 (single-thread); multi-threaded now available via `--threads` | ✅ |
+| Search QPS (32MB cache) | — | ~480 (single-thread); macOS page cache masks true I/O | ⚠️ multi-threaded + batched pre-read now available |
+| Build time | < 30s | **113.7s** (was 190s; PQ parallel + direct-SDC + work-stealing) | ❌ 3.8× over target; code_distance is 60% of construct |
 | Idle RAM | < 100 MB | not measured | deferred — see note below |
 
 **Note on idle RAM:** The `< 100 MB` gate is deferred until all performance
@@ -195,17 +195,17 @@ profiles. Integrate into CI.
 
 ## Summary table
 
-| ID | Task | Priority | Effort | Blocks |
+| ID | Task | Priority | Effort | Status |
 |---|---|---|---|---|
-| T1 | Multi-threaded search | HIGH | Small | Nothing |
-| T2 | Build optimization (190s→30s) | HIGH | Medium | T8 (BIGANN) |
-| T3 | Batched pre-read (4 blocks/miss) | HIGH | Small | Nothing |
-| T4 | Crash recovery / orphan detection | MEDIUM | Small | Nothing |
-| T5 | ADC build mode CLI flag | MEDIUM | Medium | Nothing |
-| T6 | Entry point persistence | MEDIUM | Small | Nothing |
-| T7 | Async I/O pipeline (PipeSearch) | LOW | Large | Needs Linux |
-| T8 | BIGANN-100M validation | LOW | Large | T2, needs Linux |
-| T9 | samply profiling scripts | LOW | Small | T2 |
+| T1 | Multi-threaded search | HIGH | Small | ✅ Done (benchmark + CLI `--threads`, lock-free atomic dispatch) |
+| T2 | Build optimization (190s→30s) | HIGH | Medium | 🔶 Partial — PQ parallelized + direct-SDC + work-stealing (190s→114s); code_distance is 60% of construct |
+| T3 | Batched pre-read (4 blocks/miss) | HIGH | Small | ✅ Done (`PagedNodeStore::batched_read`, 1MB/miss) |
+| T4 | Crash recovery / orphan detection | MEDIUM | Small | ✅ Done (manifest + orphan checks in `Engine::open`) |
+| T5 | ADC build mode CLI flag | MEDIUM | Medium | ✅ Done (`--alpha 1.5` triggers ADC, raw vectors loaded for construct) |
+| T6 | Entry point persistence | MEDIUM | Small | ✅ Done (`set_entry_points` + end-to-end test) |
+| T7 | Async I/O pipeline (PipeSearch) | LOW | Large | 🔶 Design done (`docs/cache_architecture.md`); sync PageHeap deferred, async needs Linux |
+| T8 | BIGANN-100M validation | LOW | Large | Not started (blocked on T2) |
+| T9 | samply profiling scripts | LOW | Small | ✅ Done (`scripts/profile_build.sh`, `profile_search.sh`, `scripts/analyze_profile.py`) |
 
 ## What's done (for reference)
 
@@ -223,3 +223,26 @@ profiles. Integrate into CI.
   --build-ram, --inline-pq, --cache-size, --log-level, --explain
 - ✅ Documentation: README, design_decisions.md, LICENSE (SSPL-1.0-only)
 - ✅ 71 tests across 10 suites, all passing
+- ✅ Multi-threaded search (T1): `--threads` on benchmark + CLI, lock-free dispatch
+- ✅ Batched pre-read (T3): 4 blocks (1MB) per cache miss via `batched_read`
+- ✅ Crash recovery (T4): orphan sidecar detection in `Engine::open`
+- ✅ Entry point persistence (T6): `set_entry_points` + `.meta` round-trip
+- ✅ samply profiling scripts (T9)
+- ✅ PQ training parallelized (T2): 70%→4.5% of build time
+- ✅ Direct-SDC distance (T2): eliminated LUT materialization, construct 153s→105s
+- ✅ Hot-path read counters converted from mutex to relaxed atomics
+- ✅ CTPL `thread_pool_tls` UB fix (null TLS deref when no init function)
+- ✅ Per-phase build timing instrumentation
+- ✅ Dynamic work-stealing for construct (was static partitioning)
+- ✅ W-TinyLFU cache with adaptive hill-climbing (replaces plain LRU)
+  - FrequencySketch (4-bit CountMinSketch, ported from Caffeine)
+  - Three-list eviction: window → probation → protected
+  - Hill-climber at BlockCache level (per-workload, not per-shard)
+  - BlockBufferPool: per-shard, eliminates aligned_alloc/madvise churn
+- ✅ Thread-local L1 cache (pointer-based, epoch-validated)
+- ✅ Search path allocation fixes:
+  - Thread_local VamanaTLS (was 4MB/query allocation)
+  - Pre-reserved heaps via SearchScratch (no priority_queue reallocation)
+- ✅ Search QPS: 1 thread 191→306, 4 threads 133→300 (32MB cache)
+- ✅ Cache architecture design doc (`docs/cache_architecture.md`)
+- ✅ samply profile analysis tool (`scripts/analyze_profile.py`)

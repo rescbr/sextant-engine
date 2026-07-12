@@ -85,6 +85,20 @@ public:
     /// Cache diagnostics (only valid when is_paged()).
     uint64_t cache_graph_reads() const;
     uint64_t cache_code_reads() const;
+    /// W-TinyLFU admission stats: {window, probation, protected} hit counts,
+    /// misses, and admission decisions. All zero when not paged.
+    struct AdmissionStats {
+        uint64_t hits_window = 0;
+        uint64_t hits_probation = 0;
+        uint64_t hits_protected = 0;
+        uint64_t misses = 0;
+        uint64_t evictions_admitted = 0;
+        uint64_t evictions_rejected = 0;
+    };
+    AdmissionStats cache_admission_stats() const;
+    /// Thread-local L1 cache hit/miss counters.
+    uint64_t tl_hits() const;
+    uint64_t tl_misses() const;
     /// Number of nodes held in the MemGraph neighborhood cache (0 if none).
     uint32_t memgraph_cached_count() const;
     /// True when flat buffers are resident in RAM (build or post-insert).

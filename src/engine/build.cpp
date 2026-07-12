@@ -118,9 +118,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
         p.alpha = 1.2f;
     }
     if (p.alpha == 1.5f) {
-        spdlog::warn("[sextant] alpha=1.5 requests ADC build mode, which is "
-                     "not yet implemented in Phase 1 (SDC only). Falling back "
-                     "to SDC construct.");
+        spdlog::info("[sextant] alpha=1.5 → ADC build mode (raw-vector construct)");
     }
     spdlog::info("[sextant] alpha = {:.2f} [{}]", p.alpha,
                  overrides.alpha != 0.0f ? "override" : "auto");

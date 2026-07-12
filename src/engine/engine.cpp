@@ -32,6 +32,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -155,13 +156,6 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     // 1. Resolve parameters.
     auto params = resolve_params(count_, dim_, config);
 
-    // ADC mode is not implemented in Phase 1 (SDC only).
-    if (params.alpha == 1.5f) {
-        spdlog::warn("[sextant] ADC build mode requested (alpha=1.5) but "
-                     "Phase 1 is SDC-only; continuing with SDC construct.");
-        params.alpha = 1.2f;
-    }
-
     // Partitioned build (Step 11): when the monolithic graph would exceed the
     // build RAM budget (K>1), partition into K shards, build each, then merge.
     if (params.K > 1) {
@@ -225,10 +219,51 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     core_->set_store(flat_store_.get());
 
     // 3-6. The pipeline passes.
+    auto _phase = [](const char* name, auto& t_prev) {
+        const auto now = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(now - t_prev).count();
+        spdlog::info("[sextant] phase '{}': {:.2f}s", name, secs);
+        t_prev = now;
+    };
+
+    auto t_phase = std::chrono::steady_clock::now();
     pass1_sample_and_train(source, params);
+    _phase("pass1_sample_and_train", t_phase);
     pass2_encode(source, params);
+    _phase("pass2_encode", t_phase);
+
+    // For ADC build (alpha=1.5), load raw vectors for construct.
+    std::vector<float> raw_vecs;
+    if (params.alpha == 1.5f) {
+        spdlog::info("[sextant] ADC build mode: loading raw vectors for construct");
+        raw_vecs.resize(static_cast<size_t>(count_) * dim_);
+        source.reset();
+        Chunk chunk{};
+        uint64_t loaded = 0;
+        while (source.next(chunk)) {
+            for (uint32_t r = 0; r < chunk.count; r++) {
+                const RowId rid = chunk.row_ids[r];
+                if (rid >= 0 && static_cast<uint64_t>(rid) < count_) {
+                    std::memcpy(raw_vecs.data() + static_cast<size_t>(rid) * dim_,
+                                chunk.vectors + static_cast<size_t>(r) * dim_,
+                                dim_ * sizeof(float));
+                    loaded++;
+                }
+            }
+        }
+        spdlog::info("[sextant] ADC: loaded {} raw vectors ({:.1f}MB)",
+                     loaded, raw_vecs.size() * sizeof(float) / 1e6);
+        core_->set_build_vecs(raw_vecs.data());
+    }
+
     parallel_construct(params);
+    _phase("parallel_construct", t_phase);
+
+    // Raw vectors are no longer needed after construct.
+    core_->set_build_vecs(nullptr);
+
     finalize_and_flush(params);
+    _phase("finalize_and_flush", t_phase);
 
     // After flush, the sidecars hold the FINAL-layout graph (node_size includes
     // inline_pq_count). Free the flat build buffers and switch the core to a
@@ -357,49 +392,63 @@ void Engine::parallel_construct(const ResolvedParams& params) {
     const uint32_t nthreads = params.num_threads > 0
                                   ? params.num_threads
                                   : std::thread::hardware_concurrency();
-    spdlog::info("[sextant] construct: {} nodes across {} threads (SDC)", n,
-                 nthreads);
+    const bool adc_mode = params.alpha == 1.5f;
+    spdlog::info("[sextant] construct: {} nodes across {} threads ({})", n,
+                 nthreads, adc_mode ? "ADC" : "SDC");
 
     // The very first insert must be serialized before spawning tasks: it
-    // claims the entry point (see VamanaCore::insert_build_from_code).
+    // claims the entry point (see VamanaCore::insert_build_from_code /
+    // insert_build).
+    const uint32_t lut_sz = quantizer_ ? quantizer_->lut_size() : 0;
     {
         VamanaTLS tls;
         tls.resize(n);
-        core_->insert_build_from_code(0, /*row_id=*/0, tls);
+        tls.resize_lut(lut_sz);
+        if (adc_mode) {
+            core_->insert_build(0, /*row_id=*/0, core_->build_vec_ptr(0), tls);
+        } else {
+            core_->insert_build_from_code(0, /*row_id=*/0, tls);
+        }
     }
 
     // Thread pool with per-thread VamanaTLS scratch.
     ctpl::thread_pool_tls<VamanaTLS> pool(
         nthreads,
-        [n](size_t /*tid*/, std::shared_ptr<VamanaTLS>& tls) {
+        [n, lut_sz](size_t /*tid*/, std::shared_ptr<VamanaTLS>& tls) {
             tls = std::make_shared<VamanaTLS>();
             tls->resize(n);
+            tls->resize_lut(lut_sz);
         });
 
-    // Split [1, n) into `nthreads` disjoint sub-ranges.
+    // Dynamic work-stealing: threads pull node IDs from a shared atomic
+    // counter. This balances load — early nodes (small graph, cheap
+    // beam_search) and late nodes (dense graph, expensive) are distributed
+    // across all threads rather than stranding slow threads with the hardest
+    // tail of a static partition.
     const uint32_t lo = 1;
     const uint32_t hi = n;
     if (hi <= lo) {
         spdlog::info("[sextant] construct: only entry-point node (n=1)");
         return;
     }
-    const uint32_t span = hi - lo;
-    const uint32_t per = (span + nthreads - 1) / nthreads;
+
+    std::atomic<uint32_t> next_id{lo};
+    auto worker = [this, hi, adc_mode, &next_id](size_t /*tid*/, VamanaTLS& tls) {
+        VamanaCore& core = *core_;
+        uint32_t id;
+        while ((id = next_id.fetch_add(1, std::memory_order_relaxed)) < hi) {
+            if (adc_mode) {
+                core.insert_build(id, static_cast<RowId>(id),
+                                  core.build_vec_ptr(id), tls);
+            } else {
+                core.insert_build_from_code(id, static_cast<RowId>(id), tls);
+            }
+        }
+    };
 
     std::vector<std::future<void>> futs;
     for (uint32_t t = 0; t < nthreads; t++) {
-        const uint32_t t_lo = lo + t * per;
-        const uint32_t t_hi = std::min(lo + (t + 1) * per, hi);
-        if (t_lo >= t_hi) break;
-
-        auto fut = pool.push(
-            [this, t_lo, t_hi](size_t /*tid*/, VamanaTLS& tls) {
-                VamanaCore& core = *core_;
-                for (uint32_t id = t_lo; id < t_hi; id++) {
-                    core.insert_build_from_code(id, static_cast<RowId>(id), tls);
-                }
-            });
-        futs.push_back(std::move(fut));
+        futs.push_back(pool.push(worker));
     }
 
     // Wait for all tasks; rethrow the first exception encountered.
@@ -446,6 +495,14 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     using engine_detail::write_padded;
     using engine_detail::fill_header;
     using engine_detail::read_exact;
+
+    // ADC + partitioning is a complex combination; partitioned build stays
+    // SDC-only for shard construct (RAM savings matter more than ADC quality
+    // at large scale).
+    if (params.alpha == 1.5f) {
+        spdlog::warn("[sextant] ADC build mode with partitioning (K>1) is not "
+                     "supported; falling back to SDC for shard construct.");
+    }
 
     spdlog::info("[sextant] partitioned build: N={} K={} closure_factor={:.4f}",
                  count_, params.K, params.closure_factor);
@@ -556,9 +613,11 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         core.prepare_for_build(shard_n);
 
         // First insert must be serialized (entry-point claim).
+        const uint32_t shard_lut_sz = quantizer_ ? quantizer_->lut_size() : 0;
         {
             VamanaTLS tls;
             tls.resize(shard_n);
+            tls.resize_lut(shard_lut_sz);
             core.insert_build_from_code(0, /*row_id=*/members[0], tls);
         }
 
@@ -568,32 +627,28 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                                       : std::thread::hardware_concurrency();
         ctpl::thread_pool_tls<VamanaTLS> pool(
             std::max<uint32_t>(1, nthreads),
-            [shard_n](size_t /*tid*/, std::shared_ptr<VamanaTLS>& tls) {
+            [shard_n, shard_lut_sz](size_t /*tid*/, std::shared_ptr<VamanaTLS>& tls) {
                 tls = std::make_shared<VamanaTLS>();
                 tls->resize(shard_n);
+                tls->resize_lut(shard_lut_sz);
             });
 
         const uint32_t lo = 1;
         const uint32_t hi = shard_n;
         std::vector<std::future<void>> futs;
         if (hi > lo) {
-            const uint32_t span = hi - lo;
-            const uint32_t per =
-                (span + std::max<uint32_t>(1, nthreads) - 1) /
-                std::max<uint32_t>(1, nthreads);
+            std::atomic<uint32_t> next_id{lo};
+            auto worker = [&core, &members, hi,
+                            &next_id](size_t /*tid*/, VamanaTLS& tls) {
+                uint32_t id;
+                while ((id = next_id.fetch_add(
+                            1, std::memory_order_relaxed)) < hi) {
+                    core.insert_build_from_code(
+                        id, static_cast<RowId>(members[id]), tls);
+                }
+            };
             for (uint32_t t = 0; t < nthreads; t++) {
-                const uint32_t t_lo = lo + t * per;
-                const uint32_t t_hi = std::min(lo + (t + 1) * per, hi);
-                if (t_lo >= t_hi) break;
-                auto fut = pool.push(
-                    [&core, &members, t_lo, t_hi](
-                        size_t /*tid*/, VamanaTLS& tls) {
-                        for (uint32_t id = t_lo; id < t_hi; id++) {
-                            core.insert_build_from_code(
-                                id, static_cast<RowId>(members[id]), tls);
-                        }
-                    });
-                futs.push_back(std::move(fut));
+                futs.push_back(pool.push(worker));
             }
             for (auto& f : futs) f.get();
         }
@@ -1207,6 +1262,7 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
     //    It also bumps core_->count_ to internal_id + 1.
     VamanaTLS tls;
     tls.resize(static_cast<uint32_t>(count_));
+    tls.resize_lut(quantizer_ ? quantizer_->lut_size() : 0);
     core_->insert_build(new_internal, row_id, vec, tls);
 
     spdlog::info("[sextant] insert: row_id={} internal_id={} (count now {})",

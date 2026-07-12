@@ -60,12 +60,37 @@ struct WorkingCmp {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Thread-local search scratch: pre-reserved heaps to avoid per-query
+// reallocation. The backing vectors are reserved once (to L+1) and clear()'d
+// (capacity retained) between queries.
+// ---------------------------------------------------------------------------
+struct SearchScratch {
+    std::vector<FrontierItem> frontier_heap;  // min-heap by dist
+    std::vector<WorkingItem> working_heap;    // max-heap by dist
+
+    void prepare(uint32_t L) {
+        if (frontier_heap.capacity() < L + 1) frontier_heap.reserve(L + 1);
+        if (working_heap.capacity() < L + 1) working_heap.reserve(L + 1);
+        frontier_heap.clear();
+        working_heap.clear();
+    }
+};
+
+thread_local SearchScratch g_search_scratch;
+
 }  // namespace
 
 void VamanaTLS::resize(uint32_t max_nodes) {
     visited_flags.resize(max_nodes, 0);
     prune_buffer.reserve(max_nodes);
     occlusion_set.reserve(max_nodes);
+}
+
+void VamanaTLS::resize_lut(uint32_t lut_size) {
+    if (lut_size > 0) {
+        lut_buffer.resize(lut_size);
+    }
 }
 
 VamanaCore::VamanaCore(VamanaParams params, PqQuantizer& quantizer)
@@ -114,6 +139,7 @@ void VamanaCore::set_build_nodes(uint8_t* nodes) {
 void VamanaCore::clear_build_buffers() {
     build_codes_ = nullptr;
     build_nodes_ = nullptr;
+    build_vecs_ = nullptr;
 }
 
 uint8_t* VamanaCore::node_ptr(uint32_t internal_id) {
@@ -196,7 +222,8 @@ void VamanaCore::set_neighbor(uint8_t* node, uint32_t i, uint32_t val) {
 
 std::vector<Candidate> VamanaCore::beam_search(
     const float* query_lut, uint32_t L, uint32_t io_limit, VamanaTLS& tls,
-    const std::vector<uint32_t>* forced_entry_points) const {
+    const std::vector<uint32_t>* forced_entry_points,
+    const uint8_t* sdc_anchor) const {
     std::vector<Candidate> out;
     if (count_ == 0 || L == 0) {
         return out;
@@ -227,19 +254,19 @@ std::vector<Candidate> VamanaCore::beam_search(
     };
 
     auto dist_to = [&](uint32_t id) {
-        if (store_) {
-            PinResult pr = store_->pin_code(id);
-            const float d = quantizer_.lut_distance(pr.data, query_lut);
-            store_->unpin_code(id);
-            return d;
-        }
-        return quantizer_.lut_distance(
-            build_codes_ + static_cast<size_t>(id) * code_size_, query_lut);
+        const uint8_t* code_ptr = store_
+            ? (store_->pin_code(id).data)
+            : (build_codes_ + static_cast<size_t>(id) * code_size_);
+        const float d = sdc_anchor
+            ? quantizer_.code_distance(sdc_anchor, code_ptr)
+            : quantizer_.lut_distance(code_ptr, query_lut);
+        if (store_) store_->unpin_code(id);
+        return d;
     };
 
-    std::priority_queue<FrontierItem, std::vector<FrontierItem>, FrontierCmp>
-        frontier;
-    std::priority_queue<WorkingItem, std::vector<WorkingItem>, WorkingCmp> W;
+    g_search_scratch.prepare(L);
+    auto& frontier = g_search_scratch.frontier_heap;  // min-heap by dist
+    auto& W = g_search_scratch.working_heap;          // max-heap by dist
 
     uint32_t io_count = 0;
 
@@ -274,10 +301,13 @@ std::vector<Candidate> VamanaCore::beam_search(
             mark_visited(ep_id);
             io_count++;
             const float d = dist_to(ep_id);
-            frontier.push({d, ep_id});
-            W.push({d, ep_id});
+            frontier.push_back({d, ep_id});
+            std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+            W.push_back({d, ep_id});
+            std::push_heap(W.begin(), W.end(), WorkingCmp{});
             if (W.size() > L_current) {
-                W.pop();
+                std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                W.pop_back();
             }
         }
     } else {
@@ -299,8 +329,10 @@ std::vector<Candidate> VamanaCore::beam_search(
             mark_visited(entry_internal);
             io_count++;
             const float entry_dist = dist_to(entry_internal);
-            frontier.push({entry_dist, entry_internal});
-            W.push({entry_dist, entry_internal});
+            frontier.push_back({entry_dist, entry_internal});
+            std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+            W.push_back({entry_dist, entry_internal});
+            std::push_heap(W.begin(), W.end(), WorkingCmp{});
         }
     }
 
@@ -309,8 +341,9 @@ std::vector<Candidate> VamanaCore::beam_search(
     }
 
     while (!frontier.empty()) {
-        const auto best = frontier.top();
-        frontier.pop();
+        const auto best = frontier.front();
+        std::pop_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+        frontier.pop_back();
 
         // DynamicWidth: track convergence and widen the beam when it stalls.
         if (!converged) {
@@ -331,7 +364,7 @@ std::vector<Candidate> VamanaCore::beam_search(
             }
         }
 
-        if (W.size() >= L_current && best.dist > W.top().dist) {
+        if (W.size() >= L_current && best.dist > W.front().dist) {
             break;
         }
 
@@ -399,11 +432,14 @@ std::vector<Candidate> VamanaCore::beam_search(
                 }
                 io_count++;
                 const float d = dist_to(bid);
-                if (W.size() < L_current || d < W.top().dist) {
-                    frontier.push({d, bid});
-                    W.push({d, bid});
+                if (W.size() < L_current || d < W.front().dist) {
+                    frontier.push_back({d, bid});
+                    std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+                    W.push_back({d, bid});
+                    std::push_heap(W.begin(), W.end(), WorkingCmp{});
                     if (W.size() > L_current) {
-                        W.pop();
+                        std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                        W.pop_back();
                     }
                 }
             }
@@ -435,11 +471,14 @@ std::vector<Candidate> VamanaCore::beam_search(
             }
             io_count++;
             const float d = dist_to(nb_internal);
-            if (W.size() < L_current || d < W.top().dist) {
-                frontier.push({d, nb_internal});
-                W.push({d, nb_internal});
+            if (W.size() < L_current || d < W.front().dist) {
+                frontier.push_back({d, nb_internal});
+                std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+                W.push_back({d, nb_internal});
+                std::push_heap(W.begin(), W.end(), WorkingCmp{});
                 if (W.size() > L_current) {
-                    W.pop();
+                    std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                    W.pop_back();
                 }
             }
         }
@@ -447,10 +486,11 @@ std::vector<Candidate> VamanaCore::beam_search(
 
     out.reserve(W.size());
     while (!W.empty()) {
-        const auto& t = W.top();
+        const auto& t = W.front();
         // internal_id stashed in Candidate::row_id; resolved by the caller.
         out.push_back({static_cast<RowId>(t.internal_id), t.dist});
-        W.pop();
+        std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+        W.pop_back();
     }
     std::reverse(out.begin(), out.end());  // ascending distance
     return out;
@@ -472,7 +512,6 @@ std::vector<Candidate> VamanaCore::beam_search(
 std::vector<Candidate> VamanaCore::robust_prune(
     std::vector<Candidate> candidates, uint16_t R, float alpha,
     VamanaTLS& tls, uint32_t max_occlusion_size) const {
-    (void)tls;  // prune_buffer/occlusion_set reserved for a future gather path.
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& a, const Candidate& b) {
                   return a.dist < b.dist;
@@ -491,16 +530,11 @@ std::vector<Candidate> VamanaCore::robust_prune(
                static_cast<size_t>(candidates[idx].row_id) * code_size_;
     };
 
-    // Per-anchor LUT scratch (local; rebuilt per outer iteration so the inner
-    // loop gathers from an L2-resident m×K buffer instead of striding through
-    // the cache-cold cross-distance table).
-    const uint32_t lut_sz = quantizer_.lut_size();
-    std::vector<float> anchor_lut;
-    bool anchor_lut_ok = lut_sz > 0;
-    if (anchor_lut_ok) {
-        anchor_lut.resize(lut_sz);
-    }
-
+    // Use direct code_distance for the occlusion check instead of
+    // materializing a per-anchor LUT. Profiling showed the 32KB LUT gather
+    // (32 scattered memcpys from the 2MB cross_distance_table) dominates
+    // construct time. Direct code_distance does the same scattered reads
+    // but skips the intermediate buffer — faster despite non-contiguous access.
     std::vector<bool> removed(n, false);
     std::vector<Candidate> kept;
     kept.reserve(std::min(n, static_cast<size_t>(R)));
@@ -512,24 +546,12 @@ std::vector<Candidate> VamanaCore::robust_prune(
         }
         kept.push_back(candidates[p_idx]);
 
-        bool lut_ready = false;
-        if (anchor_lut_ok) {
-            lut_ready =
-                quantizer_.build_code_lut(code_at(p_idx), anchor_lut.data());
-        }
-
         for (size_t pp_idx = p_idx + 1; pp_idx < n; pp_idx++) {
             if (removed[pp_idx]) {
                 continue;
             }
-            float d_pp;
-            if (lut_ready) {
-                d_pp = quantizer_.lut_distance(code_at(pp_idx),
-                                               anchor_lut.data());
-            } else {
-                d_pp = quantizer_.code_distance(code_at(p_idx),
-                                                code_at(pp_idx));
-            }
+            const float d_pp = quantizer_.code_distance(code_at(p_idx),
+                                                         code_at(pp_idx));
             if (alpha * d_pp <= candidates[pp_idx].dist) {
                 removed[pp_idx] = true;
             }
@@ -653,26 +675,20 @@ void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
         return;
     }
 
-    // Build the query LUT from the node's OWN PQ code (symmetric distance):
-    // build_code_lut extracts the code's row from the cross-distance table,
-    // giving a LUT identical in layout to preprocess_query's output.
+    // SDC build: pass the anchor code to beam_search so it computes distances
+    // via direct code-to-code lookup (code_distance), skipping the 32KB LUT
+    // materialization. The LUT is still built as a fallback but not used when
+    // sdc_anchor is non-null.
     const uint32_t lut_sz = quantizer_.lut_size();
-    std::vector<float> lut(lut_sz > 0 ? lut_sz : 1, 0.0f);
-    if (lut_sz > 0) {
-        const bool ok = quantizer_.build_code_lut(
-            build_codes_ + static_cast<size_t>(internal_id) * code_size_,
-            lut.data());
-        if (!ok) {
-            // Quantizer doesn't support SDC LUTs: fall back to zeros. The
-            // build continues (degraded topology); the engine logs this.
-        }
-    }
+    const uint8_t* anchor_code =
+        build_codes_ + static_cast<size_t>(internal_id) * code_size_;
 
     // InsertBuild tail: beam_search → robust_prune → connect_and_prune.
     const uint32_t L_build =
         params_.L_build > 0 ? params_.L_build : params_.L;
     auto selected_candidates =
-        beam_search(lut.data(), L_build, 0 /* io_limit=0 → unlimited */, tls);
+        beam_search(nullptr, L_build, 0 /* io_limit=0 → unlimited */, tls,
+                    /*forced_entry_points=*/nullptr, /*sdc_anchor=*/anchor_code);
     auto selected = robust_prune(std::move(selected_candidates), params_.R,
                                  params_.alpha, tls, params_.max_occlusion);
     connect_and_prune(internal_id, selected, tls);
@@ -715,17 +731,18 @@ void VamanaCore::insert_build(uint32_t internal_id, RowId row_id,
     }
 
     // Build a LUT from the raw vector for distance estimates during construct.
+    // Reuse the thread-local LUT scratch — no per-insert heap allocation.
     const uint32_t lut_sz = quantizer_.lut_size();
-    std::vector<float> lut(lut_sz > 0 ? lut_sz : 1, 0.0f);
+    float* lut_ptr = tls.lut_buffer.data();
     if (lut_sz > 0) {
-        quantizer_.preprocess_query(vec, lut.data());
+        quantizer_.preprocess_query(vec, lut_ptr);
     }
 
     // InsertBuild tail: beam_search → robust_prune → connect_and_prune.
     const uint32_t L_build =
         params_.L_build > 0 ? params_.L_build : params_.L;
     auto selected_candidates =
-        beam_search(lut.data(), L_build, 0 /* io_limit=0 → unlimited */, tls);
+        beam_search(lut_ptr, L_build, 0 /* io_limit=0 → unlimited */, tls);
     auto selected = robust_prune(std::move(selected_candidates), params_.R,
                                  params_.alpha, tls, params_.max_occlusion);
     connect_and_prune(internal_id, selected, tls);
@@ -811,8 +828,15 @@ std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
         L_search = k;
     }
 
-    VamanaTLS tls;
-    tls.resize(count_);
+    // Reuse a thread-local VamanaTLS across search calls. Allocating a
+    // fresh TLS (4MB for visited_flags at 1M nodes) on every query was the
+    // #1 bottleneck under multi-threaded search — vector::__append dominated.
+    thread_local VamanaTLS tls;
+    thread_local uint32_t tls_count = 0;
+    if (tls_count != count_) {
+        tls.resize(count_);
+        tls_count = count_;
+    }
 
     auto cands = beam_search(query_lut, L_search, io_limit, tls);
     if (cands.size() > k) {

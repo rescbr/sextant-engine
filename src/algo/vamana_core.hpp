@@ -4,7 +4,7 @@
 /// Vamana graph algorithm core: BeamSearch, RobustPrune, ConnectAndPrune.
 ///
 /// Evolved from Sextant's exploratory phase:
-/// - Storage backend replaced (flat-in-RAM buffers + ShardedLRUCache)
+/// - Storage backend replaced (flat-in-RAM buffers + BlockCache)
 /// - Per-node spinlocks replaced with nsync sharded lock pool
 /// - DuckDB dependencies stripped (stdlib + CTPL only)
 /// - LabelFilter machinery stripped (Phase 1 is label-less)
@@ -40,14 +40,18 @@ struct VamanaTLS {
     std::vector<uint32_t> visited_flags;
     std::vector<Candidate> prune_buffer;
     std::vector<Candidate> occlusion_set;
+    std::vector<float> lut_buffer;  // Reusable PQ distance LUT (m*K floats).
     std::mt19937 rng;
     uint32_t visit_token = 0;
 
     void resize(uint32_t max_nodes);
+    /// Size the reusable LUT scratch once per thread (m*K floats from the
+    /// quantizer). Called by the Engine after the quantizer is trained.
+    void resize_lut(uint32_t lut_size);
 };
 
 /// The Vamana graph core. Owns the flat-in-RAM node buffer and codes buffer
-/// during build, and references ShardedLRUCache during search.
+/// during build, and references BlockCache during search.
 class VamanaCore {
 public:
     VamanaCore(VamanaParams params, PqQuantizer& quantizer);
@@ -70,9 +74,14 @@ public:
                       VamanaTLS& tls);
 
     /// BeamSearch from entry points. Returns candidates.
+    /// When `sdc_anchor` is non-null, distances are computed via direct
+    /// code-to-code lookup (code_distance) instead of the materialized LUT.
+    /// This skips the 32KB LUT gather, trading scattered table reads for
+    /// zero memcpy. Only valid in SDC build mode (anchor is a PQ code).
     std::vector<Candidate> beam_search(const float* query_lut, uint32_t L,
                                        uint32_t io_limit, VamanaTLS& tls,
-                                       const std::vector<uint32_t>* forced_entry_points = nullptr) const;
+                                       const std::vector<uint32_t>* forced_entry_points = nullptr,
+                                       const uint8_t* sdc_anchor = nullptr) const;
 
     /// RobustPrune: select R neighbors from candidates with occlusion.
     std::vector<Candidate> robust_prune(std::vector<Candidate> candidates,
@@ -110,7 +119,14 @@ public:
     // --- Setters for build buffers ---
     void set_build_codes(const uint8_t* codes, uint32_t count);
     void set_build_nodes(uint8_t* nodes);
+    void set_build_vecs(const float* vecs) { build_vecs_ = vecs; }
     void clear_build_buffers();
+
+    /// Pointer to the raw float vector for `internal_id` (ADC build mode).
+    /// Only valid when set_build_vecs() has been called with a count×dim buffer.
+    const float* build_vec_ptr(uint32_t internal_id) const {
+        return build_vecs_ + static_cast<size_t>(internal_id) * params_.dim;
+    }
 
     /// Install a NodeStore for read access (search path). When set, beam_search
     /// goes through store_->pin_node/pin_code. During build, Engine installs a
@@ -121,6 +137,7 @@ public:
 
     uint32_t size() const { return count_; }
     const std::vector<uint32_t>& entry_points() const { return entry_points_; }
+    void set_entry_points(std::vector<uint32_t> eps) { entry_points_ = std::move(eps); }
 
 private:
     VamanaParams params_;
@@ -133,6 +150,7 @@ private:
     // Flat-in-RAM build buffers (Issue 13).
     const uint8_t* build_codes_ = nullptr;  // count × code_size
     uint8_t* build_nodes_ = nullptr;        // count × node_size
+    const float* build_vecs_ = nullptr;     // count × dim raw vectors (ADC mode)
 
     // NodeStore for read access (search + build both go through this). When
     // null, beam_search falls back to the flat buffers directly.

@@ -33,5 +33,7 @@ datasets/
 # Profiler output
 *.profraw
 profile_results/
+profiles/
+*.samply
 subprojects/.wraplock
 subprojects/packagecache/

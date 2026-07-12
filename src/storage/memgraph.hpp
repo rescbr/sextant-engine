@@ -4,7 +4,7 @@
 /// MemGraph — an in-memory navigation graph that caches the entry-point
 /// neighborhood for fast SSD-resident search.
 ///
-/// The paged search path (PagedNodeStore + ShardedLRUCache) thrashes under
+/// The paged search path (PagedNodeStore + BlockCache) thrashes under
 /// streaming graph access because graph search touches a wide, shifting set
 /// of nodes. The access value is concentrated at the entry-point neighborhood
 /// — the "highway" nodes that EVERY query traverses.
@@ -13,7 +13,7 @@
 /// 3 hops) of the entry points in RAM, and delegates cold nodes to a backing
 /// store (PagedNodeStore). The hot path is a single branch + direct-indexed
 /// array lookup — no locks, no hash map, no LRU list — so it is dramatically
-/// faster than the ShardedLRUCache path for the nodes it covers.
+/// faster than the BlockCache path for the nodes it covers.
 ///
 /// Construction reads the .graph sidecar (after the SidecarHeader) as a flat
 /// run of node_size-byte records, BFS-walks the neighbor lists, and copies

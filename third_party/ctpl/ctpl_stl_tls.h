@@ -260,8 +260,13 @@ namespace ctpl {
                 std::atomic<bool> & abort = *abort_ptr;
                 
                 std::shared_ptr<TLS>& tls_ptr_ref = *tls_sharedptr_ptr;
-                if(tls_init_function){
+                if (tls_init_function) {
                     tls_init_function(i, tls_ptr_ref);
+                }
+                // If no init function was provided, default-construct the TLS
+                // so the dereference below is never UB on a null shared_ptr.
+                if (!tls_ptr_ref) {
+                    tls_ptr_ref = std::make_shared<TLS>();
                 }
                 TLS& tls = *tls_ptr_ref;
 

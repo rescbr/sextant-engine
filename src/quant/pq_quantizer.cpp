@@ -8,10 +8,12 @@
 #include <numkong/numkong.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace sextant {
@@ -263,22 +265,34 @@ void PqQuantizer::train(const float* samples, uint64_t n) {
     codebook_.assign(static_cast<size_t>(m_) * K_ * sub_dim_, 0.0f);
 
     // Each segment's k-means++ is fully independent (disjoint codebook
-    // region, disjoint sub_buffer). We train each segment sequentially.
-    for (uint32_t s = 0; s < m_; s++) {
-        // Extract the sub-vectors for this segment: contiguous memcpy of
-        // sub_dim_ floats per input row.
+    // region, disjoint sub_buffer). Parallelize across segments.
+    const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t n_threads = std::min(hw, static_cast<uint32_t>(m_));
+
+    std::atomic<uint32_t> next_seg{0};
+    auto worker = [&]() {
         std::vector<float> sub_buffer(size_t(n) * sub_dim_);
-        for (uint64_t i = 0; i < n; i++) {
-            std::memcpy(sub_buffer.data() + i * sub_dim_,
-                        samples + i * dim_ + s * sub_dim_,
-                        sub_dim_ * sizeof(float));
+        uint32_t s;
+        while ((s = next_seg.fetch_add(1, std::memory_order_relaxed)) < m_) {
+            // Gather sub-vectors for this segment.
+            for (uint64_t i = 0; i < n; i++) {
+                std::memcpy(sub_buffer.data() + i * sub_dim_,
+                            samples + i * dim_ + s * sub_dim_,
+                            sub_dim_ * sizeof(float));
+            }
+            const uint64_t slot_seed =
+                seed_ ^ (0x9E3779B97F4A7C15ULL * (uint64_t(s) + 1));
+            kmeans_pp(sub_buffer.data(), n, sub_dim_, K_, slot_seed,
+                      /*max_iters=*/25,
+                      codebook_.data() + size_t(s) * K_ * sub_dim_);
         }
-        const uint64_t slot_seed =
-            seed_ ^ (0x9E3779B97F4A7C15ULL * (uint64_t(s) + 1));
-        kmeans_pp(sub_buffer.data(), n, sub_dim_, K_, slot_seed,
-                  /*max_iters=*/25,
-                  codebook_.data() + size_t(s) * K_ * sub_dim_);
+    };
+
+    std::vector<std::thread> pool;
+    for (uint32_t t = 0; t < n_threads; t++) {
+        pool.emplace_back(worker);
     }
+    for (auto& th : pool) th.join();
 
     build_cross_distance_table();
 }

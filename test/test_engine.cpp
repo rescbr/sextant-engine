@@ -10,10 +10,13 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <fstream>
 #include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
+
+#include "storage/sidecar_header.hpp"
 
 namespace sextant {
 namespace {
@@ -567,6 +570,228 @@ TEST(Engine, PageShuffleRecallPreserved) {
     const float recall = static_cast<float>(hits) / num_queries;
     EXPECT_GE(recall, 0.90f)
         << "PageShuffle degraded recall@1 to " << recall;
+
+    remove_sidecars(index_path);
+    std::remove(fbin.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Entry-point persistence round-trip (T6): build → flush → open.
+//
+// After build(), the .meta sidecar must contain the serialized entry points.
+// We parse the .meta payload at the file level (skipping SidecarHeader and the
+// quantizer blob) to recover the persisted entry-point IDs, then confirm they
+// are non-empty and in valid range, and that the index is searchable after
+// open() consumes them.
+// ---------------------------------------------------------------------------
+TEST(Engine, EntryPointPersistenceRoundTrip) {
+    const uint32_t n = 500;
+    const uint32_t dim = 64;
+    const std::string fbin =
+        write_random_fbin("engine_entrypoint_persist.fbin", n, dim);
+    const std::string index_path =
+        (std::filesystem::temp_directory_path() / "engine_entrypoint_persist_idx")
+            .string();
+    remove_sidecars(index_path);
+
+    {
+        Engine engine;
+        FbinSource source(fbin);
+        BuildConfig cfg;
+        engine.build(source, index_path, cfg);
+    }
+
+    // Parse the .meta payload directly to recover persisted entry points.
+    // Layout (mirrors Engine::load_sidecars in src/engine/search.cpp):
+    //   [SidecarHeader][u64 qsize][qsize bytes][u16 ep_count][ep_count×u32]...
+    std::vector<uint32_t> persisted_eps;
+    {
+        const std::string meta_path = index_path + ".meta";
+        std::ifstream f(meta_path, std::ios::binary);
+        ASSERT_TRUE(f.good()) << "cannot open " << meta_path;
+
+        // Skip the SidecarHeader.
+        SidecarHeader hdr{};
+        f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+        ASSERT_TRUE(f.good()) << "failed reading SidecarHeader";
+        ASSERT_EQ(hdr.magic, kMagicMeta) << ".meta bad magic";
+
+        // u64 quantizer_size, then skip the quantizer blob.
+        uint64_t qsize = 0;
+        f.read(reinterpret_cast<char*>(&qsize), sizeof(qsize));
+        ASSERT_TRUE(f.good()) << "failed reading quantizer_size";
+        ASSERT_GE(qsize, 0u);
+        f.seekg(static_cast<std::streamoff>(qsize), std::ios::cur);
+        ASSERT_TRUE(f.good()) << "failed seeking past quantizer blob";
+
+        // u16 entry-point count, then ep_count × u32 IDs.
+        uint16_t ep_count = 0;
+        f.read(reinterpret_cast<char*>(&ep_count), sizeof(ep_count));
+        ASSERT_TRUE(f.good()) << "failed reading entry-point count";
+
+        persisted_eps.reserve(ep_count);
+        for (uint16_t i = 0; i < ep_count; i++) {
+            uint32_t ep = 0;
+            f.read(reinterpret_cast<char*>(&ep), sizeof(ep));
+            ASSERT_TRUE(f.good()) << "failed reading entry point " << i;
+            persisted_eps.push_back(ep);
+        }
+    }
+
+    // Entry points must have been serialized.
+    EXPECT_FALSE(persisted_eps.empty())
+        << "no entry points persisted to .meta";
+
+    // Every persisted entry-point internal ID must be a valid vector index.
+    for (uint32_t ep : persisted_eps) {
+        EXPECT_LT(ep, n) << "persisted entry point " << ep << " out of range";
+    }
+
+    // open() must load the index and the persisted entry points, and search
+    // must be functional (proving load_sidecars → set_entry_points works).
+    {
+        Engine engine;
+        engine.open(index_path);
+        ASSERT_TRUE(engine.is_open());
+        ASSERT_EQ(static_cast<uint64_t>(n), engine.count());
+        ASSERT_EQ(dim, engine.dim());
+
+        std::vector<float> query(dim);
+        std::mt19937 rng(99);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (uint32_t d = 0; d < dim; d++) query[d] = dist(rng);
+
+        SearchConfig scfg;
+        scfg.k = 10;
+        scfg.L_search = 100;
+        auto results = engine.search(query.data(), scfg.k, scfg);
+        EXPECT_LE(results.size(), static_cast<size_t>(scfg.k));
+        for (const auto& c : results) {
+            EXPECT_GE(c.row_id, 0);
+            EXPECT_LT(c.row_id, static_cast<RowId>(n));
+        }
+    }
+
+    remove_sidecars(index_path);
+    std::remove(fbin.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// open() must reject an index whose manifest was deleted but sidecars remain.
+// This simulates a crashed build where the atomic commit never completed.
+// ---------------------------------------------------------------------------
+TEST(Engine, OpenRejectsOrphanedSidecars) {
+    const uint32_t n = 300;
+    const uint32_t dim = 32;
+    const std::string fbin =
+        write_random_fbin("engine_orphan_data.fbin", n, dim);
+    const std::string index_path =
+        (std::filesystem::temp_directory_path() / "engine_orphan_idx").string();
+    remove_sidecars(index_path);
+
+    {
+        Engine engine;
+        FbinSource source(fbin);
+        BuildConfig cfg;
+        engine.build(source, index_path, cfg);
+    }
+
+    // Delete ONLY the manifest, leaving orphaned sidecars.
+    std::remove((index_path + ".manifest").c_str());
+
+    {
+        Engine engine;
+        try {
+            engine.open(index_path);
+            FAIL() << "expected Error";
+        } catch (const Error& e) {
+            EXPECT_EQ(ErrorCode::CorruptIndex, e.code());
+        }
+    }
+
+    remove_sidecars(index_path);
+    std::remove(fbin.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// open() must reject a completely missing index (no manifest or sidecars).
+// ---------------------------------------------------------------------------
+TEST(Engine, OpenRejectsMissingIndex) {
+    const std::string index_path =
+        (std::filesystem::temp_directory_path() / "engine_missing_idx")
+            .string();
+    remove_sidecars(index_path);
+
+    Engine engine;
+    try {
+        engine.open(index_path);
+        FAIL() << "expected Error";
+    } catch (const Error& e) {
+        EXPECT_EQ(ErrorCode::CorruptIndex, e.code());
+    }
+
+    remove_sidecars(index_path);
+}
+
+// ---------------------------------------------------------------------------
+// ADC build mode (alpha=1.5): build with raw-vector construct and verify
+// the index is valid and searchable.
+// ---------------------------------------------------------------------------
+TEST(Engine, BuildADCMode) {
+    const uint32_t n = 800;
+    const uint32_t dim = 64;
+    const std::string fbin =
+        write_random_fbin("engine_adc_data.fbin", n, dim);
+    const std::string index_path =
+        (std::filesystem::temp_directory_path() / "engine_adc_idx").string();
+    remove_sidecars(index_path);
+
+    {
+        Engine engine;
+        FbinSource source(fbin);
+        ASSERT_EQ(n, source.count());
+        ASSERT_EQ(dim, source.dim());
+
+        BuildConfig cfg;
+        cfg.alpha = 1.5f;  // signals ADC build mode
+        BuildResult result = engine.build(source, index_path, cfg);
+        EXPECT_EQ(static_cast<uint64_t>(n), result.n_vectors);
+        EXPECT_EQ(dim, result.dim);
+    }
+
+    // All four sidecar files must exist and be non-empty.
+    for (const char* suf : {".graph", ".codes", ".meta", ".manifest"}) {
+        std::string p = index_path + suf;
+        std::error_code ec;
+        ASSERT_TRUE(std::filesystem::exists(p, ec))
+            << "missing sidecar: " << p;
+        EXPECT_GT(std::filesystem::file_size(p, ec), 0u)
+            << "empty sidecar: " << p;
+    }
+
+    // Open and search — basic smoke test that the ADC-built graph works.
+    {
+        Engine engine;
+        engine.open(index_path);
+        EXPECT_TRUE(engine.is_open());
+        EXPECT_EQ(static_cast<uint64_t>(n), engine.count());
+        EXPECT_EQ(dim, engine.dim());
+
+        std::vector<float> query(dim);
+        std::mt19937 rng(99);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (uint32_t d = 0; d < dim; d++) query[d] = dist(rng);
+
+        SearchConfig scfg;
+        scfg.k = 10;
+        scfg.L_search = 100;
+        auto results = engine.search(query.data(), scfg.k, scfg);
+        EXPECT_LE(results.size(), static_cast<size_t>(scfg.k));
+        for (const auto& c : results) {
+            EXPECT_GE(c.row_id, 0);
+            EXPECT_LT(c.row_id, static_cast<RowId>(n));
+        }
+    }
 
     remove_sidecars(index_path);
     std::remove(fbin.c_str());

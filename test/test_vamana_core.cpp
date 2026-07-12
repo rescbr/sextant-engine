@@ -102,6 +102,7 @@ TEST(VamanaCore, BuildStructuralInvariants) {
 
     VamanaTLS tls;
     tls.resize(N);
+    tls.resize_lut(g.quant.lut_size());
     for (uint32_t i = 0; i < N; i++) {
         g.core->insert_build_from_code(i, /*row_id=*/static_cast<RowId>(1000 + i),
                                        tls);
@@ -131,6 +132,7 @@ TEST(VamanaCore, BuildGraphConnected) {
 
     VamanaTLS tls;
     tls.resize(N);
+    tls.resize_lut(g.quant.lut_size());
     for (uint32_t i = 0; i < N; i++) {
         g.core->insert_build_from_code(i, static_cast<RowId>(i), tls);
     }
@@ -182,6 +184,7 @@ TEST(VamanaCore, InsertBuildFromVector) {
     std::vector<float> vec(g.params.dim, 0.0f);
     VamanaTLS tls;
     tls.resize(N);
+    tls.resize_lut(g.quant.lut_size());
     for (uint32_t i = 0; i < N; i++) {
         g.core->insert_build(i, static_cast<RowId>(i), vec.data(), tls);
     }
@@ -200,6 +203,36 @@ TEST(VamanaCore, InsertBuildFromVector) {
 }
 
 // ---------------------------------------------------------------------------
+// set_entry_points / entry_points round-trip — the setter must install the
+// exact vector and the getter must return it (T6: entry-point persistence).
+// ---------------------------------------------------------------------------
+
+TEST(VamanaCore, SetEntryPointsRoundTrip) {
+    const uint32_t N = 50;
+    TestGraph g(N);
+    VamanaTLS tls;
+    tls.resize(N);
+    tls.resize_lut(g.quant.lut_size());
+    for (uint32_t i = 0; i < N; i++) {
+        g.core->insert_build_from_code(i, static_cast<RowId>(i), tls);
+    }
+
+    // insert_build_from_code seeds entry_points_ with the last inserted id;
+    // set_entry_points must overwrite it with the exact persisted vector.
+    const std::vector<uint32_t> persisted = {3u, 17u, 42u, 49u};
+    g.core->set_entry_points(std::vector<uint32_t>(persisted));
+    const auto& eps = g.core->entry_points();
+    ASSERT_EQ(eps.size(), persisted.size());
+    for (size_t i = 0; i < persisted.size(); i++) {
+        EXPECT_EQ(eps[i], persisted[i]);
+    }
+
+    // Overwriting with an empty set is allowed (clears entry points).
+    g.core->set_entry_points({});
+    EXPECT_TRUE(g.core->entry_points().empty());
+}
+
+// ---------------------------------------------------------------------------
 // compute_entry_points — populates entry_points_ with evenly-spread ids.
 // ---------------------------------------------------------------------------
 
@@ -209,6 +242,7 @@ TEST(VamanaCore, ComputeEntryPoints) {
     // Populate nodes minimally so count_ is set.
     VamanaTLS tls;
     tls.resize(N);
+    tls.resize_lut(g.quant.lut_size());
     for (uint32_t i = 0; i < N; i++) {
         g.core->insert_build_from_code(i, static_cast<RowId>(i), tls);
     }
@@ -235,6 +269,7 @@ TEST(VamanaCore, SearchReturnsAtMostK) {
     TestGraph g(N);
     VamanaTLS tls;
     tls.resize(N);
+    tls.resize_lut(g.quant.lut_size());
     for (uint32_t i = 0; i < N; i++) {
         g.core->insert_build_from_code(i, static_cast<RowId>(2000 + i), tls);
     }
@@ -261,6 +296,7 @@ TEST(VamanaCore, BeamSearchForcedEntry) {
     TestGraph g(N);
     VamanaTLS tls;
     tls.resize(N);
+    tls.resize_lut(g.quant.lut_size());
     for (uint32_t i = 0; i < N; i++) {
         g.core->insert_build_from_code(i, static_cast<RowId>(i), tls);
     }
@@ -296,6 +332,7 @@ TEST(VamanaCore, FinalizeInlineCodes) {
 
     VamanaTLS tls;
     tls.resize(N);
+    tls.resize_lut(g.quant.lut_size());
     for (uint32_t i = 0; i < N; i++) {
         g.core->insert_build_from_code(i, static_cast<RowId>(i), tls);
     }
@@ -325,6 +362,7 @@ TEST(VamanaCore, BeamSearchDynamicWidth) {
     TestGraph g(N, R, /*L=*/16);
     VamanaTLS tls;
     tls.resize(N);
+    tls.resize_lut(g.quant.lut_size());
     for (uint32_t i = 0; i < N; i++) {
         g.core->insert_build_from_code(i, static_cast<RowId>(i), tls);
     }
