@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "../src/quant/pq_quantizer.hpp"
+#include "quant/pq_quantizer.hpp"
 
 namespace sextant {
 namespace {

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "../src/storage/sharded_lru.hpp"
+#include "storage/sharded_lru.hpp"
 
 namespace sextant {
 namespace {

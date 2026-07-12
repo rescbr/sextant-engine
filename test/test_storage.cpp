@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "../src/storage/direct_io.hpp"
+#include "storage/direct_io.hpp"
 #include <cstdio>
 #include <string>
 

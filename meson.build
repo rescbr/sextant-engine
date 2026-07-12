@@ -60,6 +60,7 @@ third_party_inc = include_directories('third_party')
 
 # --- Engine library -----------------------------------------------------------
 engine_inc = include_directories('include')
+src_inc = include_directories('src')
 
 engine_sources = [
     'src/storage/direct_io.cpp',
@@ -74,14 +75,14 @@ engine_sources = [
 
 sextant_lib = static_library('sextant',
     engine_sources,
-    include_directories: [engine_inc, numkong_inc, third_party_inc],
+    include_directories: [engine_inc, src_inc, numkong_inc, third_party_inc],
     dependencies: [nsync_dep, spdlog_dep],
     install: false,
 )
 
 sextant_dep = declare_dependency(
     link_with: sextant_lib,
-    include_directories: engine_inc,
+    include_directories: [engine_inc, src_inc],
     dependencies: [nsync_dep, spdlog_dep],
 )
 

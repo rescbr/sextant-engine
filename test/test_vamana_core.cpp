@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "../src/algo/vamana_core.hpp"
+#include "algo/vamana_core.hpp"
 
 namespace sextant {
 namespace {

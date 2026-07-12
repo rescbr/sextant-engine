@@ -1,8 +1,8 @@
 // Vamana core — stub implementation.
 // Full port from duckdb-vector-index/src/algo/aisaq/aisaq_core.cpp dispatched separately.
 
-#include "vamana_core.hpp"
-#include "../quant/pq_quantizer.hpp"
+#include "algo/vamana_core.hpp"
+#include "quant/pq_quantizer.hpp"
 #include "sextant/error.hpp"
 
 #include <cstring>
