@@ -108,8 +108,8 @@ TEST(MemGraph, PinReturnsRamPointersAndDelegatesCold) {
     mg.set_backing(&backing);
 
     // Cached node 50: MemGraph pointer must differ from the backing pointer.
-    const uint8_t* mg_p = mg.pin_node(50);
-    const uint8_t* bk_p = backing.pin_node(50);
+    PinResult mg_pr = mg.pin_node(50); const uint8_t* mg_p = mg_pr.data;
+    PinResult bk_pr = backing.pin_node(50); const uint8_t* bk_p = bk_pr.data;
     ASSERT_NE(mg_p, nullptr);
     ASSERT_NE(bk_p, nullptr);
     EXPECT_NE(mg_p, bk_p);
@@ -119,8 +119,8 @@ TEST(MemGraph, PinReturnsRamPointersAndDelegatesCold) {
     backing.unpin_node(50);
 
     // Cached code 50 likewise differs but matches.
-    const uint8_t* mg_c = mg.pin_code(50);
-    const uint8_t* bk_c = backing.pin_code(50);
+    PinResult mg_cr = mg.pin_code(50); const uint8_t* mg_c = mg_cr.data;
+    PinResult bk_cr = backing.pin_code(50); const uint8_t* bk_c = bk_cr.data;
     EXPECT_NE(mg_c, bk_c);
     EXPECT_EQ(std::memcmp(mg_c, bk_c, code_size), 0);
     mg.unpin_code(50);
@@ -128,8 +128,8 @@ TEST(MemGraph, PinReturnsRamPointersAndDelegatesCold) {
 
     // Cold node (far away): MemGraph delegates — pointer equals backing's.
     const uint32_t cold = 0;  // entry 50 ±2 covers {48..52}; 0 is cold
-    const uint8_t* mg_cold = mg.pin_node(cold);
-    const uint8_t* bk_cold = backing.pin_node(cold);
+    PinResult mg_cold_pr = mg.pin_node(cold); const uint8_t* mg_cold = mg_cold_pr.data;
+    PinResult bk_cold_pr = backing.pin_node(cold); const uint8_t* bk_cold = bk_cold_pr.data;
     ASSERT_NE(mg_cold, nullptr);
     EXPECT_EQ(mg_cold, bk_cold);
     mg.unpin_node(cold);

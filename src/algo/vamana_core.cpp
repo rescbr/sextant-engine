@@ -228,8 +228,8 @@ std::vector<Candidate> VamanaCore::beam_search(
 
     auto dist_to = [&](uint32_t id) {
         if (store_) {
-            const uint8_t* code = store_->pin_code(id);
-            const float d = quantizer_.lut_distance(code, query_lut);
+            PinResult pr = store_->pin_code(id);
+            const float d = quantizer_.lut_distance(pr.data, query_lut);
             store_->unpin_code(id);
             return d;
         }
@@ -258,7 +258,13 @@ std::vector<Candidate> VamanaCore::beam_search(
     // -----------------------------------------------------------------------
     constexpr uint32_t kConvergePatience = 5;     // pops w/o improvement
     constexpr float kConvergeImprovRatio = 0.99f; // <1% improvement
-    const bool use_dynamic_width = (store_ && store_->is_paged());
+    // DynamicWidth (PipeANN/OctopusANN): controls the I/O pipeline width —
+    // small during approach phase, large during converge phase. This requires
+    // async I/O (the Pipeline). With synchronous reads, there is no pipeline
+    // width to adjust, so we use the fixed L throughout.
+    //
+    // TODO: activate when the async I/O pipeline is implemented.
+    const bool use_dynamic_width = false;
     uint32_t L_current = use_dynamic_width
         ? std::min(L, std::max(static_cast<uint32_t>(params_.R), L / 4))
         : L;
@@ -332,32 +338,48 @@ std::vector<Candidate> VamanaCore::beam_search(
         }
 
         // -----------------------------------------------------------------
-        // PageSearch: when we touch a node, its whole block is fetched into
-        // the cache (PagedNodeStore) or is already in a flat buffer. Compute
-        // PQ-LUT distances for ALL co-located nodes in the same block — the
-        // I/O was already paid, so the distance work (nanoseconds each) is
-        // effectively free and discovers useful candidates. This is additive
-        // to explicit neighbor traversal below, which still reaches nodes in
-        // OTHER blocks.
-        //
-        // Only enabled on the paged (SSD) search path: during build the flat
-        // buffers are RAM-resident so there is no I/O to amortise, and the
-        // full-block scan can hurt graph quality on degenerate (near-equal
-        // distance) inputs by saturating the beam with co-located nodes
-        // before explicit edges are followed.
-        //
-        // `best` itself was already visited when pushed; is_visited() skips it.
+        // Pin the best candidate's node. Capture whether this pin caused
+        // I/O (cache miss). If from_ssd, PageSearch is worthwhile — the
+        // block read was expensive, so amortize it by scanning co-located
+        // nodes. If from_ssd=false (MemGraph hit or LRU hit), skip — the
+        // data is already in RAM and extra distance computations are
+        // pure overhead.
         // -----------------------------------------------------------------
-        // PageSearch: scan co-located nodes in the same block for additional
-        // candidates. Only active on the paged path (SSD reads) — when the
-        // graph fits entirely in RAM, there is no I/O to amortize and the
-        // extra distance computations are pure overhead.
-        //
-        // After PageShuffle (BFS reordering), a node's graph neighbors are
-        // co-located at the start of its block. Scanning R co-located nodes
-        // covers the expected neighbor set without wasting compute on
-        // non-neighbors.
-        if (store_ && store_->is_paged()) {
+        uint16_t n;
+        uint32_t neighbors_buf[1024];
+        const uint32_t* nb_ptr;
+        bool node_from_ssd = false;
+
+        if (store_) {
+            PinResult pr = store_->pin_node(best.internal_id);
+            node_from_ssd = pr.from_ssd;
+            n = get_neighbor_count(pr.data);
+            nb_ptr = (n <= 1024) ? neighbors_buf : nullptr;
+            if (nb_ptr) {
+                std::memcpy(neighbors_buf,
+                            pr.data + kNeighborArrayOffset,
+                            n * sizeof(uint32_t));
+            }
+            store_->unpin_node(best.internal_id);
+        } else {
+            const uint8_t* node = node_ptr(best.internal_id);
+            n = get_neighbor_count(node);
+            if (n <= 1024) {
+                std::memcpy(neighbors_buf,
+                            node + kNeighborArrayOffset,
+                            n * sizeof(uint32_t));
+                nb_ptr = neighbors_buf;
+            } else {
+                nb_ptr = nullptr;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // PageSearch: only when this node caused an SSD read (from_ssd=true).
+        // Scan R co-located nodes in the same block — after PageShuffle, they
+        // include the target's nearest graph neighbors.
+        // -----------------------------------------------------------------
+        if (node_from_ssd) {
             const uint32_t nodes_per_block =
                 std::max(1u, kBlockSize / node_size_);
             const uint32_t block_first =
@@ -375,7 +397,7 @@ std::vector<Candidate> VamanaCore::beam_search(
                 mark_visited(bid);
 
                 if (io_limit > 0 && io_count >= io_limit) {
-                    continue;  // out of I/O budget: mark visited, skip dist.
+                    continue;
                 }
                 io_count++;
                 const float d = dist_to(bid);
@@ -391,46 +413,17 @@ std::vector<Candidate> VamanaCore::beam_search(
 
         // -----------------------------------------------------------------
         // Expand explicit neighbors of `best`.
-        // Copy the neighbor list out of the node before any further pin
-        // (PagedNodeStore may evict the block on the next pin_code/pin_node).
         // -----------------------------------------------------------------
-        uint16_t n;
-        uint32_t neighbors_buf[1024];
-        const uint32_t* nb_ptr;
-        if (store_) {
-            const uint8_t* node = store_->pin_node(best.internal_id);
-            n = get_neighbor_count(node);
-            nb_ptr = (n <= 1024) ? neighbors_buf : nullptr;
-            // For pathological R > 1024 we read neighbor-by-neighbor below
-            // via a second pin; typical R ≤ 128 so neighbors_buf suffices.
-            if (nb_ptr) {
-                std::memcpy(neighbors_buf,
-                            node + kNeighborArrayOffset,
-                            n * sizeof(uint32_t));
-            }
-            store_->unpin_node(best.internal_id);
-        } else {
-            const uint8_t* node = node_ptr(best.internal_id);
-            n = get_neighbor_count(node);
-            if (n <= 1024) {
-                std::memcpy(neighbors_buf,
-                            node + kNeighborArrayOffset,
-                            n * sizeof(uint32_t));
-                nb_ptr = neighbors_buf;
-            } else {
-                nb_ptr = nullptr;
-            }
-        }
 
         for (uint16_t i = 0; i < n; i++) {
             const uint32_t nb_internal =
                 nb_ptr ? nb_ptr[i]
                        : (store_
                               ? get_neighbor(store_->pin_node(
-                                                 best.internal_id),
+                                                 best.internal_id).data,
                                              i)
                               : get_neighbor(
-                                  node_ptr(best.internal_id), i));
+                                   node_ptr(best.internal_id), i));
             if (store_ && !nb_ptr) {
                 store_->unpin_node(best.internal_id);
             }
@@ -832,8 +825,8 @@ std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
         const uint32_t iid = static_cast<uint32_t>(c.row_id);
         if (iid < count_) {
             if (store_) {
-                const uint8_t* node = store_->pin_node(iid);
-                const RowId rid = get_row_id(node);
+                PinResult pr = store_->pin_node(iid);
+                const RowId rid = get_row_id(pr.data);
                 store_->unpin_node(iid);
                 c.row_id = rid;
             } else {

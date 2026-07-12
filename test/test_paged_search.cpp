@@ -223,18 +223,18 @@ TEST(PagedSearch, NodeStoreReadsAndCaches) {
                              /*cache_size_bytes=*/2ull * 256 * 1024);
 
         // Pin node 0 — first access reads from disk.
-        const uint8_t* n0_first = store.pin_node(0);
+        PinResult pr1 = store.pin_node(0); const uint8_t* n0_first = pr1.data;
         ASSERT_NE(n0_first, nullptr);
         store.unpin_node(0);
         EXPECT_EQ(store.graph_reads(), 1u);
 
         // Pin node 0 again — should hit the cache (no new graph reads).
-        const uint8_t* n0_again = store.pin_node(0);
+        PinResult pr2 = store.pin_node(0); const uint8_t* n0_again = pr2.data;
         store.unpin_node(0);
         EXPECT_EQ(store.graph_reads(), 1u);  // still 1 — cache hit
 
         // Pin node 0's code — first code access reads from disk.
-        const uint8_t* c0 = store.pin_code(0);
+        PinResult pr3 = store.pin_code(0); const uint8_t* c0 = pr3.data;
         ASSERT_NE(c0, nullptr);
         store.unpin_code(0);
         EXPECT_EQ(store.code_reads(), 1u);

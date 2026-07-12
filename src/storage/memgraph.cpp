@@ -198,14 +198,15 @@ void MemGraph::materialize(const uint8_t* nodes, const uint8_t* codes) {
 // NodeStore interface — single branch + array lookup on the hot path.
 // ===========================================================================
 
-const uint8_t* MemGraph::pin_node(uint32_t id) {
+PinResult MemGraph::pin_node(uint32_t id) {
     if (id < id_to_local_.size() &&
         id_to_local_[id] != std::numeric_limits<uint32_t>::max()) {
-        return node_data_.data() +
-               static_cast<size_t>(id_to_local_[id]) * node_size_;
+        return {node_data_.data() +
+                    static_cast<size_t>(id_to_local_[id]) * node_size_,
+                false};  // MemGraph hit — served from RAM
     }
-    // Cache miss: delegate to backing store.
-    return backing_ ? backing_->pin_node(id) : nullptr;
+    // Cache miss: delegate to backing store, propagate its from_ssd flag.
+    return backing_ ? backing_->pin_node(id) : PinResult{};
 }
 
 void MemGraph::unpin_node(uint32_t id) {
@@ -214,13 +215,14 @@ void MemGraph::unpin_node(uint32_t id) {
     }
 }
 
-const uint8_t* MemGraph::pin_code(uint32_t id) {
+PinResult MemGraph::pin_code(uint32_t id) {
     if (id < id_to_local_.size() &&
         id_to_local_[id] != std::numeric_limits<uint32_t>::max()) {
-        return code_data_.data() +
-               static_cast<size_t>(id_to_local_[id]) * code_size_;
+        return {code_data_.data() +
+                    static_cast<size_t>(id_to_local_[id]) * code_size_,
+                false};
     }
-    return backing_ ? backing_->pin_code(id) : nullptr;
+    return backing_ ? backing_->pin_code(id) : PinResult{};
 }
 
 void MemGraph::unpin_code(uint32_t id) {

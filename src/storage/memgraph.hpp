@@ -49,18 +49,16 @@ public:
              uint32_t num_hops = 3);
 
     // NodeStore interface
-    const uint8_t* pin_node(uint32_t id) override;
+    PinResult pin_node(uint32_t id) override;
     void unpin_node(uint32_t) override;
-    const uint8_t* pin_code(uint32_t id) override;
+    PinResult pin_code(uint32_t id) override;
     void unpin_code(uint32_t) override;
     uint8_t* mutable_node(uint32_t) override;   // throws
     uint8_t* mutable_code(uint32_t) override;   // throws
-    /// Returns false because MemGraph serves the hot path from RAM.
-    /// PageSearch and DynamicWidth are skipped — the approach phase is
-    /// RAM-speed, and the overhead of those techniques hurts when there
-    /// are few cache misses. Cold-node misses still go to the backing
-    /// PagedNodeStore transparently.
-    bool is_paged() const override { return false; }
+    /// MemGraph wraps a paged backing store. Returns true so DynamicWidth
+    /// can activate. PageSearch is gated per-pin via PinResult.from_ssd
+    /// instead — only fires on actual cache misses.
+    bool is_paged() const override { return backing_ != nullptr; }
 
     /// Set the backing store for nodes NOT in the MemGraph.
     /// pin_node/pin_code check MemGraph first, fall through to backing store.
