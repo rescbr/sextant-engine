@@ -60,7 +60,7 @@ void read_payload(DirectFile& f, uint8_t* dst, size_t count) {
 // ===========================================================================
 
 MemGraph::MemGraph(const uint8_t* all_nodes, const uint8_t* all_codes,
-                   uint32_t node_size, uint8_t code_size, uint32_t total_count,
+                   uint32_t node_size, uint32_t code_size, uint32_t total_count,
                    const std::vector<uint32_t>& entry_points, uint32_t num_hops)
     : node_size_(node_size),
       code_size_(code_size),
@@ -73,7 +73,7 @@ MemGraph::MemGraph(const uint8_t* all_nodes, const uint8_t* all_codes,
 }
 
 MemGraph::MemGraph(const std::string& graph_path, const std::string& codes_path,
-                   uint32_t node_size, uint8_t code_size, uint32_t total_count,
+                   uint32_t node_size, uint32_t code_size, uint32_t total_count,
                    const std::vector<uint32_t>& entry_points, uint32_t num_hops)
     : node_size_(node_size),
       code_size_(code_size),

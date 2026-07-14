@@ -10,7 +10,7 @@ then it ships as a standalone C++ library and CLI.
 
 ## Novel contributions
 
-Sextant makes three contributions over native AiSAQ:
+Sextant makes four contributions over native AiSAQ:
 
 1. **PQ-codes-only build.** Raw vectors are streamed through once to train a
    product quantizer; the graph is then constructed from PQ codes alone.
@@ -18,12 +18,25 @@ Sextant makes three contributions over native AiSAQ:
    100M vectors / dim-128 this is ~30 GB of build RAM for Sextant versus ~98 GB
    for native AiSAQ — roughly 3× less.
 
-2. **`inline_pq` build-RAM decoupling.** The graph is always constructed with
+2. **Adaptive PQ selection.** The engine probes candidate `(m, bits)`
+   configurations on the reservoir sample, measuring **PQ distortion** (median
+   `|1 − pq_dist / true_dist|` over true neighbors) rather than row-id recall.
+   Distortion is geometrically grounded and robust to near-duplicate clustering
+   — a property that row-id recall lacks (see
+   [Why not row-id recall?](#why-not-row-id-recall)). The engine selects the
+   minimum-cost config whose distortion is within a configurable bound
+   (`--pq-max-distortion`, default 0.05), automatically picking 4-bit at high
+   `m` when the data distribution allows, and falling back to 8-bit only when
+   necessary. The probe runs at zero extra I/O cost on the already-sampled
+   reservoir. See [Adaptive PQ selection](#adaptive-pq-selection---pq-m-auto---pq-bits-auto)
+   below.
+
+3. **`inline_pq` build-RAM decoupling.** The graph is always constructed with
    `inline_pq = 0` (flat neighbor lists) and only reformatted into its
    search-optimized inlined-PQ layout at flush time. Build RAM is therefore
    independent of the inline layout chosen for search.
 
-3. **`closure_factor` partition overlap.** For partitioned builds, shard
+4. **`closure_factor` partition overlap.** For partitioned builds, shard
    overlap is controlled by a distance-ratio threshold
    `c = (1 − f_target)^{−1/d_eff}` rather than naive k-base replication. This
    cuts vector replication from ~100% (native AiSAQ's `k_base = 2`) to ~15%,
@@ -31,13 +44,14 @@ Sextant makes three contributions over native AiSAQ:
 
 ## Performance targets
 
-| Metric | Native AiSAQ (SE 105M) | Sextant target | SIFT-1M validated |
+| Metric | Native AiSAQ (SE 105M) | Sextant target | SIFT-1M validated (auto PQ) |
 |---|---|---|---|
-| Build time | 9.3 min | < 15 min (8-core) | ~190s ⚠️ (optimization in progress) |
-| Index size | 4.9 GB | ~5–10 GB | 208 MB (inline_pq=0) |
-| Recall@10 | 85% | ≥ 85% | **0.9957** ✅ |
-| Search QPS (full cache) | — | hardware-dependent | **~2500** (single-threaded) |
-| Search p50 latency | — | hardware-dependent | **0.45 ms** |
+| Build time | 9.3 min | < 15 min (8-core) | **100s** ✅ |
+| Index size | 4.9 GB | ~5–10 GB | 304 MB (inline_pq=0) |
+| Recall@10 | 85% | ≥ 85% | **0.9975** ✅ |
+| Search QPS (full cache, 1 thread) | — | hardware-dependent | **817** |
+| Search QPS (full cache, 10 threads) | — | hardware-dependent | **2,036** |
+| Search p50 latency | — | hardware-dependent | **0.657 ms** |
 
 > The `< 100 MB idle RAM` target is deferred until performance work is
 > complete. MemGraph caches the entry-point neighborhood in RAM for search
@@ -45,6 +59,82 @@ Sextant makes three contributions over native AiSAQ:
 >
 > Performance targets (build time, QPS under cache pressure) are claimed on
 > **Linux only** — see [macOS limitation](#macos-limitation).
+
+### SIFT-1M with adaptive PQ (everything on auto)
+
+A full SIFT-1M build with `--pq-bits auto` (no manual `m` or `bits`) produces
+the following probe trace and results:
+
+```
+pass 1:   probe m=16 bits=4  code=8B   table=16KB    distortion=0.1299
+pass 1:   probe m=16 bits=8  code=16B  table=4096KB  distortion=0.0600
+pass 1:   probe m=32 bits=4  code=16B  table=32KB    distortion=0.1043
+pass 1:   probe m=32 bits=8  code=32B  table=8192KB  distortion=0.0366  ← SELECTED
+pass 1:   probe m=64 bits=4  code=32B  table=64KB    distortion=0.0581
+pass 1:   probe m=64 bits=8  code=64B  table=16384KB distortion=0.0116
+pass 1:   probe m=128 bits=4 code=64B  table=128KB   distortion=0.0152
+pass 1:   probe m=128 bits=8 code=128B table=32768KB distortion=0.0000
+pass 1: selected m=32 bits=8 (distortion=0.0366) [min cost; max_distortion 0.05]
+```
+
+The cost model is simple: **`cost = m`** (the number of table gathers per
+distance computation). `m` is the dominant cost factor in both build and search
+— each `code_distance`/`lut_distance` call performs `m` lookups. Among configs
+meeting the distortion bound (default 0.05), the engine picks the lowest `m`.
+When two configs share the same `m` (e.g. 4-bit vs 8-bit), the smaller table
+wins as a tie-break — since a 4-bit table is 256× smaller than 8-bit at the
+same `m`, this naturally prefers 4-bit when distortion is adequate.
+
+### SIFT-1M PQ config comparison
+
+All three configs below produce excellent recall. The cost model selects the
+cheapest one that meets the distortion bound — but the tradeoffs are instructive:
+
+| Metric | m=32/8-bit (auto) | m=128/4-bit | m=128/8-bit |
+|---|---|---|---|
+| **Distortion** | 0.037 | 0.015 | 0.000 |
+| **Recall@10** | 0.9975 | 0.9990 | 0.9990 |
+| **Proximity (in-band)** | 0.998 | 1.000 | 1.000 |
+| **Build time** | **100s** | 197s | 415s |
+| **QPS (1 thread)** | **817** | 650 | 610 |
+| **QPS (10 threads)** | **2,036** | 1,534 | 1,351 |
+| Code size | **32 B/vec** | 64 B/vec | 128 B/vec |
+| Table size | 8 MB | **128 KB** | 32 MB |
+| Cost (m) | **32** | 128 | 128 |
+
+**m=32/8-bit wins on cost** — fewest gathers (32), with distortion (0.037) well
+within the 0.05 bound. The auto-selection correctly picks this. All three configs
+achieve near-perfect proximity (in-band ≥ 0.998), confirming the index finds the
+right neighborhoods.
+
+> SIFT-1M has `ties@10 = 0.01` (virtually no near-duplicates), so recall@10 and
+> proximity agree — both confirm excellent quality. On clustered data, proximity
+> is the more reliable signal (see below).
+
+**m=128/4-bit vs m=128/8-bit is the definitive case for 4-bit.** At the same
+`m` and nearly identical distortion (0.015 vs 0.000) and recall (0.9990 both),
+4-bit beats 8-bit on every other axis:
+
+| Metric | m=128/4-bit | m=128/8-bit | 4-bit advantage |
+|---|---|---|---|
+| Build time | **197s** | 415s | **2.1× faster** |
+| QPS (1 thread) | **650** | 610 | **1.07× faster** |
+| QPS (10 threads) | **1,534** | 1,351 | **1.14× faster** |
+| Code size | **64 B/vec** | 128 B/vec | **2× smaller** |
+| Table size | **128 KB** | 32 MB | **256× smaller** |
+
+The speed advantage comes from the 256× smaller table: at m=128, the 4-bit
+table (128 KB) fits per-core L2, while the 8-bit table (32 MB) spills to RAM.
+This is why 4-bit support exists: **when distortion is equal at a given m, 4-bit
+is strictly superior.** The cost model (tie-break by table size) naturally
+selects it. On SIFT, lower-`m` 8-bit configs are cheaper overall, so
+auto-selection picks m=32/8-bit. On datasets where high `m` is needed (clustered
+embeddings like geolocation data), 4-bit at that `m` is the clear winner.
+
+Loosen the distortion bound (`--pq-max-distortion 0.10`) to admit faster configs
+at the cost of end-to-end recall (e.g. m=16/8-bit: distortion 0.060, recall
+~0.968, faster build/search). Tighten it (`--pq-max-distortion 0.03`) to force
+higher-fidelity configs at the cost of build/search speed.
 
 ## Build modes
 
@@ -79,20 +169,187 @@ build parameters, including:
 
 - **R (degree):** `N<100K → 32`, `<1M → 48`, `<10M → 64`, `<100M → 96`, else `128`
 - **L (beam):** `max(100, 2 × R)`
-- **PQ m:** `dim / 4`, clamped to `[4, 64]`
+- **PQ m / bits:** auto-resolved via a reservoir probe (see below)
 - **K (partitions):** derived from the build-RAM budget (max per-shard RAM)
 - **cache_size:** `min(graph_size × 0.50, physical_ram × 0.35)`
 - **inline_pq, closure_factor, alpha, num_threads** …
 
 Any field left at 0 / default in the build config is auto-resolved; an explicit
-override wins and propagates to dependent parameters. Use the `--explain`
-dry-run to see exactly what will be used:
+override wins and propagates to dependent parameters.
+
+### Adaptive PQ selection (`--pq-m auto --pq-bits auto`)
+
+When `pq_m` or `pq_bits` is left at `auto` (the CLI default for `--pq-bits`),
+the engine probes candidate `(m, bits)` configurations on the pass-1 reservoir
+sample and selects the best one based on measured **distortion** and cost:
+
+1. **Distortion probe.** For each candidate `(m, bits)` (all divisors of `dim`
+   with `sub_dim ∈ [1, 12]`, at both 4-bit and 8-bit), the engine trains a
+   throwaway PQ on a 20K-vector subset of the reservoir, encodes it, and
+   measures the **median distortion**: `|1 − pq_distance / true_distance|` over
+   the true top-10 neighbors of 500 probe queries. Distortion is 0 when PQ
+   perfectly preserves neighbor distances; 0.05 when the median estimate is off
+   by 5%. It is direction-agnostic and geometrically grounded — see
+   [Why not row-id recall?](#why-not-row-id-recall) below.
+
+2. **Distortion bound.** Configs whose measured distortion exceeds
+   `--pq-max-distortion` (default 0.05) are filtered out.
+
+3. **Min-cost selection.** Among eligible configs, the engine picks the lowest
+   `m` (the number of table gathers per distance computation — the dominant cost
+   in build and search). When two configs share the same `m`, the smaller
+   cross-distance table wins as a tie-break. Since a 4-bit table is 256× smaller
+   than 8-bit at the same `m`, this naturally prefers 4-bit when distortion is
+   adequate — no cache-size detection or residency factors needed.
+
+This policy naturally selects **4-bit at high m** (excellent distortion with a
+tiny table) when the data distribution allows it, and falls back to **8-bit**
+only when 4-bit can't stay within the distortion bound. The probe runs entirely
+on the in-RAM reservoir (zero extra dataset I/O), costing a few seconds against
+a build that may take minutes.
+
+Typical selections at the default distortion bound (0.05):
+
+| Dataset | Selected | m | Distortion |
+|---|---|---|---|
+| SIFTsmall (128d, 10K) | m=32, 8-bit | 32 | 0.034 |
+| SIFT (128d, 1M) | m=32, 8-bit | 32 | 0.037 |
+| Geolocation embeddings (768d, 1.2M, clustered) | m=256, 8-bit | 256 | 0.031 |
+| GIST (960d, continuous) | m=96, 8-bit | 96 | ~0.04 |
+
+> On high-dimensional clustered data like geolocation embeddings, the tight
+> default (0.05) forces high `m` (m=256, build ~190s). Since recall on such data
+> is capped by tie structure (not PQ quality), users may safely loosen the bound
+> (`--pq-max-distortion 0.10`) to select m=64/8-bit instead — build drops to
+> ~80s, QPS nearly doubles, while recall@10 (0.56 → 0.58) and proximity
+> in-band (0.87 → 0.92) barely change. See
+> [Why not row-id recall?](#why-not-row-id-recall).
+
+Use the `--explain` dry-run to see the full probe trace — every candidate config,
+its measured distortion, tie diagnostics, and the selection rationale
+— without building:
 
 ```sh
 ./build/tools/sextant build --input data.fbin --index myidx --explain
 ```
 
-This prints all resolved parameters and exits without building.
+When `pq_m`/`pq_bits` are auto, `--explain` reads a random sample (default 20K
+vectors via seek — no full dataset scan) and runs the probe. With explicit
+`--pq-m`/`--pq-bits`, it stays instant (pure parameter print). The probe sample
+size is controlled by `--probe-sample N`.
+
+
+## Evaluation: recall, proximity, and ground truth
+
+**Recall@k** is the standard ANN quality metric: for each query, compute the
+true top-k nearest neighbors by brute force (exhaustive scan using the same
+distance function the index uses — L2-squared by default), then measure what
+fraction of those k ids appear in the index's top-k results. Averaged over all
+queries. Recall@10 = 1.0 means the index returned the exact top-10 for every
+query; 0.95 means it found 9.5 of the 10 true nearest neighbors on average.
+
+Sextant reports recall@10 in `sextant_bench` for comparability with standard
+ANN benchmarks (SIFT, GIST, etc.). On datasets with well-separated neighbors
+(no near-duplicates), recall@10 is an excellent quality signal.
+
+However, recall@10 has a subtle failure mode on **clustered data** — datasets
+where many vectors sit at (nearly) the same location. The next section explains
+why, and what Sextant measures instead.
+
+## Why not row-id recall?
+
+A natural question: why measure PQ quality with **distortion** instead of just
+**recall** (fraction of true neighbors the PQ ranking recovers)? The answer is
+that row-id recall is fragile on datasets with near-duplicate structure —
+exactly the datasets that real-world vector indexes serve.
+
+### The problem: tie-breaking makes "the top-10" arbitrary
+
+Many real datasets contain groups of vectors at (nearly) the same location:
+address or geolocation embeddings (multiple rows per location), document embeddings (near-
+duplicate pages), entity embeddings (repeated records). For a query landing in
+such a cluster, dozens or hundreds of base vectors may be within the 10th-NN
+distance — all equally near, all legitimate results.
+
+Ground-truth generators must pick exactly 10 ids for recall@10. When >10 vectors
+are tied at the boundary, which 10 get picked is determined by implementation
+detail (e.g. `argpartition`'s tie-breaking, or the order vectors appear in the
+file). The "true top-10" is **arbitrary** — a different chunk size or scan order
+produces a different ground truth.
+
+This has a concrete consequence: **even exact brute-force search cannot score
+recall@10 = 1.0** against such a ground truth. On a geolocation embedding dataset (768-dim,
+1.26M vectors), brute-force top-10 scores only **0.63
+recall@10** against the generated GT — not because brute force misses anything,
+but because it returns 10 different (equally-near) vectors than the 10 the GT
+arbitrarily marked. No index, however perfect, can exceed this ceiling.
+
+### What we measure instead
+
+The probe reports four diagnostics, only one of which drives selection:
+
+| Metric | What it measures | Used for selection? |
+|---|---|---|
+| **distortion** | Median `\|1 − pq_dist / true_dist\|` over true neighbors. How much PQ distorts the distances it sees. Geometric, direction-agnostic, transfers across dataset classes. | **Yes** — the selection signal. |
+| **band_recall** | Fraction of true neighbors for which the PQ top-30 shortlist contains *some* vector within the 10th-NN distance. Cluster-aware: doesn't care *which* co-located id PQ picked, only that it surfaced the right neighborhood. | No — diagnostic. |
+| **ties@10** | Fraction of probe queries where more than 10 vectors fall within the 10th-NN distance. When high, recall@10 is structurally capped below 1.0 — the "top-10" is ambiguous regardless of index quality. | No — diagnostic. |
+| **ties@30** | Same, but at the shortlist boundary (30th-NN distance). When high, even the PQ top-30 shortlist boundary is ambiguous — band_recall is the better signal. | No — diagnostic. |
+
+**Distortion** is the selection signal because it isolates PQ's own property
+(distance fidelity) from downstream effects (graph navigation, tie-breaking). A
+config with low distortion preserves the geometry the graph needs; whether the
+end-to-end system then achieves high row-id recall depends on the graph and the
+data's tie structure, not on PQ.
+
+### Interpretation guide
+
+The `--explain` table shows all four columns. Here's how to read them:
+
+```
+  m    bits  code   table     distort  band_r  ties@10 ties@30  cost   band  note
+  32   8    32B    8.00MB    0.0366  1.0000  0.01   0.02    61     RAM   ← SELECTED
+```
+
+- **distortion = 0.037**: PQ overestimates true-neighbor distances by 3.7% on
+  the median. Well within the 0.05 bound — this config is eligible.
+- **band_r = 1.0**: for every true neighbor, PQ's top-30 shortlist includes at
+  least one vector within the 10th-NN radius. PQ is finding the right
+  neighborhoods perfectly.
+- **ties@10 = 0.07**: 7% of probe queries have >10 vectors tied at the 10th-NN
+  distance. Low — most queries have a well-defined top-10.
+- **ties@30 = 0.05**: 5% have >30 vectors tied at the 30th-NN distance. Also low.
+
+Contrast with a heavily-clustered dataset where `ties@10 = 0.57` (57% of
+queries have an ambiguous top-10): there, row-id recall@10 cannot exceed ~0.57
+no matter how good the index is. The distortion and band_recall columns tell
+you PQ is doing its job; the ties columns tell you the data itself caps
+row-id recall. Without the tie diagnostics, a low recall number is
+uninterpretable — it could mean PQ is bad, the graph is bad, or the data is
+just tied. The tie columns disambiguate.
+
+### What this means for benchmarking
+
+The `sextant_bench` tool reports two quality metrics:
+
+- **Recall@k** — fraction of true top-k ids found (set intersection). Reported
+  for comparability with standard ANN benchmarks. Reliable when `ties@k` is low;
+  structurally capped when it's high.
+
+- **Proximity** — for each returned result, the ratio `d_target / d_result`
+  where `d_target` is the true k-th NN distance. Reports the fraction of results
+  at or inside the target radius (`in-band`), plus the distribution of
+  out-of-band ratios so you can see how far misses land. This is **graded**
+  (not boolean) and **cluster-aware**: it measures whether the index found the
+  right neighborhood, regardless of which specific co-located row it returned.
+
+On non-clustered data (SIFT, GIST — `ties@10` ≈ 0), both metrics agree.
+On clustered data (geolocation, entity embeddings — `ties@10` can exceed 0.5),
+proximity is the meaningful number: recall@10 is capped by tie structure, while
+proximity tells you whether the index is actually finding the right locations.
+
+> Proximity requires a ground-truth file with real distances. The `fvecs_to_fbin`
+> converter computes them automatically when given `--base` and `--queries`; the
+> SIFT-1M and SIFTsmall GTs distributed with Sextant include real distances.
 
 ## Metric handling and normalization
 
@@ -190,8 +447,11 @@ kernel page cache can mask true SSD behavior. The performance targets above
 meson setup build && meson compile -C build     # build (C++17-compatible)
 meson test -C build                             # run the test suite (56 tests)
 
-# Build an index (R/L/pq-m auto-resolved when omitted)
+# Build an index (pq-m/pq-bits auto-probed on reservoir by default)
 ./build/tools/sextant build --input data.fbin --index myidx --R 48
+
+# Dry-run: see what PQ config the probe would select (no build)
+./build/tools/sextant build --input data.fbin --index myidx --explain
 
 # Search with rerank against full-precision base vectors
 ./build/tools/sextant search --index myidx --query q.fbin \
@@ -204,8 +464,8 @@ meson test -C build                             # run the test suite (56 tests)
 ./build/tools/sextant_bench --index myidx --queries q.fbin \
     --base-data data.fbin --ground-truth gt.gt --k 10
 
-# Dry-run parameter resolution
-./build/tools/sextant build --input data.fbin --index myidx --explain
+# Explore PQ parameters (m/bits sweeps, per-segment diagnostics, per-partition)
+./build/tools/pq_explore --input data.fbin --m-sweep 32,64,128 --bits-sweep 4,8
 ```
 
 ### CLI flags
@@ -217,12 +477,14 @@ meson test -C build                             # run the test suite (56 tests)
 | | `--R` | graph degree (auto if 0) |
 | | `--L` | beam width (auto if 0) |
 | | `--alpha` | prune threshold (default 1.2) |
-| | `--pq-m` | PQ segments (auto from dim if 0) |
-| | `--pq-bits` | PQ bits (default 8) |
+| | `--pq-m` | PQ segments (`0` = auto, probed on reservoir) |
+| | `--pq-bits` | PQ bits: `4`, `8`, or `auto` (default; probed on reservoir) |
+| | `--pq-max-distortion` | max PQ distortion for auto selection (default 0.05; lower favors higher-fidelity PQ, higher admits faster low-m configs) |
+| | `--probe-sample` | sample size for `--explain` PQ probe (default 20000) |
 | | `--metric` | `l2sq` (default) or `ip` |
 | | `--threads` | build threads (auto if 0) |
 | | `--build-ram` | per-shard RAM budget in bytes (forces partitioning if small) |
-| | `--explain` | print resolved params and exit (dry-run) |
+| | `--explain` | print resolved params and exit (dry-run; runs PQ probe when m/bits auto) |
 | `search` | `--index`, `--query` | index prefix, query `.fbin` (required) |
 | | `--k` | results to return (default 10) |
 | | `--L` | search beam width (default 200) |
@@ -261,9 +523,10 @@ sextant-engine/
 │   │                    # PageSearch)
 │   ├── engine/          # build/search pipelines, partitioning, FbinSource,
 │   │                    # PageShuffle (BFS reordering at flush)
+│   ├── util/            # cache_info (cross-platform L2/L3 detection)
 │   └── logging.cpp
 ├── test/                # 71 tests across 10 suites
-├── tools/               # sextant CLI, sextant_bench, fvecs_to_fbin
+├── tools/               # sextant CLI, sextant_bench, fvecs_to_fbin, pq_explore
 ├── docs/                # design_decisions.md, remaining_tasks.md
 ├── third_party/         # nsync, NumKong (submodules); CTPL, cmdline (committed)
 ├── scripts/             # download_datasets.sh

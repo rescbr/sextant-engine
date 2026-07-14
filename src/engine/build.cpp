@@ -32,7 +32,7 @@ uint16_t auto_R(uint64_t n) {
 /// Auto-resolve the inline-PQ count preset (Issue 25). Phase 1 default is the
 /// "balanced" preset; the override sentinel 0xFFFF means "auto".
 uint16_t resolve_inline_pq(uint16_t override_val, uint64_t n_vectors,
-                            uint16_t R, uint8_t code_size,
+                            uint16_t R, uint32_t code_size,
                             uint64_t cache_budget) {
     if (override_val != 0xFFFF) return override_val;
 
@@ -105,7 +105,17 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     if (overrides.L != 0) {
         p.L = overrides.L;
     } else {
-        p.L = static_cast<uint16_t>(std::max<uint32_t>(100, 2u * p.R));
+        // L_build = 2*R. This is the beam-search width during construct. The
+        // occlusion loop is O(L_build × R), so L_build is the primary cost
+        // driver. Empirically validated across three datasets:
+        //   SIFT-1M (128-dim):     L=2R=128 → recall 0.9966
+        //   GIST-100K (960-dim):   L=2R=96  → recall 0.9074 (PQ-capped)
+        //   se_base-100K (768-dim): L=2R=96  → recall 0.9356
+        // L=R was tested but collapses recall on high-dim embeddings (se_base
+        // drops from 0.94 to 0.36) because beam_search can't navigate the
+        // high-dim manifold with a narrow beam. The cost reduction comes from
+        // the max_occlusion cap below, not from shrinking L_build.
+        p.L = static_cast<uint16_t>(std::max<uint32_t>(2u * p.R, 100u));
     }
     p.L_build = p.L;
     spdlog::info("[sextant] L / L_build = {} [{}]", p.L,
@@ -127,28 +137,48 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     if (overrides.pq_m != 0) {
         p.pq_m = overrides.pq_m;
     } else {
-        // clamp(dim/4, 4, 64); also require dim divisible by m (adjusted down).
-        uint32_t m = dim / 4;
-        if (m < 4) m = 4;
-        if (m > 64) m = 64;
-        // Ensure dim % m == 0: decrement until it divides.
-        while (m > 1 && (dim % m) != 0) {
-            m--;
-        }
-        if (m < 1) m = 1;
-        p.pq_m = static_cast<uint8_t>(m);
+        p.pq_m = 0;  // auto: resolved by probing on the pass1 reservoir.
     }
-    spdlog::info("[sextant] pq_m = {} [{}]", p.pq_m,
+    spdlog::info("[sextant] pq_m = {} [{}]", p.pq_m == 0 ? "auto" : std::to_string(p.pq_m),
                  overrides.pq_m != 0 ? "override" : "auto");
 
     // --- pq_bits ---
+    // 0 = auto (resolved by global probe in pass1); 4 or 8 = explicit.
+    if (overrides.pq_bits != 0 && overrides.pq_bits != 4 && overrides.pq_bits != 8) {
+        throw Error(ErrorCode::InvalidParam,
+                    "pq_bits must be 0 (auto), 4, or 8");
+    }
     p.pq_bits = overrides.pq_bits;
-    spdlog::info("[sextant] pq_bits = {}", p.pq_bits);
+    spdlog::info("[sextant] pq_bits = {} [{}]", p.pq_bits == 0 ? "auto" : std::to_string(p.pq_bits),
+                 overrides.pq_bits != 0 ? "override" : "auto");
+
+    // --- pq_max_distortion ---
+    // Upper bound on acceptable PQ distortion (median |1 - pq_dist/true_dist|) for
+    // auto (m, bits) selection. Only used when pq_m or pq_bits is auto. The
+    // bound filters the candidate set; the elbow of the distortion-cost Pareto
+    // frontier does the actual selection. See BuildConfig::pq_max_distortion
+    // for the full rationale.
+    p.pq_max_distortion = overrides.pq_max_distortion > 0.0f
+                              ? overrides.pq_max_distortion
+                              : 0.05f;
+    if (overrides.pq_m == 0 || overrides.pq_bits == 0) {
+        spdlog::info("[sextant] pq_max_distortion = {:.2f} [{}]",
+                     p.pq_max_distortion,
+                     overrides.pq_max_distortion > 0.0f ? "override" : "default");
+    }
 
     // --- max_occlusion ---
-    p.max_occlusion =
-        std::min<uint32_t>(4096, std::max<uint32_t>(750, 4u * p.L_build + p.R));
-    spdlog::info("[sextant] max_occlusion = {} [auto]", p.max_occlusion);
+    if (overrides.max_occlusion != 0) {
+        p.max_occlusion = overrides.max_occlusion;
+        spdlog::info("[sextant] max_occlusion = {} [override]", p.max_occlusion);
+    } else {
+        // Adaptive: cap the candidate pool at L_build. The old default
+        // (max(750, 4*L_build+R)) never engaged since beam_search returns
+        // ~L_build < 750 candidates. Capping at L_build means the occlusion
+        // loop processes at most L_build² pairs instead of L_build × 750.
+        p.max_occlusion = p.L_build;
+        spdlog::info("[sextant] max_occlusion = {} [auto]", p.max_occlusion);
+    }
 
     // --- inline_pq_count ---
     // Cache-aware resolution: inline_pq inflates nodes 6× but saves a read/hop.

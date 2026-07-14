@@ -6,7 +6,9 @@
 // .fbin format (global header): [uint32 n][uint32 dim][n × dim × float32]
 // .gt   format (ground truth):  [uint32 n_queries][uint32 k]
 //                              [n × k × uint32 neighbor IDs]
-//                              [n × k × float32 distances]  (zero-filled)
+//                              [n × k × float32 distances]
+//   With --base + --queries: distances are real L2-sq (enables proximity metrics).
+//   Without: distances are zero-filled.
 //
 // Usage:
 //   fvecs_to_fbin --input file.fvecs --output file.fbin
@@ -126,8 +128,14 @@ void convert_fvecs(const std::string& input, const std::string& output) {
 
 /// Convert .ivecs → .gt ground-truth file.
 /// Each record: [int32 k][k × int32 neighbor IDs].
-/// Output: [uint32 n][uint32 k][n×k uint32 ids][n×k float32 distances=0].
-void convert_ivecs(const std::string& input, const std::string& output) {
+/// Output: [uint32 n][uint32 k][n×k uint32 ids][n×k float32 distances].
+///
+/// If --base and --queries are provided, distances are computed as L2-squared
+/// between each query vector and its k neighbor vectors in the base. Otherwise
+/// distances are zero-filled (and proximity metrics will be unavailable).
+void convert_ivecs(const std::string& input, const std::string& output,
+                   const std::string& base_path = "",
+                   const std::string& query_path = "") {
     auto buf = read_file(input);
     const char* p = buf.data();
     const char* end = buf.data() + buf.size();
@@ -174,6 +182,52 @@ void convert_ivecs(const std::string& input, const std::string& output) {
     }
     spdlog::info("fvecs_to_fbin: {} queries, k={}", n, k);
 
+    // Optionally load base + query vectors to compute real distances.
+    const bool compute_dists = !base_path.empty() && !query_path.empty();
+    std::vector<float> base_vecs;
+    std::vector<float> query_vecs;
+    uint32_t base_n = 0, base_dim = 0, query_n = 0, query_dim = 0;
+    if (compute_dists) {
+        // Read base .fbin header + all vectors.
+        {
+            std::ifstream bf(base_path, std::ios::binary);
+            if (!bf) throw Error(ErrorCode::IoError,
+                                 "cannot open base '" + base_path + "'");
+            bf.read(reinterpret_cast<char*>(&base_n), sizeof(uint32_t));
+            bf.read(reinterpret_cast<char*>(&base_dim), sizeof(uint32_t));
+            base_vecs.resize(static_cast<size_t>(base_n) * base_dim);
+            bf.read(reinterpret_cast<char*>(base_vecs.data()),
+                    static_cast<std::streamsize>(base_vecs.size() * sizeof(float)));
+            if (!bf) throw Error(ErrorCode::IoError,
+                                 "short read on base '" + base_path + "'");
+        }
+        // Read query .fbin header + all vectors.
+        {
+            std::ifstream qf(query_path, std::ios::binary);
+            if (!qf) throw Error(ErrorCode::IoError,
+                                 "cannot open queries '" + query_path + "'");
+            qf.read(reinterpret_cast<char*>(&query_n), sizeof(uint32_t));
+            qf.read(reinterpret_cast<char*>(&query_dim), sizeof(uint32_t));
+            query_vecs.resize(static_cast<size_t>(query_n) * query_dim);
+            qf.read(reinterpret_cast<char*>(query_vecs.data()),
+                    static_cast<std::streamsize>(query_vecs.size() * sizeof(float)));
+            if (!qf) throw Error(ErrorCode::IoError,
+                                 "short read on queries '" + query_path + "'");
+        }
+        if (base_dim != query_dim) {
+            throw Error(ErrorCode::InvalidParam,
+                        "base dim " + std::to_string(base_dim) +
+                        " != query dim " + std::to_string(query_dim));
+        }
+        if (query_n < n) {
+            throw Error(ErrorCode::InvalidParam,
+                        "query file has " + std::to_string(query_n) +
+                        " vectors but GT has " + std::to_string(n) + " queries");
+        }
+        spdlog::info("fvecs_to_fbin: computing L2-sq distances (base_n={}, dim={})",
+                     base_n, base_dim);
+    }
+
     std::ofstream out(output, std::ios::binary | std::ios::trunc);
     if (!out) {
         throw Error(ErrorCode::IoError,
@@ -185,11 +239,37 @@ void convert_ivecs(const std::string& input, const std::string& output) {
         out.write(reinterpret_cast<const char*>(r.data()),
                   static_cast<std::streamsize>(k * sizeof(uint32_t)));
     }
-    // Zero-filled distances.
-    std::vector<float> zeros(k, 0.0f);
-    for (uint32_t i = 0; i < n; i++) {
-        out.write(reinterpret_cast<const char*>(zeros.data()),
-                  static_cast<std::streamsize>(k * sizeof(float)));
+    // Distances: real L2-sq if base+queries provided, else zero-filled.
+    if (compute_dists) {
+        const uint32_t dim = base_dim;
+        std::vector<float> dists(k);
+        for (uint32_t qi = 0; qi < n; qi++) {
+            const float* qv = &query_vecs[static_cast<size_t>(qi) * dim];
+            for (uint32_t ki = 0; ki < k; ki++) {
+                const uint32_t nid = records[qi][ki];
+                double acc = 0.0;
+                if (nid < base_n) {
+                    const float* bv = &base_vecs[static_cast<size_t>(nid) * dim];
+                    for (uint32_t d = 0; d < dim; d++) {
+                        const double diff = static_cast<double>(qv[d]) -
+                                            static_cast<double>(bv[d]);
+                        acc += diff * diff;
+                    }
+                }
+                dists[ki] = static_cast<float>(acc);
+            }
+            out.write(reinterpret_cast<const char*>(dists.data()),
+                      static_cast<std::streamsize>(k * sizeof(float)));
+        }
+        spdlog::info("fvecs_to_fbin: distances computed from base + queries");
+    } else {
+        spdlog::warn("fvecs_to_fbin: --base/--queries not provided; "
+                     "distances zero-filled (proximity metrics will be unavailable)");
+        std::vector<float> zeros(k, 0.0f);
+        for (uint32_t i = 0; i < n; i++) {
+            out.write(reinterpret_cast<const char*>(zeros.data()),
+                      static_cast<std::streamsize>(k * sizeof(float)));
+        }
     }
     if (!out) {
         throw Error(ErrorCode::IoError,
@@ -207,15 +287,19 @@ int main(int argc, char* argv[]) {
     p.add<std::string>("input", 0, "Input .fvecs or .ivecs file", true);
     p.add<std::string>("output", 0, "Output .fbin or .gt file", true);
     p.add("gt", 0, "Ground-truth mode (.ivecs → .gt)");
+    p.add<std::string>("base", 0, "Base .fbin (for --gt: compute real distances)", false, "");
+    p.add<std::string>("queries", 0, "Query .fbin (for --gt: compute real distances)", false, "");
     p.parse_check(argc, argv);
 
     const std::string input = p.get<std::string>("input");
     const std::string output = p.get<std::string>("output");
     const bool gt_mode = p.exist("gt");
+    const std::string base_path = p.get<std::string>("base");
+    const std::string query_path = p.get<std::string>("queries");
 
     try {
         if (gt_mode) {
-            convert_ivecs(input, output);
+            convert_ivecs(input, output, base_path, query_path);
         } else {
             convert_fvecs(input, output);
         }

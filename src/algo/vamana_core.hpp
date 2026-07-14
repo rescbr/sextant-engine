@@ -38,9 +38,17 @@ struct VamanaParams {
 /// Per-thread-local scratch for Vamana operations (visit marks, prune buffers).
 struct VamanaTLS {
     std::vector<uint32_t> visited_flags;
-    std::vector<Candidate> prune_buffer;
+    std::vector<Candidate> prune_buffer;    // robust_prune internal sort copy
     std::vector<Candidate> occlusion_set;
+    std::vector<Candidate> prune_output;    // robust_prune output (capacity retained)
+    std::vector<Candidate> search_result;   // beam_search build-path output (capacity retained)
+    std::vector<Candidate> connect_buffer;  // connect_and_prune overflow candidate pool
+    std::vector<Candidate> recip_targets;   // snapshot of selected for reciprocal loop
     std::vector<float> lut_buffer;  // Reusable PQ distance LUT (m*K floats).
+    /// Per-anchor LUT for SDC build: anchor_lut[s*K+cid] = cross_table[s*K*K + anchor_code[s]*K + cid].
+    /// Built once per insert_build_from_code; 8KB (m=32,K=256), L1-resident.
+    std::vector<float> anchor_lut;
+    std::vector<uint8_t> removed_flags;  // robust_prune removed bitset (bytes, not bools)
     std::mt19937 rng;
     uint32_t visit_token = 0;
 
@@ -59,7 +67,7 @@ public:
 
     /// Compute the static node size for a given R and inline_pq_count.
     static uint32_t static_node_size(uint16_t R, uint16_t inline_pq_count,
-                                     uint8_t code_size);
+                                     uint32_t code_size);
 
     /// Prepare for building `count` nodes.
     void prepare_for_build(uint32_t count);
@@ -78,12 +86,36 @@ public:
     /// code-to-code lookup (code_distance) instead of the materialized LUT.
     /// This skips the 32KB LUT gather, trading scattered table reads for
     /// zero memcpy. Only valid in SDC build mode (anchor is a PQ code).
+    ///
+    /// When `anchor_lut` is non-null, it takes priority over both `query_lut`
+    /// and `sdc_anchor`: distances are gathered from the 8KB per-anchor LUT
+    /// (L1-resident) via lut_distance, which is contiguous and cache-friendly.
     std::vector<Candidate> beam_search(const float* query_lut, uint32_t L,
                                        uint32_t io_limit, VamanaTLS& tls,
                                        const std::vector<uint32_t>* forced_entry_points = nullptr,
-                                       const uint8_t* sdc_anchor = nullptr) const;
+                                       const uint8_t* sdc_anchor = nullptr,
+                                       const float* anchor_lut = nullptr) const;
+
+    /// BeamSearch writing into `out` (cleared; capacity retained). Build path
+    /// uses this to avoid per-insert heap allocation.
+    void beam_search_into(std::vector<Candidate>& out,
+                          const float* query_lut, uint32_t L,
+                          uint32_t io_limit, VamanaTLS& tls,
+                          const std::vector<uint32_t>* forced_entry_points = nullptr,
+                          const uint8_t* sdc_anchor = nullptr,
+                          const float* anchor_lut = nullptr) const;
 
     /// RobustPrune: select R neighbors from candidates with occlusion.
+    /// Writes the kept candidates into `out` (cleared; capacity retained).
+    /// `candidates` is sorted in place (assumed already sorted ascending when
+    /// `presorted=true` — skips the redundant std::sort when callers pass
+    /// beam_search output, which is already ascending).
+    void robust_prune_into(const std::vector<Candidate>& candidates,
+                           std::vector<Candidate>& out, uint16_t R, float alpha,
+                           VamanaTLS& tls, uint32_t max_occlusion_size,
+                           bool presorted = false) const;
+
+    /// RobustPrune (return-by-value wrapper for the search/non-build path).
     std::vector<Candidate> robust_prune(std::vector<Candidate> candidates,
                                         uint16_t R, float alpha,
                                         VamanaTLS& tls,
@@ -145,7 +177,7 @@ private:
 
     uint32_t count_ = 0;
     uint32_t node_size_ = 0;
-    uint8_t code_size_ = 0;
+    uint32_t code_size_ = 0;
 
     // Flat-in-RAM build buffers (Issue 13).
     const uint8_t* build_codes_ = nullptr;  // count × code_size

@@ -71,7 +71,7 @@ public:
 class FlatNodeStore : public NodeStore {
 public:
     FlatNodeStore(uint8_t* nodes, const uint8_t* codes,
-                  uint32_t node_size, uint8_t code_size);
+                  uint32_t node_size, uint32_t code_size);
 
     PinResult pin_node(uint32_t id) override;
     void unpin_node(uint32_t) override {}
@@ -85,7 +85,7 @@ private:
     uint8_t* nodes_;
     const uint8_t* codes_;
     uint32_t node_size_;
-    uint8_t code_size_;
+    uint32_t code_size_;
 };
 
 /// LRU-paged backing — the SSD-resident search path.
@@ -93,7 +93,7 @@ class PagedNodeStore : public NodeStore {
 public:
     PagedNodeStore(const std::string& graph_path,
                    const std::string& codes_path,
-                   uint32_t node_size, uint8_t code_size,
+                   uint32_t node_size, uint32_t code_size,
                    uint32_t num_shards,
                    uint64_t cache_size_bytes);
     ~PagedNodeStore();
@@ -135,7 +135,7 @@ private:
     DirectFile graph_file_;
     DirectFile codes_file_;
     uint32_t node_size_;
-    uint8_t code_size_;
+    uint32_t code_size_;
     uint32_t nodes_per_block_;
     uint32_t codes_per_block_;
     uint32_t graph_block_size_;

@@ -25,7 +25,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -85,8 +87,14 @@ int cmd_build(int argc, char* argv[]) {
     p.add<uint16_t>("R", 0, "Graph degree (auto if 0)", false, 0);
     p.add<uint16_t>("L", 0, "Beam width (auto if 0)", false, 0);
     p.add<float>("alpha", 0, "Prune threshold (1.2=SDC, 1.5=ADC build mode)", false, 1.2f);
-    p.add<uint8_t>("pq-m", 0, "PQ segments (auto from dim if 0)", false, 0);
-    p.add<uint8_t>("pq-bits", 0, "PQ bits", false, 8);
+    p.add<uint16_t>("pq-m", 0, "PQ segments (0 = auto, probed on reservoir)", false, 0);
+    p.add<std::string>("pq-bits", 0, "PQ bits: 4, 8, or auto (reservoir probe)", false, "auto");
+    p.add<float>("pq-max-distortion", 0,
+                 "Max PQ distortion (median |1 - pq_dist/true_dist|) for auto (m,bits) selection "
+                 "(0 = default 0.05). Filters configs; the min-cost eligible config is selected. "
+                 "Lower (e.g. 0.03) forces higher-fidelity PQ; higher (e.g. 0.10-0.15) admits "
+                 "aggressive low-m configs for high-dimensional data.",
+                 false, 0.0f);
     p.add<std::string>("metric", 0, "l2sq or ip", false, "l2sq");
     p.add<uint32_t>("threads", 0, "Build threads (auto if 0)", false, 0);
     p.add<uint64_t>("build-ram", 0,
@@ -95,10 +103,19 @@ int cmd_build(int argc, char* argv[]) {
     p.add<uint32_t>("inline-pq", 0,
                      "Neighbor PQ codes inlined per node (0=compact, R=all, auto)",
                      false, 0xFFFF);
+    p.add<uint32_t>("max-occlusion", 0,
+                     "RobustPrune candidate cap (auto if 0)",
+                     false, 0);
     p.add<std::string>("log-level", 0,
                        "Log level: debug, info, warn, error",
                        false, "info");
-    p.add("explain", 0, "Print resolved params and exit (dry-run)");
+    p.add("explain", 0, "Print resolved params and exit (dry-run). When pq_m or "
+                        "pq_bits is auto, reads a random sample and runs the "
+                        "full PQ probe to show the actual selection.");
+    p.add<uint32_t>("probe-sample", 0,
+                    "Sample size for --explain PQ probe (default 20000). "
+                    "Reads this many random vectors via seek; no full scan.",
+                    false, 20000);
     p.parse_check(argc, argv);
 
     // Set log level.
@@ -125,11 +142,26 @@ int cmd_build(int argc, char* argv[]) {
     cfg.R = p.get<uint16_t>("R");
     cfg.L = p.get<uint16_t>("L");
     cfg.alpha = p.get<float>("alpha");
-    cfg.pq_m = p.get<uint8_t>("pq-m");
-    cfg.pq_bits = p.get<uint8_t>("pq-bits");
+    cfg.pq_m = p.get<uint16_t>("pq-m");
+    // pq-bits: "auto" (default) → 0 (resolved by global probe in pass1), else 4|8.
+    {
+        const std::string b = p.get<std::string>("pq-bits");
+        if (b == "auto" || b == "0") {
+            cfg.pq_bits = 0;
+        } else if (b == "4") {
+            cfg.pq_bits = 4;
+        } else if (b == "8") {
+            cfg.pq_bits = 8;
+        } else {
+            std::fprintf(stderr, "--pq-bits must be 4, 8, or auto (got '%s')\n", b.c_str());
+            return 1;
+        }
+    }
+    cfg.pq_max_distortion = p.get<float>("pq-max-distortion");
     cfg.num_threads = p.get<uint32_t>("threads");
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.inline_pq_count = p.get<uint32_t>("inline-pq");
+    cfg.max_occlusion = p.get<uint32_t>("max-occlusion");
     const std::string metric = p.get<std::string>("metric");
     cfg.metric = (metric == "ip") ? sextant::MetricKind::InnerProduct
                                   : sextant::MetricKind::L2Sq;
@@ -144,10 +176,69 @@ int cmd_build(int argc, char* argv[]) {
                   << "L:          " << resolved.L << "\n"
                   << "L_build:    " << resolved.L_build << "\n"
                   << "alpha:      " << resolved.alpha
-                  << (resolved.alpha == 1.5f ? "  [ADC build mode]\n" : "\n")
-                  << "pq_m:       " << static_cast<int>(resolved.pq_m) << "\n"
-                  << "pq_bits:    " << static_cast<int>(resolved.pq_bits) << "\n"
-                  << "inline_pq:  " << resolved.inline_pq_count << "\n"
+                  << (resolved.alpha == 1.5f ? "  [ADC build mode]\n" : "\n");
+
+        const bool need_probe = (resolved.pq_m == 0) || (resolved.pq_bits == 0);
+        if (need_probe) {
+            const uint32_t sample_sz = std::min<uint32_t>(
+                p.get<uint32_t>("probe-sample"), static_cast<uint32_t>(n));
+            // Read a random sample from the .fbin via seek (no full scan).
+            std::ifstream f(input, std::ios::binary);
+            std::mt19937_64 rng(0xC0FFEEULL);
+            std::vector<float> sample(static_cast<size_t>(sample_sz) * dim);
+            const uint64_t vec_bytes = static_cast<uint64_t>(dim) * sizeof(float);
+            for (uint32_t i = 0; i < sample_sz; i++) {
+                const uint64_t idx = rng() % n;
+                f.seekg(8 + idx * vec_bytes);
+                f.read(reinterpret_cast<char*>(sample.data() +
+                         static_cast<size_t>(i) * dim),
+                       static_cast<std::streamsize>(vec_bytes));
+            }
+            const auto sel = sextant::Engine::probe_pq_config(
+                sample.data(), sample_sz, dim, resolved);
+
+            std::cout << "pq_m:       " << sel.m << "  [auto, probed "
+                      << sample_sz << " random vectors]\n";
+            std::cout << "pq_bits:    " << static_cast<int>(sel.bits)
+                      << "  [auto]\n";
+            std::cout << "pq_max_distortion:  " << resolved.pq_max_distortion
+                      << " (bound)\n";
+
+            // Comparison table.
+            std::cout << "\nPQ probe results (distortion = median |1 - pq_dist/true_dist|,"
+                      << " max=" << resolved.pq_max_distortion << "):\n";
+            std::cout << "  m    bits  code   table     distort  band_r  ties@10 ties@30  note\n";
+            std::cout << "  "
+                         "----------------------------------------------------------------"
+                         "------------\n";
+            for (const auto& r : sel.all) {
+                const bool meets = r.distortion <= resolved.pq_max_distortion;
+                const bool selected = (r.m == sel.m && r.bits == sel.bits);
+                std::string note;
+                if (selected) note = "← SELECTED (" + sel.reason + ")";
+                else if (!meets) note = "(above bound)";
+                // Table size: KB if < 1MB, else MB.
+                const double tsize = r.table_bytes / 1024.0;
+                std::cout << "  " << std::left << std::setw(5) << r.m
+                          << std::setw(5) << static_cast<int>(r.bits)
+                          << std::setw(7) << r.code_bytes << "B "
+                          << std::setw(8) << (tsize < 1024 ?
+                              (std::to_string(static_cast<int>(tsize)) + "KB") :
+                              (std::to_string(tsize / 1024.0).substr(0,4) + "MB"))
+                          << std::setw(8) << std::fixed << std::setprecision(4) << r.distortion
+                          << std::setw(7) << std::setprecision(4) << r.band_recall
+                          << std::setw(7) << std::setprecision(2) << r.tie_fraction
+                          << std::setw(8) << std::setprecision(2) << r.tie30_fraction
+                          << note << "\n";
+            }
+            std::cout << "\n";
+        } else {
+            std::cout << "pq_m:       " << resolved.pq_m << "\n"
+                      << "pq_bits:    " << static_cast<int>(resolved.pq_bits) << "\n"
+                      << "pq_max_distortion:  " << resolved.pq_max_distortion
+                      << " (bound; not used — m and bits are explicit)\n";
+        }
+        std::cout << "inline_pq:  " << resolved.inline_pq_count << "\n"
                   << "threads:    " << resolved.num_threads << "\n"
                   << "build_ram:  " << resolved.build_ram_budget
                   << " bytes\n"
@@ -163,6 +254,7 @@ int cmd_build(int argc, char* argv[]) {
               << " R=" << result.R
               << " L_build=" << result.L_build
               << " pq_m=" << static_cast<int>(result.pq_m)
+              << " pq_bits=" << static_cast<int>(result.pq_bits)
               << " in " << result.build_time_sec << "s\n";
     return 0;
 }
@@ -441,10 +533,14 @@ void print_usage() {
               << "Commands:\n"
               << "  build    Build an index from a .fbin file\n"
               << "  search   Search an index with query vectors\n"
-              << "  insert   Insert a single vector into an index\n";
+              << "  insert   Insert a single vector into an index\n"
+              << "  analyze  PQ sensitivity analysis (mini-graph probe)\n";
 }
 
 }  // namespace
+
+/// Implemented in tools/analyze.cpp.
+int run_analyze(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
     sextant::init_logging();
@@ -469,6 +565,8 @@ int main(int argc, char* argv[]) {
             return cmd_search(sub_argc, sub_argv.data());
         } else if (cmd == "insert") {
             return cmd_insert(sub_argc, sub_argv.data());
+        } else if (cmd == "analyze") {
+            return run_analyze(sub_argc, sub_argv.data());
         } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {
             print_usage();
             return 0;

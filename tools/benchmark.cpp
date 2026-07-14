@@ -91,7 +91,8 @@ float l2sq_distance(const float* a, const float* b, uint32_t dim) {
 struct GroundTruth {
     uint32_t n = 0;
     uint32_t k = 0;
-    std::vector<uint32_t> ids;  // n × k, row-major
+    std::vector<uint32_t> ids;    // n × k, row-major
+    std::vector<float> dists;     // n × k, row-major (L2sq, ascending per row)
 };
 
 GroundTruth read_ground_truth(const std::string& path) {
@@ -113,6 +114,14 @@ GroundTruth read_ground_truth(const std::string& path) {
     if (!f) {
         throw Error(ErrorCode::CorruptIndex,
                     "short read on ground-truth ids in '" + path + "'");
+    }
+    // Distances are needed for proximity evaluation (k-th NN radius per query).
+    gt.dists.resize(static_cast<size_t>(gt.n) * gt.k);
+    f.read(reinterpret_cast<char*>(gt.dists.data()),
+           static_cast<std::streamsize>(gt.dists.size() * sizeof(float)));
+    if (!f) {
+        // Older GT files without distances: tolerate, disable proximity metrics.
+        gt.dists.clear();
     }
     return gt;
 }
@@ -282,6 +291,12 @@ int main(int argc, char* argv[]) {
         std::vector<double> latencies_us;
         latencies_us.reserve(n_queries);
 
+        const bool have_gt_dists = !gt.dists.empty();
+        // ratio = d_target / d_result. Capped to keep the mean sane when the
+        // result is far closer than the target (common with co-located points).
+        constexpr double kRatioCap = 10.0;
+        constexpr double kEps = 1e-6f;
+
         std::atomic<uint32_t> next{0};
         std::vector<std::thread> workers;
         workers.reserve(n_threads);
@@ -291,6 +306,9 @@ int main(int argc, char* argv[]) {
         std::vector<double> local_recall_sum(n_threads, 0.0);
         std::vector<uint64_t> local_recall_hits(n_threads, 0);
         std::vector<uint64_t> local_recall_total(n_threads, 0);
+        std::vector<std::vector<double>> local_prox_ratios(n_threads);
+        std::vector<uint64_t> local_prox_in(n_threads, 0);
+        std::vector<uint64_t> local_prox_total(n_threads, 0);
 
         const auto t_start = Clock::now();
         for (uint32_t t = 0; t < n_threads; t++) {
@@ -302,7 +320,12 @@ int main(int argc, char* argv[]) {
                 double& recall_sum_local = local_recall_sum[t];
                 uint64_t& recall_hits_local = local_recall_hits[t];
                 uint64_t& recall_total_local = local_recall_total[t];
+                auto& prox_ratios_local = local_prox_ratios[t];
+                uint64_t& prox_in_local = local_prox_in[t];
+                uint64_t& prox_total_local = local_prox_total[t];
                 latencies_local.reserve(n_queries / n_threads + 16);
+                prox_ratios_local.reserve(
+                    (n_queries / n_threads + 16) * std::max(1u, k));
 
                 uint32_t qi;
                 while ((qi = next.fetch_add(1, std::memory_order_relaxed)) < n_queries) {
@@ -318,8 +341,9 @@ int main(int argc, char* argv[]) {
                     auto results = engine.search(q, scfg.k, scfg);
 
                     // Resolve final top-k row_ids (with optional exact rerank).
-                    std::vector<sextant::RowId> topk;
-                    topk.reserve(k);
+                    // We keep each result's true L2sq distance for proximity metrics.
+                    std::vector<std::pair<float, sextant::RowId>> topk_scored;
+                    topk_scored.reserve(k);
                     if (do_rerank && !results.empty()) {
                         std::vector<std::pair<float, sextant::RowId>> scored;
                         scored.reserve(results.size());
@@ -347,12 +371,28 @@ int main(int argc, char* argv[]) {
                                   });
                         const uint32_t topk_n = std::min<uint32_t>(k, scored.size());
                         for (uint32_t i = 0; i < topk_n; i++) {
-                            topk.push_back(scored[i].second);
+                            topk_scored.push_back(scored[i]);
                         }
                     } else {
+                        // No rerank: compute true distances for proximity reporting.
                         const uint32_t topk_n = std::min<uint32_t>(k, results.size());
                         for (uint32_t i = 0; i < topk_n; i++) {
-                            topk.push_back(results[i].row_id);
+                            const auto rid = results[i].row_id;
+                            float d = std::numeric_limits<float>::infinity();
+                            if (rid >= 0 &&
+                                static_cast<uint64_t>(rid) < bh.n) {
+                                if (base_in_ram) {
+                                    const float* bv =
+                                        &base_all[static_cast<size_t>(rid) * dim];
+                                    d = l2sq_distance(q, bv, dim);
+                                } else {
+                                    read_fbin_vector(base_data, dim,
+                                                     static_cast<uint64_t>(rid),
+                                                     base_vec);
+                                    d = l2sq_distance(q, base_vec.data(), dim);
+                                }
+                            }
+                            topk_scored.emplace_back(d, rid);
                         }
                     }
                     const auto q_end = Clock::now();
@@ -366,7 +406,8 @@ int main(int argc, char* argv[]) {
                         uint32_t hits = 0;
                         for (uint32_t i = 0; i < gt_k; i++) {
                             const uint32_t g = gt_row[i];
-                            for (sextant::RowId r : topk) {
+                            for (const auto& [d, r] : topk_scored) {
+                                (void)d;
                                 if (r >= 0 && static_cast<uint32_t>(r) == g) {
                                     ++hits;
                                     break;
@@ -376,6 +417,33 @@ int main(int argc, char* argv[]) {
                         recall_sum_local += static_cast<double>(hits) / static_cast<double>(gt_k);
                         recall_hits_local += hits;
                         recall_total_local += gt_k;
+
+                        // Proximity: how close each returned result is to the
+                        // k-th true NN. ratio = d_target / d_result (>=1 = at or
+                        // inside target). For degenerate near-zero distances we
+                        // treat co-located vectors as perfectly matching.
+                        if (have_gt_dists) {
+                            const float d_target =
+                                gt.dists[static_cast<size_t>(qi) * gt.k +
+                                         (gt_k - 1)];
+                            for (const auto& [d, r] : topk_scored) {
+                                if (r < 0) continue;
+                                double ratio;
+                                if (d_target <= kEps && d <= kEps) {
+                                    ratio = 1.0;  // both co-located: perfect
+                                } else if (d <= kEps) {
+                                    ratio = kRatioCap;  // found a closer point
+                                } else if (d_target <= kEps) {
+                                    ratio = 0.0;  // target is co-located, we're not
+                                } else {
+                                    ratio = static_cast<double>(d_target) /
+                                            static_cast<double>(d);
+                                }
+                                prox_ratios_local.push_back(ratio);
+                                if (ratio >= 1.0) ++prox_in_local;
+                                ++prox_total_local;
+                            }
+                        }
                     }
                 }
             });
@@ -389,6 +457,9 @@ int main(int argc, char* argv[]) {
         double recall_sum = 0.0;
         uint64_t recall_hits = 0;
         uint64_t recall_total = 0;
+        std::vector<double> prox_ratios;
+        uint64_t prox_in = 0;
+        uint64_t prox_total = 0;
         for (uint32_t t = 0; t < n_threads; t++) {
             latencies_us.insert(latencies_us.end(),
                                 local_latencies[t].begin(),
@@ -396,6 +467,11 @@ int main(int argc, char* argv[]) {
             recall_sum += local_recall_sum[t];
             recall_hits += local_recall_hits[t];
             recall_total += local_recall_total[t];
+            prox_ratios.insert(prox_ratios.end(),
+                               local_prox_ratios[t].begin(),
+                               local_prox_ratios[t].end());
+            prox_in += local_prox_in[t];
+            prox_total += local_prox_total[t];
         }
 
         const double mean_recall =
@@ -419,6 +495,50 @@ int main(int argc, char* argv[]) {
                   << std::fixed << std::setprecision(4) << mean_recall << "\n";
         std::cout << "[benchmark] recall@" << k << " (micro-avg): "
                   << std::fixed << std::setprecision(4) << micro_recall << "\n";
+
+        // Proximity: how close results get to the k-th true NN.
+        // ratio = d_target / d_result  (>=1.0 = at or inside target radius).
+        // Reports: in-band fraction (results at/inside target), mean ratio over
+        // all results, and the ratio distribution of OUT-of-band results so you
+        // can see how far past the boundary misses land (e.g. p50=0.8 means the
+        // median miss is ~25% outside the target distance).
+        if (have_gt_dists && prox_total > 0) {
+            const double in_band =
+                static_cast<double>(prox_in) /
+                static_cast<double>(prox_total);
+            double prox_sum = 0.0;
+            std::vector<double> miss_ratios;
+            miss_ratios.reserve(prox_total - prox_in);
+            for (double r : prox_ratios) {
+                prox_sum += r;
+                if (r < 1.0) miss_ratios.push_back(r);
+            }
+            const double mean_ratio = prox_sum /
+                static_cast<double>(prox_total);
+            std::cout << "[benchmark] proximity: in-band="
+                      << std::fixed << std::setprecision(4) << in_band
+                      << " (" << prox_in << "/" << prox_total
+                      << " results at/inside d" << k << ")"
+                      << ", mean_ratio=" << std::setprecision(4)
+                      << mean_ratio << "\n";
+            std::cout << "[benchmark] proximity: miss_ratio";
+            if (miss_ratios.empty()) {
+                std::cout << "=n/a (no out-of-band results)\n";
+            } else {
+                std::sort(miss_ratios.begin(), miss_ratios.end());
+                const double mp25 = percentile(miss_ratios, 25.0);
+                const double mp50 = percentile(miss_ratios, 50.0);
+                const double mp75 = percentile(miss_ratios, 75.0);
+                const double mp90 = percentile(miss_ratios, 90.0);
+                std::cout << " p25=" << std::fixed
+                          << std::setprecision(4) << mp25
+                          << " p50=" << mp50
+                          << " p75=" << mp75
+                          << " p90=" << mp90
+                          << " (over " << miss_ratios.size()
+                          << " out-of-band; 1.0=target edge)\n";
+            }
+        }
         std::cout << "[benchmark] latency p50: " << std::fixed
                   << std::setprecision(3) << p50_us / 1000.0 << "ms, p99: "
                   << p99_us / 1000.0 << "ms\n";

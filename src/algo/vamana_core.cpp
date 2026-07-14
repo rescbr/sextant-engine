@@ -85,11 +85,21 @@ void VamanaTLS::resize(uint32_t max_nodes) {
     visited_flags.resize(max_nodes, 0);
     prune_buffer.reserve(max_nodes);
     occlusion_set.reserve(max_nodes);
+    prune_output.reserve(max_nodes);
+    search_result.reserve(max_nodes);
+    connect_buffer.reserve(max_nodes);
+    recip_targets.reserve(max_nodes);
+    removed_flags.reserve(max_nodes);
 }
 
 void VamanaTLS::resize_lut(uint32_t lut_size) {
     if (lut_size > 0) {
         lut_buffer.resize(lut_size);
+        // The per-anchor LUT is the same size (m*K floats). Pre-size once so
+        // the per-insert build_code_lut call doesn't reallocate.
+        if (anchor_lut.size() < lut_size) {
+            anchor_lut.resize(lut_size);
+        }
     }
 }
 
@@ -104,7 +114,7 @@ VamanaCore::VamanaCore(VamanaParams params, PqQuantizer& quantizer)
     if (params_.alpha < 1.0f) {
         params_.alpha = 1.0f;
     }
-    code_size_ = static_cast<uint8_t>(quantizer_.code_size());
+    code_size_ = quantizer_.code_size();
     node_size_ = static_node_size(params_.R, params_.inline_pq_count, code_size_);
     num_locks_ = std::max(256u, std::thread::hardware_concurrency() * 4);
     node_locks_ = std::unique_ptr<Mutex[]>(new Mutex[num_locks_]);
@@ -115,7 +125,7 @@ VamanaCore::~VamanaCore() {
 }
 
 uint32_t VamanaCore::static_node_size(uint16_t R, uint16_t inline_pq_count,
-                                       uint8_t code_size) {
+                                       uint32_t code_size) {
     // (16 + R*4 + 7) & ~7, plus inline codes.
     uint32_t base = (kNeighborArrayOffset + static_cast<uint32_t>(R) * 4 + 7) & ~7u;
     uint32_t inline_bytes = static_cast<uint32_t>(inline_pq_count) * code_size;
@@ -223,10 +233,22 @@ void VamanaCore::set_neighbor(uint8_t* node, uint32_t i, uint32_t val) {
 std::vector<Candidate> VamanaCore::beam_search(
     const float* query_lut, uint32_t L, uint32_t io_limit, VamanaTLS& tls,
     const std::vector<uint32_t>* forced_entry_points,
-    const uint8_t* sdc_anchor) const {
+    const uint8_t* sdc_anchor,
+    const float* anchor_lut) const {
     std::vector<Candidate> out;
+    beam_search_into(out, query_lut, L, io_limit, tls, forced_entry_points,
+                     sdc_anchor, anchor_lut);
+    return out;
+}
+
+void VamanaCore::beam_search_into(
+    std::vector<Candidate>& out, const float* query_lut, uint32_t L,
+    uint32_t io_limit, VamanaTLS& tls,
+    const std::vector<uint32_t>* forced_entry_points,
+    const uint8_t* sdc_anchor, const float* anchor_lut) const {
+    out.clear();
     if (count_ == 0 || L == 0) {
-        return out;
+        return;
     }
     L = std::max<uint32_t>(L, 1);
 
@@ -253,13 +275,21 @@ std::vector<Candidate> VamanaCore::beam_search(
         return id < tls.visited_flags.size() && tls.visited_flags[id] == vc;
     };
 
+    // Distance to a candidate node. Priority: anchor_lut (8KB, L1-resident,
+    // contiguous gather) > sdc_anchor (scattered code_distance) > query_lut
+    // (ADC, for the search path).
     auto dist_to = [&](uint32_t id) {
         const uint8_t* code_ptr = store_
             ? (store_->pin_code(id).data)
             : (build_codes_ + static_cast<size_t>(id) * code_size_);
-        const float d = sdc_anchor
-            ? quantizer_.code_distance(sdc_anchor, code_ptr)
-            : quantizer_.lut_distance(code_ptr, query_lut);
+        float d;
+        if (anchor_lut) {
+            d = quantizer_.lut_distance(code_ptr, anchor_lut);
+        } else if (sdc_anchor) {
+            d = quantizer_.code_distance(sdc_anchor, code_ptr);
+        } else {
+            d = quantizer_.lut_distance(code_ptr, query_lut);
+        }
         if (store_) store_->unpin_code(id);
         return d;
     };
@@ -337,7 +367,7 @@ std::vector<Candidate> VamanaCore::beam_search(
     }
 
     if (frontier.empty()) {
-        return out;
+        return;
     }
 
     while (!frontier.empty()) {
@@ -493,7 +523,6 @@ std::vector<Candidate> VamanaCore::beam_search(
         W.pop_back();
     }
     std::reverse(out.begin(), out.end());  // ascending distance
-    return out;
 }
 
 // ===========================================================================
@@ -505,59 +534,86 @@ std::vector<Candidate> VamanaCore::beam_search(
 //
 // Occlusion rule (DiskANN): a candidate pp is pruned if there exists an
 // already-selected neighbor p such that alpha * d(p, pp) <= d(query, pp).
-// The per-anchor LUT is rebuilt once per outer iteration for L2-cache-
-// resident distance gathers.
+// Direct code_distance is used for the occlusion check (NOT a per-anchor LUT —
+// see the inline comment below for why).
+//
+// TLS scratch: input is copied into tls.prune_buffer (sortable, capacity
+// retained across inserts); output written to `out` (typically tls.prune_output).
+// removed[] uses tls.removed_flags (bytes). Zero per-prune heap allocation.
 // ===========================================================================
 
 std::vector<Candidate> VamanaCore::robust_prune(
     std::vector<Candidate> candidates, uint16_t R, float alpha,
     VamanaTLS& tls, uint32_t max_occlusion_size) const {
-    std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate& a, const Candidate& b) {
-                  return a.dist < b.dist;
-              });
+    std::vector<Candidate> out;
+    robust_prune_into(candidates, out, R, alpha, tls, max_occlusion_size,
+                      /*presorted=*/false);
+    return out;
+}
+
+void VamanaCore::robust_prune_into(
+    const std::vector<Candidate>& candidates, std::vector<Candidate>& out,
+    uint16_t R, float alpha, VamanaTLS& tls, uint32_t max_occlusion_size,
+    bool presorted) const {
+    out.clear();
     // Cap the candidate pool (mirrors DiskANN's maxc cap).
-    if (max_occlusion_size > 0 && candidates.size() > max_occlusion_size) {
-        candidates.resize(max_occlusion_size);
-    }
-    const size_t n = candidates.size();
-    if (n == 0) {
-        return {};
+    const size_t in_n = (max_occlusion_size > 0 &&
+                         candidates.size() > max_occlusion_size)
+                            ? max_occlusion_size
+                            : candidates.size();
+    if (in_n == 0) {
+        return;
     }
 
+    // Copy candidates into a mutable, sortable buffer (tls.prune_buffer is
+    // reused — capacity retained across inserts). We copy because callers
+    // may pass a const view, and we need to truncate + sort in place.
+    auto& buf = tls.prune_buffer;
+    buf.clear();
+    buf.assign(candidates.begin(), candidates.begin() + in_n);
+    if (!presorted) {
+        std::sort(buf.begin(), buf.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.dist < b.dist;
+                  });
+    }
+
+    const size_t n = buf.size();
     auto code_at = [&](size_t idx) {
         return build_codes_ +
-               static_cast<size_t>(candidates[idx].row_id) * code_size_;
+               static_cast<size_t>(buf[idx].row_id) * code_size_;
     };
 
-    // Use direct code_distance for the occlusion check instead of
-    // materializing a per-anchor LUT. Profiling showed the 32KB LUT gather
-    // (32 scattered memcpys from the 2MB cross_distance_table) dominates
-    // construct time. Direct code_distance does the same scattered reads
-    // but skips the intermediate buffer — faster despite non-contiguous access.
-    std::vector<bool> removed(n, false);
-    std::vector<Candidate> kept;
-    kept.reserve(std::min(n, static_cast<size_t>(R)));
+    // Occlusion check. Candidate codes are accessed by row_id — scattered in
+    // the 32MB build_codes_ buffer — so the dominant cost is cache misses on
+    // candidate-code loads. Software prefetch was tested (dist 6/12/24, single
+    // and dual) but measured no reliable improvement under 10-thread
+    // contention: the cold-miss microbenchmark showed 2.9× single-threaded, but
+    // 10 threads saturate memory bandwidth, making prefetch add contention
+    // rather than hiding latency. Kept as the plain method call.
+    auto& removed = tls.removed_flags;
+    removed.assign(n, 0);
+    out.reserve(std::min(n, static_cast<size_t>(R)));
 
-    for (size_t p_idx = 0; p_idx < n && kept.size() < static_cast<size_t>(R);
+    for (size_t p_idx = 0; p_idx < n && out.size() < static_cast<size_t>(R);
          p_idx++) {
         if (removed[p_idx]) {
             continue;
         }
-        kept.push_back(candidates[p_idx]);
+        out.push_back(buf[p_idx]);
 
+        const uint8_t* p_code = code_at(p_idx);
         for (size_t pp_idx = p_idx + 1; pp_idx < n; pp_idx++) {
             if (removed[pp_idx]) {
                 continue;
             }
-            const float d_pp = quantizer_.code_distance(code_at(p_idx),
+            const float d_pp = quantizer_.code_distance(p_code,
                                                          code_at(pp_idx));
-            if (alpha * d_pp <= candidates[pp_idx].dist) {
-                removed[pp_idx] = true;
+            if (alpha * d_pp <= buf[pp_idx].dist) {
+                removed[pp_idx] = 1;
             }
         }
     }
-    return kept;
 }
 
 // ===========================================================================
@@ -593,9 +649,20 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
     const uint8_t* new_code =
         build_codes_ + static_cast<size_t>(new_internal_id) * code_size_;
 
+    // Snapshot the selected targets into tls.recip_targets BEFORE the
+    // reciprocal loop. `selected` aliases tls.prune_output (the caller's
+    // robust_prune output), and robust_prune_into on overflow writes back to
+    // tls.prune_output — so iterating `selected` by reference while an
+    // overflow rewrites it would corrupt the loop. The snapshot decouples them.
+    auto& targets = tls.recip_targets;
+    targets.resize(selected.size());
+    for (size_t i = 0; i < selected.size(); i++) {
+        targets[i] = selected[i];
+    }
+
     // Reciprocal edges. Each target's lock is acquired and released in
     // isolation — no nested lock acquisition anywhere in this loop.
-    for (const auto& s : selected) {
+    for (const auto& s : targets) {
         const uint32_t s_internal = static_cast<uint32_t>(s.row_id);
 
         ScopedWriteLock guard(*node_lock(s_internal));
@@ -611,7 +678,9 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
 
         // Overflow: re-prune s's neighbor list. Candidate pool =
         // [new_internal, s's current neighbors], distances measured from s.
-        std::vector<Candidate> cand;
+        // Reuse tls.connect_buffer (capacity retained) instead of allocating.
+        auto& cand = tls.connect_buffer;
+        cand.clear();
         cand.reserve(static_cast<size_t>(cnt) + 1);
         const uint8_t* s_code =
             build_codes_ + static_cast<size_t>(s_internal) * code_size_;
@@ -624,8 +693,14 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
             cand.push_back({static_cast<RowId>(nb),
                             quantizer_.code_distance(s_code, nb_code)});
         }
-        auto kept = robust_prune(std::move(cand), params_.R, params_.alpha, tls,
-                                 params_.max_occlusion);
+        // Overflow candidates are NOT pre-sorted (new_internal prepended).
+        // robust_prune_into copies cand into its internal sort buffer
+        // (tls.prune_buffer) and writes kept neighbors to tls.prune_output.
+        // `targets` (the loop source) and `cand` (tls.connect_buffer) are
+        // distinct buffers — no aliasing.
+        robust_prune_into(cand, tls.prune_output, params_.R, params_.alpha,
+                          tls, params_.max_occlusion, /*presorted=*/false);
+        auto& kept = tls.prune_output;
         // Write neighbors before publishing count.
         for (size_t i = 0; i < kept.size(); i++) {
             set_neighbor(s_node, static_cast<uint16_t>(i),
@@ -675,23 +750,34 @@ void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
         return;
     }
 
-    // SDC build: pass the anchor code to beam_search so it computes distances
-    // via direct code-to-code lookup (code_distance), skipping the 32KB LUT
-    // materialization. The LUT is still built as a fallback but not used when
-    // sdc_anchor is non-null.
-    const uint32_t lut_sz = quantizer_.lut_size();
+    // SDC build: build a per-anchor LUT once per insert (Opt 3).
+    // anchor_lut[s*K + cid] = cross_distance_table[s*K*K + anchor_code[s]*K + cid].
+    // This is 8KB (m=32,K=256) and stays L1-resident. beam_search then uses
+    // lut_distance — 32 sequential reads from a contiguous buffer — instead
+    // of scattered code_distance reads into the 8MB cross_distance_table.
     const uint8_t* anchor_code =
         build_codes_ + static_cast<size_t>(internal_id) * code_size_;
+    float* anchor_lut_ptr = tls.anchor_lut.data();
+    const bool lut_ok = quantizer_.build_code_lut(anchor_code, anchor_lut_ptr);
+    const float* anchor_lut_arg = lut_ok ? anchor_lut_ptr : nullptr;
 
     // InsertBuild tail: beam_search → robust_prune → connect_and_prune.
+    // All three write into TLS scratch (tls.search_result / tls.prune_output /
+    // tls.connect_buffer) — zero per-insert heap allocation (Opt 1).
     const uint32_t L_build =
         params_.L_build > 0 ? params_.L_build : params_.L;
-    auto selected_candidates =
-        beam_search(nullptr, L_build, 0 /* io_limit=0 → unlimited */, tls,
-                    /*forced_entry_points=*/nullptr, /*sdc_anchor=*/anchor_code);
-    auto selected = robust_prune(std::move(selected_candidates), params_.R,
-                                 params_.alpha, tls, params_.max_occlusion);
-    connect_and_prune(internal_id, selected, tls);
+    // beam_search_into writes candidates (ascending distance) into
+    // tls.search_result. robust_prune can skip the sort (presorted=true, Opt 2)
+    // since beam_search drains a max-heap then reverses → ascending.
+    beam_search_into(tls.search_result, nullptr, L_build,
+                     0 /* io_limit=0 → unlimited */, tls,
+                     /*forced_entry_points=*/nullptr,
+                     /*sdc_anchor=*/lut_ok ? nullptr : anchor_code,
+                     /*anchor_lut=*/anchor_lut_arg);
+    robust_prune_into(tls.search_result, tls.prune_output, params_.R,
+                      params_.alpha, tls, params_.max_occlusion,
+                      /*presorted=*/true);
+    connect_and_prune(internal_id, tls.prune_output, tls);
     count_ = std::max(count_, internal_id + 1);
 }
 
@@ -739,13 +825,16 @@ void VamanaCore::insert_build(uint32_t internal_id, RowId row_id,
     }
 
     // InsertBuild tail: beam_search → robust_prune → connect_and_prune.
+    // All write into TLS scratch — zero per-insert heap allocation (Opt 1).
+    // beam_search output is ascending; robust_prune skips the sort (Opt 2).
     const uint32_t L_build =
         params_.L_build > 0 ? params_.L_build : params_.L;
-    auto selected_candidates =
-        beam_search(lut_ptr, L_build, 0 /* io_limit=0 → unlimited */, tls);
-    auto selected = robust_prune(std::move(selected_candidates), params_.R,
-                                 params_.alpha, tls, params_.max_occlusion);
-    connect_and_prune(internal_id, selected, tls);
+    beam_search_into(tls.search_result, lut_ptr, L_build,
+                     0 /* io_limit=0 → unlimited */, tls);
+    robust_prune_into(tls.search_result, tls.prune_output, params_.R,
+                      params_.alpha, tls, params_.max_occlusion,
+                      /*presorted=*/true);
+    connect_and_prune(internal_id, tls.prune_output, tls);
     count_ = std::max(count_, internal_id + 1);
 }
 

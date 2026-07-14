@@ -246,3 +246,12 @@ profiles. Integrate into CI.
 - ✅ Search QPS: 1 thread 191→306, 4 threads 133→300 (32MB cache)
 - ✅ Cache architecture design doc (`docs/cache_architecture.md`)
 - ✅ samply profile analysis tool (`scripts/analyze_profile.py`)
+- ✅ Adaptive PQ selection (Issue 46/47): auto `(m, bits)` via reservoir probe
+  - Joint sweep of candidate (m, bits) configs on 20K reservoir subset
+  - Recall floor + three cache bands (L2/L3/RAM) + max recall within band
+  - 4-bit at high m auto-selected for clustered data (se_base: m=192/4, 0.97 recall, L2 table)
+  - Cross-platform cache detection (`src/util/cache_info.{hpp,cpp}`): sysctl/sysfs
+  - `--pq-bits auto` (CLI default), `--pq-recall-floor`, `--probe-sample`
+  - `--explain` runs the probe and shows full comparison table (no build)
+  - `pq_explore` tool: m/bits sweeps, per-segment diagnostics, per-partition analysis
+  - `PqQuantizer::m_` widened to uint16_t (was uint8_t, capped at 255)

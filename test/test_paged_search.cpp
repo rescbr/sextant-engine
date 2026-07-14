@@ -9,6 +9,7 @@
 //   4. A tiny cache forces repeated disk reads; a large cache amortizes them.
 
 #include <gtest/gtest.h>
+#include "test_data.hpp"
 #include "engine/fbin_source.hpp"
 #include "sextant/config.hpp"
 #include "sextant/engine.hpp"
@@ -55,6 +56,101 @@ static void remove_sidecars(const std::string& base) {
     for (const char* suf : {".graph", ".codes", ".meta", ".manifest"}) {
         std::remove((base + suf).c_str());
     }
+}
+
+/// Build an index on SIFTsmall, search the provided queries with rerank,
+/// and return recall@10 against the SIFTsmall ground truth. Shared by the
+/// recall tests so they use real data with well-understood behavior.
+static float siftsmall_recall(const std::string& index_path,
+                              const BuildConfig& cfg,
+                              const SearchConfig& scfg_template) {
+    remove_sidecars(index_path);
+    {
+        Engine engine;
+        FbinSource source(test::siftsmall_base());
+        engine.build(source, index_path, cfg);
+    }
+
+    const std::string fbin = test::siftsmall_base();
+    const std::string query_path = test::siftsmall_query();
+    const std::string gt_path = test::siftsmall_gt();
+
+    uint32_t n = 0, dim = 0;
+    std::vector<float> base;
+    {
+        FILE* fp = std::fopen(fbin.c_str(), "rb");
+        EXPECT_NE(fp, nullptr);
+        std::fread(&n, sizeof(n), 1, fp);
+        std::fread(&dim, sizeof(dim), 1, fp);
+        base.resize(static_cast<size_t>(n) * dim);
+        std::fread(base.data(), sizeof(float), base.size(), fp);
+        std::fclose(fp);
+    }
+
+    uint32_t nq = 0, qdim = 0;
+    std::vector<float> queries;
+    {
+        FILE* fp = std::fopen(query_path.c_str(), "rb");
+        EXPECT_NE(fp, nullptr);
+        std::fread(&nq, sizeof(nq), 1, fp);
+        std::fread(&qdim, sizeof(qdim), 1, fp);
+        EXPECT_EQ(qdim, dim);
+        queries.resize(static_cast<size_t>(nq) * dim);
+        std::fread(queries.data(), sizeof(float), queries.size(), fp);
+        std::fclose(fp);
+    }
+
+    uint32_t gtn = 0, gtk = 0;
+    std::vector<uint32_t> gt_ids;
+    {
+        FILE* fp = std::fopen(gt_path.c_str(), "rb");
+        EXPECT_NE(fp, nullptr);
+        std::fread(&gtn, sizeof(gtn), 1, fp);
+        std::fread(&gtk, sizeof(gtk), 1, fp);
+        EXPECT_EQ(gtn, nq);
+        gt_ids.resize(static_cast<size_t>(gtn) * gtk);
+        std::fread(gt_ids.data(), sizeof(uint32_t), gt_ids.size(), fp);
+        std::fclose(fp);
+    }
+
+    Engine engine;
+    engine.open(index_path);
+
+    const uint32_t k = 10;
+    uint32_t recall_hits = 0, recall_total = 0;
+    for (uint32_t q = 0; q < nq; q++) {
+        const float* query = &queries[static_cast<size_t>(q) * dim];
+        SearchConfig scfg = scfg_template;
+        auto cands = engine.search(query, scfg.k, scfg);
+        if (cands.empty()) continue;
+
+        std::vector<std::pair<float, RowId>> scored;
+        scored.reserve(cands.size());
+        for (const auto& c : cands) {
+            if (c.row_id < 0 || static_cast<uint64_t>(c.row_id) >= n) continue;
+            const float* bv = &base[static_cast<size_t>(c.row_id) * dim];
+            float dist = 0.0f;
+            for (uint32_t d = 0; d < dim; d++) {
+                const float diff = query[d] - bv[d];
+                dist += diff * diff;
+            }
+            scored.emplace_back(dist, c.row_id);
+        }
+        std::sort(scored.begin(), scored.end());
+
+        const uint32_t topk = std::min<uint32_t>(k, scored.size());
+        std::unordered_set<RowId> result_set;
+        for (uint32_t i = 0; i < topk; i++) result_set.insert(scored[i].second);
+
+        const uint32_t* gt_row = &gt_ids[static_cast<size_t>(q) * gtk];
+        for (uint32_t i = 0; i < k; i++) {
+            recall_total++;
+            if (result_set.count(static_cast<RowId>(gt_row[i]))) recall_hits++;
+        }
+    }
+
+    remove_sidecars(index_path);
+    return recall_total > 0 ? static_cast<float>(recall_hits) / recall_total : 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -332,107 +428,18 @@ TEST(PagedSearch, CacheHitsAndMisses) {
 // PageSearch + neighbor traversal works correctly together.
 // ---------------------------------------------------------------------------
 TEST(PagedSearch, PageSearchMaintainsRecall) {
-    const uint32_t n = 800;
-    const uint32_t dim = 32;
-    const std::string fbin =
-        write_random_fbin("paged_search_pagescan.fbin", n, dim, /*seed=*/7);
     const std::string index_path =
         (std::filesystem::temp_directory_path() / "paged_search_pagescan_idx")
             .string();
-    remove_sidecars(index_path);
 
-    // Read back the base vectors for ground-truth computation.
-    std::vector<float> base(static_cast<size_t>(n) * dim);
-    {
-        FILE* fp = std::fopen(fbin.c_str(), "rb");
-        ASSERT_NE(fp, nullptr);
-        uint32_t hn, hd;
-        std::fread(&hn, sizeof(hn), 1, fp);
-        std::fread(&hd, sizeof(hd), 1, fp);
-        std::fread(base.data(), sizeof(float), base.size(), fp);
-        std::fclose(fp);
-    }
+    SearchConfig scfg;
+    scfg.k = 100;  // fetch enough for rerank (SIFTsmall GT has k=100)
+    scfg.L_search = 200;
+    scfg.rerank_factor = 10;
 
-    {
-        Engine engine;
-        FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
-    }
-
-    Engine engine;
-    engine.open(index_path);
-
-    // Issue several queries = base[i] + tiny noise. The exact NN is row i.
-    const uint32_t n_queries = 20;
-    uint32_t exact_nn_hits = 0;
-    uint32_t recall_hits = 0;
-    uint32_t recall_total = 0;
-    for (uint32_t q = 0; q < n_queries; q++) {
-        const uint32_t qi = (q * 37) % n;  // spread queries across the dataset
-        std::vector<float> query(dim);
-        for (uint32_t d = 0; d < dim; d++) {
-            query[d] = base[static_cast<size_t>(qi) * dim + d] + 1e-4f;
-        }
-
-        SearchConfig scfg;
-        scfg.k = 10;
-        scfg.L_search = 150;
-        auto cands = engine.search(query.data(), scfg.k, scfg);
-        if (cands.empty()) continue;
-
-        // Rerank candidates by exact L2-sq distance.
-        std::vector<std::pair<float, RowId>> scored;
-        scored.reserve(cands.size());
-        for (const auto& c : cands) {
-            if (c.row_id < 0 || static_cast<uint64_t>(c.row_id) >= n) continue;
-            const float* bv = &base[static_cast<size_t>(c.row_id) * dim];
-            float dist = 0.0f;
-            for (uint32_t d = 0; d < dim; d++) {
-                const float diff = query[d] - bv[d];
-                dist += diff * diff;
-            }
-            scored.emplace_back(dist, c.row_id);
-        }
-        if (scored.empty()) continue;
-        std::sort(scored.begin(), scored.end());
-
-        // Exact NN check.
-        if (scored.front().second == static_cast<RowId>(qi)) {
-            exact_nn_hits++;
-        }
-
-        // Compute true top-10 over the full dataset.
-        std::vector<std::pair<float, RowId>> truth;
-        truth.reserve(n);
-        for (uint32_t i = 0; i < n; i++) {
-            const float* bv = &base[static_cast<size_t>(i) * dim];
-            float dist = 0.0f;
-            for (uint32_t d = 0; d < dim; d++) {
-                const float diff = query[d] - bv[d];
-                dist += diff * diff;
-            }
-            truth.emplace_back(dist, static_cast<RowId>(i));
-        }
-        std::sort(truth.begin(), truth.end());
-        std::unordered_set<RowId> truth_topk;
-        for (size_t i = 0; i < std::min<size_t>(10, truth.size()); i++) {
-            truth_topk.insert(truth[i].second);
-        }
-        for (const auto& s : scored) {
-            recall_total++;
-            if (truth_topk.count(s.second)) recall_hits++;
-        }
-    }
-
-    // PageSearch + neighbor traversal should find the exact NN for most queries.
-    EXPECT_GE(exact_nn_hits, n_queries * 3 / 4);
-    // Recall@10 should be high (≥ 70%) on this random dataset with L_search=150.
-    ASSERT_GT(recall_total, 0u);
-    const float recall = static_cast<float>(recall_hits) / recall_total;
-    EXPECT_GE(recall, 0.70f);
-
-    remove_sidecars(index_path);
-    std::remove(fbin.c_str());
+    const float recall = siftsmall_recall(index_path, BuildConfig{}, scfg);
+    // SIFTsmall with auto-PQ achieves ~0.95; assert ≥ 0.80 for margin.
+    EXPECT_GE(recall, 0.80f) << "paged search recall too low on SIFTsmall";
 }
 
 // ---------------------------------------------------------------------------
@@ -446,105 +453,18 @@ TEST(PagedSearch, PageSearchMaintainsRecall) {
 // hurt search quality.
 // ---------------------------------------------------------------------------
 TEST(PagedSearch, DynamicWidthMaintainsRecall) {
-    const uint32_t n = 800;
-    const uint32_t dim = 32;
-    const std::string fbin =
-        write_random_fbin("paged_search_dynwidth.fbin", n, dim, /*seed=*/99);
     const std::string index_path =
         (std::filesystem::temp_directory_path() / "paged_search_dynwidth_idx")
             .string();
-    remove_sidecars(index_path);
 
-    // Read back the base vectors for ground-truth computation.
-    std::vector<float> base(static_cast<size_t>(n) * dim);
-    {
-        FILE* fp = std::fopen(fbin.c_str(), "rb");
-        ASSERT_NE(fp, nullptr);
-        uint32_t hn, hd;
-        std::fread(&hn, sizeof(hn), 1, fp);
-        std::fread(&hd, sizeof(hd), 1, fp);
-        std::fread(base.data(), sizeof(float), base.size(), fp);
-        std::fclose(fp);
-    }
+    SearchConfig scfg;
+    scfg.k = 100;
+    scfg.L_search = 200;
+    scfg.rerank_factor = 10;
 
-    {
-        Engine engine;
-        FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
-    }
-
-    Engine engine;
-    engine.open(index_path);
-
-    const uint32_t n_queries = 25;
-    uint32_t exact_nn_hits = 0;
-    uint32_t recall_hits = 0;
-    uint32_t recall_total = 0;
-    for (uint32_t q = 0; q < n_queries; q++) {
-        const uint32_t qi = (q * 37 + 3) % n;
-        std::vector<float> query(dim);
-        for (uint32_t d = 0; d < dim; d++) {
-            query[d] = base[static_cast<size_t>(qi) * dim + d] + 1e-4f;
-        }
-
-        SearchConfig scfg;
-        scfg.k = 10;
-        scfg.L_search = 150;
-        auto cands = engine.search(query.data(), scfg.k, scfg);
-        if (cands.empty()) continue;
-
-        std::vector<std::pair<float, RowId>> scored;
-        scored.reserve(cands.size());
-        for (const auto& c : cands) {
-            if (c.row_id < 0 || static_cast<uint64_t>(c.row_id) >= n) continue;
-            const float* bv = &base[static_cast<size_t>(c.row_id) * dim];
-            float dist = 0.0f;
-            for (uint32_t d = 0; d < dim; d++) {
-                const float diff = query[d] - bv[d];
-                dist += diff * diff;
-            }
-            scored.emplace_back(dist, c.row_id);
-        }
-        if (scored.empty()) continue;
-        std::sort(scored.begin(), scored.end());
-
-        if (scored.front().second == static_cast<RowId>(qi)) {
-            exact_nn_hits++;
-        }
-
-        // Compute true top-10 over the full dataset.
-        std::vector<std::pair<float, RowId>> truth;
-        truth.reserve(n);
-        for (uint32_t i = 0; i < n; i++) {
-            const float* bv = &base[static_cast<size_t>(i) * dim];
-            float dist = 0.0f;
-            for (uint32_t d = 0; d < dim; d++) {
-                const float diff = query[d] - bv[d];
-                dist += diff * diff;
-            }
-            truth.emplace_back(dist, static_cast<RowId>(i));
-        }
-        std::sort(truth.begin(), truth.end());
-        std::unordered_set<RowId> truth_topk;
-        for (size_t i = 0; i < std::min<size_t>(10, truth.size()); i++) {
-            truth_topk.insert(truth[i].second);
-        }
-        for (const auto& s : scored) {
-            recall_total++;
-            if (truth_topk.count(s.second)) recall_hits++;
-        }
-    }
-
-    // DynamicWidth must find the exact NN for most queries.
-    EXPECT_GE(exact_nn_hits, n_queries * 3 / 4);
-    // Recall@10 should be high (≥ 70%) — same threshold as the fixed-width
-    // PageSearchMaintainsRecall test.
-    ASSERT_GT(recall_total, 0u);
-    const float recall = static_cast<float>(recall_hits) / recall_total;
-    EXPECT_GE(recall, 0.70f);
-
-    remove_sidecars(index_path);
-    std::remove(fbin.c_str());
+    const float recall = siftsmall_recall(index_path, BuildConfig{}, scfg);
+    // Same threshold as the fixed-width test.
+    EXPECT_GE(recall, 0.80f) << "dynamic-width recall too low on SIFTsmall";
 }
 
 // ---------------------------------------------------------------------------

@@ -34,15 +34,19 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <limits>
 #include <queue>
 #include <random>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
 
 namespace sextant {
 
@@ -169,13 +173,10 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
         return result;
     }
 
-    // 2. Construct the quantizer + core with build-time params.
-    //    Build ALWAYS uses inline_pq=0 flat nodes (Issue 26). The final
-    //    inline_pq layout is materialized at flush time.
-    quantizer_ = std::make_unique<PqQuantizer>(
-        params.metric, dim_, params.pq_m, params.pq_bits);
-    code_size_ = quantizer_->code_size();
-
+    // 2. Pass 1: reservoir sample + (optional) global bits probe + PQ train.
+    //    The quantizer is constructed inside pass1 once pq_bits is resolved
+    //    (auto mode runs a 4-bit recall probe on the reservoir). After pass1,
+    //    code_size_ is valid and we can size the build buffers.
     VamanaParams vparams;
     vparams.dim = dim_;
     vparams.R = params.R;
@@ -185,11 +186,24 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     vparams.inline_pq_count = 0;  // Issue 26: always 0 during build.
     vparams.n_entry_points = 16;
     vparams.max_occlusion = params.max_occlusion;
-    core_ = std::make_unique<VamanaCore>(vparams, *quantizer_);
 
-    // node_size for the flat BUILD buffer (inline_pq=0).
+    auto _phase = [](const char* name, auto& t_prev) {
+        const auto now = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(now - t_prev).count();
+        spdlog::info("[sextant] phase '{}': {:.2f}s", name, secs);
+        t_prev = now;
+    };
+
+    auto t_phase = std::chrono::steady_clock::now();
+    pass1_sample_and_train(source, params);
+    _phase("pass1_sample_and_train", t_phase);
+
+    // 3. Construct the core + allocate flat buffers now that code_size_ is known.
+    //    Build ALWAYS uses inline_pq=0 flat nodes (Issue 26). The final
+    //    inline_pq layout is materialized at flush time.
+    core_ = std::make_unique<VamanaCore>(vparams, *quantizer_);
     node_size_ = VamanaCore::static_node_size(params.R, 0,
-                                              static_cast<uint8_t>(code_size_));
+                                              code_size_);
 
     // Allocate flat buffers (aligned for potential direct-IO reuse).
     const size_t codes_bytes = static_cast<size_t>(count_) * code_size_;
@@ -215,20 +229,10 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     // insert_build) goes through the store interface.
     flat_store_ = std::make_unique<FlatNodeStore>(
         nodes_buffer_, codes_buffer_,
-        node_size_, static_cast<uint8_t>(code_size_));
+        node_size_, code_size_);
     core_->set_store(flat_store_.get());
 
-    // 3-6. The pipeline passes.
-    auto _phase = [](const char* name, auto& t_prev) {
-        const auto now = std::chrono::steady_clock::now();
-        const double secs = std::chrono::duration<double>(now - t_prev).count();
-        spdlog::info("[sextant] phase '{}': {:.2f}s", name, secs);
-        t_prev = now;
-    };
-
-    auto t_phase = std::chrono::steady_clock::now();
-    pass1_sample_and_train(source, params);
-    _phase("pass1_sample_and_train", t_phase);
+    // 4-6. The remaining pipeline passes.
     pass2_encode(source, params);
     _phase("pass2_encode", t_phase);
 
@@ -270,7 +274,7 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     // PagedNodeStore so post-build search is SSD-resident.
     const uint32_t final_node_size = VamanaCore::static_node_size(
         params.R, params.inline_pq_count,
-        static_cast<uint8_t>(code_size_));
+        code_size_);
     node_size_ = final_node_size;
     flat_store_.reset();  // disconnect store before freeing buffers
     core_->set_store(nullptr);
@@ -279,7 +283,7 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
 
     paged_store_ = std::make_unique<PagedNodeStore>(
         index_path_ + ".graph", index_path_ + ".codes",
-        final_node_size, static_cast<uint8_t>(code_size_),
+        final_node_size, code_size_,
         std::max(1u, std::thread::hardware_concurrency()),
         /*cache_size_bytes=*/64ull * 1024 * 1024);  // 64MB default cache
     core_->set_store(paged_store_.get());
@@ -297,16 +301,434 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     result.build_time_sec = secs;
     result.R = params.R;
     result.L_build = params.L_build;
-    result.pq_m = params.pq_m;
+    result.pq_m = quantizer_ ? quantizer_->m() : params.pq_m;
+    result.pq_bits = quantizer_ ? quantizer_->bits() : params.pq_bits;
     return result;
 }
 
 // ===========================================================================
-// Pass 1: reservoir sample + PQ train
+// Pass 1: reservoir sample + (optional) global bits probe + PQ train
 // ===========================================================================
 
+namespace {
+
+/// Probe pool size: we measure recall on a subset of the reservoir to keep
+/// the brute-force KNN cheap. 20K is what pq_explore uses; stable enough.
+constexpr uint32_t kProbePool = 20000;
+constexpr uint32_t kProbeQueries = 500;
+constexpr uint32_t kProbeTopk = 10;
+constexpr uint32_t kProbeRecallK = 30;
+
+/// Brute-force truth for the probe: per query, the top-kProbeTopk neighbor ids,
+/// their true L2sq distances (sorted ascending), and counts of pool vectors
+/// within the k-th and kProbeRecallK-th NN distances (tie bands — how many
+/// vectors are as near as the k-th / shortlist-boundary neighbor).
+struct ProbeTruth {
+    std::vector<std::vector<uint32_t>> ids;      // [qi] → top-k ids
+    std::vector<std::vector<float>> dists;       // [qi] → top-k true L2sq
+    std::vector<uint32_t> band_counts;           // [qi] → # vectors within k-th NN dist
+    std::vector<uint32_t> band30_counts;         // [qi] → # vectors within kProbeRecallK-th NN dist
+};
+
+/// Compute brute-force true top-kProbeTopk for a set of query indices within
+/// the pool. Returns ids + true distances (ascending) + per-query band counts.
+ProbeTruth compute_truth(const float* pool, uint32_t pool_n, Dim dim,
+                         const std::vector<uint32_t>& qidx) {
+    std::vector<float> norms(pool_n);
+    for (uint32_t i = 0; i < pool_n; i++) {
+        const float* v = pool + static_cast<size_t>(i) * dim;
+        double acc = 0.0;
+        for (uint32_t d = 0; d < dim; d++) acc += double(v[d]) * v[d];
+        norms[i] = float(acc);
+    }
+    ProbeTruth truth;
+    truth.ids.resize(qidx.size());
+    truth.dists.resize(qidx.size());
+    truth.band_counts.resize(qidx.size(), 0);
+    truth.band30_counts.resize(qidx.size(), 0);
+    for (size_t qi = 0; qi < qidx.size(); qi++) {
+        const float* q = pool + static_cast<size_t>(qidx[qi]) * dim;
+        double qn = 0.0;
+        for (uint32_t d = 0; d < dim; d++) qn += double(q[d]) * q[d];
+        std::vector<std::pair<float, uint32_t>> ranked;
+        ranked.reserve(pool_n - 1);
+        for (uint32_t i = 0; i < pool_n; i++) {
+            if (i == qidx[qi]) continue;
+            double dot = 0.0;
+            const float* v = pool + static_cast<size_t>(i) * dim;
+            for (uint32_t d = 0; d < dim; d++) dot += double(q[d]) * v[d];
+            ranked.emplace_back(float(norms[i] - 2.0 * dot + qn), i);
+        }
+        // Partial-sort to kProbeRecallK so we have both the kProbeTopk-th and
+        // kProbeRecallK-th NN distances for band counting.
+        const size_t ksort = std::min<size_t>(kProbeRecallK, ranked.size());
+        std::partial_sort(ranked.begin(), ranked.begin() + ksort, ranked.end(),
+                          [](const auto& a, const auto& b){ return a.first < b.first; });
+        const size_t kk = std::min<size_t>(kProbeTopk, ranked.size());
+        for (size_t k = 0; k < kk; k++) {
+            truth.ids[qi].push_back(ranked[k].second);
+            truth.dists[qi].push_back(ranked[k].first);
+        }
+        // Band counts: how many pool vectors are within each radius?
+        // Computed once here (not per-config) since they're dataset properties.
+        const float band_radius = ranked[kk - 1].first;
+        const float band30_radius = ranked[ksort - 1].first;
+        uint32_t bc = 0, bc30 = 0;
+        for (uint32_t i = 0; i < pool_n; i++) {
+            if (i == qidx[qi]) continue;
+            const float* v = pool + static_cast<size_t>(i) * dim;
+            double dot = 0.0;
+            for (uint32_t d = 0; d < dim; d++) dot += double(q[d]) * v[d];
+            const float td = float(norms[i] - 2.0 * dot + qn);
+            if (td <= band30_radius + 1e-6f) {
+                ++bc30;
+                if (td <= band_radius + 1e-6f) ++bc;
+            }
+        }
+        truth.band_counts[qi] = bc;
+        truth.band30_counts[qi] = bc30;
+    }
+    return truth;
+}
+
+/// Distortion + diagnostics measured for one (m, bits) config against truth.
+struct ProbeScore {
+    double distortion = 0.0;     // median |1 - pq_dist/true_dist| (≥0; 0 = perfect)
+    double band_recall = 0.0;    // frac truth neighbors within band found in PQ top-K
+    double tie_fraction = 0.0;   // frac queries whose band(@k) has >kProbeTopk tied vectors
+    double tie30_fraction = 0.0; // frac queries whose band(@kProbeRecallK) has >kProbeRecallK tied
+};
+
+/// Measure PQ quality for a given (m, bits) config.
+///
+/// distortion: for each query's true top-k neighbors, the ratio of the
+/// PQ-estimated distance to the true distance. We report the median across all
+/// truth neighbors (robust to PQ outliers). 1.0 = perfect; 1.3 = PQ overestimates
+/// true-neighbor distances by 30% on the median. This is the selection signal:
+/// it's geometrically grounded and transfers across dataset classes.
+///
+/// band_recall (diagnostic): fraction of truth neighbors for which the PQ
+/// top-kProbeRecallK shortlist contains SOME id within the band radius (the
+/// k-th true NN distance). Unlike id-recall, this is insensitive to tie-breaking
+/// among co-located vectors. On non-clustered data it ≈ id-recall.
+///
+/// tie_fraction (diagnostic): fraction of queries where the band (vectors at or
+/// inside the k-th NN distance) contains more than kProbeTopk vectors. When high,
+/// id-based recall is structurally capped below 1.0 regardless of PQ quality.
+ProbeScore probe_recall(const float* pool, uint32_t pool_n, Dim dim,
+                        MetricKind metric, uint16_t pq_m, uint8_t bits,
+                        const ProbeTruth& truth, const std::vector<uint32_t>& qidx) {
+    PqQuantizer q(metric, dim, pq_m, bits);
+    q.train(pool, pool_n);
+    const uint32_t cs = q.code_size();
+    std::vector<uint8_t> codes(static_cast<size_t>(pool_n) * cs);
+    for (uint32_t i = 0; i < pool_n; i++)
+        q.encode(pool + static_cast<size_t>(i) * dim,
+                 codes.data() + static_cast<size_t>(i) * cs);
+    std::vector<float> lut(q.lut_size());
+
+    // For distortion: collect pq_dist/true_dist ratios over all truth neighbors.
+    std::vector<double> ratios;
+    ratios.reserve(qidx.size() * kProbeTopk);
+
+    // For band_recall: per truth neighbor, did the PQ top-K shortlist contain
+    // some id within the band? We need the true distance from the query to every
+    // id in the PQ shortlist. Compute norms once.
+    std::vector<float> norms(pool_n);
+    for (uint32_t i = 0; i < pool_n; i++) {
+        const float* v = pool + static_cast<size_t>(i) * dim;
+        double acc = 0.0;
+        for (uint32_t d = 0; d < dim; d++) acc += double(v[d]) * v[d];
+        norms[i] = float(acc);
+    }
+
+    uint64_t band_hits = 0, band_total = 0;
+
+    for (size_t qi = 0; qi < qidx.size(); qi++) {
+        const float* qv = pool + static_cast<size_t>(qidx[qi]) * dim;
+        double qn = 0.0;
+        for (uint32_t d = 0; d < dim; d++) qn += double(qv[d]) * qv[d];
+
+        q.preprocess_query(qv, lut.data());
+
+        // PQ-rank the whole pool, keep top-kProbeRecallK.
+        std::vector<std::pair<float, uint32_t>> ranked;
+        ranked.reserve(pool_n - 1);
+        for (uint32_t i = 0; i < pool_n; i++) {
+            if (i == qidx[qi]) continue;
+            ranked.emplace_back(
+                q.lut_distance(codes.data() + static_cast<size_t>(i) * cs,
+                               lut.data()), i);
+        }
+        const uint32_t kp = std::min<uint32_t>(kProbeRecallK, ranked.size());
+        std::partial_sort(ranked.begin(), ranked.begin() + kp, ranked.end(),
+                          [](const auto& a, const auto& b){ return a.first < b.first; });
+
+        // Distortion: |1 - pq_dist/true_dist| for each truth neighbor.
+        // Median absolute deviation from perfect (0.0 = PQ exactly preserves
+        // neighbor distances). Always ≥0, lower = better, direction-agnostic.
+        for (size_t t = 0; t < truth.ids[qi].size(); t++) {
+            const uint32_t tid = truth.ids[qi][t];
+            const float true_d = truth.dists[qi][t];
+            const float pq_d = q.lut_distance(codes.data() + static_cast<size_t>(tid) * cs,
+                                              lut.data());
+            if (true_d > 1e-9f) {
+                ratios.push_back(std::fabs(1.0 -
+                    static_cast<double>(pq_d) / static_cast<double>(true_d)));
+            }
+        }
+
+        // band_recall: did the PQ shortlist surface any vector within the
+        // band radius (the k-th true NN distance)? This is cluster-aware:
+        // insensitive to which specific co-located id PQ picked.
+        const float band_radius = truth.dists[qi].empty()
+            ? std::numeric_limits<float>::infinity()
+            : truth.dists[qi].back();
+        bool any_in_band = false;
+        for (uint32_t k = 0; k < kp; k++) {
+            const uint32_t id = ranked[k].second;
+            const float* v = pool + static_cast<size_t>(id) * dim;
+            double dot = 0.0;
+            for (uint32_t d = 0; d < dim; d++) dot += double(qv[d]) * v[d];
+            const float td = float(norms[id] - 2.0 * dot + qn);
+            if (td <= band_radius + 1e-6f) { any_in_band = true; break; }
+        }
+        for (size_t t = 0; t < truth.ids[qi].size(); t++) {
+            band_total++;
+            if (any_in_band) band_hits++;
+        }
+    }
+
+    ProbeScore s;
+    if (!ratios.empty()) {
+        std::nth_element(ratios.begin(),
+                         ratios.begin() + ratios.size() / 2,
+                         ratios.end());
+        s.distortion = ratios[ratios.size() / 2];
+    }
+    s.band_recall = band_total ? double(band_hits) / double(band_total) : 0.0;
+    // tie_fraction is a dataset property (from compute_truth), same for all
+    // configs. Report it from the truth, not recomputed per-config.
+    if (!truth.band_counts.empty()) {
+        uint64_t tied = 0;
+        for (uint32_t bc : truth.band_counts) {
+            if (bc > kProbeTopk) ++tied;
+        }
+        s.tie_fraction = double(tied) / double(truth.band_counts.size());
+    }
+    if (!truth.band30_counts.empty()) {
+        uint64_t tied30 = 0;
+        for (uint32_t bc : truth.band30_counts) {
+            if (bc > kProbeRecallK) ++tied30;
+        }
+        s.tie30_fraction = double(tied30) / double(truth.band30_counts.size());
+    }
+    return s;
+}
+
+/// Generate candidate m values: divisors of dim spanning sub_dim ~1 to ~12,
+/// capped to [4, 256]. The low sub_dim bound (1) matters for low-dimensional
+/// datasets (e.g. SIFT-128), where high m / sub_dim=1-2 with 4-bit gives
+/// excellent recall (16 centroids densely tile a 1-2D sub-space). Sorted ascending.
+std::vector<uint16_t> candidate_ms(Dim dim) {
+    std::vector<uint16_t> ms;
+    for (uint32_t m = 4; m <= 256; m++) {
+        if (dim % m == 0) {
+            const uint32_t sd = dim / m;
+            if (sd >= 1 && sd <= 12) ms.push_back(static_cast<uint16_t>(m));
+        }
+    }
+    return ms;
+}
+
+    /// A probed (m, bits) config with its measured quality and cost.
+    struct ProbedConfig {
+        uint16_t m;
+        uint8_t bits;
+        uint32_t code_bytes;   // m * bits / 8
+        uint32_t table_bytes;  // m * K^2 * 4 (cross-distance table)
+        double distortion;       // median |1 - pq_dist/true_dist| (≥0; 0 = perfect)
+        double band_recall;      // cluster-aware recall (diagnostic)
+        double tie_fraction;     // frac queries with >topk tied at @k (diagnostic)
+        double tie30_fraction;   // frac queries with >30 tied at @30 (diagnostic)
+        double cost;           // m * residency_factor (lower = faster)
+    };
+
+/// Cross-distance table size in bytes for a given (m, bits).
+inline uint32_t pq_table_bytes(uint16_t m, uint8_t bits) {
+    const uint32_t K = 1u << bits;
+    return static_cast<uint32_t>(m) * K * K * sizeof(float);
+}
+
+/// Sweep (m, bits) candidate pairs, measure distortion, and select the minimum-
+/// cost config whose distortion is within `max_distortion`.
+///
+/// Selection policy (distortion-bounded min cost):
+///   1. Compute distortion (median |1 - pq_dist/true_dist|) and cost (m ×
+///      residency) for every candidate.
+///   2. Filter to configs with distortion ≤ max_distortion.
+///   3. Among eligible configs, pick minimum cost. Tie-break by lower
+///      distortion, then smaller code_bytes.
+///
+/// The max_distortion bound is the selector — it expresses "what's good enough"
+/// in geometric terms (how much PQ may distort true-neighbor distances). This
+/// replaces the prior recall-count floor, which was fragile under near-duplicate
+/// clustering. Distortion transfers across dataset classes because it measures
+/// PQ's fundamental property (distance fidelity) rather than a tie-breaking-
+/// dependent count.
+///
+/// If no config meets max_distortion, the lowest-distortion config is returned
+/// (with a warning). When `fixed_m != 0` or `fixed_bits != 0`, the probe is
+/// restricted to that m/bits but the quality gate still applies.
+ProbedConfig probe_best_config(const float* pool, uint32_t pool_n, Dim dim,
+                               MetricKind metric,
+                               const ProbeTruth& truth,
+                               const std::vector<uint32_t>& qidx,
+                               uint16_t fixed_m, uint8_t fixed_bits,
+                               double max_distortion,
+                               std::vector<ProbedConfig>& all_out,
+                               std::string& reason_out) {
+    // Build candidate list: m values, constrained if fixed.
+    std::vector<uint16_t> ms;
+    if (fixed_m != 0) {
+        ms.push_back(fixed_m);
+    } else {
+        ms = candidate_ms(dim);
+    }
+    // Bit values to probe: both, or just the fixed one.
+    std::vector<uint8_t> bit_vals;
+    if (fixed_bits != 0) bit_vals.push_back(fixed_bits);
+    else { bit_vals.push_back(4); bit_vals.push_back(8); }
+
+    std::vector<ProbedConfig> all;
+    for (const uint16_t m : ms) {
+        if (dim % m != 0) continue;
+        for (const uint8_t bits : bit_vals) {
+            const ProbeScore s = probe_recall(pool, pool_n, dim, metric, m, bits, truth, qidx);
+            const uint32_t cb = (static_cast<uint32_t>(m) * bits + 7) / 8;
+            const uint32_t tb = pq_table_bytes(m, bits);
+            all.push_back({m, bits, cb, tb, s.distortion, s.band_recall,
+                           s.tie_fraction, s.tie30_fraction, 0.0});
+            spdlog::info("[sextant] pass 1:   probe m={} bits={} code={}B table={}KB "
+                         "distortion={:.4f} band_recall@{}={:.4f} ties@{}={:.2f} ties@{}={:.2f}",
+                         m, bits, cb, tb / 1024, s.distortion, kProbeRecallK,
+                         s.band_recall, kProbeTopk, s.tie_fraction,
+                         kProbeRecallK, s.tie30_fraction);        }
+    }
+    if (all.empty()) {
+        all_out = all;
+        return {ms.empty() ? uint16_t{0} : ms.front(), uint8_t{8}, 0, 0,
+                0.0, 0.0, 0.0, 0.0};
+    }
+
+    // Cost model: cost = m (number of gathers per distance computation).
+    //
+    // m is the dominant cost factor in both build and search — each
+    // code_distance/lut_distance call performs m table gathers. Among configs
+    // meeting the distortion bound, the fewest-gather config is cheapest.
+    //
+    // When two configs have the same m (e.g. 4-bit vs 8-bit at the same m),
+    // tie-break by table size: the smaller table is always faster (fits a
+    // closer cache level). Since 4-bit K²=256 and 8-bit K²=65536, the 4-bit
+    // table is 256× smaller at the same m — this naturally selects 4-bit when
+    // distortion is equal, without magic residency factors or cache detection.
+    for (auto& c : all) {
+        c.cost = static_cast<double>(c.m);
+    }
+
+    // Filter to configs meeting the distortion bound.
+    std::vector<const ProbedConfig*> eligible;
+    for (const auto& c : all) {
+        if (c.distortion <= max_distortion) eligible.push_back(&c);
+    }
+
+    ProbedConfig best;
+    std::string reason;
+    if (eligible.empty()) {
+        // No config meets the bound — pick lowest distortion, warn.
+        best = *std::min_element(all.begin(), all.end(),
+            [](const auto& a, const auto& b){ return a.distortion < b.distortion; });
+        reason = "above max_distortion; lowest distortion";
+        spdlog::warn("[sextant] pass 1: no config meets max_distortion {:.3f}; "
+                     "selected lowest-distortion (m={} bits={} distortion={:.4f})",
+                     max_distortion, best.m, best.bits, best.distortion);
+    } else if (eligible.size() == 1) {
+        best = *eligible[0];
+        reason = "only config within max_distortion";
+    } else {
+        // Min cost (m), tie-break by smaller table_bytes, then code_bytes.
+        const ProbedConfig* pick = eligible[0];
+        for (const auto* c : eligible) {
+            if (c->cost < pick->cost ||
+                (c->cost == pick->cost && c->table_bytes < pick->table_bytes) ||
+                (c->cost == pick->cost && c->table_bytes == pick->table_bytes &&
+                 c->code_bytes < pick->code_bytes)) {
+                pick = c;
+            }
+        }
+        best = *pick;
+        reason = "min cost (distortion ≤ bound)";
+    }
+    spdlog::info("[sextant] pass 1: selected m={} bits={} (code={}B table={}KB "
+                 "distortion={:.4f} cost={:.0f}) [{}; max_distortion {:.3f}]",
+                 best.m, best.bits, best.code_bytes, best.table_bytes / 1024,
+                 best.distortion, best.cost, reason, max_distortion);
+    all_out = std::move(all);
+    reason_out = reason;
+    return best;
+}
+
+}  // namespace
+
+Engine::PqSelection Engine::probe_pq_config(const float* sample, uint64_t n,
+                                            Dim dim, const ResolvedParams& params) {
+    const uint16_t pq_m = params.pq_m;
+    const uint8_t pq_bits = params.pq_bits;
+    if (pq_m != 0 && pq_bits != 0) {
+        // Both explicit — no probe needed.
+        return {pq_m, pq_bits, {}, ""};
+    }
+    const uint32_t pool_n =
+        static_cast<uint32_t>(std::min<uint64_t>(kProbePool, n));
+    // Pick query indices (deterministic).
+    std::mt19937_64 rng(0xC0FFEEULL);
+    std::uniform_int_distribution<uint32_t> u(0, pool_n - 1);
+    std::vector<uint32_t> qidx;
+    std::unordered_set<uint32_t> seen;
+    while (qidx.size() < std::min<uint32_t>(kProbeQueries, pool_n - 1)) {
+        const uint32_t q = u(rng);
+        if (seen.insert(q).second) qidx.push_back(q);
+    }
+    const auto truth = compute_truth(sample, pool_n, dim, qidx);
+    std::vector<ProbedConfig> all_cfg;
+    std::string reason;
+    const auto best = probe_best_config(sample, pool_n, dim, params.metric,
+                                        truth, qidx,
+                                        /*fixed_m=*/pq_m,
+                                        /*fixed_bits=*/pq_bits,
+                                        /*max_distortion=*/params.pq_max_distortion,
+                                        all_cfg, reason);
+    uint16_t m = best.m;
+    uint8_t bits = best.bits;
+    if (m == 0) {
+        uint32_t mm = dim / 4; if (mm < 4) mm = 4;
+        while (mm > 1 && dim % mm != 0) mm--;
+        m = static_cast<uint16_t>(mm);
+    }
+    if (bits == 0) bits = 8;
+    // Copy probed rows for display.
+    std::vector<Engine::ProbedRow> rows;
+    rows.reserve(all_cfg.size());
+    for (const auto& c : all_cfg) {
+        rows.push_back({c.m, c.bits, c.code_bytes, c.table_bytes,
+                        c.distortion, c.band_recall, c.tie_fraction,
+                        c.tie30_fraction, c.cost});
+    }
+    return {m, bits, std::move(rows), std::move(reason)};
+}
+
 void Engine::pass1_sample_and_train(VectorSource& source,
-                                    const ResolvedParams& /*params*/) {
+                                    const ResolvedParams& params) {
     spdlog::info("[sextant] pass 1: reservoir sample (target {} vectors)",
                  kSampleTarget);
 
@@ -350,8 +772,27 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     spdlog::info("[sextant] pass 1: sampled {} / {} vectors", actual_sample,
                  seen);
 
-    // Train the quantizer on the reservoir.
-    spdlog::info("[sextant] pass 1: training PQ on {} samples", actual_sample);
+    // Resolve pq_m and pq_bits via the probe (if either is auto).
+    uint16_t pq_m = params.pq_m;
+    uint8_t pq_bits = params.pq_bits;
+    if (pq_m == 0 || pq_bits == 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto sel = probe_pq_config(reservoir.data(), actual_sample,
+                                         dim_, params);
+        pq_m = sel.m;
+        pq_bits = sel.bits;
+        const auto t1 = std::chrono::steady_clock::now();
+        spdlog::info("[sextant] pass 1: probe resolved (m={}, bits={}) [{:.2f}s]",
+                     pq_m, pq_bits,
+                     std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    // Construct + train the quantizer at the resolved params.
+    quantizer_ = std::make_unique<PqQuantizer>(
+        params.metric, dim_, pq_m, pq_bits);
+    code_size_ = quantizer_->code_size();
+    spdlog::info("[sextant] pass 1: training PQ (m={}, bits={}) on {} samples",
+                 pq_m, pq_bits, actual_sample);
     quantizer_->train(reservoir.data(), actual_sample);
     spdlog::info("[sextant] pass 1: PQ trained (code_size={})", code_size_);
 }
@@ -361,12 +802,20 @@ void Engine::pass1_sample_and_train(VectorSource& source,
 // ===========================================================================
 
 void Engine::pass2_encode(VectorSource& source,
-                          const ResolvedParams& /*params*/) {
-    spdlog::info("[sextant] pass 2: encoding {} vectors", count_);
+                          const ResolvedParams& params) {
+    spdlog::info("[sextant] pass 2: encoding {} vectors ({} threads)", count_,
+                 params.num_threads);
 
+    // Option C (per the plan): read all vectors into a contiguous flat buffer
+    // keyed by row_id, then parallel-encode with work-stealing. The .fbin is
+    // read sequentially once; each encode() is independent (nearest-centroid
+    // per segment, no shared mutable state), so it parallelizes cleanly.
+
+    // 1. Materialize all vectors into a flat buffer: vecs[rid * dim_ + ...].
+    std::vector<float> flat_vecs(static_cast<size_t>(count_) * dim_);
     source.reset();
     Chunk chunk{};
-    uint64_t encoded = 0;
+    uint64_t loaded = 0;
     while (source.next(chunk)) {
         for (uint32_t r = 0; r < chunk.count; r++) {
             const RowId rid = chunk.row_ids[r];
@@ -374,13 +823,39 @@ void Engine::pass2_encode(VectorSource& source,
                 throw Error(ErrorCode::InvalidParam,
                             "Engine::pass2: row_id out of range");
             }
-            const float* vec = chunk.vectors + static_cast<size_t>(r) * dim_;
-            quantizer_->encode(vec, codes_buffer_ +
-                                       static_cast<size_t>(rid) * code_size_);
-            encoded++;
+            std::memcpy(flat_vecs.data() + static_cast<size_t>(rid) * dim_,
+                        chunk.vectors + static_cast<size_t>(r) * dim_,
+                        dim_ * sizeof(float));
+            loaded++;
         }
     }
-    spdlog::info("[sextant] pass 2: encoded {} vectors", encoded);
+
+    // 2. Parallel encode with atomic-counter work-stealing (same pattern as
+    //    parallel_construct). Each thread encodes disjoint row_ids into the
+    //    appropriate slot of codes_buffer_.
+    const uint32_t nthreads = params.num_threads > 0
+                                  ? params.num_threads
+                                  : std::thread::hardware_concurrency();
+    const uint32_t n = static_cast<uint32_t>(count_);
+    std::atomic<uint32_t> next_id{0};
+    auto worker = [this, &flat_vecs, n, &next_id]() {
+        const PqQuantizer& q = *quantizer_;
+        uint32_t id;
+        while ((id = next_id.fetch_add(1, std::memory_order_relaxed)) < n) {
+            const float* vec = flat_vecs.data() +
+                               static_cast<size_t>(id) * dim_;
+            q.encode(vec, codes_buffer_ +
+                              static_cast<size_t>(id) * code_size_);
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (uint32_t t = 0; t < std::min(nthreads, n); t++) {
+        pool.emplace_back(worker);
+    }
+    for (auto& th : pool) th.join();
+
+    spdlog::info("[sextant] pass 2: encoded {} vectors", loaded);
 }
 
 // ===========================================================================
@@ -425,6 +900,10 @@ void Engine::parallel_construct(const ResolvedParams& params) {
     // beam_search) and late nodes (dense graph, expensive) are distributed
     // across all threads rather than stranding slow threads with the hardest
     // tail of a static partition.
+    //
+    // Chunked stealing (Opt 4): each fetch_add grabs a chunk of IDs (rather
+    // than one), reducing atomic-counter contention by ~chunk_size×. The
+    // chunk is small enough (64) that load imbalance stays bounded.
     const uint32_t lo = 1;
     const uint32_t hi = n;
     if (hi <= lo) {
@@ -432,16 +911,20 @@ void Engine::parallel_construct(const ResolvedParams& params) {
         return;
     }
 
+    constexpr uint32_t kChunk = 64;
     std::atomic<uint32_t> next_id{lo};
     auto worker = [this, hi, adc_mode, &next_id](size_t /*tid*/, VamanaTLS& tls) {
         VamanaCore& core = *core_;
-        uint32_t id;
-        while ((id = next_id.fetch_add(1, std::memory_order_relaxed)) < hi) {
-            if (adc_mode) {
-                core.insert_build(id, static_cast<RowId>(id),
-                                  core.build_vec_ptr(id), tls);
-            } else {
-                core.insert_build_from_code(id, static_cast<RowId>(id), tls);
+        uint32_t chunk_lo;
+        while ((chunk_lo = next_id.fetch_add(kChunk, std::memory_order_relaxed)) < hi) {
+            const uint32_t chunk_hi = std::min(chunk_lo + kChunk, hi);
+            for (uint32_t id = chunk_lo; id < chunk_hi; id++) {
+                if (adc_mode) {
+                    core.insert_build(id, static_cast<RowId>(id),
+                                      core.build_vec_ptr(id), tls);
+                } else {
+                    core.insert_build_from_code(id, static_cast<RowId>(id), tls);
+                }
             }
         }
     };
@@ -507,15 +990,15 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     spdlog::info("[sextant] partitioned build: N={} K={} closure_factor={:.4f}",
                  count_, params.K, params.closure_factor);
 
-    // --- 1. Quantizer (global) ---
-    quantizer_ = std::make_unique<PqQuantizer>(
-        params.metric, dim_, params.pq_m, params.pq_bits);
-    code_size_ = quantizer_->code_size();
+    // --- 1. Quantizer (global): train via pass1 (resolves pq_bits if auto) ---
+    // pass1 fills the reservoir, runs the global probe if pq_bits==0, then
+    // constructs + trains the quantizer. After it, code_size_ is valid.
+    pass1_sample_and_train(source, params);
 
     // node_size for the FINAL build buffer (inline_pq=0). Shards build at
     // R_shard, but the merged result lands in nodes_buffer_ at full R.
     node_size_ = VamanaCore::static_node_size(params.R, 0,
-                                              static_cast<uint8_t>(code_size_));
+                                              code_size_);
 
     // Allocate global flat buffers.
     {
@@ -533,9 +1016,8 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         std::memset(nodes_buffer_, 0, nodes_bytes);
     }
 
-    // Train + encode (same passes as monolithic). The quantizer needs its
-    // cross-distance table for SDC; PqQuantizer builds it during train().
-    pass1_sample_and_train(source, params);
+    // Encode (pass2). The quantizer needs its cross-distance table for SDC;
+    // PqQuantizer builds it during train() in pass1.
     pass2_encode(source, params);
 
     // --- 2. Partition via k-means on PQ codes ---
@@ -554,7 +1036,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                  params.R);
 
     const uint32_t shard_node_size = VamanaCore::static_node_size(
-        R_shard, 0, static_cast<uint8_t>(code_size_));
+        R_shard, 0, code_size_);
 
     // Store each shard's node buffer + local→global map for the merge.
     std::vector<std::vector<uint8_t>> shard_node_bufs(K);
@@ -915,7 +1397,8 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     result.dim = dim_;
     result.R = params.R;
     result.L_build = params.L_build;
-    result.pq_m = params.pq_m;
+    result.pq_m = quantizer_ ? quantizer_->m() : params.pq_m;
+    result.pq_bits = quantizer_ ? quantizer_->bits() : params.pq_bits;
     return result;
 }
 
@@ -929,7 +1412,7 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
 
     // Final node layout: node_size with the resolved inline_pq_count.
     const uint32_t final_node_size = VamanaCore::static_node_size(
-        params.R, params.inline_pq_count, static_cast<uint8_t>(code_size_));
+        params.R, params.inline_pq_count, code_size_);
     const uint32_t build_node_size = node_size_;  // inline_pq=0 layout
 
     // ----- PageShuffle: compute BFS reordering from entry points -----
@@ -1253,7 +1736,7 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
     // so beam_search inside insert_build reads current data.
     flat_store_ = std::make_unique<FlatNodeStore>(
         nodes_buffer_, codes_buffer_,
-        node_size_, static_cast<uint8_t>(code_size_));
+        node_size_, code_size_);
     core_->set_store(flat_store_.get());
 
     // --- 4. Drive the Vamana insert flow (single-thread). ---

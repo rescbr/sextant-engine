@@ -42,7 +42,7 @@ std::atomic<uint64_t> PagedNodeStore::next_instance_id_{0};
 // ===========================================================================
 
 FlatNodeStore::FlatNodeStore(uint8_t* nodes, const uint8_t* codes,
-                              uint32_t node_size, uint8_t code_size)
+                              uint32_t node_size, uint32_t code_size)
     : nodes_(nodes),
       codes_(codes),
       node_size_(node_size),
@@ -71,7 +71,7 @@ uint8_t* FlatNodeStore::mutable_code(uint32_t id) {
 
 PagedNodeStore::PagedNodeStore(const std::string& graph_path,
                                const std::string& codes_path,
-                               uint32_t node_size, uint8_t code_size,
+                               uint32_t node_size, uint32_t code_size,
                                uint32_t num_shards,
                                uint64_t cache_size_bytes)
     : graph_file_(graph_path, /*create=*/false),

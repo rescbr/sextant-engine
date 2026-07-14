@@ -25,6 +25,10 @@ foreach src : test_sources
         src,
         dependencies: [sextant_dep, gtest_dep, gtest_main_dep],
         include_directories: test_inc,
+        cpp_args: ['-DSEXTANT_SOURCE_DIR="' + meson.source_root() + '"'],
     )
-    test(name, exe)
+    test(name, exe, env: ['SEXTANT_TEST_DATA=' + meson.current_source_dir() / 'data'])
 endforeach
+
+# Install test data files (SIFTsmall etc.) so tests find them at runtime.
+install_data('data/siftsmall_base.fbin', install_dir: 'sextant-test')

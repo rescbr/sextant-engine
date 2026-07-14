@@ -29,8 +29,9 @@ struct ResolvedParams {
     uint16_t L_build = 100;
     float alpha = 1.2f;
     uint16_t inline_pq_count = 0;
-    uint8_t pq_m = 32;
-    uint8_t pq_bits = 8;
+    uint16_t pq_m = 32;
+    uint8_t pq_bits = 8;          ///< 0 = auto (resolved by reservoir probe in pass1)
+    float pq_max_distortion = 0.0f;   ///< 0 = default (1.20); max acceptable PQ distortion
     uint32_t max_occlusion = 750;
     MetricKind metric = MetricKind::L2Sq;
     uint64_t build_ram_budget = 0;
@@ -56,6 +57,32 @@ public:
     /// Build an index from a vector source. Writes sidecar files.
     BuildResult build(VectorSource& source, const std::string& index_path,
                       const BuildConfig& config);
+
+    /// Probe PQ (m, bits) selection on a sample. Runs the full auto-selection
+    /// policy (recall floor + cache-band preference) on `sample` (n × dim
+    /// floats) and returns the resolved (m, bits). Used by the build path
+    /// (pass1) and by --explain (dry-run preview without building).
+    /// `pq_m`/`pq_bits` in `params`: 0 = auto, else fixed. Does not modify
+    /// engine state.
+    struct ProbedRow {
+        uint16_t m;
+        uint8_t bits;
+        uint32_t code_bytes;
+        uint32_t table_bytes;
+        double distortion;       ///< median |1 - pq_dist/true_dist| (≥0; 0 = perfect)
+        double band_recall;      ///< cluster-aware recall (diagnostic)
+        double tie_fraction;     ///< frac queries with >topk tied at @k (diagnostic)
+        double tie30_fraction;   ///< frac queries with >30 tied at @30 (diagnostic)
+        double cost;
+    };
+    struct PqSelection {
+        uint16_t m;
+        uint8_t bits;
+        std::vector<ProbedRow> all;     ///< every probed config (for display)
+        std::string reason;             ///< selection rationale
+    };
+    static PqSelection probe_pq_config(const float* sample, uint64_t n, Dim dim,
+                                       const ResolvedParams& params);
 
     /// Load an index from sidecar files for searching.
     void open(const std::string& index_path);
@@ -135,6 +162,8 @@ private:
     bool params_loaded_ = false;
 
     /// Build helpers.
+    /// pass1 fills the reservoir, resolves pq_bits (if auto, via global probe),
+    /// constructs + trains the quantizer. After return, code_size_ is valid.
     void pass1_sample_and_train(VectorSource& source,
                                  const ResolvedParams& params);
     void pass2_encode(VectorSource& source, const ResolvedParams& params);

@@ -29,6 +29,9 @@ datasets/
 *.bvec
 *.fvec
 *.gt
+# Exception: committed test fixtures (SIFTsmall)
+!test/data/*.fbin
+!test/data/*.gt
 
 # Profiler output
 *.profraw

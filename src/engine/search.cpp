@@ -241,7 +241,7 @@ void Engine::load_sidecars() {
     // Reconstruct the final node size from the resolved params.
     node_size_ = VamanaCore::static_node_size(
         params.R, params.inline_pq_count,
-        static_cast<uint8_t>(code_size_));
+        code_size_);
 
     // --- Reconstruct the VamanaCore with the loaded params ---
     VamanaParams vparams;
@@ -307,7 +307,7 @@ void Engine::load_sidecars() {
 
         paged_store_ = std::make_unique<PagedNodeStore>(
             index_path_ + ".graph", index_path_ + ".codes",
-            node_size_, static_cast<uint8_t>(code_size_),
+            node_size_, code_size_,
             std::max(1u, std::thread::hardware_concurrency()),
             cache_bytes);
     }
@@ -323,7 +323,7 @@ void Engine::load_sidecars() {
         }
         memgraph_ = std::make_unique<MemGraph>(
             index_path_ + ".graph", index_path_ + ".codes",
-            node_size_, static_cast<uint8_t>(code_size_),
+            node_size_, code_size_,
             static_cast<uint32_t>(count_), eps, /*num_hops=*/3);
         memgraph_->set_backing(paged_store_.get());
 

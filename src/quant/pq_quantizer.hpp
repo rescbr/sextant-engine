@@ -14,14 +14,17 @@ namespace sextant {
 
 class PqQuantizer {
 public:
-    PqQuantizer(MetricKind metric, Dim dim, uint8_t m, uint8_t bits = 8,
+    PqQuantizer(MetricKind metric, Dim dim, uint16_t m, uint8_t bits = 8,
                 uint64_t seed = 0xC0DE1234ULL);
 
     /// Number of bytes per PQ code.
     uint32_t code_size() const;
 
     /// Number of PQ segments.
-    uint8_t m() const { return m_; }
+    uint16_t m() const { return m_; }
+
+    /// Bits per segment (4 or 8).
+    uint8_t bits() const { return bits_; }
 
     /// Train the codebook via batch k-means++ on a sample of vectors.
     /// `samples` is `n × dim` float32, row-major.
@@ -44,6 +47,12 @@ public:
     /// Size of the LUT (in floats) = m × K.
     uint32_t lut_size() const;
 
+    /// Read-only codebook access for diagnostics / build-time heuristics.
+    /// Layout: m segments × K centroids × sub_dim floats, row-major.
+    const float* codebook() const { return codebook_.data(); }
+    uint32_t K() const { return K_; }
+    uint32_t sub_dim() const { return sub_dim_; }
+
     /// Build a LUT from a PQ code (for SDC build mode).
     bool build_code_lut(const uint8_t* code, float* out) const;
 
@@ -59,7 +68,7 @@ public:
 private:
     MetricKind metric_;
     Dim dim_;
-    uint8_t m_;
+    uint16_t m_;
     uint8_t bits_;
     uint64_t seed_;
 

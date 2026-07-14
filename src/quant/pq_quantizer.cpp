@@ -228,7 +228,7 @@ void kmeans_pp(const float* data, uint64_t n, uint32_t dim, uint32_t k,
 // Construction
 // ---------------------------------------------------------------------------
 
-PqQuantizer::PqQuantizer(MetricKind metric, Dim dim, uint8_t m, uint8_t bits,
+PqQuantizer::PqQuantizer(MetricKind metric, Dim dim, uint16_t m, uint8_t bits,
                          uint64_t seed)
     : metric_(metric), dim_(dim), m_(m), bits_(bits), seed_(seed) {
     if (m_ == 0) {
@@ -438,31 +438,34 @@ float PqQuantizer::code_distance(const uint8_t* code_a,
 // ---------------------------------------------------------------------------
 
 void PqQuantizer::serialize(std::vector<uint8_t>& out) const {
-    // Layout: {metric:u8, m:u8, bits:u8, dim:u32, codebook:float32[m*K*sub_dim]}
-    const size_t header = sizeof(uint8_t) * 3 + sizeof(uint32_t);
+    // Layout: {metric:u8, m:u16 LE, bits:u8, dim:u32 LE, codebook:float32[m*K*sub_dim]}
+    const size_t header = sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint32_t);
     const size_t book_bytes = codebook_.size() * sizeof(float);
     out.resize(header + book_bytes);
     uint8_t* ptr = out.data();
     ptr[0] = static_cast<uint8_t>(metric_);
-    ptr[1] = m_;
-    ptr[2] = bits_;
+    uint16_t m = m_;
+    std::memcpy(ptr + 1, &m, sizeof(m));
+    ptr[3] = bits_;
     uint32_t d = dim_;
-    std::memcpy(ptr + 3, &d, sizeof(d));
+    std::memcpy(ptr + 4, &d, sizeof(d));
     if (book_bytes > 0) {
         std::memcpy(ptr + header, codebook_.data(), book_bytes);
     }
 }
 
 void PqQuantizer::deserialize(const uint8_t* in, size_t size) {
-    const size_t header = sizeof(uint8_t) * 3 + sizeof(uint32_t);
+    const size_t header = sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint32_t);
     if (size < header) {
         throw Error(ErrorCode::CorruptIndex, "PQ deserialize: blob too small");
     }
     metric_ = static_cast<MetricKind>(in[0]);
-    m_ = in[1];
-    bits_ = in[2];
+    uint16_t m;
+    std::memcpy(&m, in + 1, sizeof(m));
+    m_ = m;
+    bits_ = in[3];
     uint32_t d;
-    std::memcpy(&d, in + 3, sizeof(d));
+    std::memcpy(&d, in + 4, sizeof(d));
     dim_ = d;
     if (m_ == 0 || dim_ % static_cast<Dim>(m_) != 0 ||
         (bits_ != 4 && bits_ != 8)) {

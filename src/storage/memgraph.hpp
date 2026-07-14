@@ -36,7 +36,7 @@ public:
     /// Collects all nodes within `num_hops` BFS hops of any entry point.
     /// Stores their neighbor lists and PQ codes in compact RAM buffers.
     MemGraph(const uint8_t* all_nodes, const uint8_t* all_codes,
-             uint32_t node_size, uint8_t code_size, uint32_t total_count,
+             uint32_t node_size, uint32_t code_size, uint32_t total_count,
              const std::vector<uint32_t>& entry_points,
              uint32_t num_hops = 3);
 
@@ -44,7 +44,7 @@ public:
     /// .graph and .codes into RAM. `graph_path`/`codes_path` are the full
     /// sidecar paths (each begins with a SidecarHeader).
     MemGraph(const std::string& graph_path, const std::string& codes_path,
-             uint32_t node_size, uint8_t code_size, uint32_t total_count,
+             uint32_t node_size, uint32_t code_size, uint32_t total_count,
              const std::vector<uint32_t>& entry_points,
              uint32_t num_hops = 3);
 
@@ -93,7 +93,7 @@ private:
     std::vector<uint32_t> id_to_local_;
 
     uint32_t node_size_;
-    uint8_t code_size_;
+    uint32_t code_size_;
     uint32_t total_count_;
     uint32_t cached_count_ = 0;
     NodeStore* backing_ = nullptr;
