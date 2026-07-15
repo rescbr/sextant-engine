@@ -38,13 +38,17 @@ inline void write_padded(DirectFile& f, const void* buf, size_t count,
 /// within the file (or tolerate trailing zeros from a padded write).
 inline void read_exact(DirectFile& f, void* buf, size_t count, uint64_t offset) {
     if (count == 0) return;
-    const size_t aligned =
-        (count + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
-    void* stage = aligned_alloc(kDiskAlign, aligned);
-    std::memset(stage, 0, aligned);
-    // pread may return less at EOF; the caller only needs the leading bytes.
-    f.pread_aligned(stage, aligned, offset);
-    std::memcpy(buf, stage, count);
+    // O_DIRECT requires buffer, count, AND offset to be aligned to the
+    // logical block size (512 on Linux). Align the offset down, read more,
+    // and skip the leading bytes.
+    const uint64_t misalign = offset & (kDiskAlign - 1);
+    const uint64_t aligned_offset = offset - misalign;
+    const size_t aligned_count =
+        ((count + misalign + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1));
+    void* stage = aligned_alloc(kDiskAlign, aligned_count);
+    std::memset(stage, 0, aligned_count);
+    f.pread_aligned(stage, aligned_count, aligned_offset);
+    std::memcpy(buf, static_cast<uint8_t*>(stage) + misalign, count);
     aligned_free(stage);
 }
 
