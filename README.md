@@ -445,26 +445,54 @@ kernel page cache can mask true SSD behavior. The performance targets above
 ```sh
 ./bootstrap.sh                                  # fetch nsync + NumKong submodules
 meson setup build && meson compile -C build     # build (C++17-compatible)
-meson test -C build                             # run the test suite (56 tests)
+meson test -C build                             # run the test suite
 
-# Build an index (pq-m/pq-bits auto-probed on reservoir by default)
-./build/tools/sextant build --input data.fbin --index myidx --R 48
+# 1. Find the best PQ config for your data (~30-60s)
+./build/tools/sextant analyze --input data.fbin --proximity-target 0.95
+# → outputs: "Build with: --pq-m 32 --pq-bits 8"
 
-# Dry-run: see what PQ config the probe would select (no build)
-./build/tools/sextant build --input data.fbin --index myidx --explain
+# 2. Build using the recommended config
+./build/tools/sextant build --input data.fbin --index myidx --pq-m 32 --pq-bits 8
+```
 
-# Search with rerank against full-precision base vectors
+### `analyze` — find the best PQ config
+
+```sh
+./build/tools/sextant analyze --input data.fbin --proximity-target 0.95
+./build/tools/sextant analyze --input data.fbin                      # no target → knee-based
+```
+
+### `build` — build an index
+
+```sh
+./build/tools/sextant build --input data.fbin --index myidx --pq-m 32 --pq-bits 8
+./build/tools/sextant build --input data.fbin --index myidx          # auto-probe PQ config
+./build/tools/sextant build --input data.fbin --index myidx --explain  # dry-run, no build
+```
+
+### `search` — query an index
+
+```sh
 ./build/tools/sextant search --index myidx --query q.fbin \
     --base-data data.fbin --k 10 --rerank 10
+```
 
-# Insert a single vector
+### `insert` — add a single vector
+
+```sh
 ./build/tools/sextant insert --index myidx --vector vec.fbin --row-id 42
+```
 
-# Benchmark recall / QPS / latency against ground truth
+### `sextant_bench` — benchmark recall / QPS / latency
+
+```sh
 ./build/tools/sextant_bench --index myidx --queries q.fbin \
     --base-data data.fbin --ground-truth gt.gt --k 10
+```
 
-# Explore PQ parameters (m/bits sweeps, per-segment diagnostics, per-partition)
+### `pq_explore` — PQ parameter sweeps
+
+```sh
 ./build/tools/pq_explore --input data.fbin --m-sweep 32,64,128 --bits-sweep 4,8
 ```
 
@@ -493,6 +521,72 @@ meson test -C build                             # run the test suite (56 tests)
 | | `--output` | output file (default: stdout) |
 | `insert` | `--index`, `--vector` | index prefix, single-vector `.fbin` (required) |
 | | `--row-id` | row ID for the inserted vector (required) |
+| `analyze` | `--input` | input `.fbin` (required) |
+| | `--pq-max-distortion` | max PQ distortion for eligibility (default 0.05; ignored when a target is set) |
+| | `--proximity-target` | target proximity in-band; probes all configs, recommends cheapest meeting it (default: knee-based) |
+| | `--id-recall-target` | override: target id-recall@k instead of proximity (for entity matching/dedup) |
+| | `--id-recall-k` | k for --id-recall-target (default 10) |
+| | `--probe-sample` | probe pool size (0 = auto-size from density ratio, default) |
+| | `--threads` | threads for the mini-graph sweep (default: hardware_concurrency) |
+| | `--metric` | `l2sq` (default) or `ip` |
+
+### `analyze` — PQ config advisor
+
+Run `sextant analyze` before building to find the best `(m, bits)` PQ config
+for your dataset and workload. It builds mini Vamana graphs on an auto-sized
+sample, sweeps no-rerank proximity at L=50/100/200 for each config, then
+recommends a config and outputs the exact `sextant build` command.
+
+**Target-driven mode** (recommended): pass `--proximity-target` with your
+workload's quality requirement. The tool probes all configs and recommends the
+cheapest whose mini-graph proximity meets the target:
+
+```sh
+# "I need 95% proximity for my search workload"
+./build/tools/sextant analyze --input data.fbin --proximity-target 0.95
+```
+
+Proximity in-band is the primary quality metric — it measures whether the index
+finds the right neighborhood, robust to near-duplicate clustering. For entity
+matching/dedup where exact ids matter, use `--id-recall-target` instead. See
+`docs/proximity_vs_recall.md` for why proximity is the better default.
+
+Typical targets (see `docs/recall_targets.md` for the full literature survey):
+
+| Target | Workload | Basis |
+|---|---|---|
+| 0.80 | RAG / retrieval | Downstream quality robust to recall ≥ 0.4 (arXiv:2606.04522) |
+| 0.95 | General search / benchmark | ANN community convention (Aumüller et al., 2020) |
+| 0.99 | Entity matching / dedup / geocoding | Missed matches unrecoverable (Christen, 2012; BlockingPy, 2025) |
+
+**Knee-driven mode** (default, no target): uses `--pq-max-distortion` to
+filter eligible configs, then finds the diminishing-returns knee via relative
+proximity deltas. Useful when you don't have a specific recall target and want
+the best cost/quality tradeoff.
+
+**Scales to billions.** `analyze` reads a random sample (auto-sized: 10K–100K
+vectors via seek, not a scan) and builds mini-graphs on that sample only.
+The cost is **constant** regardless of dataset size — it takes the same ~30-60s
+whether you have 1M or 1B vectors. This works because of the curse of
+dimensionality: the k-th nearest-neighbor distance is nearly constant above
+~1M vectors, so a small sample's neighborhood structure matches the full
+dataset. The auto-sizer computes the exact density ratio and shows it in the
+output; see `docs/sensitivity_probe.md` for the math.
+
+**Run `analyze` before `build`.** The build path's distortion probe (which
+selects PQ config automatically) measures PQ quality in isolation — it doesn't
+know whether your data is PQ-sensitive or whether higher `m` is worth the
+build cost. `analyze` measures end-to-end (PQ + graph + search) on a
+representative sample and tells you exactly which config to use. A 30-60s
+analysis that picks the right config can save a multi-hour build at the wrong
+`m`, or prevent wasted spend on an unnecessarily high `m`.
+
+By default the probe pool is **auto-sized** from the dataset's N and dim to
+achieve a 10th-NN density ratio ≤ 1.05. The mini-graph no-rerank proximity is
+a conservative lower bound on full-scale proximity (rerank + larger graph both
+help), so if a config meets the target here, it will at full scale too. See
+`docs/sensitivity_probe.md` for validation data and
+`docs/proximity_vs_recall.md` for why proximity is the primary metric.
 
 ## Partitioned build
 

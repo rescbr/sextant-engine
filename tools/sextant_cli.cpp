@@ -534,7 +534,7 @@ void print_usage() {
               << "  build    Build an index from a .fbin file\n"
               << "  search   Search an index with query vectors\n"
               << "  insert   Insert a single vector into an index\n"
-              << "  analyze  PQ sensitivity analysis (mini-graph probe)\n";
+              << "  analyze  PQ sensitivity advisory (pre-build mini-graph sweep)\n";
 }
 
 }  // namespace
