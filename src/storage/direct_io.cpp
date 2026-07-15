@@ -75,12 +75,17 @@ DirectFile& DirectFile::operator=(DirectFile&& other) noexcept {
 }
 
 size_t DirectFile::pread_aligned(void* buf, size_t count, uint64_t offset) {
-    // O_DIRECT on Linux requires offset alignment to the block device's
-    // logical block size (typically 512 or 4096). If the offset is not
-    // aligned, align down, read the excess, and shift.
-    const uint64_t misalign = offset & (kDiskAlign - 1);
-    if (misalign == 0) {
-        // Common case: already aligned.
+    if (count == 0) return 0;
+
+    // O_DIRECT on Linux requires buf, count, AND offset to all be aligned
+    // to the logical block size. Check all three; if any is unaligned, go
+    // through a staging buffer.
+    const uint64_t off_misalign = offset & (kDiskAlign - 1);
+    const size_t count_misalign = count & (kDiskAlign - 1);
+    const bool buf_aligned =
+        (reinterpret_cast<uintptr_t>(buf) & (kDiskAlign - 1)) == 0;
+
+    if (off_misalign == 0 && count_misalign == 0 && buf_aligned) {
         ssize_t n = ::pread(fd_, buf, count, static_cast<off_t>(offset));
         if (n < 0) {
             throw Error(ErrorCode::IoError,
@@ -89,11 +94,12 @@ size_t DirectFile::pread_aligned(void* buf, size_t count, uint64_t offset) {
         }
         return static_cast<size_t>(n);
     }
-    // Unaligned offset: read into a temp aligned buffer, then shift.
-    // Round count up to include the misaligned prefix.
-    const uint64_t aligned_off = offset - misalign;
+
+    // Slow path: align offset down, round count up, read via staging buffer.
+    const uint64_t aligned_off = offset - off_misalign;
+    const size_t total = count + off_misalign;
     const size_t aligned_count =
-        ((count + misalign + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1));
+        (total + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
     void* stage = aligned_alloc(kDiskAlign, aligned_count);
     std::memset(stage, 0, aligned_count);
     ssize_t n = ::pread(fd_, stage, aligned_count,
@@ -104,12 +110,11 @@ size_t DirectFile::pread_aligned(void* buf, size_t count, uint64_t offset) {
                     "DirectFile::pread failed on '" + path_ + "': " +
                         std::strerror(errno));
     }
-    const size_t usable = (static_cast<size_t>(n) > misalign)
-        ? (static_cast<size_t>(n) - misalign) : 0;
-    const size_t to_copy = std::min(usable, count);
-    std::memcpy(buf, static_cast<uint8_t*>(stage) + misalign, to_copy);
+    const size_t usable = (static_cast<size_t>(n) > off_misalign)
+        ? std::min(static_cast<size_t>(static_cast<size_t>(n) - off_misalign), count) : 0;
+    std::memcpy(buf, static_cast<uint8_t*>(stage) + off_misalign, usable);
     aligned_free(stage);
-    return to_copy;
+    return usable;
 }
 
 size_t DirectFile::pwrite_aligned(const void* buf, size_t count, uint64_t offset) {
