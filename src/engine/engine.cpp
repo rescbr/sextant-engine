@@ -934,10 +934,41 @@ void Engine::parallel_construct(const ResolvedParams& params) {
         futs.push_back(pool.push(worker));
     }
 
+    // Progress logger: a separate thread that reads the atomic counter every
+    // 5s and logs throughput + ETA. Zero contention with workers — just a
+    // relaxed read of next_id. Joined before we call f.get().
+    std::thread logger([&]() {
+        const auto t_start = std::chrono::steady_clock::now();
+        auto t_last = t_start;
+        uint32_t last_done = lo;
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            const auto now = std::chrono::steady_clock::now();
+            const uint32_t done = std::min(
+                next_id.load(std::memory_order_relaxed), hi);
+            const double elapsed = std::chrono::duration<double>(
+                now - t_start).count();
+            const double interval = std::chrono::duration<double>(
+                now - t_last).count();
+            const uint32_t processed = done - lo;
+            const uint32_t interval_processed = done - last_done;
+            const double rate = processed / elapsed;
+            const uint32_t remaining = (hi - lo) - processed;
+            const double eta = rate > 0 ? remaining / rate : 0;
+            spdlog::info("[sextant] construct: {}/{} nodes ({:.0f}/s, ETA {:.0f}s)",
+                         processed + 1, hi - lo,
+                         interval_processed / interval, eta);
+            if (done >= hi) break;
+            last_done = done;
+            t_last = now;
+        }
+    });
+
     // Wait for all tasks; rethrow the first exception encountered.
     for (auto& f : futs) {
         f.get();
     }
+    logger.join();
 
     spdlog::info("[sextant] construct: all {} nodes inserted", n);
 }
