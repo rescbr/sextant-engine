@@ -3,6 +3,7 @@
 /// @file logging.hpp
 /// Engine logging interface (spdlog-backed).
 
+#include <cstdint>
 #include <string>
 
 namespace sextant {
