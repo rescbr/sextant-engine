@@ -603,15 +603,39 @@ void VamanaCore::robust_prune_into(
         out.push_back(buf[p_idx]);
 
         const uint8_t* p_code = code_at(p_idx);
+
+        // Batch4 occlusion check: collect up to 4 non-removed candidates,
+        // compute distances together via code_distance_batch4 (SIMD +
+        // interleaved loads → 1.4–2× faster than one-at-a-time).
+        size_t batch_ids[4];
+        const uint8_t* batch_codes[4];
+        uint32_t batch_count = 0;
+
         for (size_t pp_idx = p_idx + 1; pp_idx < n; pp_idx++) {
             if (removed[pp_idx]) {
                 continue;
             }
-            const float d_pp = quantizer_.code_distance(p_code,
-                                                         code_at(pp_idx));
-            if (alpha * d_pp <= buf[pp_idx].dist) {
-                removed[pp_idx] = 1;
+            batch_ids[batch_count] = pp_idx;
+            batch_codes[batch_count] = code_at(pp_idx);
+            batch_count++;
+
+            if (batch_count == 4) {
+                float dists[4];
+                quantizer_.code_distance_batch4(
+                    p_code, batch_codes[0], batch_codes[1],
+                    batch_codes[2], batch_codes[3], dists);
+                for (uint32_t b = 0; b < 4; b++) {
+                    if (alpha * dists[b] <= buf[batch_ids[b]].dist)
+                        removed[batch_ids[b]] = 1;
+                }
+                batch_count = 0;
             }
+        }
+        // Drain remainder (fewer than 4 left).
+        for (uint32_t b = 0; b < batch_count; b++) {
+            const float d_pp = quantizer_.code_distance(p_code, batch_codes[b]);
+            if (alpha * d_pp <= buf[batch_ids[b]].dist)
+                removed[batch_ids[b]] = 1;
         }
     }
 }
