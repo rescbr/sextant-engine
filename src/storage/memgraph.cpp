@@ -44,16 +44,12 @@ inline uint32_t node_neighbor(const uint8_t* node, uint32_t i) {
 // Mirrors engine_detail::read_exact but stays within the storage layer.
 void read_payload(DirectFile& f, uint8_t* dst, size_t count) {
     if (count == 0) return;
-    // O_DIRECT requires offset alignment too — align down and skip.
-    constexpr uint64_t hdr = sizeof(SidecarHeader);
-    const uint64_t misalign = hdr & (kDiskAlign - 1);
-    const uint64_t aligned_off = hdr - misalign;
     const size_t aligned =
-        ((count + misalign + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1));
+        (count + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
     void* stage = aligned_alloc(kDiskAlign, aligned);
     std::memset(stage, 0, aligned);
-    f.pread_aligned(stage, aligned, aligned_off);
-    std::memcpy(dst, static_cast<uint8_t*>(stage) + misalign, count);
+    f.pread_aligned(stage, aligned, sizeof(SidecarHeader));
+    std::memcpy(dst, stage, count);
     aligned_free(stage);
 }
 
