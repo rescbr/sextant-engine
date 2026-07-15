@@ -35,6 +35,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#ifdef __linux__
+#include <sys/mman.h>  // madvise(MADV_HUGEPAGE) for TLB-friendly build buffers
+#endif
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -215,6 +218,23 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     if (!codes_buffer_ || !nodes_buffer_) {
         throw Error(ErrorCode::OutOfMemory, "Engine::build: buffer alloc failed");
     }
+#ifdef __linux__
+    // Hint the kernel to back the build buffers with transparent huge pages.
+    // The buffers are accessed randomly during graph construction; 2 MB pages
+    // reduce TLB pressure on the large (≥122 MB codes) cloud dataset. Advisory
+    // only — if THP is unavailable (containerized, low nr_hugepages) the build
+    // proceeds normally on standard 4 KB pages.
+    if (codes_bytes > 0 && madvise(codes_buffer_, codes_bytes,
+                                   MADV_HUGEPAGE) != 0) {
+        spdlog::debug("[sextant] huge pages unavailable for codes buffer, "
+                      "using standard pages");
+    }
+    if (nodes_bytes > 0 && madvise(nodes_buffer_, nodes_bytes,
+                                   MADV_HUGEPAGE) != 0) {
+        spdlog::debug("[sextant] huge pages unavailable for nodes buffer, "
+                      "using standard pages");
+    }
+#endif
     spdlog::info("[sextant] allocating flat build buffers: codes={:.1f}MB "
                  "nodes={:.1f}MB total={:.1f}MB (per_vec={}B)",
                  codes_bytes / 1e6, nodes_bytes / 1e6,
@@ -1048,6 +1068,19 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         }
         std::memset(codes_buffer_, 0, codes_bytes);
         std::memset(nodes_buffer_, 0, nodes_bytes);
+#ifdef __linux__
+        // Same THP hint as the single-partition build path (see Engine::build).
+        if (codes_bytes > 0 && madvise(codes_buffer_, codes_bytes,
+                                       MADV_HUGEPAGE) != 0) {
+            spdlog::debug("[sextant] huge pages unavailable for codes buffer "
+                          "(partitioned), using standard pages");
+        }
+        if (nodes_bytes > 0 && madvise(nodes_buffer_, nodes_bytes,
+                                       MADV_HUGEPAGE) != 0) {
+            spdlog::debug("[sextant] huge pages unavailable for nodes buffer "
+                          "(partitioned), using standard pages");
+        }
+#endif
     }
 
     // Encode (pass2). The quantizer needs its cross-distance table for SDC;
