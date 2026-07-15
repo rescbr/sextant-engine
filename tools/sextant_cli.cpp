@@ -86,9 +86,14 @@ int cmd_build(int argc, char* argv[]) {
     p.add<std::string>("index", 0, "Index name/path prefix", true);
     p.add<uint16_t>("R", 0, "Graph degree (auto if 0)", false, 0);
     p.add<uint16_t>("L", 0, "Beam width (auto if 0)", false, 0);
-    p.add<float>("alpha", 0, "Prune threshold (1.2=SDC, 1.5=ADC build mode)", false, 1.2f);
-    p.add<uint16_t>("pq-m", 0, "PQ segments (0 = auto, probed on reservoir)", false, 0);
-    p.add<std::string>("pq-bits", 0, "PQ bits: 4, 8, or auto (reservoir probe)", false, "auto");
+    p.add<float>("alpha", 0, "Vamana prune threshold (default 1.2). Purely the prune "
+                        "threshold; build mode is set via --build-mode.", false, 1.2f);
+    p.add<std::string>("build-mode", 0, "Build mode: sdc (code-distance construct) or adc "
+                                      "(raw-vector construct, default sdc)", false, "sdc");
+    p.add<uint16_t>("pq-m", 0, "PQ segments — REQUIRED for build (e.g. 96). "
+                         "Run `sextant analyze` first if unsure what to pick.", false, 0);
+    p.add<std::string>("pq-bits", 0, "PQ bits — REQUIRED for build: 4 or 8 (e.g. 8). "
+                                  "Run `sextant analyze` first if unsure what to pick.", false, "auto");
     p.add<float>("pq-max-distortion", 0,
                  "Max PQ distortion (median |1 - pq_dist/true_dist|) for auto (m,bits) selection "
                  "(0 = default 0.05). Filters configs; the min-cost eligible config is selected. "
@@ -142,6 +147,18 @@ int cmd_build(int argc, char* argv[]) {
     cfg.R = p.get<uint16_t>("R");
     cfg.L = p.get<uint16_t>("L");
     cfg.alpha = p.get<float>("alpha");
+    // build-mode: sdc (default) → SDC, adc → ADC.
+    {
+        const std::string bm = p.get<std::string>("build-mode");
+        if (bm == "sdc" || bm == "0") {
+            cfg.build_mode = sextant::BuildMode::SDC;
+        } else if (bm == "adc" || bm == "1") {
+            cfg.build_mode = sextant::BuildMode::ADC;
+        } else {
+            std::fprintf(stderr, "--build-mode must be sdc or adc (got '%s')\n", bm.c_str());
+            return 1;
+        }
+    }
     cfg.pq_m = p.get<uint16_t>("pq-m");
     // pq-bits: "auto" (default) → 0 (resolved by global probe in pass1), else 4|8.
     {
@@ -176,7 +193,9 @@ int cmd_build(int argc, char* argv[]) {
                   << "L:          " << resolved.L << "\n"
                   << "L_build:    " << resolved.L_build << "\n"
                   << "alpha:      " << resolved.alpha
-                  << (resolved.alpha == 1.5f ? "  [ADC build mode]\n" : "\n");
+                  << "  [build_mode="
+                  << (resolved.build_mode == sextant::BuildMode::ADC ? "ADC" : "SDC")
+                  << "]\n";
 
         const bool need_probe = (resolved.pq_m == 0) || (resolved.pq_bits == 0);
         if (need_probe) {

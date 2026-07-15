@@ -121,14 +121,16 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     spdlog::info("[sextant] L / L_build = {} [{}]", p.L,
                  overrides.L != 0 ? "override" : "auto");
 
-    // --- alpha (SDC default 1.2) ---
+    // --- alpha (prune threshold; default 1.2) ---
     if (overrides.alpha != 0.0f) {
         p.alpha = overrides.alpha;
     } else {
         p.alpha = 1.2f;
     }
-    if (p.alpha == 1.5f) {
-        spdlog::info("[sextant] alpha=1.5 → ADC build mode (raw-vector construct)");
+    // --- build_mode (SDC default; ADC uses raw-vector construct) ---
+    p.build_mode = overrides.build_mode;
+    if (p.build_mode == BuildMode::ADC) {
+        spdlog::info("[sextant] build_mode = ADC (raw-vector construct)");
     }
     spdlog::info("[sextant] alpha = {:.2f} [{}]", p.alpha,
                  overrides.alpha != 0.0f ? "override" : "auto");

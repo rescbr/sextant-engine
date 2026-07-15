@@ -171,6 +171,13 @@ public:
     const std::vector<uint32_t>& entry_points() const { return entry_points_; }
     void set_entry_points(std::vector<uint32_t> eps) { entry_points_ = std::move(eps); }
 
+    /// T5: install a progress signal for dynamic L_build. The pointer must
+    /// outlive the build; it is read with a relaxed load inside the insert
+    /// path. Pass nullptr (the default) to use a fixed L_build.
+    void set_build_progress(std::atomic<uint32_t>* progress) {
+        build_progress_ = progress;
+    }
+
 private:
     VamanaParams params_;
     PqQuantizer& quantizer_;
@@ -194,6 +201,11 @@ private:
 
     // Entry points (computed after construct).
     std::vector<uint32_t> entry_points_;
+
+    // T5: progress signal for dynamic L_build (optional). Set by
+    // parallel_construct to &next_id; read with a relaxed load. Null in
+    // paths without a global progress counter (partitioned/online/tests).
+    std::atomic<uint32_t>* build_progress_ = nullptr;
 
     /// Get a pointer into the flat node buffer.
     uint8_t* node_ptr(uint32_t internal_id);

@@ -236,9 +236,9 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     pass2_encode(source, params);
     _phase("pass2_encode", t_phase);
 
-    // For ADC build (alpha=1.5), load raw vectors for construct.
+    // For ADC build, load raw vectors for construct.
     std::vector<float> raw_vecs;
-    if (params.alpha == 1.5f) {
+    if (params.build_mode == BuildMode::ADC) {
         spdlog::info("[sextant] ADC build mode: loading raw vectors for construct");
         raw_vecs.resize(static_cast<size_t>(count_) * dim_);
         source.reset();
@@ -772,19 +772,20 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     spdlog::info("[sextant] pass 1: sampled {} / {} vectors", actual_sample,
                  seen);
 
-    // Resolve pq_m and pq_bits via the probe (if either is auto).
-    uint16_t pq_m = params.pq_m;
-    uint8_t pq_bits = params.pq_bits;
+    // Build requires explicit pq_m and pq_bits. The probe-based auto-selection
+    // belongs in `sextant analyze` (the advisory tool); build is a committed
+    // path and should never spend 30-130s probing on the reservoir.
+    const uint16_t pq_m = params.pq_m;
+    const uint8_t pq_bits = params.pq_bits;
     if (pq_m == 0 || pq_bits == 0) {
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto sel = probe_pq_config(reservoir.data(), actual_sample,
-                                         dim_, params);
-        pq_m = sel.m;
-        pq_bits = sel.bits;
-        const auto t1 = std::chrono::steady_clock::now();
-        spdlog::info("[sextant] pass 1: probe resolved (m={}, bits={}) [{:.2f}s]",
-                     pq_m, pq_bits,
-                     std::chrono::duration<double>(t1 - t0).count());
+        throw Error(
+            ErrorCode::InvalidParam,
+            "build requires explicit --pq-m and --pq-bits (got pq_m=" +
+                std::to_string(pq_m) + ", pq_bits=" +
+                std::to_string(pq_bits) +
+                "). Pass them on the command line, e.g. `sextant build ... "
+                "--pq-m 96 --pq-bits 8`, or run `sextant analyze` first to "
+                "get a dataset-specific recommendation.");
     }
 
     // Construct + train the quantizer at the resolved params.
@@ -867,7 +868,7 @@ void Engine::parallel_construct(const ResolvedParams& params) {
     const uint32_t nthreads = params.num_threads > 0
                                   ? params.num_threads
                                   : std::thread::hardware_concurrency();
-    const bool adc_mode = params.alpha == 1.5f;
+    const bool adc_mode = params.build_mode == BuildMode::ADC;
     spdlog::info("[sextant] construct: {} nodes across {} threads ({})", n,
                  nthreads, adc_mode ? "ADC" : "SDC");
 
@@ -913,6 +914,7 @@ void Engine::parallel_construct(const ResolvedParams& params) {
 
     constexpr uint32_t kChunk = 64;
     std::atomic<uint32_t> next_id{lo};
+    core_->set_build_progress(&next_id);
     auto worker = [this, hi, adc_mode, &next_id](size_t /*tid*/, VamanaTLS& tls) {
         VamanaCore& core = *core_;
         uint32_t chunk_lo;
@@ -969,6 +971,7 @@ void Engine::parallel_construct(const ResolvedParams& params) {
         f.get();
     }
     logger.join();
+    core_->set_build_progress(nullptr);
 
     spdlog::info("[sextant] construct: all {} nodes inserted", n);
 }
@@ -1013,7 +1016,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // ADC + partitioning is a complex combination; partitioned build stays
     // SDC-only for shard construct (RAM savings matter more than ADC quality
     // at large scale).
-    if (params.alpha == 1.5f) {
+    if (params.build_mode == BuildMode::ADC) {
         spdlog::warn("[sextant] ADC build mode with partitioning (K>1) is not "
                      "supported; falling back to SDC for shard construct.");
     }
@@ -1151,6 +1154,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         std::vector<std::future<void>> futs;
         if (hi > lo) {
             std::atomic<uint32_t> next_id{lo};
+            core.set_build_progress(&next_id);
             auto worker = [&core, &members, hi,
                             &next_id](size_t /*tid*/, VamanaTLS& tls) {
                 uint32_t id;
@@ -1164,6 +1168,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                 futs.push_back(pool.push(worker));
             }
             for (auto& f : futs) f.get();
+            core.set_build_progress(nullptr);
         }
         // Shard built; node buffer retained in shard_node_bufs[k].
     }

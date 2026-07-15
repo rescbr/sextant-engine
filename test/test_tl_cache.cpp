@@ -167,7 +167,7 @@ TEST(TLBlockCache, IntegrationL1ServesRepeatedPins) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     uint32_t node_size = 0;
@@ -232,8 +232,8 @@ TEST(TLBlockCache, PerInstanceIsolation) {
     remove_sidecars(idx_b);
 
     {
-        Engine ea; FbinSource sa(fbin_a); ea.build(sa, idx_a, BuildConfig{});
-        Engine eb; FbinSource sb(fbin_b); eb.build(sb, idx_b, BuildConfig{});
+        Engine ea; FbinSource sa(fbin_a); ea.build(sa, idx_a, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Engine eb; FbinSource sb(fbin_b); eb.build(sb, idx_b, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     uint32_t node_size_a = 0, node_size_b = 0;

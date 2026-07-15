@@ -28,6 +28,7 @@ struct ResolvedParams {
     uint16_t L = 100;
     uint16_t L_build = 100;
     float alpha = 1.2f;
+    BuildMode build_mode = BuildMode::SDC;
     uint16_t inline_pq_count = 0;
     uint16_t pq_m = 32;
     uint8_t pq_bits = 8;          ///< 0 = auto (resolved by reservoir probe in pass1)

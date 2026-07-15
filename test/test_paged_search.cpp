@@ -169,7 +169,7 @@ TEST(PagedSearch, OpenIsPagedMode) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
         EXPECT_TRUE(engine.is_paged());
         EXPECT_FALSE(engine.has_flat_buffers());
     }
@@ -202,7 +202,7 @@ TEST(PagedSearch, FindsExactNN) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Read base vectors.
@@ -271,7 +271,7 @@ TEST(PagedSearch, NodeStoreReadsAndCaches) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Determine node_size + code_size from the meta-side params by reconstructing
@@ -363,7 +363,7 @@ TEST(PagedSearch, CacheHitsAndMisses) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Derive node_size + code_size from file sizes.
@@ -437,8 +437,9 @@ TEST(PagedSearch, PageSearchMaintainsRecall) {
     scfg.L_search = 200;
     scfg.rerank_factor = 10;
 
-    const float recall = siftsmall_recall(index_path, BuildConfig{}, scfg);
-    // SIFTsmall with auto-PQ achieves ~0.95; assert ≥ 0.80 for margin.
+    const float recall = siftsmall_recall(index_path,
+        BuildConfig{.pq_m = 32, .pq_bits = 8}, scfg);
+    // SIFTsmall with m=32 achieves ~0.95; assert ≥ 0.80 for margin.
     EXPECT_GE(recall, 0.80f) << "paged search recall too low on SIFTsmall";
 }
 
@@ -462,7 +463,8 @@ TEST(PagedSearch, DynamicWidthMaintainsRecall) {
     scfg.L_search = 200;
     scfg.rerank_factor = 10;
 
-    const float recall = siftsmall_recall(index_path, BuildConfig{}, scfg);
+    const float recall = siftsmall_recall(index_path,
+        BuildConfig{.pq_m = 32, .pq_bits = 8}, scfg);
     // Same threshold as the fixed-width test.
     EXPECT_GE(recall, 0.80f) << "dynamic-width recall too low on SIFTsmall";
 }
@@ -489,7 +491,7 @@ TEST(PagedSearch, BatchedPreReadPopulatesCache) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Derive node_size from the .graph file so we can compute nodes_per_block.

@@ -160,8 +160,9 @@ TEST(Partition, PartitionedBuildProducesValidIndex) {
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.R = 32;
+        cfg.pq_m = 16; cfg.pq_bits = 8;
         // per_vec ≈ code_size(16) + node_size(144) = 160.
-        // budget = 80000 → max_per_partition = 500 → K = ceil(1500/500) = 3.
+        // budget = 80000 → max_per_partition = 500 → K = ceil(2000/500) = 4.
         cfg.build_ram_budget = 80000;
         BuildResult result = engine.build(source, index_path, cfg);
         EXPECT_EQ(static_cast<uint64_t>(n), result.n_vectors);
@@ -218,6 +219,7 @@ TEST(Partition, MergedGraphIsConnected) {
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.R = 32;
+        cfg.pq_m = 16; cfg.pq_bits = 8;
         cfg.inline_pq_count = 0;  // deterministic node_size = build layout
         cfg.build_ram_budget = 80000;  // forces K ≈ 3
         engine.build(source, index_path, cfg);
@@ -339,6 +341,7 @@ TEST(Partition, K1VsK4RecallParity) {
     // Monolithic (K=1): large RAM budget.
     BuildConfig cfg_mono;
     cfg_mono.R = 32;
+    cfg_mono.pq_m = 16; cfg_mono.pq_bits = 8;
     cfg_mono.build_ram_budget = static_cast<uint64_t>(1) << 40;  // 1 TiB → K=1
     const float recall_mono = measure_recall(fbin, n, dim, base, idx_mono,
                                              cfg_mono, k, n_queries, 300);
@@ -346,6 +349,7 @@ TEST(Partition, K1VsK4RecallParity) {
     // Partitioned (K=4): budget = 500×160 → max_per_partition=500 → K=ceil(2000/500)=4.
     BuildConfig cfg_part;
     cfg_part.R = 32;
+    cfg_part.pq_m = 16; cfg_part.pq_bits = 8;
     cfg_part.build_ram_budget = 80000;
     const float recall_part = measure_recall(fbin, n, dim, base, idx_part,
                                              cfg_part, k, n_queries, 300);
@@ -394,6 +398,7 @@ TEST(Partition, KSweepRecallDegradesGracefully) {
     for (auto& pr : probes) {
         BuildConfig cfg;
         cfg.R = 32;
+        cfg.pq_m = 16; cfg.pq_bits = 8;
         cfg.build_ram_budget = pr.budget;
         std::string idx =
             (std::filesystem::temp_directory_path() /

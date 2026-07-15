@@ -60,6 +60,23 @@ struct WorkingCmp {
     }
 };
 
+// T5: Dynamic beam width for graph construction. Ramps L_build from L_min to
+// L_max as construction progresses from 25% to 50% complete, holding L_min
+// before and L_max after. Fewer candidates early (sparse graph) reduce gather
+// work in robust_prune without hurting recall. Conservative: L_min is half of
+// L_max (floor 32), not a quarter.
+inline uint32_t dynamic_L_build(uint32_t inserted, uint32_t total,
+                                uint32_t L_max) {
+    const uint32_t L_min = std::max<uint32_t>(L_max / 2, 32);
+    if (total == 0) return L_max;
+    const double frac = static_cast<double>(inserted) / static_cast<double>(total);
+    if (frac < 0.25) return L_min;
+    if (frac > 0.50) return L_max;
+    // Linear ramp between 25% and 50%.
+    const double t = (frac - 0.25) / 0.25;
+    return L_min + static_cast<uint32_t>(t * static_cast<double>(L_max - L_min));
+}
+
 // ---------------------------------------------------------------------------
 // Thread-local search scratch: pre-reserved heaps to avoid per-query
 // reallocation. The backing vectors are reserved once (to L+1) and clear()'d
@@ -854,8 +871,17 @@ void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
     // InsertBuild tail: beam_search → robust_prune → connect_and_prune.
     // All three write into TLS scratch (tls.search_result / tls.prune_output /
     // tls.connect_buffer) — zero per-insert heap allocation (Opt 1).
-    const uint32_t L_build =
+    // T5: dynamic beam width — ramp L_build up as construction progresses,
+    // using the global inserted count (not internal_id, which is meaningless
+    // under work-stealing). Falls back to fixed L_build when no progress
+    // signal is installed.
+    const uint32_t L_build_full =
         params_.L_build > 0 ? params_.L_build : params_.L;
+    const uint32_t L_build =
+        build_progress_
+            ? dynamic_L_build(build_progress_->load(std::memory_order_relaxed),
+                              count_, L_build_full)
+            : L_build_full;
     // beam_search_into writes candidates (ascending distance) into
     // tls.search_result. robust_prune can skip the sort (presorted=true, Opt 2)
     // since beam_search drains a max-heap then reverses → ascending.
@@ -917,8 +943,14 @@ void VamanaCore::insert_build(uint32_t internal_id, RowId row_id,
     // InsertBuild tail: beam_search → robust_prune → connect_and_prune.
     // All write into TLS scratch — zero per-insert heap allocation (Opt 1).
     // beam_search output is ascending; robust_prune skips the sort (Opt 2).
-    const uint32_t L_build =
+    // T5: dynamic beam width (see insert_build_from_code).
+    const uint32_t L_build_full =
         params_.L_build > 0 ? params_.L_build : params_.L;
+    const uint32_t L_build =
+        build_progress_
+            ? dynamic_L_build(build_progress_->load(std::memory_order_relaxed),
+                              count_, L_build_full)
+            : L_build_full;
     beam_search_into(tls.search_result, lut_ptr, L_build,
                      0 /* io_limit=0 → unlimited */, tls);
     robust_prune_into(tls.search_result, tls.prune_output, params_.R,

@@ -71,6 +71,7 @@ TEST(Engine, BuildWritesAllSidecars) {
         ASSERT_EQ(dim, source.dim());
 
         BuildConfig cfg;
+        cfg.pq_m = 8; cfg.pq_bits = 8;
         BuildResult result = engine.build(source, index_path, cfg);
         EXPECT_EQ(static_cast<uint64_t>(n), result.n_vectors);
         EXPECT_EQ(dim, result.dim);
@@ -107,6 +108,7 @@ TEST(Engine, ManifestAtomicity) {
         Engine engine;
         FbinSource source(fbin);
         BuildConfig cfg;
+        cfg.pq_m = 8; cfg.pq_bits = 8;
         engine.build(source, index_path, cfg);
     }
 
@@ -138,6 +140,7 @@ TEST(Engine, OpenAndSearch) {
         Engine engine;
         FbinSource source(fbin);
         BuildConfig cfg;
+        cfg.pq_m = 8; cfg.pq_bits = 8;
         engine.build(source, index_path, cfg);
     }
 
@@ -187,6 +190,7 @@ TEST(Engine, OpenIsPagedLowIdleRam) {
         Engine engine;
         FbinSource source(fbin);
         BuildConfig cfg;
+        cfg.pq_m = 8; cfg.pq_bits = 8;
         engine.build(source, index_path, cfg);
         // After build+flush: flat buffers freed, paged mode active.
         EXPECT_TRUE(engine.is_paged());
@@ -240,7 +244,7 @@ TEST(Engine, PagedSearchMatchesFlat) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Build a set of queries.
@@ -308,6 +312,7 @@ TEST(Engine, InsertAfterBuildIsFindable) {
         Engine engine;
         FbinSource source(fbin);
         BuildConfig cfg;
+        cfg.pq_m = 8; cfg.pq_bits = 8;
         engine.build(source, index_path, cfg);
     }
 
@@ -397,7 +402,7 @@ TEST(Engine, InsertDimMismatchThrows) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     {
@@ -428,7 +433,7 @@ TEST(Engine, SearchRerankFindsExactNN) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Read all base vectors so we can compute exact distances for rerank and
@@ -510,7 +515,7 @@ TEST(Engine, PageShuffleRecallPreserved) {
     {
         Engine engine;
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{});
+        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Read all base vectors to compute exact distances for rerank.
@@ -598,6 +603,7 @@ TEST(Engine, EntryPointPersistenceRoundTrip) {
         Engine engine;
         FbinSource source(fbin);
         BuildConfig cfg;
+        cfg.pq_m = 8; cfg.pq_bits = 8;
         engine.build(source, index_path, cfg);
     }
 
@@ -693,6 +699,7 @@ TEST(Engine, OpenRejectsOrphanedSidecars) {
         Engine engine;
         FbinSource source(fbin);
         BuildConfig cfg;
+        cfg.pq_m = 8; cfg.pq_bits = 8;
         engine.build(source, index_path, cfg);
     }
 
@@ -734,7 +741,7 @@ TEST(Engine, OpenRejectsMissingIndex) {
 }
 
 // ---------------------------------------------------------------------------
-// ADC build mode (alpha=1.5): build with raw-vector construct and verify
+// ADC build mode (build_mode=ADC): build with raw-vector construct and verify
 // the index is valid and searchable.
 // ---------------------------------------------------------------------------
 TEST(Engine, BuildADCMode) {
@@ -753,7 +760,8 @@ TEST(Engine, BuildADCMode) {
         ASSERT_EQ(dim, source.dim());
 
         BuildConfig cfg;
-        cfg.alpha = 1.5f;  // signals ADC build mode
+        cfg.pq_m = 8; cfg.pq_bits = 8;
+        cfg.build_mode = BuildMode::ADC;  // ADC build mode (raw-vector construct)
         BuildResult result = engine.build(source, index_path, cfg);
         EXPECT_EQ(static_cast<uint64_t>(n), result.n_vectors);
         EXPECT_EQ(dim, result.dim);
