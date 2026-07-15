@@ -477,38 +477,104 @@ void VamanaCore::beam_search_into(
 
         // -----------------------------------------------------------------
         // Expand explicit neighbors of `best`.
+        //
+        // Build path (anchor_lut set, no store_): batch distance computation
+        // via lut_distance_batch4 for 1.4–2× throughput. All unvisited
+        // neighbors are distance-evaluated regardless of heap state, so we
+        // can collect them first, batch the distances, then push results.
+        //
+        // Search path (store_ active): one-at-a-time (pin/unpin per node
+        // makes batching the code pointers complex).
         // -----------------------------------------------------------------
 
-        for (uint16_t i = 0; i < n; i++) {
-            const uint32_t nb_internal =
-                nb_ptr ? nb_ptr[i]
-                       : (store_
-                              ? get_neighbor(store_->pin_node(
-                                                 best.internal_id).data,
-                                             i)
-                              : get_neighbor(
-                                   node_ptr(best.internal_id), i));
-            if (store_ && !nb_ptr) {
-                store_->unpin_node(best.internal_id);
-            }
-            if (is_visited(nb_internal)) {
-                continue;
-            }
-            mark_visited(nb_internal);
+        const bool can_batch = (anchor_lut != nullptr) && (store_ == nullptr);
 
-            if (io_limit > 0 && io_count >= io_limit) {
-                continue;  // out of I/O budget: mark visited, skip distance.
+        if (can_batch) {
+            // Collect unvisited neighbor ids (already copied into nb_ptr).
+            uint32_t unvisited_ids[1024];
+            const uint8_t* unvisited_codes[1024];
+            uint32_t nu = 0;
+            for (uint16_t i = 0; i < n; i++) {
+                const uint32_t nb_internal = nb_ptr ? nb_ptr[i] : 0;
+                if (is_visited(nb_internal)) continue;
+                mark_visited(nb_internal);
+                if (io_limit > 0 && io_count >= io_limit) continue;
+                unvisited_ids[nu] = nb_internal;
+                unvisited_codes[nu] = build_codes_ +
+                    static_cast<size_t>(nb_internal) * code_size_;
+                nu++;
+                io_count++;
             }
-            io_count++;
-            const float d = dist_to(nb_internal);
-            if (W.size() < L_current || d < W.front().dist) {
-                frontier.push_back({d, nb_internal});
-                std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
-                W.push_back({d, nb_internal});
-                std::push_heap(W.begin(), W.end(), WorkingCmp{});
-                if (W.size() > L_current) {
-                    std::pop_heap(W.begin(), W.end(), WorkingCmp{});
-                    W.pop_back();
+            // Batch distances 4 at a time.
+            uint32_t idx = 0;
+            for (; idx + 3 < nu; idx += 4) {
+                float dists[4];
+                quantizer_.lut_distance_batch4(
+                    unvisited_codes[idx], unvisited_codes[idx+1],
+                    unvisited_codes[idx+2], unvisited_codes[idx+3],
+                    anchor_lut, dists);
+                for (uint32_t b = 0; b < 4; b++) {
+                    const uint32_t id = unvisited_ids[idx + b];
+                    const float d = dists[b];
+                    if (W.size() < L_current || d < W.front().dist) {
+                        frontier.push_back({d, id});
+                        std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+                        W.push_back({d, id});
+                        std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                        if (W.size() > L_current) {
+                            std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                            W.pop_back();
+                        }
+                    }
+                }
+            }
+            // Remainder.
+            for (; idx < nu; idx++) {
+                const float d = quantizer_.lut_distance(unvisited_codes[idx], anchor_lut);
+                const uint32_t id = unvisited_ids[idx];
+                if (W.size() < L_current || d < W.front().dist) {
+                    frontier.push_back({d, id});
+                    std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+                    W.push_back({d, id});
+                    std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                    if (W.size() > L_current) {
+                        std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                        W.pop_back();
+                    }
+                }
+            }
+        } else {
+            for (uint16_t i = 0; i < n; i++) {
+                const uint32_t nb_internal =
+                    nb_ptr ? nb_ptr[i]
+                        : (store_
+                            ? get_neighbor(store_->pin_node(
+                                                best.internal_id).data,
+                                            i)
+                            : get_neighbor(
+                                node_ptr(best.internal_id), i));
+                if (store_ && !nb_ptr) {
+                    store_->unpin_node(best.internal_id);
+                }
+                if (is_visited(nb_internal)) {
+                    continue;
+                }
+                mark_visited(nb_internal);
+
+                if (io_limit > 0 && io_count >= io_limit) {
+                    continue;  // out of I/O budget: mark visited, skip distance.
+                }
+                io_count++;
+                const float d = dist_to(nb_internal);
+                if (W.size() < L_current || d < W.front().dist) {
+                    frontier.push_back({d, nb_internal});
+                    std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+                    W.push_back({d, nb_internal});
+                    std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                    if (W.size() > L_current) {
+                        std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                        W.pop_back();
+                    }
                 }
             }
         }
