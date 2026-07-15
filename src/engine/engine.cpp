@@ -163,166 +163,17 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     // 1. Resolve parameters.
     auto params = resolve_params(count_, dim_, config);
 
-    // Partitioned build (Step 11): when the monolithic graph would exceed the
-    // build RAM budget (K>1), partition into K shards, build each, then merge.
-    if (params.K > 1) {
-        auto result = build_partitioned(source, index_path, params);
-        const auto t1 = std::chrono::steady_clock::now();
-        result.build_time_sec =
-            std::chrono::duration<double>(t1 - t0).count() +
-            result.build_time_sec;
-        spdlog::info("[sextant] partitioned build complete (K={}) in {:.2f}s",
-                     params.K, result.build_time_sec);
-        return result;
-    }
-
-    // 2. Pass 1: reservoir sample + (optional) global bits probe + PQ train.
-    //    The quantizer is constructed inside pass1 once pq_bits is resolved
-    //    (auto mode runs a 4-bit recall probe on the reservoir). After pass1,
-    //    code_size_ is valid and we can size the build buffers.
-    VamanaParams vparams;
-    vparams.dim = dim_;
-    vparams.R = params.R;
-    vparams.L = params.L;
-    vparams.L_build = params.L_build;
-    vparams.alpha = params.alpha;
-    vparams.inline_pq_count = 0;  // Issue 26: always 0 during build.
-    vparams.n_entry_points = 16;
-    vparams.max_occlusion = params.max_occlusion;
-
-    auto _phase = [](const char* name, auto& t_prev) {
-        const auto now = std::chrono::steady_clock::now();
-        const double secs = std::chrono::duration<double>(now - t_prev).count();
-        spdlog::info("[sextant] phase '{}': {:.2f}s", name, secs);
-        t_prev = now;
-    };
-
-    auto t_phase = std::chrono::steady_clock::now();
-    pass1_sample_and_train(source, params);
-    _phase("pass1_sample_and_train", t_phase);
-
-    // 3. Construct the core + allocate flat buffers now that code_size_ is known.
-    //    Build ALWAYS uses inline_pq=0 flat nodes (Issue 26). The final
-    //    inline_pq layout is materialized at flush time.
-    core_ = std::make_unique<VamanaCore>(vparams, *quantizer_);
-    node_size_ = VamanaCore::static_node_size(params.R, 0,
-                                              code_size_);
-
-    // Allocate flat buffers (aligned for potential direct-IO reuse).
-    const size_t codes_bytes = static_cast<size_t>(count_) * code_size_;
-    const size_t nodes_bytes = static_cast<size_t>(count_) * node_size_;
-    codes_buffer_ = static_cast<uint8_t*>(aligned_alloc(kDiskAlign, codes_bytes));
-    nodes_buffer_ = static_cast<uint8_t*>(aligned_alloc(kDiskAlign, nodes_bytes));
-    std::memset(codes_buffer_, 0, codes_bytes);
-    std::memset(nodes_buffer_, 0, nodes_bytes);
-    if (!codes_buffer_ || !nodes_buffer_) {
-        throw Error(ErrorCode::OutOfMemory, "Engine::build: buffer alloc failed");
-    }
-#ifdef __linux__
-    // Hint the kernel to back the build buffers with transparent huge pages.
-    // The buffers are accessed randomly during graph construction; 2 MB pages
-    // reduce TLB pressure on the large (≥122 MB codes) cloud dataset. Advisory
-    // only — if THP is unavailable (containerized, low nr_hugepages) the build
-    // proceeds normally on standard 4 KB pages.
-    if (codes_bytes > 0 && madvise(codes_buffer_, codes_bytes,
-                                   MADV_HUGEPAGE) != 0) {
-        spdlog::debug("[sextant] huge pages unavailable for codes buffer, "
-                      "using standard pages");
-    }
-    if (nodes_bytes > 0 && madvise(nodes_buffer_, nodes_bytes,
-                                   MADV_HUGEPAGE) != 0) {
-        spdlog::debug("[sextant] huge pages unavailable for nodes buffer, "
-                      "using standard pages");
-    }
-#endif
-    spdlog::info("[sextant] allocating flat build buffers: codes={:.1f}MB "
-                 "nodes={:.1f}MB total={:.1f}MB (per_vec={}B)",
-                 codes_bytes / 1e6, nodes_bytes / 1e6,
-                 (codes_bytes + nodes_bytes) / 1e6,
-                 code_size_ + node_size_);
-
-    core_->set_build_codes(codes_buffer_, static_cast<uint32_t>(count_));
-    core_->set_build_nodes(nodes_buffer_);
-    core_->prepare_for_build(static_cast<uint32_t>(count_));
-
-    // Install a FlatNodeStore over the flat buffers so beam_search (used in
-    // insert_build) goes through the store interface.
-    flat_store_ = std::make_unique<FlatNodeStore>(
-        nodes_buffer_, codes_buffer_,
-        node_size_, code_size_);
-    core_->set_store(flat_store_.get());
-
-    // 4-6. The remaining pipeline passes.
-    pass2_encode(source, params);
-    _phase("pass2_encode", t_phase);
-
-    // For ADC build, load raw vectors for construct.
-    std::vector<float> raw_vecs;
-    if (params.build_mode == BuildMode::ADC) {
-        spdlog::info("[sextant] ADC build mode: loading raw vectors for construct");
-        raw_vecs.resize(static_cast<size_t>(count_) * dim_);
-        source.reset();
-        Chunk chunk{};
-        uint64_t loaded = 0;
-        while (source.next(chunk)) {
-            for (uint32_t r = 0; r < chunk.count; r++) {
-                const RowId rid = chunk.row_ids[r];
-                if (rid >= 0 && static_cast<uint64_t>(rid) < count_) {
-                    std::memcpy(raw_vecs.data() + static_cast<size_t>(rid) * dim_,
-                                chunk.vectors + static_cast<size_t>(r) * dim_,
-                                dim_ * sizeof(float));
-                    loaded++;
-                }
-            }
-        }
-        spdlog::info("[sextant] ADC: loaded {} raw vectors ({:.1f}MB)",
-                     loaded, raw_vecs.size() * sizeof(float) / 1e6);
-        core_->set_build_vecs(raw_vecs.data());
-    }
-
-    parallel_construct(params);
-    _phase("parallel_construct", t_phase);
-
-    // Raw vectors are no longer needed after construct.
-    core_->set_build_vecs(nullptr);
-
-    finalize_and_flush(params);
-    _phase("finalize_and_flush", t_phase);
-
-    // After flush, the sidecars hold the FINAL-layout graph (node_size includes
-    // inline_pq_count). Free the flat build buffers and switch the core to a
-    // PagedNodeStore so post-build search is SSD-resident.
-    const uint32_t final_node_size = VamanaCore::static_node_size(
-        params.R, params.inline_pq_count,
-        code_size_);
-    node_size_ = final_node_size;
-    flat_store_.reset();  // disconnect store before freeing buffers
-    core_->set_store(nullptr);
-    if (codes_buffer_) { aligned_free(codes_buffer_); codes_buffer_ = nullptr; }
-    if (nodes_buffer_) { aligned_free(nodes_buffer_); nodes_buffer_ = nullptr; }
-
-    paged_store_ = std::make_unique<PagedNodeStore>(
-        index_path_ + ".graph", index_path_ + ".codes",
-        final_node_size, code_size_,
-        std::max(1u, std::thread::hardware_concurrency()),
-        /*cache_size_bytes=*/64ull * 1024 * 1024);  // 64MB default cache
-    core_->set_store(paged_store_.get());
-
+    // Unified build path: K=1 (monolithic) is a special case of the
+    // partitioned path. build_partitioned handles both — K==1 builds the full
+    // graph directly into the global buffers (no partition/merge); K>1
+    // partitions into K shards, builds each at R_shard=2R/3, then merges.
+    // All optimizations (T5 dynamic L_build, THP, future work) live in one place.
+    auto result = build_partitioned(source, index_path, params);
     const auto t1 = std::chrono::steady_clock::now();
-    const double secs = std::chrono::duration<double>(t1 - t0).count();
-    spdlog::info("[sextant] build complete in {:.2f}s", secs);
-
-    opened_ = true;
-
-    BuildResult result;
-    result.index_path = index_path;
-    result.n_vectors = count_;
-    result.dim = dim_;
-    result.build_time_sec = secs;
-    result.R = params.R;
-    result.L_build = params.L_build;
-    result.pq_m = quantizer_ ? quantizer_->m() : params.pq_m;
-    result.pq_bits = quantizer_ ? quantizer_->bits() : params.pq_bits;
+    result.build_time_sec =
+        std::chrono::duration<double>(t1 - t0).count() + result.build_time_sec;
+    spdlog::info("[sextant] build complete (K={}) in {:.2f}s", params.K,
+                 result.build_time_sec);
     return result;
 }
 
@@ -997,23 +848,6 @@ void Engine::parallel_construct(const ResolvedParams& params) {
 }
 
 // ===========================================================================
-// Finalize + flush
-// ===========================================================================
-
-void Engine::finalize_and_flush(const ResolvedParams& params) {
-    spdlog::info("[sextant] finalize: computing entry points");
-    core_->compute_entry_points();
-
-    // finalize_inline_codes operates on the build (inline_pq=0) layout, which
-    // is a no-op. The final-layout inlining happens during flush below.
-    // (Issue 26: build nodes are flat; flush reformats to final node_size.)
-    core_->finalize_inline_codes();
-
-    spdlog::info("[sextant] flush: writing sidecar files");
-    flush_sidecars(params);
-}
-
-// ===========================================================================
 // Partitioned build (Step 11)
 //
 // Phases:
@@ -1033,15 +867,15 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     using engine_detail::fill_header;
     using engine_detail::read_exact;
 
-    // ADC + partitioning is a complex combination; partitioned build stays
-    // SDC-only for shard construct (RAM savings matter more than ADC quality
-    // at large scale).
-    if (params.build_mode == BuildMode::ADC) {
+    // ADC + partitioning (K>1) is a complex combination; shard construct stays
+    // SDC-only (RAM savings matter more than ADC quality at large scale). K==1
+    // is the unified monolithic path and supports ADC natively.
+    if (params.build_mode == BuildMode::ADC && params.K > 1) {
         spdlog::warn("[sextant] ADC build mode with partitioning (K>1) is not "
                      "supported; falling back to SDC for shard construct.");
     }
 
-    spdlog::info("[sextant] partitioned build: N={} K={} closure_factor={:.4f}",
+    spdlog::info("[sextant] build: N={} K={} closure_factor={:.4f}",
                  count_, params.K, params.closure_factor);
 
     // --- 1. Quantizer (global): train via pass1 (resolves pq_bits if auto) ---
@@ -1087,8 +921,73 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // PqQuantizer builds it during train() in pass1.
     pass2_encode(source, params);
 
-    // --- 2. Partition via k-means on PQ codes ---
     const uint32_t n = static_cast<uint32_t>(count_);
+
+    // =====================================================================
+    // K==1 fast path: build the full graph directly into the global buffers.
+    // This is the unified monolithic path — K=1 is a special case of the
+    // partitioned path with a single identity shard. It reuses parallel_construct
+    // (chunked work-stealing + T5 dynamic L_build progress logger) so the graph
+    // is bit-identical to the former standalone monolithic build.
+    // =====================================================================
+    if (params.K == 1) {
+        VamanaParams vp_full;
+        vp_full.dim = dim_;
+        vp_full.R = params.R;
+        vp_full.L = params.L;
+        vp_full.L_build = params.L_build;
+        vp_full.alpha = params.alpha;
+        vp_full.inline_pq_count = 0;  // build nodes are flat (Issue 26)
+        vp_full.n_entry_points = 16;
+        vp_full.max_occlusion = params.max_occlusion;
+
+        core_ = std::make_unique<VamanaCore>(vp_full, *quantizer_);
+        core_->set_build_codes(codes_buffer_, n);
+        core_->set_build_nodes(nodes_buffer_);
+        core_->prepare_for_build(n);
+
+        // FlatNodeStore over the flat buffers so beam_search (used in
+        // insert_build) goes through the store interface.
+        flat_store_ = std::make_unique<FlatNodeStore>(
+            nodes_buffer_, codes_buffer_, node_size_, code_size_);
+        core_->set_store(flat_store_.get());
+
+        // ADC build: load raw vectors for construct (monolithic parity).
+        std::vector<float> raw_vecs;
+        if (params.build_mode == BuildMode::ADC) {
+            spdlog::info("[sextant] ADC build mode: loading raw vectors for construct");
+            raw_vecs.resize(static_cast<size_t>(count_) * dim_);
+            source.reset();
+            Chunk chunk{};
+            uint64_t loaded = 0;
+            while (source.next(chunk)) {
+                for (uint32_t r = 0; r < chunk.count; r++) {
+                    const RowId rid = chunk.row_ids[r];
+                    if (rid >= 0 && static_cast<uint64_t>(rid) < count_) {
+                        std::memcpy(raw_vecs.data() +
+                                        static_cast<size_t>(rid) * dim_,
+                                    chunk.vectors +
+                                        static_cast<size_t>(r) * dim_,
+                                    dim_ * sizeof(float));
+                        loaded++;
+                    }
+                }
+            }
+            spdlog::info("[sextant] ADC: loaded {} raw vectors ({:.1f}MB)",
+                         loaded, raw_vecs.size() * sizeof(float) / 1e6);
+            core_->set_build_vecs(raw_vecs.data());
+        }
+
+        parallel_construct(params);
+
+        // Raw vectors are no longer needed after construct.
+        core_->set_build_vecs(nullptr);
+    } else {
+    // =====================================================================
+    // K>1 partitioned path: partition → per-shard build (R_shard=2R/3) → merge.
+    // =====================================================================
+
+    // --- 2. Partition via k-means on PQ codes ---
     auto assignment = partition_codes(*quantizer_, codes_buffer_, n,
                                       code_size_, params.K,
                                       params.closure_factor);
@@ -1438,7 +1337,8 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     spdlog::info("[sextant] merge complete; flushing sidecars");
 
     // Set up the master VamanaCore (full R) over the merged nodes_buffer_ for
-    // entry-point computation and final-layout inlining during flush.
+    // entry-point computation and final-layout inlining during flush. (K==1
+    // already has core_ set up over the global buffers in the fast path above.)
     VamanaParams vp_full;
     vp_full.dim = dim_;
     vp_full.R = params.R;
@@ -1452,11 +1352,34 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     core_->set_build_codes(codes_buffer_, n);
     core_->set_build_nodes(nodes_buffer_);
     core_->prepare_for_build(n);
+    }  // end K>1 partitioned branch
 
-    // --- 5. Flush (entry points + final-layout inlining + sidecars) ---
+    // --- Flush (entry points + final-layout inlining + sidecars) ---
+    // Shared by both K==1 (graph built directly) and K>1 (merged graph). For
+    // K==1, core_ is already wired to nodes_buffer_/codes_buffer_.
     core_->compute_entry_points();
     core_->finalize_inline_codes();
     flush_sidecars(params);
+
+    // Post-flush: switch from flat build buffers to a PagedNodeStore so
+    // post-build search is SSD-resident. The sidecars now hold the FINAL-layout
+    // graph (node_size includes inline_pq_count). This runs for ALL K — the
+    // partitioned path previously omitted it (left flat buffers resident and
+    // no paged store), which was an asymmetry vs the monolithic path.
+    const uint32_t final_node_size = VamanaCore::static_node_size(
+        params.R, params.inline_pq_count, code_size_);
+    node_size_ = final_node_size;
+    flat_store_.reset();  // disconnect store before freeing buffers
+    core_->set_store(nullptr);
+    if (codes_buffer_) { aligned_free(codes_buffer_); codes_buffer_ = nullptr; }
+    if (nodes_buffer_) { aligned_free(nodes_buffer_); nodes_buffer_ = nullptr; }
+
+    paged_store_ = std::make_unique<PagedNodeStore>(
+        index_path_ + ".graph", index_path_ + ".codes",
+        final_node_size, code_size_,
+        std::max(1u, std::thread::hardware_concurrency()),
+        /*cache_size_bytes=*/64ull * 1024 * 1024);  // 64MB default cache
+    core_->set_store(paged_store_.get());
 
     opened_ = true;
 

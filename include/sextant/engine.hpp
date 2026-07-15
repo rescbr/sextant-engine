@@ -169,9 +169,10 @@ private:
                                  const ResolvedParams& params);
     void pass2_encode(VectorSource& source, const ResolvedParams& params);
     void parallel_construct(const ResolvedParams& params);
-    void finalize_and_flush(const ResolvedParams& params);
 
-    /// Partitioned build (K>1): partition → per-shard build → merge → flush.
+    /// Unified build (K==1 fast path + K>1 partitioned): partition → per-shard
+    /// build → merge → flush. K==1 builds the full graph directly (no
+    /// partition/merge) and is bit-identical to the former monolithic path.
     BuildResult build_partitioned(VectorSource& source,
                                    const std::string& index_path,
                                    const ResolvedParams& params);
