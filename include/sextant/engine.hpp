@@ -11,6 +11,7 @@
 #include <sextant/config.hpp>
 #include <memory>
 #include <string>
+#include <functional>
 #include <vector>
 
 namespace sextant {
@@ -169,6 +170,15 @@ private:
                                  const ResolvedParams& params);
     void pass2_encode(VectorSource& source, const ResolvedParams& params);
     void parallel_construct(const ResolvedParams& params);
+
+    /// Core construct loop: chunked work-stealing + T5 dynamic L_build + progress
+    /// logger. Shared by K==1 (full graph) and K>1 (per-shard). The row-id mapper
+    /// translates local construct IDs to global RowIds (identity for K==1,
+    /// shard membership table for K>1).
+    void construct_into(VamanaCore& core, uint32_t count, bool adc_mode,
+                        const std::function<RowId(uint32_t)>& row_id_at,
+                        uint32_t lut_sz, uint32_t nthreads,
+                        const char* label);
 
     /// Unified build (K==1 fast path + K>1 partitioned): partition → per-shard
     /// build → merge → flush. K==1 builds the full graph directly (no

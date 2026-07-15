@@ -740,63 +740,75 @@ void Engine::parallel_construct(const ResolvedParams& params) {
                                   ? params.num_threads
                                   : std::thread::hardware_concurrency();
     const bool adc_mode = params.build_mode == BuildMode::ADC;
-    spdlog::info("[sextant] construct: {} nodes across {} threads ({})", n,
+    const uint32_t lut_sz = quantizer_ ? quantizer_->lut_size() : 0;
+    construct_into(*core_, n, adc_mode,
+                   [](uint32_t id) { return static_cast<RowId>(id); },
+                   lut_sz, nthreads, "construct");
+}
+
+// ===========================================================================
+// construct_into — the canonical parallel construct loop.
+// Chunked work-stealing + T5 dynamic L_build + progress logger.
+// Shared by K==1 (parallel_construct → identity mapper) and K>1 (shard build
+// → membership mapper). No special cases.
+// ===========================================================================
+
+void Engine::construct_into(VamanaCore& core, uint32_t count, bool adc_mode,
+                            const std::function<RowId(uint32_t)>& row_id_at,
+                            uint32_t lut_sz, uint32_t nthreads,
+                            const char* label) {
+    if (count == 0) return;
+    nthreads = std::max(1u, nthreads);
+    spdlog::info("[sextant] {}: {} nodes across {} threads ({})", label, count,
                  nthreads, adc_mode ? "ADC" : "SDC");
 
     // The very first insert must be serialized before spawning tasks: it
     // claims the entry point (see VamanaCore::insert_build_from_code /
     // insert_build).
-    const uint32_t lut_sz = quantizer_ ? quantizer_->lut_size() : 0;
     {
         VamanaTLS tls;
-        tls.resize(n);
+        tls.resize(count);
         tls.resize_lut(lut_sz);
         if (adc_mode) {
-            core_->insert_build(0, /*row_id=*/0, core_->build_vec_ptr(0), tls);
+            core.insert_build(0, /*row_id=*/row_id_at(0),
+                              core.build_vec_ptr(0), tls);
         } else {
-            core_->insert_build_from_code(0, /*row_id=*/0, tls);
+            core.insert_build_from_code(0, /*row_id=*/row_id_at(0), tls);
         }
+    }
+
+    const uint32_t lo = 1;
+    const uint32_t hi = count;
+    if (hi <= lo) {
+        spdlog::info("[sextant] {}: only entry-point node (n=1)", label);
+        return;
     }
 
     // Thread pool with per-thread VamanaTLS scratch.
     ctpl::thread_pool_tls<VamanaTLS> pool(
         nthreads,
-        [n, lut_sz](size_t /*tid*/, std::shared_ptr<VamanaTLS>& tls) {
+        [count, lut_sz](size_t /*tid*/, std::shared_ptr<VamanaTLS>& tls) {
             tls = std::make_shared<VamanaTLS>();
-            tls->resize(n);
+            tls->resize(count);
             tls->resize_lut(lut_sz);
         });
 
     // Dynamic work-stealing: threads pull node IDs from a shared atomic
-    // counter. This balances load — early nodes (small graph, cheap
-    // beam_search) and late nodes (dense graph, expensive) are distributed
-    // across all threads rather than stranding slow threads with the hardest
-    // tail of a static partition.
-    //
-    // Chunked stealing (Opt 4): each fetch_add grabs a chunk of IDs (rather
-    // than one), reducing atomic-counter contention by ~chunk_size×. The
-    // chunk is small enough (64) that load imbalance stays bounded.
-    const uint32_t lo = 1;
-    const uint32_t hi = n;
-    if (hi <= lo) {
-        spdlog::info("[sextant] construct: only entry-point node (n=1)");
-        return;
-    }
-
+    // counter. Chunked stealing (kChunk=64): each fetch_add grabs a chunk of
+    // IDs, reducing atomic-counter contention by ~chunk_size×.
     constexpr uint32_t kChunk = 64;
     std::atomic<uint32_t> next_id{lo};
-    core_->set_build_progress(&next_id);
-    auto worker = [this, hi, adc_mode, &next_id](size_t /*tid*/, VamanaTLS& tls) {
-        VamanaCore& core = *core_;
+    core.set_build_progress(&next_id);
+    auto worker = [&core, &row_id_at, adc_mode, hi,
+                   &next_id](size_t /*tid*/, VamanaTLS& tls) {
         uint32_t chunk_lo;
         while ((chunk_lo = next_id.fetch_add(kChunk, std::memory_order_relaxed)) < hi) {
             const uint32_t chunk_hi = std::min(chunk_lo + kChunk, hi);
             for (uint32_t id = chunk_lo; id < chunk_hi; id++) {
                 if (adc_mode) {
-                    core.insert_build(id, static_cast<RowId>(id),
-                                      core.build_vec_ptr(id), tls);
+                    core.insert_build(id, row_id_at(id), core.build_vec_ptr(id), tls);
                 } else {
-                    core.insert_build_from_code(id, static_cast<RowId>(id), tls);
+                    core.insert_build_from_code(id, row_id_at(id), tls);
                 }
             }
         }
@@ -807,9 +819,7 @@ void Engine::parallel_construct(const ResolvedParams& params) {
         futs.push_back(pool.push(worker));
     }
 
-    // Progress logger: a separate thread that reads the atomic counter every
-    // 5s and logs throughput + ETA. Zero contention with workers — just a
-    // relaxed read of next_id. Joined before we call f.get().
+    // Progress logger: reads the atomic counter every 5s. Zero contention.
     std::thread logger([&]() {
         const auto t_start = std::chrono::steady_clock::now();
         auto t_last = t_start;
@@ -828,8 +838,8 @@ void Engine::parallel_construct(const ResolvedParams& params) {
             const double rate = processed / elapsed;
             const uint32_t remaining = (hi - lo) - processed;
             const double eta = rate > 0 ? remaining / rate : 0;
-            spdlog::info("[sextant] construct: {}/{} nodes ({:.0f}/s, ETA {:.0f}s)",
-                         processed + 1, hi - lo,
+            spdlog::info("[sextant] {}: {}/{} nodes ({:.0f}/s, ETA {:.0f}s)",
+                         label, processed + 1, hi - lo,
                          interval_processed / interval, eta);
             if (done >= hi) break;
             last_done = done;
@@ -837,14 +847,13 @@ void Engine::parallel_construct(const ResolvedParams& params) {
         }
     });
 
-    // Wait for all tasks; rethrow the first exception encountered.
     for (auto& f : futs) {
         f.get();
     }
     logger.join();
-    core_->set_build_progress(nullptr);
+    core.set_build_progress(nullptr);
 
-    spdlog::info("[sextant] construct: all {} nodes inserted", n);
+    spdlog::info("[sextant] {}: all {} nodes inserted", label, count);
 }
 
 // ===========================================================================
@@ -1060,48 +1069,17 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         core.set_build_nodes(shard_nodes);
         core.prepare_for_build(shard_n);
 
-        // First insert must be serialized (entry-point claim).
+        // Parallel construct via the canonical loop (chunked work-stealing,
+        // T5 dynamic L_build, progress logger). Row IDs remapped to global.
         const uint32_t shard_lut_sz = quantizer_ ? quantizer_->lut_size() : 0;
-        {
-            VamanaTLS tls;
-            tls.resize(shard_n);
-            tls.resize_lut(shard_lut_sz);
-            core.insert_build_from_code(0, /*row_id=*/members[0], tls);
-        }
-
-        // Parallel construct over local IDs [1, shard_n).
         const uint32_t nthreads = params.num_threads > 0
                                       ? params.num_threads
                                       : std::thread::hardware_concurrency();
-        ctpl::thread_pool_tls<VamanaTLS> pool(
-            std::max<uint32_t>(1, nthreads),
-            [shard_n, shard_lut_sz](size_t /*tid*/, std::shared_ptr<VamanaTLS>& tls) {
-                tls = std::make_shared<VamanaTLS>();
-                tls->resize(shard_n);
-                tls->resize_lut(shard_lut_sz);
-            });
-
-        const uint32_t lo = 1;
-        const uint32_t hi = shard_n;
-        std::vector<std::future<void>> futs;
-        if (hi > lo) {
-            std::atomic<uint32_t> next_id{lo};
-            core.set_build_progress(&next_id);
-            auto worker = [&core, &members, hi,
-                            &next_id](size_t /*tid*/, VamanaTLS& tls) {
-                uint32_t id;
-                while ((id = next_id.fetch_add(
-                            1, std::memory_order_relaxed)) < hi) {
-                    core.insert_build_from_code(
-                        id, static_cast<RowId>(members[id]), tls);
-                }
-            };
-            for (uint32_t t = 0; t < nthreads; t++) {
-                futs.push_back(pool.push(worker));
-            }
-            for (auto& f : futs) f.get();
-            core.set_build_progress(nullptr);
-        }
+        const std::string shard_label = "shard " + std::to_string(k) + "/" + std::to_string(K);
+        construct_into(
+            core, shard_n, /*adc_mode=*/false,
+            [&members](uint32_t local_id) { return static_cast<RowId>(members[local_id]); },
+            shard_lut_sz, nthreads, shard_label.c_str());
         // Shard built; node buffer retained in shard_node_bufs[k].
     }
 
