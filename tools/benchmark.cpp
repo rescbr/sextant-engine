@@ -383,10 +383,26 @@ int main(int argc, char* argv[]) {
                         // k-th true NN. ratio = d_target / d_result (>=1 = at or
                         // inside target). For degenerate near-zero distances we
                         // treat co-located vectors as perfectly matching.
-                        if (have_gt_dists) {
-                            const float d_target =
-                                gt.dists[static_cast<size_t>(qi) * gt.k +
-                                         (gt_k - 1)];
+                        //
+                        // IMPORTANT: d_target is recomputed from the base vectors
+                        // using L2sq (matching d_result), NOT from gt.dists.
+                        // GT files may store cosine distance, L2, or L2sq
+                        // depending on the tool that generated them — using a
+                        // mismatched metric makes the ratio meaningless.
+                        if (have_gt_dists && base_in_ram) {
+                            // Recompute the k-th true NN distance in L2sq.
+                            const uint32_t gt_kth_id =
+                                gt.ids[static_cast<size_t>(qi) * gt.k +
+                                       (gt_k - 1)];
+                            float d_target;
+                            if (gt_kth_id < bh.n) {
+                                const float* bv_kth =
+                                    &base_all[static_cast<size_t>(gt_kth_id) * dim];
+                                d_target = l2sq_distance(q, bv_kth, dim);
+                            } else {
+                                d_target = gt.dists[static_cast<size_t>(qi) * gt.k +
+                                                     (gt_k - 1)];
+                            }
                             for (const auto& [d, r] : topk_scored) {
                                 if (r < 0) continue;
                                 double ratio;
