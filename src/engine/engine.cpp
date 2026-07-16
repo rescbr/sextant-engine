@@ -1177,19 +1177,23 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         VamanaCore::set_inline_pq_count(out_node, 0);
 
         ++visit_token;
-        std::vector<std::pair<float, uint32_t>> cands;
-        cands.reserve(adj[gid].size());
-        const uint8_t* my_code =
-            codes_buffer_ + static_cast<size_t>(gid) * code_size_;
-        for (uint32_t gnb : adj[gid]) {
-            if (gnb == gid) continue;
-            if (seen[gnb] == visit_token) continue;  // dedup
-            seen[gnb] = visit_token;
-            const uint8_t* nb_code =
-                codes_buffer_ + static_cast<size_t>(gnb) * code_size_;
-            const float d = quantizer_->code_distance(my_code, nb_code);
-            cands.emplace_back(d, gnb);
-        }
+         std::vector<std::pair<float, uint32_t>> cands;
+         cands.reserve(adj[gid].size());
+         const float16_t* my_vec =
+             raw_vecs_buffer_ + static_cast<size_t>(gid) * dim_;
+         for (uint32_t gnb : adj[gid]) {
+             if (gnb == gid) continue;
+             if (seen[gnb] == visit_token) continue;  // dedup
+             seen[gnb] = visit_token;
+             const float16_t* nb_vec =
+                 raw_vecs_buffer_ + static_cast<size_t>(gnb) * dim_;
+             const float d = raw_vecs_buffer_
+                 ? l2sq_f16(my_vec, nb_vec, dim_)
+                 : quantizer_->code_distance(
+                       codes_buffer_ + static_cast<size_t>(gid) * code_size_,
+                       codes_buffer_ + static_cast<size_t>(gnb) * code_size_);
+             cands.emplace_back(d, gnb);
+         }
         // Free the adjacency now that we've consumed it.
         std::vector<uint32_t>().swap(adj[gid]);
 
@@ -1278,25 +1282,28 @@ BuildResult Engine::build_partitioned(VectorSource& source,
             }
             for (auto& [rep, members] : comp_map) {
                 if (rep == root_rep) continue;
-                // Find nearest (comp_member, root_sample) pair by SDC.
-                float best_d = std::numeric_limits<float>::max();
-                uint32_t best_c = members[0];
-                uint32_t best_r = root_sample[0];
-                for (uint32_t c : members) {
-                    const uint8_t* cc =
-                        codes_buffer_ + static_cast<size_t>(c) * code_size_;
-                    for (uint32_t r : root_sample) {
-                        const uint8_t* rc =
-                            codes_buffer_ +
-                            static_cast<size_t>(r) * code_size_;
-                        const float d = quantizer_->code_distance(cc, rc);
-                        if (d < best_d) {
-                            best_d = d;
-                            best_c = c;
-                            best_r = r;
-                        }
-                    }
-                }
+                 // Find nearest (comp_member, root_sample) pair by FP16 L2sq.
+                 float best_d = std::numeric_limits<float>::max();
+                 uint32_t best_c = members[0];
+                 uint32_t best_r = root_sample[0];
+                 for (uint32_t c : members) {
+                     const float16_t* cv =
+                         raw_vecs_buffer_ + static_cast<size_t>(c) * dim_;
+                     for (uint32_t r : root_sample) {
+                         const float16_t* rv =
+                             raw_vecs_buffer_ + static_cast<size_t>(r) * dim_;
+                         const float d = raw_vecs_buffer_
+                             ? l2sq_f16(cv, rv, dim_)
+                             : quantizer_->code_distance(
+                                 codes_buffer_ + static_cast<size_t>(c) * code_size_,
+                                 codes_buffer_ + static_cast<size_t>(r) * code_size_);
+                         if (d < best_d) {
+                             best_d = d;
+                             best_c = c;
+                             best_r = r;
+                         }
+                     }
+                 }
                 // Add bidirectional edge best_c ↔ best_r. Append to each
                 // node's neighbor list (both have room since R_shard*... but
                 // final R may be full). We overwrite the last neighbor slot if

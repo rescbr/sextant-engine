@@ -24,6 +24,54 @@ namespace sextant {
 struct PqQuantizer;
 struct ResolvedParams;  // defined in engine.hpp; only the factory needs the full type.
 
+#if defined(__ARM_FEATURE_SVE) || defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define SEXTANT_HAS_NEON 1
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#define SEXTANT_HAS_AVX2 1
+#endif
+
+/// L2-squared distance between two FP16 vectors. FP32 accumulation (no overflow),
+/// FP16 per-element precision. Used by the FP16 prune occlusion check and the
+/// partitioned-build merge truncation.
+inline float l2sq_f16(const float16_t* a, const float16_t* b, uint32_t dim) {
+#if defined(SEXTANT_HAS_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    uint32_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t va = vcvt_f32_f16(vld1_f16(a + i));
+        float32x4_t vb = vcvt_f32_f16(vld1_f16(b + i));
+        float32x4_t diff = vsubq_f32(va, vb);
+        acc = vfmaq_f32(acc, diff, diff);
+    }
+    float r = vaddvq_f32(acc);
+    for (; i < dim; i++) { float diff = static_cast<float>(a[i]) - static_cast<float>(b[i]); r += diff * diff; }
+    return r;
+#elif defined(SEXTANT_HAS_AVX2) && defined(__F16C__)
+    __m256 acc = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 va = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)));
+        __m256 vb = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i)));
+        __m256 diff = _mm256_sub_ps(va, vb);
+        acc = _mm256_fmadd_ps(diff, diff, acc);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float r = _mm_cvtss_f32(sum);
+    for (; i < dim; i++) { float diff = static_cast<float>(a[i]) - static_cast<float>(b[i]); r += diff * diff; }
+    return r;
+#else
+    float r = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) { float diff = static_cast<float>(a[i]) - static_cast<float>(b[i]); r += diff * diff; }
+    return r;
+#endif
+}
+
 /// Parameters for the Vamana graph.
 struct VamanaParams {
     Dim dim = 0;
