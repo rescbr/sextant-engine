@@ -20,6 +20,11 @@ using InternalId = uint32_t;
 /// Dimensionality of vectors.
 using Dim = uint32_t;
 
+/// Half-precision float for build-time distance computation (FP16 prune).
+/// Maps to the compiler's native __fp16 (ARM NEON + x86 F16C). The meson build
+/// verifies hardware FP16 support at configure time.
+using float16_t = __fp16;
+
 /// Metric kind for distance computation.
 enum class MetricKind : uint8_t {
     /// Squared Euclidean distance. The build metric always.

@@ -156,6 +156,7 @@ Engine::Engine() {
 Engine::~Engine() {
     if (codes_buffer_) aligned_free(codes_buffer_);
     if (nodes_buffer_) aligned_free(nodes_buffer_);
+    if (raw_vecs_buffer_) aligned_free(raw_vecs_buffer_);
 }
 
 // ===========================================================================
@@ -950,6 +951,46 @@ BuildResult Engine::build_partitioned(VectorSource& source,
 
     const uint32_t n = static_cast<uint32_t>(count_);
 
+    // Load raw vectors as FP16 for the FP16 prune. Used by BOTH K=1 (full
+    // graph) and K>1 (per-shard copy). In ADC mode, these are also used for
+    // beam_search LUTs (upconverted to FP32 per insert). In SDC mode, they
+    // enable the FP16 prune (exact FP16 L2sq occlusion check instead of PQ
+    // code_distance). Stored as FP16 (half the RAM of FP32) and consumed
+    // directly by l2sq_f16 — no per-call conversion.
+    {
+        const size_t vecs_bytes =
+            static_cast<size_t>(count_) * dim_ * sizeof(float16_t);
+        raw_vecs_buffer_ = static_cast<float16_t*>(
+            aligned_alloc(kDiskAlign, vecs_bytes));
+        if (!raw_vecs_buffer_) {
+            throw Error(ErrorCode::OutOfMemory,
+                        "build_partitioned: raw_vecs_buffer_ alloc failed");
+        }
+        spdlog::info("[sextant] loading raw vectors as FP16 ({:.1f}MB) for "
+                     "{} prune",
+                     vecs_bytes / 1e6,
+                     params.build_mode == BuildMode::ADC ? "ADC" : "SDC (FP16)");
+        source.reset();
+        Chunk chunk{};
+        uint64_t loaded = 0;
+        while (source.next(chunk)) {
+            for (uint32_t r = 0; r < chunk.count; r++) {
+                const RowId rid = chunk.row_ids[r];
+                if (rid >= 0 && static_cast<uint64_t>(rid) < count_) {
+                    float16_t* dst = raw_vecs_buffer_ +
+                                  static_cast<size_t>(rid) * dim_;
+                    const float* src = chunk.vectors +
+                                       static_cast<size_t>(r) * dim_;
+                    for (uint32_t d = 0; d < dim_; d++) {
+                        dst[d] = static_cast<float16_t>(src[d]);
+                    }
+                    loaded++;
+                }
+            }
+        }
+        spdlog::info("[sextant] loaded {} raw vectors as FP16", loaded);
+    }
+
     // =====================================================================
     // K==1 fast path: build the full graph directly into the global buffers.
     // This is the unified monolithic path — K=1 is a special case of the
@@ -973,38 +1014,11 @@ BuildResult Engine::build_partitioned(VectorSource& source,
             nodes_buffer_, codes_buffer_, node_size_, code_size_);
         core_->set_store(flat_store_.get());
 
-        // Load raw vectors for construct. In ADC mode, these are needed for
-        // beam_search LUTs. In SDC mode, they enable the FP16 prune hybrid
-        // (exact FP16 L2sq occlusion check instead of PQ code_distance).
-        // K=1 monolithic builds always fit the vectors in RAM at target scale
-        // (1.34M × 768d × 4B = 4.1GB), so we always load them.
-        std::vector<float> raw_vecs;
-        spdlog::info("[sextant] {} build mode: loading raw vectors for construct",
-                     params.build_mode == BuildMode::ADC ? "ADC" : "SDC (FP16 prune)");
-        raw_vecs.resize(static_cast<size_t>(count_) * dim_);
-        source.reset();
-        Chunk chunk{};
-        uint64_t loaded = 0;
-        while (source.next(chunk)) {
-            for (uint32_t r = 0; r < chunk.count; r++) {
-                const RowId rid = chunk.row_ids[r];
-                if (rid >= 0 && static_cast<uint64_t>(rid) < count_) {
-                    std::memcpy(raw_vecs.data() +
-                                    static_cast<size_t>(rid) * dim_,
-                                chunk.vectors +
-                                    static_cast<size_t>(r) * dim_,
-                                dim_ * sizeof(float));
-                    loaded++;
-                }
-            }
-        }
-        spdlog::info("[sextant] loaded {} raw vectors ({:.1f}MB)",
-                     loaded, raw_vecs.size() * sizeof(float) / 1e6);
-        core_->set_build_vecs(raw_vecs.data());
+        core_->set_build_vecs(raw_vecs_buffer_);
 
         parallel_construct(params);
 
-        // Raw vectors are no longer needed after construct.
+        // Raw vectors are no longer needed after construct (for K=1).
         core_->set_build_vecs(nullptr);
     } else {
     // =====================================================================
@@ -1049,13 +1063,17 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                      "{} threads)",
                      k, K, shard_n,
                      (static_cast<double>(shard_n) *
-                          (code_size_ + shard_node_size)) /
+                          (code_size_ + shard_node_size +
+                           static_cast<size_t>(dim_) * sizeof(float16_t))) /
                          1e6,
                      params.num_threads);
 
         // Contiguous shard codes: local index i → members[i]'s global code.
         std::vector<uint8_t> shard_codes(
             static_cast<size_t>(shard_n) * code_size_, 0);
+        // Contiguous shard FP16 vectors: same mapping, for the FP16 prune.
+        std::vector<float16_t> shard_vecs(
+            static_cast<size_t>(shard_n) * dim_, 0);
         shard_local_to_global[k].resize(shard_n);
         for (uint32_t i = 0; i < shard_n; i++) {
             const uint32_t gid = members[i];
@@ -1064,6 +1082,10 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                             static_cast<size_t>(i) * code_size_,
                         codes_buffer_ + static_cast<size_t>(gid) * code_size_,
                         code_size_);
+            std::memcpy(shard_vecs.data() +
+                            static_cast<size_t>(i) * dim_,
+                        raw_vecs_buffer_ + static_cast<size_t>(gid) * dim_,
+                        dim_ * sizeof(float16_t));
         }
 
         // Shard node buffer (aligned for direct-IO reuse).
@@ -1077,6 +1099,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         VamanaCore core(vp_shard, *quantizer_);
         core.set_build_codes(shard_codes_ptr, shard_n);
         core.set_build_nodes(shard_nodes);
+        core.set_build_vecs(shard_vecs.data());
         core.prepare_for_build(shard_n);
 
         // Parallel construct via the canonical loop (chunked work-stealing,
@@ -1355,6 +1378,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     core_->set_store(nullptr);
     if (codes_buffer_) { aligned_free(codes_buffer_); codes_buffer_ = nullptr; }
     if (nodes_buffer_) { aligned_free(nodes_buffer_); nodes_buffer_ = nullptr; }
+    if (raw_vecs_buffer_) { aligned_free(raw_vecs_buffer_); raw_vecs_buffer_ = nullptr; }
 
     paged_store_ = std::make_unique<PagedNodeStore>(
         index_path_ + ".graph", index_path_ + ".codes",
@@ -1737,10 +1761,17 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
     //    insert_build handles the first-node case (becomes an entry point)
     //    and the general case (beam_search → robust_prune → connect_and_prune).
     //    It also bumps core_->count_ to internal_id + 1.
+    //    build_vecs_ is not set in the live-insert path, so the prune uses
+    //    adc_vec directly as the FP16 prune query.
     VamanaTLS tls;
     tls.resize(static_cast<uint32_t>(count_));
     tls.resize_lut(quantizer_ ? quantizer_->lut_size() : 0);
-    core_->insert_build(new_internal, row_id, vec, tls);
+    // Upconvert the incoming FP32 vector to FP16 for insert_build (ADC mode).
+    std::vector<float16_t> fp16_vec(dim_);
+    for (uint32_t d = 0; d < dim_; d++) {
+        fp16_vec[d] = static_cast<float16_t>(vec[d]);
+    }
+    core_->insert_build(new_internal, row_id, fp16_vec.data(), tls);
 
     spdlog::info("[sextant] insert: row_id={} internal_id={} (count now {})",
                  row_id, new_internal, count_);

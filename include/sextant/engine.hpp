@@ -146,6 +146,7 @@ private:
     // Flat-in-RAM build buffers (owned by Engine during build).
     uint8_t* codes_buffer_ = nullptr;   // count × code_size
     uint8_t* nodes_buffer_ = nullptr;   // count × node_size
+    float16_t* raw_vecs_buffer_ = nullptr; // count × dim, FP16 (build prune)
     uint32_t code_size_ = 0;
     uint32_t node_size_ = 0;
 

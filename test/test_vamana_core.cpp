@@ -181,7 +181,7 @@ TEST(VamanaCore, InsertBuildFromVector) {
     const uint16_t R = 6;
     TestGraph g(N, R, /*L=*/12);
 
-    std::vector<float> vec(g.params.dim, 0.0f);
+    std::vector<float16_t> vec(g.params.dim, static_cast<float16_t>(0));
     VamanaTLS tls;
     tls.resize(N);
     tls.resize_lut(g.quant.lut_size());

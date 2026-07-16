@@ -41,6 +41,39 @@ else
     endif
 endif
 
+# --- FP16 support (required for FP16 prune) -----------------------------------
+# Sextant requires hardware FP16 support for the build-time prune occlusion check.
+# On ARM: NEON (any AArch64). On x86: F16C (Haswell 2013+).
+#
+# We DETECT support but do NOT force-add -mf16c. If the user passes -march=native
+# or -mcpu=neoverse-v2 (which enable F16C implicitly on capable hardware), the
+# detection passes. Forcing -mf16c would conflict with architecture-specific flags.
+fp16_ok = cpp.compiles('''
+    #if defined(__x86_64__) || defined(__i386__)
+    #include <immintrin.h>
+    int main() {
+        __m128i h = _mm_setzero_si128();
+        __m256 f = _mm256_cvtph_ps(h);
+        (void)f;
+        return 0;
+    }
+    #elif defined(__aarch64__) || defined(__ARM_NEON)
+    #include <arm_neon.h>
+    int main() {
+        float16x4_t h = vdup_n_f16(0);
+        float32x4_t f = vcvt_f32_f16(h);
+        (void)f;
+        return 0;
+    }
+    #else
+    #error unsupported architecture
+    #endif
+''')
+if not fp16_ok
+    error('Sextant requires hardware FP16 support (NEON on ARM, F16C on x86). ' +
+          'Ensure -march=native or -mf16c is enabled, or build on AArch64.')
+endif
+
 # --- Third-party dependencies -------------------------------------------------
 
 # nsync: built as a native Meson subproject (Meson's cmake converter doesn't

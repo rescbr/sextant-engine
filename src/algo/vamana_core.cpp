@@ -21,10 +21,12 @@
 #include <queue>
 #include <thread>
 
-// --- FP16 L2-squared distance (FP16 prune hybrid) ---------------------------
-// Used by robust_prune_into for the occlusion check. Inputs are FP32 vectors;
-// they are narrowed to FP16 and widened back, giving FP16 per-element precision
-// with FP32 accumulation (avoids FP16 accumulation overflow at high dim).
+// --- FP16 L2-squared distance (native FP16 storage) ------------------------
+// Used by robust_prune_into for the occlusion check. Inputs are native float16_t
+// vectors (build_vecs_ is stored as FP16). The function loads FP16 values and
+// converts to FP32 for accumulation (avoids FP16 accumulation overflow at high
+// dim) while retaining FP16 per-element precision (~0.5% worst-case). On NEON,
+// vld1_f16 + vcvt_f32_f16 gives a clean 4-wide pipeline.
 #if defined(__ARM_FEATURE_SVE) || defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #define SEXTANT_HAS_NEON 1
@@ -37,32 +39,22 @@ namespace sextant {
 
 namespace {
 
-/// L2-squared distance between two FP32 vectors, computed with FP16-rounded
-/// inputs. Each element is narrowed to FP16 then widened back to FP32, so the
-/// multiply-accumulate runs in FP32 (no accumulation overflow) but the per-
-/// element precision is FP16 (~0.05% worst-case). This trades a tiny amount of
-/// precision for: (a) matching the metric used by AISAQ's exact-float prune
-/// much more closely than PQ (~3.6% distortion), and (b) on NEON, the FP16
-/// conversion is cheap (VCVT). Sufficient for the alpha=1.2 occlusion slack.
-inline float l2sq_f16(const float* a, const float* b, uint32_t dim) {
+/// L2-squared distance between two native FP16 vectors. FP32 accumulation
+/// (no overflow), FP16 per-element precision. Sufficient for alpha=1.2
+/// occlusion slack.
+inline float l2sq_f16(const float16_t* a, const float16_t* b, uint32_t dim) {
 #if defined(SEXTANT_HAS_NEON)
     float32x4_t acc = vdupq_n_f32(0.0f);
     uint32_t i = 0;
     for (; i + 4 <= dim; i += 4) {
-        // FP32 → FP16 → FP32 roundtrip (vcvt works on the low half of a
-        // float32x4_t / float16x4_t pair). This rounds each element to FP16.
-        float32x4_t va = vcvt_f32_f16(vcvt_f16_f32(vld1q_f32(a + i)));
-        float32x4_t vb = vcvt_f32_f16(vcvt_f16_f32(vld1q_f32(b + i)));
+        float32x4_t va = vcvt_f32_f16(vld1_f16(a + i));
+        float32x4_t vb = vcvt_f32_f16(vld1_f16(b + i));
         float32x4_t diff = vsubq_f32(va, vb);
         acc = vfmaq_f32(acc, diff, diff);
     }
     float result = vaddvq_f32(acc);
-    // Scalar remainder for dim not divisible by 4.
     for (; i < dim; i++) {
-        // Manually round to FP16 precision for the tail (via __fp16 conversion).
-        __fp16 ha = static_cast<__fp16>(a[i]);
-        __fp16 hb = static_cast<__fp16>(b[i]);
-        float diff = static_cast<float>(ha) - static_cast<float>(hb);
+        float diff = static_cast<float>(a[i]) - static_cast<float>(b[i]);
         result += diff * diff;
     }
     return result;
@@ -70,21 +62,13 @@ inline float l2sq_f16(const float* a, const float* b, uint32_t dim) {
     __m256 acc = _mm256_setzero_ps();
     uint32_t i = 0;
     for (; i + 8 <= dim; i += 8) {
-        // _mm256_cvtph_ps(_mm_cvtps_ph(x, 0)) rounds to FP16 and back.
-        __m256 va = _mm256_cvtph_ps(_mm_cvtps_ph(_mm256_castps256_ps128(
-            _mm256_loadu_ps(a + i)), 0));
-        __m256 va_hi = _mm256_cvtph_ps(_mm_cvtps_ph(_mm256_extractf128_ps(
-            _mm256_loadu_ps(a + i), 1), 0));
-        __m256 vb = _mm256_cvtph_ps(_mm_cvtps_ph(_mm256_castps256_ps128(
-            _mm256_loadu_ps(b + i)), 0));
-        __m256 vb_hi = _mm256_cvtph_ps(_mm_cvtps_ph(_mm256_extractf128_ps(
-            _mm256_loadu_ps(b + i), 1), 0));
-        __m256 diff_lo = _mm256_sub_ps(va, vb);
-        __m256 diff_hi = _mm256_sub_ps(va_hi, vb_hi);
-        acc = _mm256_fmadd_ps(diff_lo, diff_lo, acc);
-        acc = _mm256_fmadd_ps(diff_hi, diff_hi, acc);
+        __m256 va = _mm256_cvtph_ps(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)));
+        __m256 vb = _mm256_cvtph_ps(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i)));
+        __m256 diff = _mm256_sub_ps(va, vb);
+        acc = _mm256_fmadd_ps(diff, diff, acc);
     }
-    // Horizontal sum of 8 lanes.
     __m128 lo = _mm256_castps256_ps128(acc);
     __m128 hi = _mm256_extractf128_ps(acc, 1);
     __m128 sum = _mm_add_ps(lo, hi);
@@ -92,21 +76,15 @@ inline float l2sq_f16(const float* a, const float* b, uint32_t dim) {
     sum = _mm_hadd_ps(sum, sum);
     float result = _mm_cvtss_f32(sum);
     for (; i < dim; i++) {
-        __m128 va = _mm_cvtph_ps(_mm_cvtps_ph(
-            _mm_set_ss(a[i]), 0));
-        __m128 vb = _mm_cvtph_ps(_mm_cvtps_ph(
-            _mm_set_ss(b[i]), 0));
-        float diff = _mm_cvtss_f32(va) - _mm_cvtss_f32(vb);
+        float diff = static_cast<float>(a[i]) - static_cast<float>(b[i]);
         result += diff * diff;
     }
     return result;
 #else
-    // Scalar fallback: round each element to FP16 via __fp16.
+    // Scalar fallback.
     float result = 0.0f;
     for (uint32_t i = 0; i < dim; i++) {
-        __fp16 ha = static_cast<__fp16>(a[i]);
-        __fp16 hb = static_cast<__fp16>(b[i]);
-        float diff = static_cast<float>(ha) - static_cast<float>(hb);
+        float diff = static_cast<float>(a[i]) - static_cast<float>(b[i]);
         result += diff * diff;
     }
     return result;
@@ -726,7 +704,7 @@ void VamanaCore::beam_search_into(
 void VamanaCore::robust_prune_into(
     const std::vector<Candidate>& candidates, std::vector<Candidate>& out,
     uint16_t R, float alpha, VamanaTLS& tls, uint32_t max_occlusion_size,
-    bool presorted, const float* query_vec) const {
+    bool presorted, const float16_t* query_vec) const {
     out.clear();
     // Cap the candidate pool (mirrors DiskANN's maxc cap).
     const size_t in_n = (max_occlusion_size > 0 &&
@@ -755,7 +733,7 @@ void VamanaCore::robust_prune_into(
         // FP16 L2sq (replacing the PQ distance from beam_search). The PQ
         // ordering ≠ FP16 ordering, so we must re-sort afterward.
         for (size_t i = 0; i < buf.size(); i++) {
-            const float* pp_vec =
+            const float16_t* pp_vec =
                 build_vecs_ + static_cast<size_t>(buf[i].row_id) * params_.dim;
             buf[i].dist = l2sq_f16(query_vec, pp_vec, params_.dim);
         }
@@ -804,18 +782,20 @@ void VamanaCore::robust_prune_into(
             // The candidate→candidate distance and the query→candidate
             // distance (buf[].dist, already recomputed above) are both FP16
             // L2sq, so the occlusion rule is self-consistent.
-            const float* p_vec = vec_at(p_idx);
+            const float16_t* p_vec = vec_at(p_idx);
             for (size_t pp_idx = p_idx + 1; pp_idx < n; pp_idx++) {
                 if (removed[pp_idx]) {
                     continue;
                 }
-                const float* pp_vec = vec_at(pp_idx);
+                const float16_t* pp_vec = vec_at(pp_idx);
                 const float d_pp = l2sq_f16(p_vec, pp_vec, params_.dim);
                 if (alpha * d_pp <= buf[pp_idx].dist)
                     removed[pp_idx] = 1;
             }
         } else {
-            // PQ code_distance occlusion check (original path).
+            // PQ code_distance occlusion check (fallback for tests / untrained
+            // quantizers where build_vecs_ is null). The primary build path
+            // always sets build_vecs_ and uses the FP16 path above.
             const uint8_t* p_code = code_at(p_idx);
 
             // Batch4 occlusion check: collect up to 4 non-removed candidates,
@@ -961,12 +941,12 @@ void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
 }
 
 void VamanaCore::insert_build(uint32_t internal_id, RowId row_id,
-                                const float* vec, VamanaTLS& tls) {
+                                const float16_t* vec, VamanaTLS& tls) {
     insert_build_core(internal_id, row_id, tls, vec);
 }
 
 void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
-                                     VamanaTLS& tls, const float* adc_vec) {
+                                     VamanaTLS& tls, const float16_t* adc_vec) {
     // SDC mode requires the build_codes_ buffer (own PQ code); ADC needs only
     // build_nodes_. build_nodes_ is always required.
     if (!build_nodes_ || (adc_vec == nullptr && !build_codes_)) {
@@ -1009,12 +989,18 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     const uint8_t* sdc_anchor = nullptr;
     const float* anchor_lut = nullptr;
     if (adc_vec != nullptr) {
-        // ADC: LUT from raw vector. Reuse the thread-local LUT scratch — no
-        // per-insert heap allocation.
+        // ADC: LUT from raw vector. preprocess_query needs FP32, so upconvert
+        // the FP16 vector once per insert into TLS scratch (~200ns for dim=768).
         const uint32_t lut_sz = quantizer_.lut_size();
         float* lut_ptr = tls.lut_buffer.data();
         if (lut_sz > 0) {
-            quantizer_.preprocess_query(adc_vec, lut_ptr);
+            if (tls.fp32_scratch.size() < params_.dim) {
+                tls.fp32_scratch.resize(params_.dim);
+            }
+            for (uint32_t d = 0; d < params_.dim; d++) {
+                tls.fp32_scratch[d] = static_cast<float>(adc_vec[d]);
+            }
+            quantizer_.preprocess_query(tls.fp32_scratch.data(), lut_ptr);
             query_lut = lut_ptr;
         }
     } else {
@@ -1063,7 +1049,7 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     // presorted is only honored on the PQ path (beam_search output is ascending
     // by PQ dist). On the FP16 path, robust_prune_into re-sorts after
     // recomputing distances, so presorted is ignored.
-    const float* prune_query_vec = nullptr;
+    const float16_t* prune_query_vec = nullptr;
     if (adc_vec != nullptr) {
         prune_query_vec = adc_vec;
     } else if (build_vecs_ != nullptr) {

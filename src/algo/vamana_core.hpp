@@ -58,6 +58,7 @@ struct VamanaTLS {
     /// Built once per insert_build_from_code; 8KB (m=32,K=256), L1-resident.
     std::vector<float> anchor_lut;
     std::vector<uint8_t> removed_flags;  // robust_prune removed bitset (bytes, not bools)
+    std::vector<float> fp32_scratch;  // FP16→FP32 upconvert for ADC preprocess_query
     std::mt19937 rng;
     uint32_t visit_token = 0;
 
@@ -86,15 +87,17 @@ public:
     void insert_build_from_code(uint32_t internal_id, RowId row_id,
                                 VamanaTLS& tls);
 
-    /// Insert a node during parallel build (from raw vector, ADC mode).
-    void insert_build(uint32_t internal_id, RowId row_id, const float* vec,
+    /// Insert a node during parallel build (from raw FP16 vector, ADC mode).
+    /// The vector is used to build the distance LUT and as the prune query.
+    void insert_build(uint32_t internal_id, RowId row_id, const float16_t* vec,
                       VamanaTLS& tls);
 
     /// Shared build-insert core. When `adc_vec` is null the node is inserted
     /// in SDC mode (LUT built from its own PQ code); otherwise ADC mode
-    /// (LUT built from the raw vector via preprocess_query).
+    /// (LUT built from the raw vector via preprocess_query). `adc_vec` is
+    /// FP16 — it is upconverted to FP32 once per insert for preprocess_query.
     void insert_build_core(uint32_t internal_id, RowId row_id, VamanaTLS& tls,
-                           const float* adc_vec);
+                           const float16_t* adc_vec);
 
     /// BeamSearch from entry points. Returns candidates.
     /// When `sdc_anchor` is non-null, distances are computed via direct
@@ -127,17 +130,18 @@ public:
     /// beam_search output, which is already ascending).
     ///
     /// When `query_vec` is non-null AND build_vecs_ is set, the occlusion check
-    /// uses FP16 L2-squared distances (computed from raw float vectors) instead
-    /// of PQ code_distance. This closes the recall gap caused by PQ distortion
-    /// (~3.6%) flipping occlusion decisions. Both the query→candidate distance
-    /// (buf[].dist) and the candidate→candidate distance (d(p,pp)) are
+    /// uses FP16 L2-squared distances (computed directly from raw FP16 vectors)
+    /// instead of PQ code_distance. This closes the recall gap caused by PQ
+    /// distortion (~3.6%) flipping occlusion decisions. Both the query→candidate
+    /// distance (buf[].dist) and the candidate→candidate distance (d(p,pp)) are
     /// recomputed as FP16 L2sq so both sides of the occlusion rule use the same
-    /// metric. When `query_vec` is null, falls back to the existing PQ path.
+    /// metric. When `query_vec` is null, falls back to the existing PQ path
+    /// (tests / untrained quantizers).
     void robust_prune_into(const std::vector<Candidate>& candidates,
                            std::vector<Candidate>& out, uint16_t R, float alpha,
                            VamanaTLS& tls, uint32_t max_occlusion_size,
                            bool presorted = false,
-                           const float* query_vec = nullptr) const;
+                           const float16_t* query_vec = nullptr) const;
 
     /// Connect new node to selected neighbors and prune reciprocal edges.
     void connect_and_prune(uint32_t new_internal_id,
@@ -169,12 +173,12 @@ public:
     // --- Setters for build buffers ---
     void set_build_codes(const uint8_t* codes, uint32_t count);
     void set_build_nodes(uint8_t* nodes);
-    void set_build_vecs(const float* vecs) { build_vecs_ = vecs; }
+    void set_build_vecs(const float16_t* vecs) { build_vecs_ = vecs; }
     void clear_build_buffers();
 
-    /// Pointer to the raw float vector for `internal_id` (ADC build mode).
+    /// Pointer to the raw FP16 vector for `internal_id` (ADC build + FP16 prune).
     /// Only valid when set_build_vecs() has been called with a count×dim buffer.
-    const float* build_vec_ptr(uint32_t internal_id) const {
+    const float16_t* build_vec_ptr(uint32_t internal_id) const {
         return build_vecs_ + static_cast<size_t>(internal_id) * params_.dim;
     }
 
@@ -207,7 +211,7 @@ private:
     // Flat-in-RAM build buffers (Issue 13).
     const uint8_t* build_codes_ = nullptr;  // count × code_size
     uint8_t* build_nodes_ = nullptr;        // count × node_size
-    const float* build_vecs_ = nullptr;     // count × dim raw vectors (ADC mode)
+    const float16_t* build_vecs_ = nullptr;     // count × dim raw vectors (FP16)
 
     // NodeStore for read access (search + build both go through this). When
     // null, beam_search falls back to the flat buffers directly.
