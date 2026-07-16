@@ -695,59 +695,57 @@ void Engine::pass1_sample_and_train(VectorSource& source,
 
 void Engine::pass2_encode(VectorSource& source,
                           const ResolvedParams& params) {
-    spdlog::info("[sextant] pass 2: encoding {} vectors ({} threads)", count_,
-                 params.num_threads);
-
-    // Option C (per the plan): read all vectors into a contiguous flat buffer
-    // keyed by row_id, then parallel-encode with work-stealing. The .fbin is
-    // read sequentially once; each encode() is independent (nearest-centroid
-    // per segment, no shared mutable state), so it parallelizes cleanly.
-
-    // 1. Materialize all vectors into a flat buffer: vecs[rid * dim_ + ...].
-    std::vector<float> flat_vecs(static_cast<size_t>(count_) * dim_);
-    source.reset();
-    Chunk chunk{};
-    uint64_t loaded = 0;
-    while (source.next(chunk)) {
-        for (uint32_t r = 0; r < chunk.count; r++) {
-            const RowId rid = chunk.row_ids[r];
-            if (rid < 0 || static_cast<uint64_t>(rid) >= count_) {
-                throw Error(ErrorCode::InvalidParam,
-                            "Engine::pass2: row_id out of range");
-            }
-            std::memcpy(flat_vecs.data() + static_cast<size_t>(rid) * dim_,
-                        chunk.vectors + static_cast<size_t>(r) * dim_,
-                        dim_ * sizeof(float));
-            loaded++;
-        }
-    }
-
-    // 2. Parallel encode with atomic-counter work-stealing (same pattern as
-    //    parallel_construct). Each thread encodes disjoint row_ids into the
-    //    appropriate slot of codes_buffer_.
     const uint32_t nthreads = params.num_threads > 0
                                   ? params.num_threads
                                   : std::thread::hardware_concurrency();
-    const uint32_t n = static_cast<uint32_t>(count_);
-    std::atomic<uint32_t> next_id{0};
-    auto worker = [this, &flat_vecs, n, &next_id]() {
-        const PqQuantizer& q = *quantizer_;
-        uint32_t id;
-        while ((id = next_id.fetch_add(1, std::memory_order_relaxed)) < n) {
-            const float* vec = flat_vecs.data() +
-                               static_cast<size_t>(id) * dim_;
-            q.encode(vec, codes_buffer_ +
-                              static_cast<size_t>(id) * code_size_);
+
+    spdlog::info("[sextant] pass 2: encoding {} vectors ({} threads)", count_,
+                 nthreads);
+
+    // Streaming encode: pull vectors one chunk at a time and parallel-encode
+    // each chunk directly into codes_buffer_ at the vector's row_id slot.
+    // This avoids materializing the full dataset into a transient flat buffer
+    // (peak RAM is now chunk_size × dim × 4, not N × dim × 4).
+    source.reset();
+    Chunk chunk{};
+    uint64_t encoded = 0;
+
+    while (source.next(chunk)) {
+        const uint32_t chunk_n = chunk.count;
+        if (chunk_n == 0) continue;
+
+        // Parallel encode with atomic-counter work-stealing (same pattern as
+        // parallel_construct). Each thread encodes disjoint row_ids into the
+        // appropriate slot of codes_buffer_. encode() is const (reads only the
+        // codebook, writes only its disjoint output slot) → thread-safe.
+        std::atomic<uint32_t> next_r{0};
+        auto worker = [this, &chunk, chunk_n, &next_r]() {
+            const PqQuantizer& q = *quantizer_;
+            uint32_t r;
+            while ((r = next_r.fetch_add(1, std::memory_order_relaxed))
+                   < chunk_n) {
+                const RowId rid = chunk.row_ids[r];
+                if (rid < 0 || static_cast<uint64_t>(rid) >= count_) {
+                    throw Error(ErrorCode::InvalidParam,
+                                "Engine::pass2: row_id out of range");
+                }
+                const float* vec =
+                    chunk.vectors + static_cast<size_t>(r) * dim_;
+                q.encode(vec,
+                         codes_buffer_ + static_cast<size_t>(rid) * code_size_);
+            }
+        };
+
+        std::vector<std::thread> pool;
+        for (uint32_t t = 0; t < std::min(nthreads, chunk_n); t++) {
+            pool.emplace_back(worker);
         }
-    };
+        for (auto& th : pool) th.join();
 
-    std::vector<std::thread> pool;
-    for (uint32_t t = 0; t < std::min(nthreads, n); t++) {
-        pool.emplace_back(worker);
+        encoded += chunk_n;
     }
-    for (auto& th : pool) th.join();
 
-    spdlog::info("[sextant] pass 2: encoded {} vectors", loaded);
+    spdlog::info("[sextant] pass 2: encoded {} vectors", encoded);
 }
 
 // ===========================================================================
