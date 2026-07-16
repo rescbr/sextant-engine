@@ -200,7 +200,7 @@ struct MiniGraph {
     std::unique_ptr<FlatNodeStore> store_;
 
     MiniGraph(MetricKind metric, Dim dim, uint16_t pq_m, uint8_t pq_bits,
-              const float* pool, uint32_t n)
+              const float* pool, uint32_t n, float alpha = 1.2f)
         : quantizer(metric, dim, pq_m, pq_bits), pool_n(n) {
         quantizer.train(pool, n);
         code_sz = quantizer.code_size();
@@ -214,6 +214,7 @@ struct MiniGraph {
         VamanaParams vp =
             VamanaParams::from_resolved(sextant::ResolvedParams{}, dim,
                                         /*R_override=*/32);
+        vp.alpha = alpha;  // override prune occlusion aggressiveness
 
         core_ = std::make_unique<VamanaCore>(vp, quantizer);
         core_->prepare_for_build(n);
@@ -315,6 +316,37 @@ struct ConfigRow {
     std::array<double, kNoRerankLs.size()> no_rerank_proximity;
     bool cheapest_eligible;
 };
+
+/// Run an alpha sweep on the probe pool: build mini-graphs at several alpha
+/// values using the recommended PQ config and measure proximity at L=200.
+/// Alpha controls prune occlusion aggressiveness; the optimal value is
+/// dataset-dependent (some datasets prefer dense graphs, others sparse).
+/// Returns the alpha with the highest proximity.
+float sweep_alpha(MetricKind metric, Dim dim, uint16_t pq_m, uint8_t pq_bits,
+                  const float* pool, uint32_t pool_n, const Truth& truth,
+                  const std::vector<uint32_t>& qidx) {
+    static constexpr std::array<float, 4> kAlphas = {{1.0f, 1.1f, 1.2f, 1.5f}};
+    constexpr uint32_t kAlphaL = 200;
+
+    std::cout << "\n  Alpha sweep (m=" << pq_m << "/"
+              << static_cast<int>(pq_bits) << ", L=" << kAlphaL << "):\n";
+
+    float best_alpha = 1.2f;
+    double best_proximity = -1.0;
+    for (float a : kAlphas) {
+        MiniGraph mg(metric, dim, pq_m, pq_bits, pool, pool_n, a);
+        auto sr = search_no_rerank(mg, pool, dim, kAlphaL, truth, qidx);
+        std::cout << "    α=" << std::fixed << std::setprecision(1) << a
+                  << "  proximity=" << std::setprecision(3) << sr.proximity;
+        if (a == 1.2f) std::cout << "  ← current default";
+        std::cout << "\n";
+        if (sr.proximity > best_proximity) {
+            best_proximity = sr.proximity;
+            best_alpha = a;
+        }
+    }
+    return best_alpha;
+}
 
 int cmd_analyze(int argc, char* argv[]) {
     cmdline::parser p;
@@ -693,8 +725,20 @@ int cmd_analyze(int argc, char* argv[]) {
                       << "    but proximity measures neighborhood quality.\n";
         }
 
+        // ── Alpha sweep ──
+        // Build mini-graphs at several alpha values using the recommended PQ
+        // config. Alpha controls prune occlusion aggressiveness; the optimal
+        // value is dataset-dependent (some datasets prefer dense graphs,
+        // others sparse).
+        const float rec_alpha = sweep_alpha(
+            metric, dim, rec_m, rec_bits, pool.data(), pool_n, truth, qidx);
+
         std::cout << "\n  Build with: --pq-m " << rec_m << " --pq-bits "
-                  << static_cast<int>(rec_bits) << "\n";
+                  << static_cast<int>(rec_bits);
+        if (rec_alpha != 1.2f) {
+            std::cout << " --alpha " << std::setprecision(1) << rec_alpha;
+        }
+        std::cout << "\n";
 
         std::cout << "\n  NOTE: " << (use_id_recall ? "Id-recall" : "Proximity")
                   << " is measured without rerank on a " << pool_n
@@ -791,8 +835,21 @@ int cmd_analyze(int argc, char* argv[]) {
         }
     }
 
+    // ── Alpha sweep ──
+    // Build mini-graphs at several alpha values using the recommended PQ
+    // config. Alpha controls prune occlusion aggressiveness; the optimal
+    // value is dataset-dependent (some datasets prefer dense graphs,
+    // others sparse).
+    const float rec_alpha = sweep_alpha(
+        metric, dim, rec_m, rec_bits, pool.data(), pool_n, truth, qidx);
+
     std::cout << "\n  Build with: --pq-m " << rec_m << " --pq-bits "
-              << static_cast<int>(rec_bits) << "\n";
+              << static_cast<int>(rec_bits);
+    if (rec_alpha != 1.2f) {
+        std::cout << " --alpha " << std::fixed << std::setprecision(1)
+                  << rec_alpha;
+    }
+    std::cout << "\n";
 
     std::cout << "\n  NOTE: Proximity is measured without rerank on a "
               << pool_n << "-vector mini-graph — a conservative lower bound\n"
