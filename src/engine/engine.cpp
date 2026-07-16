@@ -58,6 +58,26 @@ using engine_detail::read_exact;
 using engine_detail::write_padded;
 
 // ---------------------------------------------------------------------------
+// VamanaParams::from_resolved — factory used by all build/search cores.
+// Defined here (not in vamana_core.cpp) because it needs the full
+// ResolvedParams definition from engine.hpp.
+// ---------------------------------------------------------------------------
+VamanaParams VamanaParams::from_resolved(const ResolvedParams& p, Dim dim,
+                                           uint16_t R_override,
+                                           uint16_t inline_pq) {
+    VamanaParams v;
+    v.dim = dim;
+    v.R = R_override ? R_override : p.R;
+    v.L = p.L;
+    v.L_build = p.L_build;
+    v.alpha = p.alpha;
+    v.inline_pq_count = inline_pq;
+    v.n_entry_points = 16;
+    v.max_occlusion = p.max_occlusion;
+    return v;
+}
+
+// ---------------------------------------------------------------------------
 // Node layout offsets (mirror vamana_core.cpp — kept private to the engine).
 // ---------------------------------------------------------------------------
 namespace {
@@ -940,15 +960,9 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // is bit-identical to the former standalone monolithic build.
     // =====================================================================
     if (params.K == 1) {
-        VamanaParams vp_full;
-        vp_full.dim = dim_;
-        vp_full.R = params.R;
-        vp_full.L = params.L;
-        vp_full.L_build = params.L_build;
-        vp_full.alpha = params.alpha;
-        vp_full.inline_pq_count = 0;  // build nodes are flat (Issue 26)
-        vp_full.n_entry_points = 16;
-        vp_full.max_occlusion = params.max_occlusion;
+        // K==1 full-graph build core. inline_pq=0 (build layout is flat).
+        VamanaParams vp_full =
+            VamanaParams::from_resolved(params, dim_, 0, 0);
 
         core_ = std::make_unique<VamanaCore>(vp_full, *quantizer_);
         core_->set_build_codes(codes_buffer_, n);
@@ -1018,15 +1032,10 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     std::vector<std::vector<uint32_t>> shard_local_to_global(K);
 
     // Build a single VamanaParams template; R/L per shard.
-    VamanaParams vp_shard;
-    vp_shard.dim = dim_;
-    vp_shard.R = R_shard;
-    vp_shard.L = params.L;
-    vp_shard.L_build = params.L_build;
-    vp_shard.alpha = params.alpha;
-    vp_shard.inline_pq_count = 0;
-    vp_shard.n_entry_points = 16;
-    vp_shard.max_occlusion = params.max_occlusion;
+    // Build a single VamanaParams template; R/L per shard. R_shard is the
+    // per-shard degree (2R/3); inline_pq=0 (build layout is flat).
+    VamanaParams vp_shard =
+        VamanaParams::from_resolved(params, dim_, R_shard, 0);
 
     for (uint32_t k = 0; k < K; k++) {
         auto& members = assignment.shards[k];
@@ -1317,15 +1326,9 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // Set up the master VamanaCore (full R) over the merged nodes_buffer_ for
     // entry-point computation and final-layout inlining during flush. (K==1
     // already has core_ set up over the global buffers in the fast path above.)
-    VamanaParams vp_full;
-    vp_full.dim = dim_;
-    vp_full.R = params.R;
-    vp_full.L = params.L;
-    vp_full.L_build = params.L_build;
-    vp_full.alpha = params.alpha;
-    vp_full.inline_pq_count = 0;
-    vp_full.n_entry_points = 16;
-    vp_full.max_occlusion = params.max_occlusion;
+    // K>1 merged-graph build core. inline_pq=0 (build layout is flat).
+    VamanaParams vp_full =
+        VamanaParams::from_resolved(params, dim_, 0, 0);
     core_ = std::make_unique<VamanaCore>(vp_full, *quantizer_);
     core_->set_build_codes(codes_buffer_, n);
     core_->set_build_nodes(nodes_buffer_);
@@ -1506,87 +1509,107 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
     }
 
     // ----- .meta (serialized quantizer + entry points + params) -----
+    // PageShuffle: remap entry points from build (old) IDs to BFS (new) IDs
+    // so the search path starts at the correct disk positions.
     {
-        const std::string path = index_path_ + ".meta";
-        DirectFile f(path, true);
-        SidecarHeader h;
-        fill_header(h, kMagicMeta, count_, dim_, uuid);
-        write_padded(f, &h, sizeof(h), 0);
-
-        // Serialize the quantizer.
-        std::vector<uint8_t> qblob;
-        quantizer_->serialize(qblob);
-        uint64_t qsize = qblob.size();
-        // Payload layout: [u64 quantizer_size][quantizer_bytes]
-        //                 [u16 entry_point_count][entry_point_count × u32]
-        //                 [ResolvedParams POD block]
-        std::vector<uint8_t> payload;
-        payload.insert(payload.end(),
-                       reinterpret_cast<uint8_t*>(&qsize),
-                       reinterpret_cast<uint8_t*>(&qsize) + sizeof(qsize));
-        payload.insert(payload.end(), qblob.begin(), qblob.end());
-
         const auto& eps = core_->entry_points();
-        // PageShuffle: remap entry points from build (old) IDs to BFS (new)
-        // IDs so the search path starts at the correct disk positions.
         std::vector<uint32_t> remapped_eps;
         remapped_eps.reserve(eps.size());
         for (uint32_t ep : eps) {
             remapped_eps.push_back(ep < n ? remap[ep] : ep);
         }
-        uint16_t ep_count = static_cast<uint16_t>(remapped_eps.size());
-        payload.insert(payload.end(),
-                       reinterpret_cast<uint8_t*>(&ep_count),
-                       reinterpret_cast<uint8_t*>(&ep_count) + sizeof(ep_count));
-        for (uint32_t ep : remapped_eps) {
-            payload.insert(payload.end(),
-                           reinterpret_cast<uint8_t*>(&ep),
-                           reinterpret_cast<uint8_t*>(&ep) + sizeof(ep));
-        }
-
-        // Append the resolved params as a POD block so open() can rebuild the
-        // VamanaCore with the same R/L/alpha/inline_pq/max_occlusion.
-        ResolvedParams p = params;  // copy
-        payload.insert(payload.end(),
-                       reinterpret_cast<uint8_t*>(&p),
-                       reinterpret_cast<uint8_t*>(&p) + sizeof(p));
-
-        write_padded(f, payload.data(), payload.size(), sizeof(h));
-        f.sync();
-        spdlog::info("[sextant] wrote {} ({} bytes payload, {} entry points)",
-                     path, payload.size(), remapped_eps.size());
+        write_meta_file(params, remapped_eps, uuid);
     }
 
     // ----- .manifest (atomic commit — written LAST via temp + rename) -----
-    {
-        const std::string path = index_path_ + ".manifest";
-        const std::string tmp = path + ".tmp";
-        {
-            DirectFile f(tmp, true);
-            SidecarHeader h;
-            fill_header(h, kMagicManifest, count_, dim_, uuid);
-            write_padded(f, &h, sizeof(h), 0);
-            // The manifest is the commit point. We record the four sidecar
-            // basenames + a "ready" marker.
-            std::string commit =
-                std::string("ready\n") +
-                std::to_string(count_) + "\n" +
-                std::to_string(dim_) + "\n" +
-                std::to_string(params.R) + "\n" +
-                std::to_string(params.pq_m) + "\n";
-            write_padded(f, commit.data(), commit.size(), sizeof(h));
-            f.sync();
-        }
-        // Atomic rename: the manifest appears all at once, signaling a
-        // complete, consistent build.
-        std::error_code ec;
-        std::filesystem::rename(tmp, path, ec);
-        if (ec) {
-            throw Error(ErrorCode::IoError,
-                        "Engine::flush: manifest rename failed: " + ec.message());
-        }
-        spdlog::info("[sextant] wrote {} (commit point)", path);
+    write_manifest_file(params, uuid);
+}
+
+// ===========================================================================
+// write_meta_file / write_manifest_file — shared .meta and .manifest writers.
+//
+// Both flush_sidecars (build path) and flush (post-insert path) emit the same
+// .meta payload (serialized quantizer + entry points + ResolvedParams) and the
+// same .manifest commit point. The only caller-specific detail is the entry-
+// point vector: flush_sidecars BFS-remaps build IDs to disk positions, while
+// flush passes core_->entry_points() verbatim (buffers are already final).
+// Callers prepare the entry-point vector and pass it in.
+// ===========================================================================
+
+void Engine::write_meta_file(const ResolvedParams& params,
+                              const std::vector<uint32_t>& entry_points,
+                              const std::pair<uint64_t, uint64_t>& uuid) {
+    const std::string path = index_path_ + ".meta";
+    DirectFile f(path, true);
+    SidecarHeader h;
+    fill_header(h, kMagicMeta, count_, dim_, uuid);
+    write_padded(f, &h, sizeof(h), 0);
+
+    // Serialize the quantizer.
+    std::vector<uint8_t> qblob;
+    quantizer_->serialize(qblob);
+    uint64_t qsize = qblob.size();
+    // Payload layout: [u64 quantizer_size][quantizer_bytes]
+    //                 [u16 entry_point_count][entry_point_count × u32]
+    //                 [ResolvedParams POD block]
+    std::vector<uint8_t> payload;
+    payload.insert(payload.end(),
+                   reinterpret_cast<uint8_t*>(&qsize),
+                   reinterpret_cast<uint8_t*>(&qsize) + sizeof(qsize));
+    payload.insert(payload.end(), qblob.begin(), qblob.end());
+
+    uint16_t ep_count = static_cast<uint16_t>(entry_points.size());
+    payload.insert(payload.end(),
+                   reinterpret_cast<uint8_t*>(&ep_count),
+                   reinterpret_cast<uint8_t*>(&ep_count) + sizeof(ep_count));
+    for (uint32_t ep : entry_points) {
+        payload.insert(payload.end(),
+                       reinterpret_cast<uint8_t*>(&ep),
+                       reinterpret_cast<uint8_t*>(&ep) + sizeof(ep));
     }
+
+    // Append the resolved params as a POD block so open() can rebuild the
+    // VamanaCore with the same R/L/alpha/inline_pq/max_occlusion.
+    ResolvedParams p = params;  // copy
+    payload.insert(payload.end(),
+                   reinterpret_cast<uint8_t*>(&p),
+                   reinterpret_cast<uint8_t*>(&p) + sizeof(p));
+
+    write_padded(f, payload.data(), payload.size(), sizeof(h));
+    f.sync();
+    spdlog::info("[sextant] wrote {} ({} bytes payload, {} entry points)",
+                 path, payload.size(), entry_points.size());
+}
+
+void Engine::write_manifest_file(const ResolvedParams& params,
+                                  const std::pair<uint64_t, uint64_t>& uuid) {
+    const std::string path = index_path_ + ".manifest";
+    const std::string tmp = path + ".tmp";
+    {
+        DirectFile f(tmp, true);
+        SidecarHeader h;
+        fill_header(h, kMagicManifest, count_, dim_, uuid);
+        write_padded(f, &h, sizeof(h), 0);
+        // The manifest is the commit point. We record the four sidecar
+        // basenames + a "ready" marker.
+        std::string commit =
+            std::string("ready\n") +
+            std::to_string(count_) + "\n" +
+            std::to_string(dim_) + "\n" +
+            std::to_string(params.R) + "\n" +
+            std::to_string(params.pq_m) + "\n";
+        write_padded(f, commit.data(), commit.size(), sizeof(h));
+        f.sync();
+    }
+    // Atomic rename: the manifest appears all at once, signaling a
+    // complete, consistent build.
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        throw Error(ErrorCode::IoError,
+                    "Engine::flush: manifest rename failed: " + ec.message());
+    }
+    spdlog::info("[sextant] wrote {} (commit point)", path);
 }
 
 // ===========================================================================
@@ -1771,65 +1794,12 @@ void Engine::flush() {
     }
 
     // ----- .meta (quantizer + entry points + params) -----
-    {
-        const std::string path = index_path_ + ".meta";
-        DirectFile f(path, true);
-        SidecarHeader h;
-        fill_header(h, kMagicMeta, count_, dim_, uuid);
-        write_padded(f, &h, sizeof(h), 0);
-
-        std::vector<uint8_t> qblob;
-        quantizer_->serialize(qblob);
-        uint64_t qsize = qblob.size();
-        std::vector<uint8_t> payload;
-        payload.insert(payload.end(),
-                       reinterpret_cast<uint8_t*>(&qsize),
-                       reinterpret_cast<uint8_t*>(&qsize) + sizeof(qsize));
-        payload.insert(payload.end(), qblob.begin(), qblob.end());
-
-        const auto& eps = core_->entry_points();
-        uint16_t ep_count = static_cast<uint16_t>(eps.size());
-        payload.insert(payload.end(),
-                       reinterpret_cast<uint8_t*>(&ep_count),
-                       reinterpret_cast<uint8_t*>(&ep_count) + sizeof(ep_count));
-        for (uint32_t ep : eps) {
-            payload.insert(payload.end(),
-                           reinterpret_cast<uint8_t*>(&ep),
-                           reinterpret_cast<uint8_t*>(&ep) + sizeof(ep));
-        }
-        ResolvedParams p = params;
-        payload.insert(payload.end(),
-                       reinterpret_cast<uint8_t*>(&p),
-                       reinterpret_cast<uint8_t*>(&p) + sizeof(p));
-        write_padded(f, payload.data(), payload.size(), sizeof(h));
-        f.sync();
-    }
+    // Post-insert: entry points are already in final disk layout, so pass
+    // them verbatim.
+    write_meta_file(params, core_->entry_points(), uuid);
 
     // ----- .manifest (atomic commit) -----
-    {
-        const std::string path = index_path_ + ".manifest";
-        const std::string tmp = path + ".tmp";
-        {
-            DirectFile f(tmp, true);
-            SidecarHeader h;
-            fill_header(h, kMagicManifest, count_, dim_, uuid);
-            write_padded(f, &h, sizeof(h), 0);
-            std::string commit =
-                std::string("ready\n") +
-                std::to_string(count_) + "\n" +
-                std::to_string(dim_) + "\n" +
-                std::to_string(params.R) + "\n" +
-                std::to_string(params.pq_m) + "\n";
-            write_padded(f, commit.data(), commit.size(), sizeof(h));
-            f.sync();
-        }
-        std::error_code ec;
-        std::filesystem::rename(tmp, path, ec);
-        if (ec) {
-            throw Error(ErrorCode::IoError,
-                        "Engine::flush: manifest rename failed: " + ec.message());
-        }
-    }
+    write_manifest_file(params, uuid);
 
     spdlog::info("[sextant] flush: sidecars rewritten (count={})", count_);
 }

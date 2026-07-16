@@ -12,6 +12,7 @@
 //   benchmark --index myindex --queries query.fbin --base-data base.fbin \
 //             --ground-truth gt.gt --k 10 --L 200 --rerank 10
 
+#include "fbin_io.hpp"
 #include "sextant/config.hpp"
 #include "sextant/engine.hpp"
 #include "sextant/error.hpp"
@@ -41,47 +42,7 @@ using sextant::Error;
 using sextant::ErrorCode;
 using Clock = std::chrono::steady_clock;
 using US = std::chrono::duration<double, std::micro>;
-
-// ---------------------------------------------------------------------------
-// .fbin / .gt readers.
-// ---------------------------------------------------------------------------
-
-struct FbinHeader {
-    uint32_t n = 0;
-    uint32_t dim = 0;
-};
-
-bool read_fbin_header(const std::string& path, FbinHeader& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    f.read(reinterpret_cast<char*>(&out.n), sizeof(out.n));
-    f.read(reinterpret_cast<char*>(&out.dim), sizeof(out.dim));
-    return f.good();
-}
-
-/// Read a single vector (row `idx`) from a .fbin file into `out`.
-bool read_fbin_vector(const std::string& path, uint32_t dim, uint64_t idx,
-                      std::vector<float>& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    const uint64_t off = 8 + idx * static_cast<uint64_t>(dim) * sizeof(float);
-    f.seekg(off);
-    if (!f.good()) return false;
-    out.resize(dim);
-    f.read(reinterpret_cast<char*>(out.data()),
-           static_cast<std::streamsize>(dim * sizeof(float)));
-    return f.good();
-}
-
-/// Exact L2-squared distance.
-float l2sq_distance(const float* a, const float* b, uint32_t dim) {
-    float acc = 0.0f;
-    for (uint32_t i = 0; i < dim; i++) {
-        const float d = a[i] - b[i];
-        acc += d * d;
-    }
-    return acc;
-}
+using namespace sextant::fbin_io;  // FbinHeader, read_fbin_header, read_fbin_vector, l2sq_distance
 
 // ---------------------------------------------------------------------------
 // Ground-truth .gt reader: [uint32 n][uint32 k][n×k uint32 ids][n×k float dists].

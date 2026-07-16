@@ -209,15 +209,11 @@ struct MiniGraph {
             quantizer.encode(pool + static_cast<size_t>(i) * dim,
                              codes.data() + static_cast<size_t>(i) * code_sz);
 
-        VamanaParams vp;
-        vp.dim = dim;
-        vp.R = 32;
-        vp.L = 100;
-        vp.L_build = 100;
-        vp.alpha = 1.2f;
-        vp.inline_pq_count = 0;
-        vp.n_entry_points = 16;
-        vp.max_occlusion = 750;
+        // Defaults (R=32, L=100, alpha=1.2, max_occlusion=750) match a default
+        // ResolvedParams with R overridden to 32. inline_pq=0 (build layout).
+        VamanaParams vp =
+            VamanaParams::from_resolved(sextant::ResolvedParams{}, dim,
+                                        /*R_override=*/32);
 
         core_ = std::make_unique<VamanaCore>(vp, quantizer);
         core_->prepare_for_build(n);

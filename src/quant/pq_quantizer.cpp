@@ -409,14 +409,15 @@ bool PqQuantizer::build_code_lut(const uint8_t* code, float* out) const {
 float PqQuantizer::code_distance(const uint8_t* code_a,
                                  const uint8_t* code_b) const {
     if (cross_distance_table_.empty()) {
-        // Fallback: compute from codebook directly (shouldn't happen after
-        // train() or deserialize()).
+        // Fallback: compute from codebook directly. Reached by stub/untrained
+        // quantizers (e.g. VamanaCore unit tests); train()/deserialize() build
+        // the table for production paths.
         float acc = 0.0f;
         for (uint32_t s = 0; s < m_; s++) {
             const uint32_t ca = read_code(code_a, bits_, s);
             const uint32_t cb = read_code(code_b, bits_, s);
             const float* book =
-                codebook_.data() + size_t(s) * K_ * sub_dim_;
+                codebook_.data() + size_t(s) * K_ * K_ * sub_dim_;
             const float* va = book + ca * sub_dim_;
             const float* vb = book + cb * sub_dim_;
             switch (metric_) {
@@ -460,8 +461,10 @@ void PqQuantizer::code_distance_batch4(const uint8_t* anchor,
                                        const uint8_t* code_b1,
                                        const uint8_t* code_b2,
                                        const uint8_t* code_b3,
-                                       float* out) const {
+                                        float* out) const {
     if (cross_distance_table_.empty()) {
+        // Fallback: delegate to scalar code_distance (reached by stub/untrained
+        // quantizers, e.g. VamanaCore unit tests).
         out[0] = code_distance(anchor, code_b0);
         out[1] = code_distance(anchor, code_b1);
         out[2] = code_distance(anchor, code_b2);

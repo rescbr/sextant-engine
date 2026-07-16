@@ -244,15 +244,9 @@ void Engine::load_sidecars() {
         code_size_);
 
     // --- Reconstruct the VamanaCore with the loaded params ---
-    VamanaParams vparams;
-    vparams.dim = dim_;
-    vparams.R = params.R;
-    vparams.L = params.L;
-    vparams.L_build = params.L_build;
-    vparams.alpha = params.alpha;
-    vparams.inline_pq_count = params.inline_pq_count;
-    vparams.n_entry_points = 16;
-    vparams.max_occlusion = params.max_occlusion;
+    // Search core uses the resolved inline_pq_count (nodes carry inline codes).
+    VamanaParams vparams =
+        VamanaParams::from_resolved(params, dim_, 0, params.inline_pq_count);
     core_ = std::make_unique<VamanaCore>(vparams, *quantizer_);
     core_->prepare_for_build(static_cast<uint32_t>(count_));
 

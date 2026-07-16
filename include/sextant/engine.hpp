@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <functional>
+#include <utility>
 #include <vector>
 
 namespace sextant {
@@ -189,6 +190,19 @@ private:
 
     /// Flush sidecar files (Issue 32: ring-buffered).
     void flush_sidecars(const ResolvedParams& params);
+
+    /// Write the .meta sidecar (serialized quantizer + entry points + params).
+    /// `entry_points` is already in final disk layout (BFS-remapped by the
+    /// build path, verbatim by the post-insert path). Shared by flush_sidecars
+    /// and flush.
+    void write_meta_file(const ResolvedParams& params,
+                         const std::vector<uint32_t>& entry_points,
+                         const std::pair<uint64_t, uint64_t>& uuid);
+
+    /// Write the .manifest sidecar (atomic commit point). Shared by
+    /// flush_sidecars and flush.
+    void write_manifest_file(const ResolvedParams& params,
+                             const std::pair<uint64_t, uint64_t>& uuid);
 
     /// Load sidecar files for search.
     void load_sidecars();

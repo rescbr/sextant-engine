@@ -504,9 +504,15 @@ void VamanaCore::beam_search_into(
         // makes batching the code pointers complex).
         // -----------------------------------------------------------------
 
-        const bool can_batch = (anchor_lut != nullptr) && (store_ == nullptr);
+        const bool can_batch =
+            ((anchor_lut != nullptr) || (query_lut != nullptr)) &&
+            (store_ == nullptr);
 
         if (can_batch) {
+            // SDC build uses the per-anchor LUT (anchor_lut); ADC build uses
+            // the per-query LUT (query_lut). lut_distance(_batch4) takes a
+            // plain const float* LUT, so either works.
+            const float* batch_lut = anchor_lut ? anchor_lut : query_lut;
             // Collect unvisited neighbor ids (already copied into nb_ptr).
             uint32_t unvisited_ids[1024];
             const uint8_t* unvisited_codes[1024];
@@ -529,7 +535,7 @@ void VamanaCore::beam_search_into(
                 quantizer_.lut_distance_batch4(
                     unvisited_codes[idx], unvisited_codes[idx+1],
                     unvisited_codes[idx+2], unvisited_codes[idx+3],
-                    anchor_lut, dists);
+                    batch_lut, dists);
                 for (uint32_t b = 0; b < 4; b++) {
                     const uint32_t id = unvisited_ids[idx + b];
                     const float d = dists[b];
@@ -547,7 +553,7 @@ void VamanaCore::beam_search_into(
             }
             // Remainder.
             for (; idx < nu; idx++) {
-                const float d = quantizer_.lut_distance(unvisited_codes[idx], anchor_lut);
+                const float d = quantizer_.lut_distance(unvisited_codes[idx], batch_lut);
                 const uint32_t id = unvisited_ids[idx];
                 if (W.size() < L_current || d < W.front().dist) {
                     frontier.push_back({d, id});
@@ -624,15 +630,6 @@ void VamanaCore::beam_search_into(
 // retained across inserts); output written to `out` (typically tls.prune_output).
 // removed[] uses tls.removed_flags (bytes). Zero per-prune heap allocation.
 // ===========================================================================
-
-std::vector<Candidate> VamanaCore::robust_prune(
-    std::vector<Candidate> candidates, uint16_t R, float alpha,
-    VamanaTLS& tls, uint32_t max_occlusion_size) const {
-    std::vector<Candidate> out;
-    robust_prune_into(candidates, out, R, alpha, tls, max_occlusion_size,
-                      /*presorted=*/false);
-    return out;
-}
 
 void VamanaCore::robust_prune_into(
     const std::vector<Candidate>& candidates, std::vector<Candidate>& out,
@@ -818,15 +815,28 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
 }
 
 // ===========================================================================
-// insert_build_from_code — SDC build path (LUT from own PQ code).
-// SDC build mode: build the query LUT from the node's own PQ code.
+// insert_build_from_code / insert_build — thin wrappers over the shared
+// insert_build_core. SDC (from PQ code) passes adc_vec=nullptr; ADC (from raw
+// vector) passes the raw float pointer. Only the LUT production differs.
 // ===========================================================================
 
 void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
-                                         VamanaTLS& tls) {
-    if (!build_nodes_ || !build_codes_) {
+                                          VamanaTLS& tls) {
+    insert_build_core(internal_id, row_id, tls, /*adc_vec=*/nullptr);
+}
+
+void VamanaCore::insert_build(uint32_t internal_id, RowId row_id,
+                                const float* vec, VamanaTLS& tls) {
+    insert_build_core(internal_id, row_id, tls, vec);
+}
+
+void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
+                                     VamanaTLS& tls, const float* adc_vec) {
+    // SDC mode requires the build_codes_ buffer (own PQ code); ADC needs only
+    // build_nodes_. build_nodes_ is always required.
+    if (!build_nodes_ || (adc_vec == nullptr && !build_codes_)) {
         throw Error(ErrorCode::InvalidParam,
-                    "VamanaCore::insert_build_from_code: build buffers not set");
+                    "VamanaCore::insert_build_core: build buffers not set");
     }
 
     // Zero the fixed header + neighbor array. The inline PQ region, if any,
@@ -857,16 +867,34 @@ void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
         return;
     }
 
-    // SDC build: build a per-anchor LUT once per insert (Opt 3).
-    // anchor_lut[s*K + cid] = cross_distance_table[s*K*K + anchor_code[s]*K + cid].
-    // This is 8KB (m=32,K=256) and stays L1-resident. beam_search then uses
-    // lut_distance — 32 sequential reads from a contiguous buffer — instead
-    // of scattered code_distance reads into the 8MB cross_distance_table.
-    const uint8_t* anchor_code =
-        build_codes_ + static_cast<size_t>(internal_id) * code_size_;
-    float* anchor_lut_ptr = tls.anchor_lut.data();
-    const bool lut_ok = quantizer_.build_code_lut(anchor_code, anchor_lut_ptr);
-    const float* anchor_lut_arg = lut_ok ? anchor_lut_ptr : nullptr;
+    // Produce the distance LUT for beam_search. ADC builds it from the raw
+    // vector; SDC builds a per-anchor LUT from the node's own PQ code (Opt 3),
+    // falling back to direct code-to-code lookup when the LUT build fails.
+    const float* query_lut = nullptr;
+    const uint8_t* sdc_anchor = nullptr;
+    const float* anchor_lut = nullptr;
+    if (adc_vec != nullptr) {
+        // ADC: LUT from raw vector. Reuse the thread-local LUT scratch — no
+        // per-insert heap allocation.
+        const uint32_t lut_sz = quantizer_.lut_size();
+        float* lut_ptr = tls.lut_buffer.data();
+        if (lut_sz > 0) {
+            quantizer_.preprocess_query(adc_vec, lut_ptr);
+            query_lut = lut_ptr;
+        }
+    } else {
+        // SDC: LUT from own PQ code. anchor_lut[s*K + cid] =
+        // cross_distance_table[s*K*K + anchor_code[s]*K + cid]. This is 8KB
+        // (m=32,K=256) and stays L1-resident. beam_search then uses
+        // lut_distance — 32 sequential reads from a contiguous buffer —
+        // instead of scattered code_distance reads into the 8MB table.
+        const uint8_t* anchor_code =
+            build_codes_ + static_cast<size_t>(internal_id) * code_size_;
+        float* alut = tls.anchor_lut.data();
+        const bool lut_ok = quantizer_.build_code_lut(anchor_code, alut);
+        anchor_lut = lut_ok ? alut : nullptr;
+        sdc_anchor = lut_ok ? nullptr : anchor_code;
+    }
 
     // InsertBuild tail: beam_search → robust_prune → connect_and_prune.
     // All three write into TLS scratch (tls.search_result / tls.prune_output /
@@ -885,74 +913,11 @@ void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
     // beam_search_into writes candidates (ascending distance) into
     // tls.search_result. robust_prune can skip the sort (presorted=true, Opt 2)
     // since beam_search drains a max-heap then reverses → ascending.
-    beam_search_into(tls.search_result, nullptr, L_build,
+    beam_search_into(tls.search_result, query_lut, L_build,
                      0 /* io_limit=0 → unlimited */, tls,
                      /*forced_entry_points=*/nullptr,
-                     /*sdc_anchor=*/lut_ok ? nullptr : anchor_code,
-                     /*anchor_lut=*/anchor_lut_arg);
-    robust_prune_into(tls.search_result, tls.prune_output, params_.R,
-                      params_.alpha, tls, params_.max_occlusion,
-                      /*presorted=*/true);
-    connect_and_prune(internal_id, tls.prune_output, tls);
-    count_ = std::max(count_, internal_id + 1);
-}
-
-// ===========================================================================
-// insert_build — ADC build path (LUT from raw vector).
-// ADC build mode: build the query LUT from the raw vector.
-// ===========================================================================
-
-void VamanaCore::insert_build(uint32_t internal_id, RowId row_id,
-                               const float* vec, VamanaTLS& tls) {
-    if (!build_nodes_) {
-        throw Error(ErrorCode::InvalidParam,
-                    "VamanaCore::insert_build: build buffer not set");
-    }
-
-    uint8_t* node = node_ptr(internal_id);
-    std::memset(node, 0,
-                kNeighborArrayOffset +
-                    static_cast<size_t>(params_.R) * sizeof(uint32_t));
-    set_row_id(node, row_id);
-    set_internal_id(node, internal_id);
-    set_neighbor_count(node, 0);
-    set_inline_pq_count(node, params_.inline_pq_count);
-
-    if (internal_id >= tls.visited_flags.size()) {
-        tls.visited_flags.resize(
-            std::max<size_t>(tls.visited_flags.size() * 2,
-                             static_cast<size_t>(internal_id) + 1),
-            0);
-    }
-
-    if (count_ == 0 || entry_points_.empty()) {
-        entry_points_.clear();
-        entry_points_.push_back(internal_id);
-        count_ = std::max(count_, internal_id + 1);
-        return;
-    }
-
-    // Build a LUT from the raw vector for distance estimates during construct.
-    // Reuse the thread-local LUT scratch — no per-insert heap allocation.
-    const uint32_t lut_sz = quantizer_.lut_size();
-    float* lut_ptr = tls.lut_buffer.data();
-    if (lut_sz > 0) {
-        quantizer_.preprocess_query(vec, lut_ptr);
-    }
-
-    // InsertBuild tail: beam_search → robust_prune → connect_and_prune.
-    // All write into TLS scratch — zero per-insert heap allocation (Opt 1).
-    // beam_search output is ascending; robust_prune skips the sort (Opt 2).
-    // T5: dynamic beam width (see insert_build_from_code).
-    const uint32_t L_build_full =
-        params_.L_build > 0 ? params_.L_build : params_.L;
-    const uint32_t L_build =
-        build_progress_
-            ? dynamic_L_build(build_progress_->load(std::memory_order_relaxed),
-                              count_, L_build_full)
-            : L_build_full;
-    beam_search_into(tls.search_result, lut_ptr, L_build,
-                     0 /* io_limit=0 → unlimited */, tls);
+                     /*sdc_anchor=*/sdc_anchor,
+                     /*anchor_lut=*/anchor_lut);
     robust_prune_into(tls.search_result, tls.prune_output, params_.R,
                       params_.alpha, tls, params_.max_occlusion,
                       /*presorted=*/true);

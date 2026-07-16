@@ -51,6 +51,10 @@ double elapsed_sec(T start, T end) {
 
 // ---------------------------------------------------------------------------
 // .fbin reader: [uint32 n][uint32 dim][n*dim float32 vectors].
+//
+// NOTE: this is a bulk whole-file loader (returns the full n×dim buffer),
+// distinct from fbin_io.hpp's single-vector random-access helpers used by
+// the CLI/benchmark rerank path. Kept separate intentionally.
 // ---------------------------------------------------------------------------
 
 struct FbinData {

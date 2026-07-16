@@ -22,6 +22,7 @@
 namespace sextant {
 
 struct PqQuantizer;
+struct ResolvedParams;  // defined in engine.hpp; only the factory needs the full type.
 
 /// Parameters for the Vamana graph.
 struct VamanaParams {
@@ -33,6 +34,14 @@ struct VamanaParams {
     uint16_t inline_pq_count = 0; ///< Neighbor PQ codes inlined per node
     uint16_t n_entry_points = 16;
     uint32_t max_occlusion = 750; ///< RobustPrune occlusion set size
+
+    /// Factory: build VamanaParams from resolved engine params.
+    /// `R_override` (0 = use p.R) lets callers pick a per-shard R (e.g. 2R/3).
+    /// `inline_pq` is 0 for build cores (flat layout) and the resolved
+    /// inline_pq_count for search cores. n_entry_points is fixed at 16.
+    static VamanaParams from_resolved(const ResolvedParams& p, Dim dim,
+                                       uint16_t R_override = 0,
+                                       uint16_t inline_pq = 0);
 };
 
 /// Per-thread-local scratch for Vamana operations (visit marks, prune buffers).
@@ -81,6 +90,12 @@ public:
     void insert_build(uint32_t internal_id, RowId row_id, const float* vec,
                       VamanaTLS& tls);
 
+    /// Shared build-insert core. When `adc_vec` is null the node is inserted
+    /// in SDC mode (LUT built from its own PQ code); otherwise ADC mode
+    /// (LUT built from the raw vector via preprocess_query).
+    void insert_build_core(uint32_t internal_id, RowId row_id, VamanaTLS& tls,
+                           const float* adc_vec);
+
     /// BeamSearch from entry points. Returns candidates.
     /// When `sdc_anchor` is non-null, distances are computed via direct
     /// code-to-code lookup (code_distance) instead of the materialized LUT.
@@ -114,12 +129,6 @@ public:
                            std::vector<Candidate>& out, uint16_t R, float alpha,
                            VamanaTLS& tls, uint32_t max_occlusion_size,
                            bool presorted = false) const;
-
-    /// RobustPrune (return-by-value wrapper for the search/non-build path).
-    std::vector<Candidate> robust_prune(std::vector<Candidate> candidates,
-                                        uint16_t R, float alpha,
-                                        VamanaTLS& tls,
-                                        uint32_t max_occlusion_size) const;
 
     /// Connect new node to selected neighbors and prune reciprocal edges.
     void connect_and_prune(uint32_t new_internal_id,
