@@ -973,31 +973,34 @@ BuildResult Engine::build_partitioned(VectorSource& source,
             nodes_buffer_, codes_buffer_, node_size_, code_size_);
         core_->set_store(flat_store_.get());
 
-        // ADC build: load raw vectors for construct (monolithic parity).
+        // Load raw vectors for construct. In ADC mode, these are needed for
+        // beam_search LUTs. In SDC mode, they enable the FP16 prune hybrid
+        // (exact FP16 L2sq occlusion check instead of PQ code_distance).
+        // K=1 monolithic builds always fit the vectors in RAM at target scale
+        // (1.34M × 768d × 4B = 4.1GB), so we always load them.
         std::vector<float> raw_vecs;
-        if (params.build_mode == BuildMode::ADC) {
-            spdlog::info("[sextant] ADC build mode: loading raw vectors for construct");
-            raw_vecs.resize(static_cast<size_t>(count_) * dim_);
-            source.reset();
-            Chunk chunk{};
-            uint64_t loaded = 0;
-            while (source.next(chunk)) {
-                for (uint32_t r = 0; r < chunk.count; r++) {
-                    const RowId rid = chunk.row_ids[r];
-                    if (rid >= 0 && static_cast<uint64_t>(rid) < count_) {
-                        std::memcpy(raw_vecs.data() +
-                                        static_cast<size_t>(rid) * dim_,
-                                    chunk.vectors +
-                                        static_cast<size_t>(r) * dim_,
-                                    dim_ * sizeof(float));
-                        loaded++;
-                    }
+        spdlog::info("[sextant] {} build mode: loading raw vectors for construct",
+                     params.build_mode == BuildMode::ADC ? "ADC" : "SDC (FP16 prune)");
+        raw_vecs.resize(static_cast<size_t>(count_) * dim_);
+        source.reset();
+        Chunk chunk{};
+        uint64_t loaded = 0;
+        while (source.next(chunk)) {
+            for (uint32_t r = 0; r < chunk.count; r++) {
+                const RowId rid = chunk.row_ids[r];
+                if (rid >= 0 && static_cast<uint64_t>(rid) < count_) {
+                    std::memcpy(raw_vecs.data() +
+                                    static_cast<size_t>(rid) * dim_,
+                                chunk.vectors +
+                                    static_cast<size_t>(r) * dim_,
+                                dim_ * sizeof(float));
+                    loaded++;
                 }
             }
-            spdlog::info("[sextant] ADC: loaded {} raw vectors ({:.1f}MB)",
-                         loaded, raw_vecs.size() * sizeof(float) / 1e6);
-            core_->set_build_vecs(raw_vecs.data());
         }
+        spdlog::info("[sextant] loaded {} raw vectors ({:.1f}MB)",
+                     loaded, raw_vecs.size() * sizeof(float) / 1e6);
+        core_->set_build_vecs(raw_vecs.data());
 
         parallel_construct(params);
 

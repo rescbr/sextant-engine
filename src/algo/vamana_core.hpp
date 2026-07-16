@@ -125,10 +125,19 @@ public:
     /// `candidates` is sorted in place (assumed already sorted ascending when
     /// `presorted=true` — skips the redundant std::sort when callers pass
     /// beam_search output, which is already ascending).
+    ///
+    /// When `query_vec` is non-null AND build_vecs_ is set, the occlusion check
+    /// uses FP16 L2-squared distances (computed from raw float vectors) instead
+    /// of PQ code_distance. This closes the recall gap caused by PQ distortion
+    /// (~3.6%) flipping occlusion decisions. Both the query→candidate distance
+    /// (buf[].dist) and the candidate→candidate distance (d(p,pp)) are
+    /// recomputed as FP16 L2sq so both sides of the occlusion rule use the same
+    /// metric. When `query_vec` is null, falls back to the existing PQ path.
     void robust_prune_into(const std::vector<Candidate>& candidates,
                            std::vector<Candidate>& out, uint16_t R, float alpha,
                            VamanaTLS& tls, uint32_t max_occlusion_size,
-                           bool presorted = false) const;
+                           bool presorted = false,
+                           const float* query_vec = nullptr) const;
 
     /// Connect new node to selected neighbors and prune reciprocal edges.
     void connect_and_prune(uint32_t new_internal_id,
