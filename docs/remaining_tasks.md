@@ -121,20 +121,13 @@ these should error with a clear message.
 
 **Effort:** Small — filesystem checks + error messages.
 
-### T5: ADC build mode CLI flag
+### T5: ADC build mode — REMOVED
 
-**Problem:** The engine has `insert_build()` (ADC path — builds LUT from raw
-vector) but the CLI doesn't expose `--build-mode sdc|adc`. Currently, if
-alpha=1.5 is passed, the engine warns and falls back to SDC.
-
-**Solution:** Add `--build-mode` flag to the CLI build command. When `adc`:
-set alpha=1.5, use `insert_build` instead of `insert_build_from_code` in
-the parallel construct. This requires re-reading vectors from the source
-during construct (Issue 29, Mode B).
-
-**Files:** `tools/sextant_cli.cpp`, `src/engine/engine.cpp` (construct loop).
-
-**Effort:** Medium — requires the source to be re-readable during construct.
+ADC (Asymmetric Distance Computation) build mode has been removed. The FP16
+prune hybrid made it redundant (only +0.0003 recall at 1.4× build cost). The
+`BuildMode` enum is retained with `SDC` as the sole value for API compat.
+The `--build-mode` CLI flag is kept as a deprecated no-op (accepts `sdc` only,
+errors on `adc`).
 
 ### T6: Entry point persistence
 

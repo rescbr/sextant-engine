@@ -8,10 +8,10 @@
 
 namespace sextant {
 
-/// Build mode: SDC uses PQ-code distances during graph construct; ADC uses
-/// raw-vector distances (higher quality, more RAM). Decoupled from the Vamana
-/// prune threshold `alpha`.
-enum class BuildMode : uint8_t { SDC = 0, ADC = 1 };
+/// Build mode. ADC (raw-vector construct) has been removed — the FP16 prune
+/// hybrid made it redundant (only +0.0003 recall at 1.4× build cost). The enum
+/// is retained with SDC as the sole value for API compatibility.
+enum class BuildMode : uint8_t { SDC = 0 };
 
 /// Build configuration. Fields set to 0/default are auto-resolved.
 struct BuildConfig {
@@ -20,7 +20,7 @@ struct BuildConfig {
     float alpha = 0.0f;         ///< Vamana prune threshold: alpha * d(p,pp) <= d(q,pp).
                                 ///< 0 = auto (1.2). Purely the prune threshold;
                                 ///< build mode is set via `build_mode`.
-    BuildMode build_mode = BuildMode::SDC;  ///< SDC (code-distance) or ADC (raw-vector) construct
+    BuildMode build_mode = BuildMode::SDC;  ///< SDC (code-distance construct); ADC removed
     uint16_t inline_pq_count = 0xFFFF; ///< 0xFFFF = auto (balanced preset)
     uint16_t pq_m = 0;          ///< 0 = auto (reservoir probe)
     uint8_t pq_bits = 8;        ///< 4, 8, or 0 (auto via reservoir probe)

@@ -48,10 +48,9 @@ int cmd_build(int argc, char* argv[]) {
     p.add<std::string>("index", 0, "Index name/path prefix", true);
     p.add<uint16_t>("R", 0, "Graph degree (auto if 0)", false, 0);
     p.add<uint16_t>("L", 0, "Beam width (auto if 0)", false, 0);
-    p.add<float>("alpha", 0, "Vamana prune threshold (default 1.2). Purely the prune "
-                        "threshold; build mode is set via --build-mode.", false, 1.2f);
-    p.add<std::string>("build-mode", 0, "Build mode: sdc (code-distance construct) or adc "
-                                      "(raw-vector construct, default sdc)", false, "sdc");
+    p.add<float>("alpha", 0, "Vamana prune threshold (default 1.2).", false, 1.2f);
+    p.add<std::string>("build-mode", 0, "Build mode (deprecated, always sdc). "
+                                      "Accepted for backward compat: sdc only.", false, "sdc");
     p.add<uint16_t>("pq-m", 0, "PQ segments — REQUIRED for build (e.g. 96). "
                          "Run `sextant analyze` first if unsure what to pick.", false, 0);
     p.add<std::string>("pq-bits", 0, "PQ bits — REQUIRED for build: 4 or 8 (e.g. 8). "
@@ -109,15 +108,18 @@ int cmd_build(int argc, char* argv[]) {
     cfg.R = p.get<uint16_t>("R");
     cfg.L = p.get<uint16_t>("L");
     cfg.alpha = p.get<float>("alpha");
-    // build-mode: sdc (default) → SDC, adc → ADC.
+    // build-mode: deprecated, always SDC. Accept "sdc" for backward compat;
+    // error on "adc" (removed — FP16 prune hybrid made it redundant).
     {
         const std::string bm = p.get<std::string>("build-mode");
         if (bm == "sdc" || bm == "0") {
             cfg.build_mode = sextant::BuildMode::SDC;
         } else if (bm == "adc" || bm == "1") {
-            cfg.build_mode = sextant::BuildMode::ADC;
+            std::fprintf(stderr, "--build-mode adc is no longer supported (FP16 prune "
+                                 "hybrid made it redundant). Use sdc.\n");
+            return 1;
         } else {
-            std::fprintf(stderr, "--build-mode must be sdc or adc (got '%s')\n", bm.c_str());
+            std::fprintf(stderr, "--build-mode must be sdc (got '%s')\n", bm.c_str());
             return 1;
         }
     }
@@ -155,9 +157,7 @@ int cmd_build(int argc, char* argv[]) {
                   << "L:          " << resolved.L << "\n"
                   << "L_build:    " << resolved.L_build << "\n"
                   << "alpha:      " << resolved.alpha
-                  << "  [build_mode="
-                  << (resolved.build_mode == sextant::BuildMode::ADC ? "ADC" : "SDC")
-                  << "]\n";
+                  << "\n";
 
         const bool need_probe = (resolved.pq_m == 0) || (resolved.pq_bits == 0);
         if (need_probe) {

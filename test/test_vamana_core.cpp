@@ -173,20 +173,19 @@ TEST(VamanaCore, BuildGraphConnected) {
 }
 
 // ---------------------------------------------------------------------------
-// ADC build path (insert_build from raw vector) — structural invariant.
+// SDC build path (insert_build_from_code) — structural invariant.
 // ---------------------------------------------------------------------------
 
-TEST(VamanaCore, InsertBuildFromVector) {
+TEST(VamanaCore, InsertBuildFromCode) {
     const uint32_t N = 20;
     const uint16_t R = 6;
     TestGraph g(N, R, /*L=*/12);
 
-    std::vector<float16_t> vec(g.params.dim, static_cast<float16_t>(0));
     VamanaTLS tls;
     tls.resize(N);
     tls.resize_lut(g.quant.lut_size());
     for (uint32_t i = 0; i < N; i++) {
-        g.core->insert_build(i, static_cast<RowId>(i), vec.data(), tls);
+        g.core->insert_build_from_code(i, static_cast<RowId>(i), tls);
     }
     EXPECT_EQ(N, g.core->size());
 

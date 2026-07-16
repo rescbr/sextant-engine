@@ -873,26 +873,21 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
 }
 
 // ===========================================================================
-// insert_build_from_code / insert_build — thin wrappers over the shared
-// insert_build_core. SDC (from PQ code) passes adc_vec=nullptr; ADC (from raw
-// vector) passes the raw float pointer. Only the LUT production differs.
+// insert_build_from_code — the sole build entry point. LUT is always built
+// via build_code_lut from the node's own PQ code (SDC). The prune query vec
+// comes from build_vec_ptr(internal_id) when build_vecs_ is set (FP16 prune).
 // ===========================================================================
 
 void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
                                           VamanaTLS& tls) {
-    insert_build_core(internal_id, row_id, tls, /*adc_vec=*/nullptr);
-}
-
-void VamanaCore::insert_build(uint32_t internal_id, RowId row_id,
-                                const float16_t* vec, VamanaTLS& tls) {
-    insert_build_core(internal_id, row_id, tls, vec);
+    insert_build_core(internal_id, row_id, tls);
 }
 
 void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
-                                     VamanaTLS& tls, const float16_t* adc_vec) {
-    // SDC mode requires the build_codes_ buffer (own PQ code); ADC needs only
-    // build_nodes_. build_nodes_ is always required.
-    if (!build_nodes_ || (adc_vec == nullptr && !build_codes_)) {
+                                     VamanaTLS& tls) {
+    // SDC mode requires the build_codes_ buffer (own PQ code).
+    // build_nodes_ is always required.
+    if (!build_nodes_ || !build_codes_) {
         throw Error(ErrorCode::InvalidParam,
                     "VamanaCore::insert_build_core: build buffers not set");
     }
@@ -925,28 +920,13 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
         return;
     }
 
-    // Produce the distance LUT for beam_search. ADC builds it from the raw
-    // vector; SDC builds a per-anchor LUT from the node's own PQ code (Opt 3),
-    // falling back to direct code-to-code lookup when the LUT build fails.
+    // Produce the distance LUT for beam_search. SDC builds a per-anchor LUT
+    // from the node's own PQ code, falling back to direct code-to-code lookup
+    // when the LUT build fails.
     const float* query_lut = nullptr;
     const uint8_t* sdc_anchor = nullptr;
     const float* anchor_lut = nullptr;
-    if (adc_vec != nullptr) {
-        // ADC: LUT from raw vector. preprocess_query needs FP32, so upconvert
-        // the FP16 vector once per insert into TLS scratch (~200ns for dim=768).
-        const uint32_t lut_sz = quantizer_.lut_size();
-        float* lut_ptr = tls.lut_buffer.data();
-        if (lut_sz > 0) {
-            if (tls.fp32_scratch.size() < params_.dim) {
-                tls.fp32_scratch.resize(params_.dim);
-            }
-            for (uint32_t d = 0; d < params_.dim; d++) {
-                tls.fp32_scratch[d] = static_cast<float>(adc_vec[d]);
-            }
-            quantizer_.preprocess_query(tls.fp32_scratch.data(), lut_ptr);
-            query_lut = lut_ptr;
-        }
-    } else {
+    {
         // SDC: LUT from own PQ code. anchor_lut[s*K + cid] =
         // cross_distance_table[s*K*K + anchor_code[s]*K + cid]. This is 8KB
         // (m=32,K=256) and stays L1-resident. beam_search then uses
@@ -985,19 +965,15 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
 
     // FP16 prune hybrid: pass the insert point's float vector to
     // robust_prune_into so the occlusion check uses FP16 L2sq instead of PQ
-    // code_distance. In ADC mode, adc_vec is the raw vector. In SDC mode with
-    // build_vecs_ set, use build_vec_ptr(internal_id). When build_vecs_ is null
-    // (tests, untrained quantizers), query_vec stays null → PQ fallback.
+    // code_distance. When build_vecs_ is set, use build_vec_ptr(internal_id).
+    // When build_vecs_ is null (tests, untrained quantizers), query_vec stays
+    // null → PQ fallback.
     //
     // presorted is only honored on the PQ path (beam_search output is ascending
     // by PQ dist). On the FP16 path, robust_prune_into re-sorts after
     // recomputing distances, so presorted is ignored.
-    const float16_t* prune_query_vec = nullptr;
-    if (adc_vec != nullptr) {
-        prune_query_vec = adc_vec;
-    } else if (build_vecs_ != nullptr) {
-        prune_query_vec = build_vec_ptr(internal_id);
-    }
+    const float16_t* prune_query_vec =
+        build_vecs_ != nullptr ? build_vec_ptr(internal_id) : nullptr;
     robust_prune_into(tls.search_result, tls.prune_output, params_.R,
                       params_.alpha, tls, params_.max_occlusion,
                       /*presorted=*/(prune_query_vec == nullptr),

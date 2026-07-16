@@ -758,9 +758,8 @@ void Engine::parallel_construct(const ResolvedParams& params) {
     const uint32_t nthreads = params.num_threads > 0
                                   ? params.num_threads
                                   : std::thread::hardware_concurrency();
-    const bool adc_mode = params.build_mode == BuildMode::ADC;
     const uint32_t lut_sz = quantizer_ ? quantizer_->lut_size() : 0;
-    construct_into(*core_, n, adc_mode,
+    construct_into(*core_, n,
                    [](uint32_t id) { return static_cast<RowId>(id); },
                    lut_sz, nthreads, "construct");
 }
@@ -772,28 +771,22 @@ void Engine::parallel_construct(const ResolvedParams& params) {
 // → membership mapper). No special cases.
 // ===========================================================================
 
-void Engine::construct_into(VamanaCore& core, uint32_t count, bool adc_mode,
+void Engine::construct_into(VamanaCore& core, uint32_t count,
                             const std::function<RowId(uint32_t)>& row_id_at,
                             uint32_t lut_sz, uint32_t nthreads,
                             const char* label) {
     if (count == 0) return;
     nthreads = std::max(1u, nthreads);
-    spdlog::info("[sextant] {}: {} nodes across {} threads ({})", label, count,
-                 nthreads, adc_mode ? "ADC" : "SDC");
+    spdlog::info("[sextant] {}: {} nodes across {} threads (SDC)", label, count,
+                 nthreads);
 
     // The very first insert must be serialized before spawning tasks: it
-    // claims the entry point (see VamanaCore::insert_build_from_code /
-    // insert_build).
+    // claims the entry point (see VamanaCore::insert_build_from_code).
     {
         VamanaTLS tls;
         tls.resize(count);
         tls.resize_lut(lut_sz);
-        if (adc_mode) {
-            core.insert_build(0, /*row_id=*/row_id_at(0),
-                              core.build_vec_ptr(0), tls);
-        } else {
-            core.insert_build_from_code(0, /*row_id=*/row_id_at(0), tls);
-        }
+        core.insert_build_from_code(0, /*row_id=*/row_id_at(0), tls);
     }
 
     const uint32_t lo = 1;
@@ -818,17 +811,13 @@ void Engine::construct_into(VamanaCore& core, uint32_t count, bool adc_mode,
     constexpr uint32_t kChunk = 64;
     std::atomic<uint32_t> next_id{lo};
     core.set_build_progress(&next_id);
-    auto worker = [&core, &row_id_at, adc_mode, hi,
+    auto worker = [&core, &row_id_at, hi,
                    &next_id](size_t /*tid*/, VamanaTLS& tls) {
         uint32_t chunk_lo;
         while ((chunk_lo = next_id.fetch_add(kChunk, std::memory_order_relaxed)) < hi) {
             const uint32_t chunk_hi = std::min(chunk_lo + kChunk, hi);
             for (uint32_t id = chunk_lo; id < chunk_hi; id++) {
-                if (adc_mode) {
-                    core.insert_build(id, row_id_at(id), core.build_vec_ptr(id), tls);
-                } else {
-                    core.insert_build_from_code(id, row_id_at(id), tls);
-                }
+                core.insert_build_from_code(id, row_id_at(id), tls);
             }
         }
     };
@@ -895,13 +884,8 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     using engine_detail::fill_header;
     using engine_detail::read_exact;
 
-    // ADC + partitioning (K>1) is a complex combination; shard construct stays
-    // SDC-only (RAM savings matter more than ADC quality at large scale). K==1
-    // is the unified monolithic path and supports ADC natively.
-    if (params.build_mode == BuildMode::ADC && params.K > 1) {
-        spdlog::warn("[sextant] ADC build mode with partitioning (K>1) is not "
-                     "supported; falling back to SDC for shard construct.");
-    }
+    // Partitioned build uses SDC shard construct exclusively — RAM savings
+    // matter more than marginal quality at large scale.
 
     spdlog::info("[sextant] build: N={} K={} closure_factor={:.4f}",
                  count_, params.K, params.closure_factor);
@@ -952,11 +936,10 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     const uint32_t n = static_cast<uint32_t>(count_);
 
     // Load raw vectors as FP16 for the FP16 prune. Used by BOTH K=1 (full
-    // graph) and K>1 (per-shard copy). In ADC mode, these are also used for
-    // beam_search LUTs (upconverted to FP32 per insert). In SDC mode, they
-    // enable the FP16 prune (exact FP16 L2sq occlusion check instead of PQ
-    // code_distance). Stored as FP16 (half the RAM of FP32) and consumed
-    // directly by l2sq_f16 — no per-call conversion.
+    // graph) and K>1 (per-shard copy). They enable the FP16 prune (exact FP16
+    // L2sq occlusion check instead of PQ code_distance). Stored as FP16 (half
+    // the RAM of FP32) and consumed directly by l2sq_f16 — no per-call
+    // conversion.
     {
         const size_t vecs_bytes =
             static_cast<size_t>(count_) * dim_ * sizeof(float16_t);
@@ -967,9 +950,8 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                         "build_partitioned: raw_vecs_buffer_ alloc failed");
         }
         spdlog::info("[sextant] loading raw vectors as FP16 ({:.1f}MB) for "
-                     "{} prune",
-                     vecs_bytes / 1e6,
-                     params.build_mode == BuildMode::ADC ? "ADC" : "SDC (FP16)");
+                     "SDC (FP16 prune)",
+                     vecs_bytes / 1e6);
         source.reset();
         Chunk chunk{};
         uint64_t loaded = 0;
@@ -1009,7 +991,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         core_->prepare_for_build(n);
 
         // FlatNodeStore over the flat buffers so beam_search (used in
-        // insert_build) goes through the store interface.
+        // insert_build_from_code) goes through the store interface.
         flat_store_ = std::make_unique<FlatNodeStore>(
             nodes_buffer_, codes_buffer_, node_size_, code_size_);
         core_->set_store(flat_store_.get());
@@ -1110,7 +1092,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                                       : std::thread::hardware_concurrency();
         const std::string shard_label = "shard " + std::to_string(k) + "/" + std::to_string(K);
         construct_into(
-            core, shard_n, /*adc_mode=*/false,
+            core, shard_n,
             [&members](uint32_t local_id) { return static_cast<RowId>(members[local_id]); },
             shard_lut_sz, nthreads, shard_label.c_str());
         // Shard built; node buffer retained in shard_node_bufs[k].
@@ -1649,7 +1631,7 @@ void Engine::write_manifest_file(const ResolvedParams& params,
 //
 // Live insert = "build one node". We grow the flat codes/nodes buffers by one
 // slot, encode the vector, then drive the Vamana insert flow (beam_search →
-// robust_prune → connect_and_prune) via VamanaCore::insert_build.
+// robust_prune → connect_and_prune) via VamanaCore::insert_build_from_code.
 //
 // PHASE 1: insert requires mutable flat buffers. After open() the engine is
 // in SSD-resident (paged) mode; the first insert materializes the flat
@@ -1758,27 +1740,45 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
     core_->set_build_nodes(nodes_buffer_);
 
     // (Re)create the FlatNodeStore over the (possibly realloc'd) live buffers
-    // so beam_search inside insert_build reads current data.
+    // so beam_search inside insert_build_from_code reads current data.
     flat_store_ = std::make_unique<FlatNodeStore>(
         nodes_buffer_, codes_buffer_,
         node_size_, code_size_);
     core_->set_store(flat_store_.get());
 
+    // --- 3b. Grow raw_vecs_buffer_ by one FP16 vector (O(N) copy). ---
+    // Needed so build_vec_ptr(new_internal) works for the FP16 prune.
+    {
+        const size_t old_bytes = static_cast<size_t>(count_ - 1) * dim_ * sizeof(float16_t);
+        const size_t new_bytes = static_cast<size_t>(count_) * dim_ * sizeof(float16_t);
+        const size_t alloc_bytes = (new_bytes + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
+        float16_t* nb =
+            static_cast<float16_t*>(aligned_alloc(kDiskAlign, alloc_bytes));
+        if (!nb) {
+            throw Error(ErrorCode::OutOfMemory,
+                        "Engine::insert: raw_vecs realloc failed");
+        }
+        if (raw_vecs_buffer_) {
+            std::memcpy(nb, raw_vecs_buffer_, old_bytes);
+            aligned_free(raw_vecs_buffer_);
+        }
+        float16_t* dst = nb + static_cast<size_t>(new_internal) * dim_;
+        for (uint32_t d = 0; d < dim_; d++) {
+            dst[d] = static_cast<float16_t>(vec[d]);
+        }
+        raw_vecs_buffer_ = nb;
+    }
+    core_->set_build_vecs(raw_vecs_buffer_);
+
     // --- 4. Drive the Vamana insert flow (single-thread). ---
-    //    insert_build handles the first-node case (becomes an entry point)
-    //    and the general case (beam_search → robust_prune → connect_and_prune).
-    //    It also bumps core_->count_ to internal_id + 1.
-    //    build_vecs_ is not set in the live-insert path, so the prune uses
-    //    adc_vec directly as the FP16 prune query.
+    //    insert_build_from_code handles the first-node case (becomes an entry
+    //    point) and the general case (beam_search → robust_prune →
+    //    connect_and_prune). It also bumps core_->count_ to internal_id + 1.
+    //    build_vecs_ is set above so the prune uses FP16 L2sq.
     VamanaTLS tls;
     tls.resize(static_cast<uint32_t>(count_));
     tls.resize_lut(quantizer_ ? quantizer_->lut_size() : 0);
-    // Upconvert the incoming FP32 vector to FP16 for insert_build (ADC mode).
-    std::vector<float16_t> fp16_vec(dim_);
-    for (uint32_t d = 0; d < dim_; d++) {
-        fp16_vec[d] = static_cast<float16_t>(vec[d]);
-    }
-    core_->insert_build(new_internal, row_id, fp16_vec.data(), tls);
+    core_->insert_build_from_code(new_internal, row_id, tls);
 
     spdlog::info("[sextant] insert: row_id={} internal_id={} (count now {})",
                  row_id, new_internal, count_);

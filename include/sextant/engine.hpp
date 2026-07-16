@@ -177,7 +177,7 @@ private:
     /// logger. Shared by K==1 (full graph) and K>1 (per-shard). The row-id mapper
     /// translates local construct IDs to global RowIds (identity for K==1,
     /// shard membership table for K>1).
-    void construct_into(VamanaCore& core, uint32_t count, bool adc_mode,
+    void construct_into(VamanaCore& core, uint32_t count,
                         const std::function<RowId(uint32_t)>& row_id_at,
                         uint32_t lut_sz, uint32_t nthreads,
                         const char* label);

@@ -106,7 +106,6 @@ struct VamanaTLS {
     /// Built once per insert_build_from_code; 8KB (m=32,K=256), L1-resident.
     std::vector<float> anchor_lut;
     std::vector<uint8_t> removed_flags;  // robust_prune removed bitset (bytes, not bools)
-    std::vector<float> fp32_scratch;  // FP16→FP32 upconvert for ADC preprocess_query
     std::mt19937 rng;
     uint32_t visit_token = 0;
 
@@ -130,22 +129,16 @@ public:
     /// Prepare for building `count` nodes.
     void prepare_for_build(uint32_t count);
 
-    /// Insert a node during parallel build (from PQ code, SDC mode).
+    /// Insert a node during parallel build (SDC mode: LUT from PQ code).
     /// Each thread calls this for disjoint node-ID ranges.
     void insert_build_from_code(uint32_t internal_id, RowId row_id,
                                 VamanaTLS& tls);
 
-    /// Insert a node during parallel build (from raw FP16 vector, ADC mode).
-    /// The vector is used to build the distance LUT and as the prune query.
-    void insert_build(uint32_t internal_id, RowId row_id, const float16_t* vec,
-                      VamanaTLS& tls);
-
-    /// Shared build-insert core. When `adc_vec` is null the node is inserted
-    /// in SDC mode (LUT built from its own PQ code); otherwise ADC mode
-    /// (LUT built from the raw vector via preprocess_query). `adc_vec` is
-    /// FP16 — it is upconverted to FP32 once per insert for preprocess_query.
-    void insert_build_core(uint32_t internal_id, RowId row_id, VamanaTLS& tls,
-                           const float16_t* adc_vec);
+    /// Shared build-insert core: beam_search → robust_prune → connect_and_prune.
+    /// The LUT is always built via build_code_lut from the node's own PQ code.
+    /// The prune query vec is build_vec_ptr(internal_id) when build_vecs_ is set
+    /// (FP16 prune hybrid); otherwise nullptr (PQ fallback).
+    void insert_build_core(uint32_t internal_id, RowId row_id, VamanaTLS& tls);
 
     /// BeamSearch from entry points. Returns candidates.
     /// When `sdc_anchor` is non-null, distances are computed via direct
@@ -224,7 +217,7 @@ public:
     void set_build_vecs(const float16_t* vecs) { build_vecs_ = vecs; }
     void clear_build_buffers();
 
-    /// Pointer to the raw FP16 vector for `internal_id` (ADC build + FP16 prune).
+    /// Pointer to the raw FP16 vector for `internal_id` (FP16 prune).
     /// Only valid when set_build_vecs() has been called with a count×dim buffer.
     const float16_t* build_vec_ptr(uint32_t internal_id) const {
         return build_vecs_ + static_cast<size_t>(internal_id) * params_.dim;
