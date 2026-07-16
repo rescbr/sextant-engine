@@ -918,7 +918,8 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
         // `targets` (the loop source) and `cand` (tls.connect_buffer) are
         // distinct buffers — no aliasing.
         robust_prune_into(cand, tls.prune_output, params_.R, params_.alpha,
-                          tls, params_.max_occlusion, /*presorted=*/false);
+                          tls, params_.max_occlusion, /*presorted=*/false,
+                          /*query_vec=*/build_vecs_ ? build_vec_ptr(new_internal_id) : nullptr);
         auto& kept = tls.prune_output;
         // Write neighbors before publishing count.
         for (size_t i = 0; i < kept.size(); i++) {
