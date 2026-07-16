@@ -16,7 +16,14 @@
 #include <thread>
 #include <vector>
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#if defined(__ARM_FEATURE_SVE)
+// SVE2-capable hardware (GCP Axion / Neoverse V2). Also defines __ARM_NEON,
+// so we check SVE first to prefer the gather-load paths.
+#include <arm_sve.h>
+#include <arm_neon.h>
+#define SEXTANT_HAS_SVE 1
+#define SEXTANT_HAS_NEON 1
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #define SEXTANT_HAS_NEON 1
 #elif defined(__AVX2__)
@@ -481,7 +488,29 @@ void PqQuantizer::code_distance_batch4(const uint8_t* anchor,
     for (uint32_t s = 0; s < m_; s++)
         ac[s] = read_code(anchor, bits_, s);
 
-#if defined(SEXTANT_HAS_NEON)
+#if defined(SEXTANT_HAS_SVE)
+    // SVE2 gather-load path — only on SVE2 hardware (Neoverse V2 / GCP Axion).
+    // Apple M4 has NEON but NOT SVE, so this branch is never selected on M4.
+    // We process exactly 4 candidates; predicate activates the first 4 lanes.
+    const svbool_t pg4 = svwhilelt_b32_u32(0u, 4u);
+    svfloat32_t vacc = svdup_f32(0.0f);
+    for (uint32_t s = 0; s < m_; s++) {
+        const float* row = tbl + size_t(s) * KK + ac[s] * K_;
+        // Code byte per candidate at segment s → element index into `row`.
+        uint32_t idx[4] = {
+            read_code(code_b0, bits_, s),
+            read_code(code_b1, bits_, s),
+            read_code(code_b2, bits_, s),
+            read_code(code_b3, bits_, s)
+        };
+        svuint32_t sidx = svld1_u32(pg4, idx);
+        // Gather-load 4 floats from row[idx[0..3]] (indices are element offsets).
+        svfloat32_t vals = svld1_gather_u32index_f32(pg4, row, sidx);
+        // _z: zero inactive lanes before adding → safe with any vector length.
+        vacc = svadd_f32_z(pg4, vacc, vals);
+    }
+    svst1_f32(pg4, out, vacc);
+#elif defined(SEXTANT_HAS_NEON)
     float32x4_t vacc = vdupq_n_f32(0.0f);
     for (uint32_t s = 0; s < m_; s++) {
         const float* row = tbl + size_t(s) * KK + ac[s] * K_;
@@ -532,7 +561,25 @@ void PqQuantizer::lut_distance_batch4(const uint8_t* code_b0,
                                       const uint8_t* code_b3,
                                       const float* lut,
                                       float* out) const {
-#if defined(SEXTANT_HAS_NEON)
+#if defined(SEXTANT_HAS_SVE)
+    // SVE2 gather-load path — only on SVE2 hardware (Neoverse V2 / GCP Axion).
+    // Apple M4 has NEON but NOT SVE, so this branch is never selected on M4.
+    const svbool_t pg4 = svwhilelt_b32_u32(0u, 4u);
+    svfloat32_t vacc = svdup_f32(0.0f);
+    for (uint32_t s = 0; s < m_; s++) {
+        const float* row = lut + s * K_;
+        uint32_t idx[4] = {
+            read_code(code_b0, bits_, s),
+            read_code(code_b1, bits_, s),
+            read_code(code_b2, bits_, s),
+            read_code(code_b3, bits_, s)
+        };
+        svuint32_t sidx = svld1_u32(pg4, idx);
+        svfloat32_t vals = svld1_gather_u32index_f32(pg4, row, sidx);
+        vacc = svadd_f32_z(pg4, vacc, vals);
+    }
+    svst1_f32(pg4, out, vacc);
+#elif defined(SEXTANT_HAS_NEON)
     float32x4_t vacc = vdupq_n_f32(0.0f);
     for (uint32_t s = 0; s < m_; s++) {
         const float* row = lut + s * K_;
