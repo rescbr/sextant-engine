@@ -36,6 +36,7 @@ public:
     uint64_t count() const override { return count_; }
     void reset() override;
     bool next(Chunk& out) override;
+    std::string path() const override { return path_; }
 
 private:
     enum class ElemType { Float32, Int8, Uint8 };

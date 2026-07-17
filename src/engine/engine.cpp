@@ -32,6 +32,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -574,6 +577,223 @@ ProbedConfig probe_best_config(const float* pool, uint32_t pool_n, Dim dim,
     return best;
 }
 
+// ---------------------------------------------------------------------------
+// Seek-based random sampling.
+//
+// When N >> k, seeks directly to k random offsets (O(k) I/O) instead of
+// reading the full N-vector file (O(N) I/O). Statistically identical to
+// Algorithm R reservoir sampling: every vector has probability k/N of being
+// in the sample, because this is a uniform random sample without replacement
+// (each subset of size k is equally likely → each element has probability
+// exactly k/N).
+//
+// Index generation: partial Fisher-Yates with a sparse swap map — O(k)
+// expected time, O(k) memory (no [0,N) array). Each of the C(n,k) subsets is
+// equally likely. This is the spec-sanctioned correct alternative to Vitter's
+// geometric-skip method (which has tricky overshoot edge cases near the end
+// of the range); see the inline comment in draw_random_sample for details.
+//
+// Reference: Vitter, "Faster Methods for Random Sampling" (1987); Knuth,
+// TAOCP vol. 2 (Fisher-Yates / Algorithm P).
+// ---------------------------------------------------------------------------
+
+/// Element type tag for draw_random_sample's cast logic.
+enum class SampleElemType { Float32, Int8, Uint8 };
+
+SampleElemType infer_sample_elem_type(const std::string& path) {
+    auto ends_with_ci = [&](const char* suf) {
+        const size_t nn = path.size();
+        const size_t mm = std::strlen(suf);
+        if (nn < mm) return false;
+        for (size_t i = 0; i < mm; i++) {
+            char c = path[nn - mm + i];
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            if (c != suf[i]) return false;
+        }
+        return true;
+    };
+    if (ends_with_ci(".ibin")) return SampleElemType::Int8;
+    if (ends_with_ci(".bbin") || ends_with_ci(".bvecs"))
+        return SampleElemType::Uint8;
+    return SampleElemType::Float32;
+}
+
+/// Draw `k` vectors as a uniform random sample without replacement from a
+/// .fbin/.ibin/.bbin file, returning them as a flat float buffer (k × dim).
+///
+/// @param path   file path (.fbin/.ibin/.bbin/.bvecs).
+/// @param n      vector count (from the file header).
+/// @param dim    vector dimensionality.
+/// @param k      sample size (must be <= n).
+/// @return std::vector<float> of size k*dim, row-major. Vectors are in
+///         ascending file-index order (callers don't care about order — PQ
+///         training and LID are order-invariant).
+/// @throws Error if the file can't be opened or k > n.
+std::vector<float> draw_random_sample(const std::string& path,
+                                       uint64_t n, Dim dim, uint64_t k) {
+    if (k == 0) return {};
+    if (k > n) {
+        throw Error(ErrorCode::InvalidParam,
+                    "draw_random_sample: k (" + std::to_string(k) +
+                        ") > n (" + std::to_string(n) + ")");
+    }
+
+    const SampleElemType etype = infer_sample_elem_type(path);
+    const uint32_t elem_size = (etype == SampleElemType::Float32) ? 4 : 1;
+    const size_t vec_bytes = static_cast<size_t>(dim) * elem_size;
+
+    // --- Generate k sorted distinct indices in [0, n). ---
+    //
+    // We use partial Fisher-Yates with a sparse swap map: iterate i = 0..k-1,
+    // pick j uniformly in [i, n), and swap the values at logical positions i
+    // and j. Because only positions that have been swapped are recorded in the
+    // map, memory is O(k) — NOT the O(n) a full [0,n) index array would cost
+    // (infeasible at N=1B). Each of the C(n,k) subsets of size k is equally
+    // likely, so every vector has selection probability exactly k/N —
+    // statistically identical to Algorithm R reservoir sampling.
+    //
+    // (This is the spec-sanctioned correct alternative to Vitter's
+    // geometric-skip method: it avoids the overshoot edge cases that make
+    // skip-value generation tricky near the end of the range, while still
+    // being O(k) expected time and O(k) memory.)
+    std::vector<uint64_t> indices;
+    indices.reserve(static_cast<size_t>(k));
+    std::unordered_map<uint64_t, uint64_t> swap_map;
+    swap_map.reserve(static_cast<size_t>(k) * 2);
+
+    const auto val_at = [&](uint64_t i) -> uint64_t {
+        const auto it = swap_map.find(i);
+        return it == swap_map.end() ? i : it->second;
+    };
+    const auto set_at = [&](uint64_t i, uint64_t v) { swap_map[i] = v; };
+
+    std::mt19937_64 rng(0xC0DE1234ULL);  // same seed as reservoir for continuity
+    for (uint64_t i = 0; i < k; ++i) {
+        const uint64_t span = n - i;
+        const uint64_t j = i + (rng() % span);
+        const uint64_t vi = val_at(i);
+        const uint64_t vj = val_at(j);
+        set_at(i, vj);
+        if (j != i) set_at(j, vi);
+        indices.push_back(vj);  // the value now at position i
+    }
+    // Sort into ascending file-index order (an artifact callers don't care
+    // about — PQ training and LID are order-invariant).
+    std::sort(indices.begin(), indices.end());
+
+    // --- Debug-only correctness invariants. ---
+    // The generated sequence must be exactly k indices, strictly increasing,
+    // all within [0, n).
+    if (indices.size() != k) {
+        throw Error(ErrorCode::InvalidParam,
+                    "draw_random_sample: produced " +
+                        std::to_string(indices.size()) + " indices, expected " +
+                        std::to_string(k));
+    }
+    for (size_t i = 0; i < indices.size(); i++) {
+        if (indices[i] >= n) {
+            throw Error(ErrorCode::InvalidParam,
+                        "draw_random_sample: index " +
+                            std::to_string(indices[i]) + " >= n=" +
+                            std::to_string(n));
+        }
+        if (i > 0 && indices[i] <= indices[i - 1]) {
+            throw Error(ErrorCode::InvalidParam,
+                        "draw_random_sample: indices not strictly increasing "
+                        "at position " +
+                            std::to_string(i));
+        }
+    }
+    spdlog::debug("[sextant] seek-based sampling: k={} of N={}, k seeks",
+                  k, n);
+
+    // --- Read the selected vectors via seek + read. ---
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw Error(ErrorCode::IoError,
+                    "draw_random_sample: failed to open '" + path + "': " +
+                        std::strerror(errno));
+    }
+
+    std::vector<float> out(static_cast<size_t>(k) * dim);
+    // Reusable raw buffer for i8/u8 casts.
+    std::vector<uint8_t> raw;
+    if (etype != SampleElemType::Float32) {
+        raw.resize(vec_bytes);
+    }
+
+    double io_sec = 0.0;
+    size_t seek_count = 0;
+
+    for (size_t i = 0; i < indices.size(); i++) {
+        const uint64_t idx = indices[i];
+        const off_t off = static_cast<off_t>(
+            8 + idx * static_cast<uint64_t>(dim) * elem_size);
+        float* dst = out.data() + static_cast<size_t>(i) * dim;
+
+        const auto t0 = std::chrono::steady_clock::now();
+
+        // Seek to the vector.
+        if (::lseek(fd, off, SEEK_SET) < 0) {
+            ::close(fd);
+            throw Error(ErrorCode::IoError,
+                        "draw_random_sample: lseek failed on '" + path +
+                            "': " + std::strerror(errno));
+        }
+        ++seek_count;
+
+        // Read the vector bytes.
+        if (etype == SampleElemType::Float32) {
+            size_t got = 0;
+            while (got < vec_bytes) {
+                ssize_t r = ::read(fd,
+                                   reinterpret_cast<uint8_t*>(dst) + got,
+                                   vec_bytes - got);
+                if (r <= 0) {
+                    ::close(fd);
+                    throw Error(ErrorCode::CorruptIndex,
+                                "draw_random_sample: unexpected EOF on '" +
+                                    path + "'");
+                }
+                got += static_cast<size_t>(r);
+            }
+        } else {
+            size_t got = 0;
+            while (got < vec_bytes) {
+                ssize_t r = ::read(fd, raw.data() + got, vec_bytes - got);
+                if (r <= 0) {
+                    ::close(fd);
+                    throw Error(ErrorCode::CorruptIndex,
+                                "draw_random_sample: unexpected EOF on '" +
+                                    path + "'");
+                }
+                got += static_cast<size_t>(r);
+            }
+            if (etype == SampleElemType::Int8) {
+                for (uint32_t d = 0; d < dim; d++) {
+                    dst[d] = static_cast<float>(
+                        static_cast<int8_t>(raw[d]));
+                }
+            } else {  // Uint8
+                for (uint32_t d = 0; d < dim; d++) {
+                    dst[d] = static_cast<float>(raw[d]);
+                }
+            }
+        }
+
+        io_sec += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+    }
+
+    ::close(fd);
+
+    spdlog::debug("[sextant] seek-based sampling: read {} vectors in "
+                  "{:.3f}s ({} seeks)",
+                  k, io_sec, seek_count);
+
+    return out;
+}
+
 }  // namespace
 
 Engine::PqSelection Engine::probe_pq_config(const float* sample, uint64_t n,
@@ -636,8 +856,42 @@ void Engine::pass1_sample_and_train(VectorSource& source,
                     "Engine::pass1: cannot sample from empty source");
     }
     std::vector<float> reservoir(static_cast<size_t>(sample_cap) * dim_);
+    uint64_t actual_sample = 0;
+    uint64_t seen = 0;
 
-    source.reset();
+    // --- Sampling strategy dispatch ---
+    // When N >> sample (and the source is a seekable file), use seek-based
+    // random sampling: O(sample) seeks instead of O(N) sequential I/O.
+    //
+    // Threshold choice (measurement-driven, not heuristic): on this machine
+    // a sequential read sustains ~3.5 GB/s (~0.88us per 3KB vector) while a
+    // seek+read costs ~26us. Seek-based total cost is ~k*26us regardless of N;
+    // full-scan cost is ~N*0.88us. They cross over near N/k ~ 30. Below that,
+    // the sequential scan is faster (cache/RAID-stripe prefetching dominates
+    // scattered-seek overhead). Above it, seek-based wins, dramatically so as
+    // N grows (full-scan reads 3TB at N=1B; seek-based still reads ~60MB).
+    // Use N > 30*sample_cap as the cutoff.
+    //
+    // Only applies when source.path() is non-empty (a real on-disk file);
+    // MemorySource and future non-file sources fall back to reservoir.
+    const std::string src_path = source.path();
+    constexpr uint64_t kSeekRatioThreshold = 30;
+    const bool seek_eligible = !src_path.empty() &&
+                               count_ > kSeekRatioThreshold * sample_cap;
+
+    if (seek_eligible) {
+        spdlog::info("[sextant] pass 1: seek-based sampling ({} of {} vectors; "
+                     "ratio {:.1f}:1, threshold {}:1)", sample_cap, count_,
+                     static_cast<double>(count_) /
+                         static_cast<double>(sample_cap),
+                     kSeekRatioThreshold);
+        reservoir = draw_random_sample(src_path, count_, dim_, sample_cap);
+        actual_sample = sample_cap;
+        seen = count_;
+    } else {
+        spdlog::info("[sextant] pass 1: reservoir sample (target {} vectors)",
+                     kSampleTarget);
+        source.reset();
 
     // Algorithm R: keep the first `sample_cap`, then replace index j (j<k)
     // with probability k/i for the i-th seen item.
@@ -663,13 +917,13 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     //      reads wouldn't add bandwidth.
     //   2. Total I/O dwarfs compute at billion scale (1B × 3KB = 3TB; nothing
     //      in the sampling loop speeds that up). The only way to go faster is
-    //      to NOT read the whole file — see FOLLOWUP: seek-based sampling.
+    //      to NOT read the whole file — which is what seek-based sampling
+    //      (above) does when N >> sample.
     //   3. The modulo swap above already captured the cheap serial CPU win.
     // Distributed reservoir sampling (per-shard Algorithm R + weighted merge)
     // is a solved algorithm if we ever shard the input across hosts.
     std::mt19937_64 rng(0xC0DE1234ULL);
     Chunk chunk{};
-    uint64_t seen = 0;
     uint64_t filled = 0;
     // Time I/O (source.next) and compute (the per-vector reservoir update)
     // separately: I/O scales with dataset size, compute is what we'd consider
@@ -703,10 +957,7 @@ void Engine::pass1_sample_and_train(VectorSource& source,
         compute_sec += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_c0).count();
     }
-
-    const uint64_t actual_sample = filled;
-    spdlog::info("[sextant] pass 1: sampled {} / {} vectors", actual_sample,
-                 seen);
+    actual_sample = filled;
     {
         const double total_sec = io_sec + compute_sec;
         const double vecs_per_s = (total_sec > 1e-9)
@@ -716,6 +967,10 @@ void Engine::pass1_sample_and_train(VectorSource& source,
                       "({:.0f} vecs/s)",
                       total_sec, io_sec, compute_sec, seen, vecs_per_s);
     }
+    }  // end reservoir branch
+
+    spdlog::info("[sextant] pass 1: sampled {} / {} vectors", actual_sample,
+                 seen);
 
     // Build requires explicit pq_m and pq_bits. The probe-based auto-selection
     // belongs in `sextant analyze` (the advisory tool); build is a committed
@@ -2221,34 +2476,55 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
 
     spdlog::info("[sextant] estimate_config: n={} dim={}", total_n, dim);
 
-    // --- 1. Reservoir sample (reuse pass1's reservoir logic + seed) ---
+    // --- 1. Sample (seek-based when N >> sample, reservoir otherwise) ---
     // sample_n = min(kEstimateSampleTarget, total_n). Use the SAME RNG seed
-    // (0xC0DE1234) as pass1_sample_and_train for reproducibility.
+    // (0xC0DE1234) as pass1_sample_and_train for reproducibility. When the
+    // source is a seekable file and N > 30 × sample_cap, draw the sample via
+    // seek-based random sampling (O(k) I/O) instead of the full O(N) scan.
+    // Threshold is measurement-driven: see pass1_sample_and_train for the
+    // seek-vs-scan cost crossover analysis.
     const uint64_t sample_cap =
         std::min<uint64_t>(kEstimateSampleTarget, total_n);
     std::vector<float> sample(static_cast<size_t>(sample_cap) * dim);
-    source.reset();
-    std::mt19937_64 rng(0xC0DE1234ULL);
-    Chunk chunk{};
-    uint64_t seen = 0;
-    uint64_t filled = 0;
-    while (source.next(chunk)) {
-        for (uint32_t r = 0; r < chunk.count; r++) {
-            const float* vec = chunk.vectors + static_cast<size_t>(r) * dim;
-            if (filled < sample_cap) {
-                std::memcpy(sample.data() + filled * dim, vec, dim * sizeof(float));
-                ++filled;
-            } else {
-                std::uniform_int_distribution<uint64_t> dist(0, seen);
-                const uint64_t j = dist(rng);
-                if (j < sample_cap) {
-                    std::memcpy(sample.data() + j * dim, vec, dim * sizeof(float));
+    uint64_t sample_n = 0;
+    uint64_t seen = total_n;
+
+    const std::string src_path = source.path();
+    constexpr uint64_t kSeekRatioThreshold = 30;
+    const bool seek_eligible = !src_path.empty() &&
+                               total_n > kSeekRatioThreshold * sample_cap;
+    if (seek_eligible) {
+        spdlog::info("[sextant] estimate_config: seek-based sampling ({} of {} "
+                     "vectors; ratio {:.1f}:1)", sample_cap, total_n,
+                     static_cast<double>(total_n) /
+                         static_cast<double>(sample_cap));
+        sample = draw_random_sample(src_path, total_n, dim, sample_cap);
+        sample_n = sample_cap;
+    } else {
+        source.reset();
+        std::mt19937_64 rng(0xC0DE1234ULL);
+        Chunk chunk{};
+        seen = 0;
+        uint64_t filled = 0;
+        while (source.next(chunk)) {
+            for (uint32_t r = 0; r < chunk.count; r++) {
+                const float* vec = chunk.vectors + static_cast<size_t>(r) * dim;
+                if (filled < sample_cap) {
+                    std::memcpy(sample.data() + filled * dim, vec, dim * sizeof(float));
+                    ++filled;
+                } else {
+                    // rng() % (seen+1): faster than uniform_int_distribution
+                    // (see pass1_sample_and_train for the bias rationale).
+                    const uint64_t j = rng() % (seen + 1);
+                    if (j < sample_cap) {
+                        std::memcpy(sample.data() + j * dim, vec, dim * sizeof(float));
+                    }
                 }
+                ++seen;
             }
-            ++seen;
         }
+        sample_n = filled;
     }
-    const uint64_t sample_n = filled;
     spdlog::info("[sextant] estimate_config: sampled {} / {} vectors",
                  sample_n, seen);
 

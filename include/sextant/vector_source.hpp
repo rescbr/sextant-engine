@@ -26,6 +26,15 @@ public:
 
     /// Read the next chunk. Returns false at EOF.
     virtual bool next(Chunk& out) = 0;
+
+    /// Filesystem path backing this source, or empty if the source has no
+    /// on-disk file (e.g. MemorySource, future DuckDB source).
+    ///
+    /// When non-empty, the engine can seek directly into the file for
+    /// seek-based random sampling (O(k) I/O for a k-vector sample) instead of
+    /// the O(N) sequential reservoir scan. When empty, callers fall back to
+    /// Algorithm R reservoir sampling over next().
+    virtual std::string path() const { return {}; }
 };
 
 }  // namespace sextant
