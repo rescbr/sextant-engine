@@ -125,7 +125,20 @@ int main(int argc, char* argv[]) {
                      "Search LRU cache size in bytes (0 = auto)", false, 0);
     p.add("no-cache-rebalance", 0,
           "Disable adaptive graph/code cache rebalancing (default: enabled in paged mode)");
+    p.add<std::string>("log-level", 0,
+                       "Log level: debug, info, warn, error",
+                       false, "info");
     p.parse_check(argc, argv);
+
+    // Set log level (must come after init_logging() above and before any
+    // spdlog calls). debug exposes the cache-rebalance controller's per-call
+    // sample log, BFS reorder details, and other diagnostic output.
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") sextant::set_log_level(sextant::LogLevel::Debug);
+        else if (lvl == "warn") sextant::set_log_level(sextant::LogLevel::Warn);
+        else if (lvl == "error") sextant::set_log_level(sextant::LogLevel::Error);
+    }
 
     const std::string index = p.get<std::string>("index");
     const std::string query_path = p.get<std::string>("queries");
