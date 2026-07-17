@@ -172,6 +172,15 @@ Engine::~Engine() {
 
 BuildResult Engine::build(VectorSource& source, const std::string& index_path,
                           const BuildConfig& config) {
+    // Resolve params, then forward to the ResolvedParams overload which does
+    // the count/dim/index_path setup, build_partitioned, and timing.
+    count_ = source.count();
+    dim_ = source.dim();
+    return build(source, index_path, resolve_params(count_, dim_, config));
+}
+
+BuildResult Engine::build(VectorSource& source, const std::string& index_path,
+                          const ResolvedParams& params) {
     const auto t0 = std::chrono::steady_clock::now();
 
     count_ = source.count();
@@ -188,14 +197,6 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     spdlog::info("[sextant] build: n={} dim={} → '{}'", count_, dim_,
                  index_path);
 
-    // 1. Resolve parameters.
-    auto params = resolve_params(count_, dim_, config);
-
-    // Unified build path: K=1 (monolithic) is a special case of the
-    // partitioned path. build_partitioned handles both — K==1 builds the full
-    // graph directly into the global buffers (no partition/merge); K>1
-    // partitions into K shards, builds each at R_shard=2R/3, then merges.
-    // All optimizations (T5 dynamic L_build, THP, future work) live in one place.
     auto result = build_partitioned(source, index_path, params);
     const auto t1 = std::chrono::steady_clock::now();
     result.build_time_sec =
@@ -2801,7 +2802,15 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
     p.alpha = alpha_rec;
     p.pq_m = pq_m;
     p.pq_bits = pq_bits;
-    p.L_build = static_cast<uint16_t>(std::max<uint32_t>(2u * p.R, 100u));
+    // Honor an explicit L override (the T5 dynamic-ramp ceiling). Mirror
+    // resolve_params's behavior: overrides.L != 0 locks L_build directly;
+    // otherwise L_build = max(2*R, 100). Previously this was silently ignored
+    // — an inconsistency between the heuristic and the estimation paths.
+    if (overrides.L != 0) {
+        p.L_build = overrides.L;
+    } else {
+        p.L_build = static_cast<uint16_t>(std::max<uint32_t>(2u * p.R, 100u));
+    }
     p.L = p.L_build;
     p.max_occlusion = (overrides.max_occlusion != 0)
                            ? overrides.max_occlusion

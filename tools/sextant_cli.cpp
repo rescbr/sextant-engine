@@ -1,15 +1,20 @@
-// sextant CLI — build / search / insert.
+// sextant CLI — build / autobuild / search / insert / analyze.
 //
 // Uses the vendored cmdline.h (header-only) for argument parsing.
 // Commands:
-//   sextant build   — build an index from a .fbin file
-//   sextant search  — search an index with query vectors
-//   sextant insert  — insert a single vector into an index
+//   sextant build      — build an index from a .fbin file (explicit params)
+//   sextant autobuild  — estimate_config then build, in one process
+//   sextant search     — search an index with query vectors
+//   sextant insert     — insert a single vector into an index
+//   sextant analyze    — read-only dataset-adaptive parameter advisory
+//
+// build/autobuild/analyze share a common flag parser (tools/shared_cli.hpp).
 //
 // The CLI catches all exceptions, prints to stderr, returns non-zero.
 
 #include "engine/fbin_source.hpp"
 #include "fbin_io.hpp"
+#include "shared_cli.hpp"
 #include "sextant/config.hpp"
 #include "sextant/engine.hpp"
 #include "sextant/error.hpp"
@@ -43,57 +48,19 @@ using namespace sextant::fbin_io;  // FbinHeader, read_fbin_header, read_fbin_ve
 // ---------------------------------------------------------------------------
 
 int cmd_build(int argc, char* argv[]) {
+    using namespace sextant_cli;
     cmdline::parser p;
-    p.add<std::string>("input", 0, "Input .fbin/.ibin/.bbin file", true);
-    p.add<std::string>("index", 0, "Index name/path prefix", true);
-    p.add<uint16_t>("R", 0, "Graph degree (auto if 0)", false, 0);
-    p.add<uint16_t>("L", 0, "Beam width (auto if 0)", false, 0);
-    p.add<float>("alpha", 0, "Vamana prune threshold (default 1.2).", false, 1.2f);
-    p.add<std::string>("build-mode", 0, "Build mode (deprecated, always sdc). "
-                                      "Accepted for backward compat: sdc only.", false, "sdc");
-    p.add<uint16_t>("pq-m", 0, "PQ segments — REQUIRED for build (e.g. 96). "
-                         "Run `sextant analyze` first if unsure what to pick.", false, 0);
-    p.add<std::string>("pq-bits", 0, "PQ bits — REQUIRED for build: 4 or 8 (e.g. 8). "
-                                  "Run `sextant analyze` first if unsure what to pick.", false, "auto");
-    p.add<float>("pq-max-distortion", 0,
-                 "Max PQ distortion (median |1 - pq_dist/true_dist|) for auto (m,bits) selection "
-                 "(0 = default 0.05). Filters configs; the min-cost eligible config is selected. "
-                 "Lower (e.g. 0.03) forces higher-fidelity PQ; higher (e.g. 0.10-0.15) admits "
-                 "aggressive low-m configs for high-dimensional data.",
-                 false, 0.0f);
-    p.add<std::string>("metric", 0, "l2sq or ip", false, "l2sq");
-    p.add<uint32_t>("threads", 0, "Build threads (auto if 0)", false, 0);
-    p.add<uint64_t>("build-ram", 0,
-                     "Build RAM budget in bytes (forces partitioning if small)",
-                     false, 0);
-    p.add<uint32_t>("inline-pq", 0,
-                     "Neighbor PQ codes inlined per node (0=compact, R=all; deprecated)",
-                     false, 0);
-    p.add<uint32_t>("max-occlusion", 0,
-                     "RobustPrune candidate cap (auto if 0)",
-                     false, 0);
-    p.add<std::string>("log-level", 0,
-                       "Log level: debug, info, warn, error",
-                       false, "info");
-    p.add("explain", 0, "Print resolved params and exit (dry-run). When pq_m or "
-                        "pq_bits is auto, reads a random sample and runs the "
-                        "full PQ probe to show the actual selection.");
-    p.add<uint32_t>("probe-sample", 0,
-                    "Sample size for --explain PQ probe (default 20000). "
-                    "Reads this many random vectors via seek; no full scan.",
-                    false, 20000);
+    add_common_flags(p);
+    add_mode_extras(p, Mode::Build);
     p.parse_check(argc, argv);
-
-    // Set log level.
-    {
-        const auto lvl = p.get<std::string>("log-level");
-        if (lvl == "debug") sextant::set_log_level(sextant::LogLevel::Debug);
-        else if (lvl == "warn") sextant::set_log_level(sextant::LogLevel::Warn);
-        else if (lvl == "error") sextant::set_log_level(sextant::LogLevel::Error);
-    }
+    apply_log_level(p);
 
     const std::string input = p.get<std::string>("input");
     const std::string index = p.get<std::string>("index");
+    if (index.empty()) {
+        std::cerr << "sextant build: --index is required\n";
+        return 1;
+    }
 
     sextant::FbinSource source(input);
     const uint64_t n = source.count();
@@ -104,115 +71,62 @@ int cmd_build(int argc, char* argv[]) {
         return 1;
     }
 
-    sextant::BuildConfig cfg;
-    cfg.R = p.get<uint16_t>("R");
-    cfg.L = p.get<uint16_t>("L");
-    cfg.alpha = p.get<float>("alpha");
-    // build-mode: deprecated, always SDC. Accept "sdc" for backward compat;
-    // error on "adc" (removed — FP16 prune hybrid made it redundant).
-    {
-        const std::string bm = p.get<std::string>("build-mode");
-        if (bm == "sdc" || bm == "0") {
-            cfg.build_mode = sextant::BuildMode::SDC;
-        } else if (bm == "adc" || bm == "1") {
-            std::fprintf(stderr, "--build-mode adc is no longer supported (FP16 prune "
-                                 "hybrid made it redundant). Use sdc.\n");
-            return 1;
-        } else {
-            std::fprintf(stderr, "--build-mode must be sdc (got '%s')\n", bm.c_str());
-            return 1;
-        }
-    }
-    cfg.pq_m = p.get<uint16_t>("pq-m");
-    // pq-bits: "auto" (default) → 0 (resolved by global probe in pass1), else 4|8.
-    {
-        const std::string b = p.get<std::string>("pq-bits");
-        if (b == "auto" || b == "0") {
-            cfg.pq_bits = 0;
-        } else if (b == "4") {
-            cfg.pq_bits = 4;
-        } else if (b == "8") {
-            cfg.pq_bits = 8;
-        } else {
-            std::fprintf(stderr, "--pq-bits must be 4, 8, or auto (got '%s')\n", b.c_str());
-            return 1;
-        }
-    }
-    cfg.pq_max_distortion = p.get<float>("pq-max-distortion");
-    cfg.num_threads = p.get<uint32_t>("threads");
+    sextant::BuildConfig cfg = build_config_from_parser(p);
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
-    cfg.inline_pq_count = p.get<uint32_t>("inline-pq");
-    cfg.max_occlusion = p.get<uint32_t>("max-occlusion");
-    const std::string metric = p.get<std::string>("metric");
-    cfg.metric = (metric == "ip") ? sextant::MetricKind::InnerProduct
-                                  : sextant::MetricKind::L2Sq;
-
-    if (p.exist("explain")) {
-        // If ANY of (R, alpha, pq_m, pq_bits) is auto, run the full
-        // sample-driven estimate_config (it does PQ probe + alpha sweep +
-        // R prediction via mini-builds). If ALL are locked, use the fast
-        // resolve_params path (no sampling needed).
-        const bool any_auto = (cfg.R == 0) || (cfg.alpha == 0.0f) ||
-                              (cfg.pq_m == 0) || (cfg.pq_bits == 0);
-
-        sextant::ResolvedParams resolved;
-        bool used_estimate_config = false;
-        if (any_auto) {
-            sextant::Engine engine;
-            resolved = engine.estimate_config(source, cfg);
-            used_estimate_config = true;
-        } else {
-            resolved = sextant::resolve_params(n, dim, cfg);
-        }
-
-        std::cout << "input:      " << input << "\n"
-                  << "index:      " << index << "\n"
-                  << "n_vectors:  " << n << "\n"
-                  << "dim:        " << dim << "\n"
-                  << "R:          " << resolved.R
-                  << (cfg.R != 0 ? "  [locked]\n" : "  [estimated]\n")
-                  << "L:          " << resolved.L << "\n"
-                  << "L_build:    " << resolved.L_build << "\n"
-                  << "alpha:      " << resolved.alpha
-                  << (cfg.alpha != 0.0f ? "  [locked]\n" : "  [estimated]\n");
-
-        if (used_estimate_config) {
-            std::cout << "pq_m:       " << resolved.pq_m
-                      << (cfg.pq_m != 0 ? "  [locked]\n" : "  [estimated]\n");
-            std::cout << "pq_bits:    " << static_cast<int>(resolved.pq_bits)
-                      << (cfg.pq_bits != 0 ? "  [locked]\n" : "  [estimated]\n");
-            // Show the measured signals that drove the estimation.
-            std::cout << "\n─── Measured signals (estimate_config) ───\n";
-            std::cout << "  median LID:         " << std::fixed
-                      << std::setprecision(2) << resolved.measured_median_lid
-                      << "\n";
-            std::cout << "  avg degree (R̄):     " << std::setprecision(2)
-                      << resolved.measured_avg_degree << "\n";
-            std::cout << "  clustering coeff:   " << std::setprecision(4)
-                      << resolved.measured_clustering << "\n";
-            std::cout << "  dead-end fraction:  " << std::setprecision(4)
-                      << resolved.measured_dead_end_frac << "\n";
-            std::cout << "  closure_factor:     " << std::setprecision(4)
-                      << resolved.closure_factor << "\n";
-        } else {
-            std::cout << "pq_m:       " << resolved.pq_m << "\n"
-                      << "pq_bits:    " << static_cast<int>(resolved.pq_bits)
-                      << "\n";
-            std::cout << "pq_max_distortion:  " << resolved.pq_max_distortion
-                      << " (bound; not used — m and bits are explicit)\n";
-        }
-        std::cout << "max_occlusion:  " << resolved.max_occlusion << "\n"
-                  << "inline_pq:  " << resolved.inline_pq_count << "\n"
-                  << "threads:    " << resolved.num_threads << "\n"
-                  << "build_ram:  " << resolved.build_ram_budget
-                  << " bytes\n"
-                  << "K:          " << resolved.K << "\n"
-                  << "metric:     " << metric << "\n";
-        return 0;
-    }
+    cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
 
     sextant::Engine engine;
     sextant::BuildResult result = engine.build(source, index, cfg);
+    std::cout << "built index '" << index << "': n=" << result.n_vectors
+              << " dim=" << result.dim
+              << " R=" << result.R
+              << " L_build=" << result.L_build
+              << " pq_m=" << static_cast<int>(result.pq_m)
+              << " pq_bits=" << static_cast<int>(result.pq_bits)
+              << " in " << result.build_time_sec << "s\n";
+    return 0;
+}
+
+int cmd_autobuild(int argc, char* argv[]) {
+    using namespace sextant_cli;
+    cmdline::parser p;
+    add_common_flags(p);
+    add_mode_extras(p, Mode::Autobuild);
+    p.parse_check(argc, argv);
+    apply_log_level(p);
+
+    const std::string input = p.get<std::string>("input");
+    const std::string index = p.get<std::string>("index");
+    if (index.empty()) {
+        std::cerr << "sextant autobuild: --index is required\n";
+        return 1;
+    }
+
+    sextant::FbinSource source(input);
+    const uint64_t n = source.count();
+    const sextant::Dim dim = source.dim();
+    if (n == 0 || dim == 0) {
+        std::cerr << "sextant autobuild: empty or invalid source '" << input
+                  << "'\n";
+        return 1;
+    }
+
+    sextant::BuildConfig cfg = build_config_from_parser(p);
+    cfg.proximity_target = p.get<float>("proximity-target");
+    cfg.recall_target    = p.get<float>("recall-target");
+    cfg.build_ram_budget = p.get<uint64_t>("build-ram");
+    cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
+
+    sextant::Engine engine;
+    // estimate_config handles all auto knobs; locked ones override.
+    const sextant::ResolvedParams params = engine.estimate_config(source, cfg);
+
+    // Print the analysis (shared pretty-print with analyze).
+    print_analysis_(source, input, cfg, params);
+
+    // Build with the resolved params (in-process, no string round-trip).
+    const sextant::BuildResult result = engine.build(source, index, params);
+    std::cout << "\n═══ Build Result ═══\n";
     std::cout << "built index '" << index << "': n=" << result.n_vectors
               << " dim=" << result.dim
               << " R=" << result.R
@@ -227,10 +141,17 @@ int cmd_search(int argc, char* argv[]) {
     cmdline::parser p;
     p.add<std::string>("index", 0, "Index name/path prefix", true);
     p.add<std::string>("query", 0, "Query .fbin file", true);
-    p.add<uint32_t>("k", 0, "Number of results", false, 10);
-    p.add<uint32_t>("L", 0, "Search beam width", false, 200);
-    p.add<uint32_t>("rerank", 0, "Rerank factor", false, 10);
-    p.add<uint32_t>("threads", 0, "Search threads (0 = 1, serial)", false, 1);
+    p.add<uint32_t>("topk", 0,
+        "Number of nearest neighbors to return per query (k in ANN literature)",
+        false, 10);
+    p.add<uint32_t>("search-beam-width", 0,
+        "Search-time beam width (L in Vamana literature). Higher = more accurate, "
+        "slower. Must be >= topk.",
+        false, 200);
+    p.add<uint32_t>("rerank", 0, "Rerank factor (0/1 = no rerank)", false, 10);
+    p.add<uint32_t>("threads", 0,
+        "Search threads (0 = hardware_concurrency; 1 = force serial path)",
+        false, 0);
     p.add<std::string>("output", 0, "Output file (default: stdout)", false, "");
     p.add<std::string>(
         "base-data", 0,
@@ -252,12 +173,18 @@ int cmd_search(int argc, char* argv[]) {
 
     const std::string index = p.get<std::string>("index");
     const std::string query_path = p.get<std::string>("query");
-    const uint32_t k = p.get<uint32_t>("k");
-    const uint32_t L = p.get<uint32_t>("L");
+    const uint32_t k = p.get<uint32_t>("topk");
+    const uint32_t L = p.get<uint32_t>("search-beam-width");
     const uint32_t rerank = p.get<uint32_t>("rerank");
     const std::string output = p.get<std::string>("output");
     const std::string base_data = p.get<std::string>("base-data");
-    const uint32_t num_threads = p.get<uint32_t>("threads");
+    uint32_t num_threads = p.get<uint32_t>("threads");
+    // 0 = hardware_concurrency (parallel by default — ANN search is
+    // embarrassingly parallel across queries). 1 explicitly selects the
+    // serial code path (used for deterministic-output / single-query debug).
+    if (num_threads == 0) {
+        num_threads = std::max(1u, std::thread::hardware_concurrency());
+    }
 
     sextant::Engine engine;
     engine.set_cache_size(p.get<uint64_t>("cache-size"));
@@ -500,10 +427,21 @@ int cmd_insert(int argc, char* argv[]) {
 void print_usage() {
     std::cerr << "Usage: sextant <command> [options]\n"
               << "Commands:\n"
-              << "  build    Build an index from a .fbin file\n"
-              << "  search   Search an index with query vectors\n"
-              << "  insert   Insert a single vector into an index\n"
-              << "  analyze  PQ sensitivity advisory (pre-build mini-graph sweep)\n";
+              << "  build      Build an index from a .fbin file (explicit params).\n"
+              << "             Common flags: --input --index --max-node-neighbors (R)\n"
+              << "             --beam-width-ceiling (L) --prune-threshold (alpha)\n"
+              << "             --pq-segments (m) --pq-bits --threads --metric\n"
+              << "             --build-ram --prune-candidate-cap --log-level\n"
+              << "  autobuild  Estimate config (analyze) then build, in-process.\n"
+              << "             Accepts all build flags plus estimate knobs:\n"
+              << "             --proximity-target --recall-target\n"
+              << "  analyze    Read-only dataset-adaptive parameter advisory.\n"
+              << "             Flags: --input --metric --proximity-target\n"
+              << "             --recall-target --max-node-neighbors --prune-threshold\n"
+              << "             --pq-segments --pq-bits --pq-max-distortion --threads\n"
+              << "             --log-level\n"
+              << "  search     Search an index with query vectors\n"
+              << "  insert     Insert a single vector into an index\n";
 }
 
 }  // namespace
@@ -530,6 +468,8 @@ int main(int argc, char* argv[]) {
     try {
         if (cmd == "build") {
             return cmd_build(sub_argc, sub_argv.data());
+        } else if (cmd == "autobuild") {
+            return cmd_autobuild(sub_argc, sub_argv.data());
         } else if (cmd == "search") {
             return cmd_search(sub_argc, sub_argv.data());
         } else if (cmd == "insert") {

@@ -74,8 +74,19 @@ public:
     Engine& operator=(const Engine&) = delete;
 
     /// Build an index from a vector source. Writes sidecar files.
+    /// Auto-resolves params from `config` via resolve_params() (any field
+    /// set to 0/auto in `config` is resolved heuristically — but pq_m and
+    /// pq_bits MUST be explicit; pass1 throws otherwise).
     BuildResult build(VectorSource& source, const std::string& index_path,
                       const BuildConfig& config);
+
+    /// Build overload taking a fully-resolved params struct directly (e.g.
+    /// the result of estimate_config). Skips resolve_params entirely — the
+    /// caller is responsible for producing a complete ResolvedParams. This
+    /// is the path used by `sextant autobuild` so the analyze→build chain
+    /// stays in-process (no string serialization round-trip).
+    BuildResult build(VectorSource& source, const std::string& index_path,
+                      const ResolvedParams& params);
 
     /// Probe PQ (m, bits) selection on a sample. Runs the full auto-selection
     /// policy (recall floor + cache-band preference) on `sample` (n × dim

@@ -114,7 +114,7 @@ int main(int argc, char* argv[]) {
     p.add<std::string>("queries", 0, "Query .fbin file", true);
     p.add<std::string>("base-data", 0, "Original base .fbin for rerank", true);
     p.add<std::string>("ground-truth", 0, "Ground-truth .gt file", true);
-    p.add<uint32_t>("k", 0, "Number of results to evaluate", false, 10);
+    p.add<uint32_t>("topk", 0, "Number of nearest neighbors to return per query (k in ANN literature)", false, 10);
     p.add<uint32_t>("L", 0, "Search beam width", false, 200);
     p.add<uint32_t>("rerank", 0, "Rerank factor (0/1 = no rerank)", false, 10);
     p.add<uint32_t>("io-limit", 0, "Search I/O budget (0 = unlimited)", false, 0);
