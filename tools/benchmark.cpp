@@ -115,7 +115,9 @@ int main(int argc, char* argv[]) {
     p.add<std::string>("base-data", 0, "Original base .fbin for rerank", true);
     p.add<std::string>("ground-truth", 0, "Ground-truth .gt file", true);
     p.add<uint32_t>("topk", 0, "Number of nearest neighbors to return per query (k in ANN literature)", false, 10);
-    p.add<uint32_t>("L", 0, "Search beam width", false, 200);
+    p.add<uint32_t>("search-beam-width", 0,
+        "Search-time beam width (L in Vamana literature). Higher = more accurate, slower.",
+        false, 200);
     p.add<uint32_t>("rerank", 0, "Rerank factor (0/1 = no rerank)", false, 10);
     p.add<uint32_t>("io-limit", 0, "Search I/O budget (0 = unlimited)", false, 0);
     p.add<uint32_t>("limit", 0, "Max queries to run (0 = all)", false, 0);
@@ -145,7 +147,7 @@ int main(int argc, char* argv[]) {
     const std::string base_data = p.get<std::string>("base-data");
     const std::string gt_path = p.get<std::string>("ground-truth");
     const uint32_t k = p.get<uint32_t>("k");
-    const uint32_t L = p.get<uint32_t>("L");
+    const uint32_t L = p.get<uint32_t>("search-beam-width");
     const uint32_t rerank = p.get<uint32_t>("rerank");
     const uint32_t io_limit = p.get<uint32_t>("io-limit");
     const uint32_t limit = p.get<uint32_t>("limit");
