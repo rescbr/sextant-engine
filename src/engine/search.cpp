@@ -135,7 +135,7 @@ void Engine::open(const std::string& index_path) {
 
 void Engine::load_sidecars() {
     // --- .meta ---
-    // Payload layout (written by flush_sidecars):
+    // Payload layout (written by write_sidecars_):
     //   [u64 quantizer_size][quantizer_bytes]
     //   [u16 entry_point_count][entry_point_count × u32]
     //   [ResolvedParams POD block]

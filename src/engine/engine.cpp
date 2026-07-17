@@ -45,6 +45,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <random>
 #include <string>
@@ -877,7 +878,7 @@ void Engine::construct_into(VamanaCore& core, uint32_t count,
 //      contiguous copy of its members' PQ codes. Nodes store GLOBAL row_ids.
 //   4. Merge: union neighbor lists per global node, remap shard-local IDs →
 //      global IDs, truncate to R by SDC code distance.
-//   5. Flush: standard flush_sidecars (merged graph + global codes).
+//   5. Flush: standard write_sidecars_ (merged graph + global codes).
 // ===========================================================================
 
 BuildResult Engine::build_partitioned(VectorSource& source,
@@ -1361,7 +1362,8 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                      params.inline_pq_count);
     }
     core_->finalize_inline_codes();
-    flush_sidecars(params);
+    auto bfs = compute_bfs_reorder_(params);
+    write_sidecars_(index_path_, bfs, params);
 
     // Post-flush: switch from flat build buffers to a PagedNodeStore so
     // post-build search is SSD-resident. The sidecars now hold the FINAL-layout
@@ -1398,10 +1400,26 @@ BuildResult Engine::build_partitioned(VectorSource& source,
 }
 
 // ===========================================================================
-// Flush sidecars (Issue 32 — ring-buffered; here, sequential padded writes)
+// compute_bfs_reorder_ — pure BFS reorder of build IDs → disk positions.
+// write_sidecars_  — streams all four sidecars using the precomputed reorder.
 // ===========================================================================
 
-void Engine::flush_sidecars(const ResolvedParams& params) {
+Engine::BfsReorder Engine::compute_bfs_reorder_(const ResolvedParams& params) const {
+    const uint32_t n = static_cast<uint32_t>(count_);
+    const uint32_t build_node_size = node_size_;  // inline_pq=0 layout
+    const auto& raw_entry_points = core_->entry_points();
+    BfsReorder bfs;
+    bfs.order = compute_bfs_order(nodes_buffer_, n, build_node_size, raw_entry_points);
+    bfs.remap.resize(n);
+    for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
+        bfs.remap[bfs.order[new_pos]] = new_pos;
+    }
+    return bfs;
+}
+
+void Engine::write_sidecars_(const std::string& index_path,
+                             const BfsReorder& bfs,
+                             const ResolvedParams& params) {
     const auto uuid = make_uuid();
     const uint32_t n = static_cast<uint32_t>(count_);
 
@@ -1410,41 +1428,64 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
         params.R, params.inline_pq_count, code_size_);
     const uint32_t build_node_size = node_size_;  // inline_pq=0 layout
 
-    // ----- PageShuffle: compute BFS reordering from entry points -----
-    // bfs_order[new_pos] = old_id. remap[old_id] = new_pos.
-    const auto& raw_entry_points = core_->entry_points();
-    const std::vector<uint32_t> bfs_order = compute_bfs_order(
-        nodes_buffer_, n, build_node_size, raw_entry_points);
-    std::vector<uint32_t> remap(n);
-    for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
-        remap[bfs_order[new_pos]] = new_pos;
-    }
-
-    // ----- .codes (reordered to BFS order) -----
+    // ----- .codes (reordered to BFS order, STREAMED) -----
     {
-        const std::string path = index_path_ + ".codes";
+        const std::string path = index_path + ".codes";
         DirectFile f(path, true);
         SidecarHeader h;
         fill_header(h, kMagicCodes, count_, dim_, uuid);
         write_padded(f, &h, sizeof(h), 0);
-        // Stage reordered codes so a single write_padded emits them contiguously.
+
         const size_t codes_bytes = static_cast<size_t>(n) * code_size_;
-        std::vector<uint8_t> shuffled(codes_bytes);
+        // Stream the reorder through a block-aligned ring buffer (256KB) instead
+        // of materializing the full N×code_size in RAM. At 1B×96B the old path
+        // allocated 96GB transiently here.
+        //
+        // Chunk sizing: each FULL chunk must hold a kDiskAlign-multiple of bytes
+        // so write_padded emits it verbatim (no interior zero-padding). Only the
+        // final partial chunk is padded — matching the former single-write tail,
+        // which is what keeps the on-disk layout byte-identical to the old path.
+        const size_t block_cap = kBlockSize;  // 256KB
+        const uint32_t align_step =
+            kDiskAlign / std::gcd(kDiskAlign, code_size_);
+        uint32_t codes_per_block =
+            static_cast<uint32_t>(block_cap / code_size_);
+        codes_per_block -= codes_per_block % align_step;  // round down
+        codes_per_block = std::max<uint32_t>(codes_per_block, align_step);
+        const size_t buf_cap = static_cast<size_t>(codes_per_block) * code_size_;
+        uint8_t* ring = static_cast<uint8_t*>(aligned_alloc(kDiskAlign, buf_cap));
+        if (!ring) {
+            throw Error(ErrorCode::OutOfMemory,
+                        "write_sidecars_: .codes ring alloc failed");
+        }
+
+        uint64_t write_off = sizeof(h);
+        uint32_t in_block = 0;
         for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
-            const uint32_t old_id = bfs_order[new_pos];
-            std::memcpy(shuffled.data() + static_cast<size_t>(new_pos) * code_size_,
+            const uint32_t old_id = bfs.order[new_pos];
+            std::memcpy(ring + static_cast<size_t>(in_block) * code_size_,
                         codes_buffer_ + static_cast<size_t>(old_id) * code_size_,
                         code_size_);
+            if (++in_block >= codes_per_block) {
+                write_padded(f, ring,
+                             static_cast<size_t>(in_block) * code_size_, write_off);
+                write_off += static_cast<size_t>(in_block) * code_size_;
+                in_block = 0;
+            }
         }
-        write_padded(f, shuffled.data(), codes_bytes, sizeof(h));
+        if (in_block > 0) {
+            write_padded(f, ring,
+                         static_cast<size_t>(in_block) * code_size_, write_off);
+        }
+        aligned_free(ring);
         f.sync();
-        spdlog::info("[sextant] wrote {} ({} bytes, BFS-reordered)", path,
-                     codes_bytes);
+        spdlog::info("[sextant] wrote {} ({} bytes, BFS-reordered, streamed)",
+                     path, codes_bytes);
     }
 
     // ----- .graph (reformat to final layout, inline neighbor PQ codes) -----
     {
-        const std::string path = index_path_ + ".graph";
+        const std::string path = index_path + ".graph";
         DirectFile f(path, true);
         SidecarHeader h;
         fill_header(h, kMagicGraph, count_, dim_, uuid);
@@ -1470,8 +1511,8 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
         uint32_t in_block = 0;
         for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
             // PageShuffle: emit nodes in BFS order. The node at disk position
-            // new_pos is the build node whose old_id = bfs_order[new_pos].
-            const uint32_t old_id = bfs_order[new_pos];
+            // new_pos is the build node whose old_id = bfs.order[new_pos].
+            const uint32_t old_id = bfs.order[new_pos];
             const uint8_t* src = nodes_buffer_ +
                                  static_cast<size_t>(old_id) * build_node_size;
             uint8_t* dst = ring + static_cast<size_t>(in_block) * final_node_size;
@@ -1488,7 +1529,7 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
             for (uint16_t i = 0; i < ndeg; i++) {
                 const uint32_t old_nb = VamanaCore::get_neighbor(dst, i);
                 if (old_nb < n) {
-                    VamanaCore::set_neighbor(dst, i, remap[old_nb]);
+                    VamanaCore::set_neighbor(dst, i, bfs.remap[old_nb]);
                 }
             }
 
@@ -1538,7 +1579,7 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
         std::vector<uint32_t> remapped_eps;
         remapped_eps.reserve(eps.size());
         for (uint32_t ep : eps) {
-            remapped_eps.push_back(ep < n ? remap[ep] : ep);
+            remapped_eps.push_back(ep < n ? bfs.remap[ep] : ep);
         }
         write_meta_file(params, remapped_eps, uuid);
     }
@@ -1550,10 +1591,10 @@ void Engine::flush_sidecars(const ResolvedParams& params) {
 // ===========================================================================
 // write_meta_file / write_manifest_file — shared .meta and .manifest writers.
 //
-// Both flush_sidecars (build path) and flush (post-insert path) emit the same
+// Both write_sidecars_ (build path) and flush (post-insert path) emit the same
 // .meta payload (serialized quantizer + entry points + ResolvedParams) and the
 // same .manifest commit point. The only caller-specific detail is the entry-
-// point vector: flush_sidecars BFS-remaps build IDs to disk positions, while
+// point vector: write_sidecars_ BFS-remaps build IDs to disk positions, while
 // flush passes core_->entry_points() verbatim (buffers are already final).
 // Callers prepare the entry-point vector and pass it in.
 // ===========================================================================

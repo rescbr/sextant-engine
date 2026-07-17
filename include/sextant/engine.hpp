@@ -245,19 +245,34 @@ private:
                                    const std::string& index_path,
                                    const ResolvedParams& params);
 
-    /// Flush sidecar files (Issue 32: ring-buffered).
-    void flush_sidecars(const ResolvedParams& params);
+    /// BFS reorder of build IDs → disk positions (PageShuffle). Pure: does not
+    /// mutate nodes_buffer_. Computed once per build, consumed by write_sidecars_.
+    struct BfsReorder {
+        std::vector<uint32_t> order;  // order[new_pos] = old_id
+        std::vector<uint32_t> remap;  // remap[old_id]  = new_pos
+    };
+
+    /// Compute the BFS reorder from the build entry points. Pure.
+    BfsReorder compute_bfs_reorder_(const ResolvedParams& params) const;
+
+    /// Stream all four sidecars (.codes, .graph, .meta, .manifest) to
+    /// `index_path` using the precomputed BFS reorder. Does not mutate buffers.
+    /// Replaces the former monolithic flush; the .codes write is now
+    /// streamed (was a full N×code_size transient allocation — 96GB at 1B).
+    void write_sidecars_(const std::string& index_path,
+                         const BfsReorder& bfs,
+                         const ResolvedParams& params);
 
     /// Write the .meta sidecar (serialized quantizer + entry points + params).
     /// `entry_points` is already in final disk layout (BFS-remapped by the
-    /// build path, verbatim by the post-insert path). Shared by flush_sidecars
+    /// build path, verbatim by the post-insert path). Shared by write_sidecars_
     /// and flush.
     void write_meta_file(const ResolvedParams& params,
                          const std::vector<uint32_t>& entry_points,
                          const std::pair<uint64_t, uint64_t>& uuid);
 
     /// Write the .manifest sidecar (atomic commit point). Shared by
-    /// flush_sidecars and flush.
+    /// write_sidecars_ and flush.
     void write_manifest_file(const ResolvedParams& params,
                              const std::pair<uint64_t, uint64_t>& uuid);
 
