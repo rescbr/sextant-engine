@@ -88,6 +88,47 @@ void CacheShard::on_protected_hit(LRUEntry* e) {
 // with the current limits: demoting over-capacity protected entries back to
 // probation, and spilling an oversized window through TinyLFU admission.
 
+// --- resize (per-shard capacity change; caller holds mu_) -----------------
+//
+// Evicts entries (window LRU → probation LRU → protected LRU) until the
+// resident count fits the new capacity, then recomputes the window/protected
+// limits and calls maybe_adapt() to reconcile. free_entry() adjusts the
+// per-segment size counters itself (based on e->status), so we do NOT
+// decrement them here.
+
+void CacheShard::resize(uint32_t new_capacity) {
+    capacity_ = new_capacity;
+    max_window_.store(std::max(1u, capacity_ * 1 / 100),
+                      std::memory_order_relaxed);
+    max_protected_.store((capacity_ - max_window_.load()) * 80 / 100,
+                         std::memory_order_relaxed);
+
+    // Evict excess entries: window first, then probation, then protected.
+    while (map_.size() > capacity_) {
+        LRUEntry* victim = window_.lru();
+        if (victim == nullptr) {
+            victim = probation_.lru();
+        }
+        if (victim == nullptr) {
+            victim = protected_.lru();
+        }
+        if (victim == nullptr) {
+            break;  // all lists empty but map_ non-empty? shouldn't happen
+        }
+        // Unlink from the list BEFORE free_entry (which erases from the map
+        // but does not unlink). free_entry adjusts the size counters based
+        // on victim->status, so we don't touch them here.
+        switch (victim->status) {
+            case Status::WINDOW:    window_.unlink(victim);    break;
+            case Status::PROBATION: probation_.unlink(victim); break;
+            case Status::PROTECTED: protected_.unlink(victim); break;
+        }
+        free_entry(victim);
+    }
+
+    maybe_adapt();
+}
+
 void CacheShard::maybe_adapt() {
     uint32_t cur_max_protected = max_protected_.load(std::memory_order_relaxed);
     uint32_t cur_max_window = max_window_.load(std::memory_order_relaxed);
@@ -298,6 +339,21 @@ CacheStats BlockCache::stats() const {
         s.evictions_rejected += shard->evictions_rejected();
     }
     return s;
+}
+
+void BlockCache::resize(uint32_t new_blocks_per_shard) {
+    // Per-shard eviction under each shard's write lock.
+    for (auto& shard : shards_) {
+        ScopedWriteLock lock(shard->mutex());
+        shard->resize(new_blocks_per_shard);
+    }
+
+    // Reset the cache-level hill-climber fields to match the new capacity.
+    hc_per_shard_capacity_ = new_blocks_per_shard;
+    hc_capacity_ = static_cast<uint64_t>(new_blocks_per_shard) * shards_.size();
+    hc_sample_size_ = 10u * hc_capacity_;
+    hc_step_size_ = std::max(2.0, hc_per_shard_capacity_ * 0.0625);
+    hc_prev_hit_rate_ = 0.0;  // workload may shift after resize
 }
 
 // --- cache-level hill-climbing (ported from Caffeine's BoundedLocalCache) ----

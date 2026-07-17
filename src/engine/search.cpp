@@ -259,6 +259,12 @@ void Engine::load_sidecars() {
     {
         const uint64_t graph_size =
             static_cast<uint64_t>(count_) * node_size_;
+        // codes_size: n × code_size (the .codes sidecar payload). Previously
+        // the budget considered only graph_size, under-provisioning the code
+        // cache — now both files are accounted for.
+        const uint64_t codes_size =
+            static_cast<uint64_t>(count_) * code_size_;
+        const uint64_t total_index_size = graph_size + codes_size;
         uint64_t phys_ram = 0;
 #ifdef __APPLE__
         // sysctl hw.memsize
@@ -280,24 +286,24 @@ void Engine::load_sidecars() {
             cache_bytes = cache_size_override_;
         } else if (phys_ram > 0) {
             const uint64_t ram_budget = phys_ram * 35 / 100;
-            if (graph_size <= ram_budget) {
-                // Full graph fits in the RAM budget — cache it entirely.
-                // No reason to page when everything fits.
-                cache_bytes = graph_size;
+            if (total_index_size <= ram_budget) {
+                // Both files fit in the RAM budget — cache everything. No
+                // reason to page when it all fits.
+                cache_bytes = total_index_size;
             } else {
-                // Graph exceeds RAM budget — cache the working set fraction.
-                cache_bytes = std::min(graph_size / 2, ram_budget);
+                // Index exceeds RAM budget — cache the working set fraction.
+                cache_bytes = std::min(total_index_size / 2, ram_budget);
             }
         } else {
-            cache_bytes = graph_size;
+            cache_bytes = total_index_size;
         }
         // Clamp to a minimum of 16MB so tiny indices still have enough blocks.
         cache_bytes = std::max<uint64_t>(cache_bytes, 16ull * 1024 * 1024);
 
         spdlog::info("[sextant] search cache: {:.1f}MB (graph={:.1f}MB, "
-                     "phys_ram={:.1f}MB)",
+                     "codes={:.1f}MB, phys_ram={:.1f}MB)",
                      cache_bytes / 1e6, graph_size / 1e6,
-                     phys_ram / 1e6);
+                     codes_size / 1e6, phys_ram / 1e6);
 
         paged_store_ = std::make_unique<PagedNodeStore>(
             index_path_ + ".graph", index_path_ + ".codes",
@@ -350,11 +356,21 @@ uint64_t Engine::cache_code_reads() const {
 
 Engine::AdmissionStats Engine::cache_admission_stats() const {
     if (!paged_store_) return {};
-    const auto& s = paged_store_->cache_stats();
+    const auto cs = paged_store_->cache_stats();
     return {
-        s.hits_window, s.hits_probation, s.hits_protected,
-        s.misses, s.evictions_admitted, s.evictions_rejected
+        cs.graph.hits_window + cs.code.hits_window,
+        cs.graph.hits_probation + cs.code.hits_probation,
+        cs.graph.hits_protected + cs.code.hits_protected,
+        cs.graph.misses + cs.code.misses,
+        cs.graph.evictions_admitted + cs.code.evictions_admitted,
+        cs.graph.evictions_rejected + cs.code.evictions_rejected,
     };
+}
+
+void Engine::rebalance_caches() {
+    if (paged_store_) {
+        paged_store_->maybe_rebalance_caches();
+    }
 }
 
 uint32_t Engine::memgraph_cached_count() const {

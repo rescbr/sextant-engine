@@ -58,7 +58,8 @@ struct TLBlockCache {
     static constexpr uint32_t kCapacity = 32;
 
     /// Sentinel key marking an unused slot. Real keys are always < this
-    /// (block indices, possibly OR'd with kCodeKeyBit, are well below 2^63-1).
+    /// (block indices, possibly OR'd with the code L1 namespace bit, are well
+    /// below 2^63-1).
     static constexpr uint64_t kInvalidKey = UINT64_MAX;
 
     struct Entry {

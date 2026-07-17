@@ -126,6 +126,11 @@ public:
         uint64_t evictions_rejected = 0;
     };
     AdmissionStats cache_admission_stats() const;
+
+    /// Periodically rebalance the graph/code cache split based on hit/miss
+    /// ratios. No-op if not in paged mode. Wired up but NOT called
+    /// automatically from the hot search loop yet (follow-up).
+    void rebalance_caches();
     /// Thread-local L1 cache hit/miss counters.
     uint64_t tl_hits() const;
     uint64_t tl_misses() const;

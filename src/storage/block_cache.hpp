@@ -172,6 +172,13 @@ private:
     /// the last operation). Called under mu_ from lookup()/insert().
     void maybe_adapt();
 
+    /// Resize this shard to `new_capacity` blocks. The caller MUST hold mu_.
+    /// Evicts excess entries (window LRU first, then probation, then protected)
+    /// until map_.size() <= capacity_, recomputes the window/protected limits,
+    /// and calls maybe_adapt() to reconcile. If new_capacity == 0, evicts ALL
+    /// entries.
+    void resize(uint32_t new_capacity);
+
     // Fast xorshift RNG for anti-starvation admission on frequency ties.
     uint32_t hc_rng_state_ = 0x12345678u;
     uint32_t hc_rng() {
@@ -255,6 +262,11 @@ public:
 
     /// Aggregated profiling counters across all shards.
     CacheStats stats() const;
+
+    /// Resize the cache: sets a new per-shard block capacity and evicts excess
+    /// entries from each shard (under each shard's write lock). Also resets the
+    /// cache-level hill-climber fields to match the new capacity.
+    void resize(uint32_t new_blocks_per_shard);
 
     // --- adaptive-window introspection (cache-level hill-climber) ------------
     /// Current window capacity applied uniformly across all shards

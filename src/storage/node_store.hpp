@@ -16,6 +16,7 @@
 /// buffers; during search, Engine installs a MemGraph over a PagedNodeStore.
 
 #include "storage/block_cache.hpp"
+#include "storage/cache_controller.hpp"
 #include "storage/direct_io.hpp"
 #include "storage/sidecar_header.hpp"
 #include "storage/tl_cache.hpp"
@@ -128,8 +129,19 @@ public:
     }
 
     /// W-TinyLFU cache profiling counters (window/probation/protected hits,
-    /// misses, admission decisions).
-    CacheStats cache_stats() const { return cache_.stats(); }
+    /// misses, admission decisions). Combined across the graph and code caches.
+    struct CombinedCacheStats {
+        CacheStats graph;
+        CacheStats code;
+    };
+    CombinedCacheStats cache_stats() const {
+        return {graph_cache_.stats(), code_cache_.stats()};
+    }
+
+    /// Periodically rebalance the graph/code cache split based on hit/miss
+    /// ratios. Wired up but NOT called automatically from the hot search loop
+    /// yet (follow-up). Safe to call from any thread.
+    void maybe_rebalance_caches();
 
 private:
     DirectFile graph_file_;
@@ -140,14 +152,29 @@ private:
     uint32_t codes_per_block_;
     uint32_t graph_block_size_;
     uint32_t codes_block_size_;
-    BlockCache cache_;
-    static constexpr uint64_t kCodeKeyBit = 1ULL << 63;
+    // Separate L2 caches for graph (.graph) and code (.codes) blocks so they
+    // don't evict each other. An adaptive CacheController may rebalance their
+    // relative sizes based on hit/miss ratios.
+    BlockCache graph_cache_;
+    BlockCache code_cache_;
+
+    // L1 key namespace separator: graph uses plain block_idx as the L1 key;
+    // code uses block_idx | kCodeL1KeyBit. This ONLY disambiguates the L1
+    // (thread-local) entries — the L2 caches are fully separate and use plain
+    // block_idx as keys.
+    static constexpr uint64_t kCodeL1KeyBit = 1ULL << 63;
 
     // Relaxed atomics: these are statistical counters read only after a
     // benchmark run completes. No ordering needed, just lock-free increments
     // on the cache-miss hot path.
     mutable std::atomic<uint64_t> graph_reads_{0};
     mutable std::atomic<uint64_t> code_reads_{0};
+
+    // Adaptive controller that rebalances graph_cache_ / code_cache_ sizes.
+    // Constructed after the caches (lazily initialized in the constructor body
+    // since it needs the resolved budget, which depends on file sizes read
+    // after the files are open).
+    std::unique_ptr<CacheController> cache_controller_;
 
     // --- Thread-local L1 (per-search-thread block cache) -------------------
     // Each thread that calls batched_read() gets its own TLBlockCache for THIS
@@ -174,11 +201,14 @@ private:
     /// Shared batched-read helper. On a cache miss for `block_idx`, reads up
     /// to kBlocksPerRead contiguous blocks from `file` in a single pread and
     /// inserts each into its own shard. Returns the pointer to the requested
-    /// block (always a miss → from_ssd=true). `key_base` is the block_idx
-    /// possibly OR'd with kCodeKeyBit for code blocks.
+    /// block (always a miss → from_ssd=true). `key_base` is the L1 key
+    /// (block_idx for graph, block_idx | kCodeL1KeyBit for code — disambiguates
+    /// the shared L1). `cache` is the L2 cache to use (graph_cache_ or
+    /// code_cache_).
     PinResult batched_read(DirectFile& file, uint32_t block_size,
                            uint64_t block_idx, uint64_t key_base,
-                           std::atomic<uint64_t>& counter);
+                           std::atomic<uint64_t>& counter,
+                           BlockCache& cache);
 };
 
 }  // namespace sextant
