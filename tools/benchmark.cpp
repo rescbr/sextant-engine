@@ -146,7 +146,7 @@ int main(int argc, char* argv[]) {
     const std::string query_path = p.get<std::string>("queries");
     const std::string base_data = p.get<std::string>("base-data");
     const std::string gt_path = p.get<std::string>("ground-truth");
-    const uint32_t k = p.get<uint32_t>("k");
+    const uint32_t k = p.get<uint32_t>("topk");
     const uint32_t L = p.get<uint32_t>("search-beam-width");
     const uint32_t rerank = p.get<uint32_t>("rerank");
     const uint32_t io_limit = p.get<uint32_t>("io-limit");
