@@ -20,6 +20,7 @@
 
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <thread>
@@ -64,6 +65,12 @@ std::vector<Candidate> Engine::search(const float* query, uint32_t k,
     // VamanaCore::search resolves internal_ids → row_ids for us.
     auto results =
         core_->search(lut.data(), k, config.L_search, config.io_limit);
+
+    // Adaptive cache rebalance (paged mode only). Cheap relaxed-atomic add per
+    // search; the rare resize is CAS-guarded so only one thread runs it.
+    if (paged_store_ && cache_rebalance_enabled_) {
+        maybe_rebalance_();
+    }
     return results;
 }
 
@@ -370,6 +377,30 @@ Engine::AdmissionStats Engine::cache_admission_stats() const {
 void Engine::rebalance_caches() {
     if (paged_store_) {
         paged_store_->maybe_rebalance_caches();
+    }
+}
+
+void Engine::maybe_rebalance_() {
+    const uint64_t n = search_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n < rebalance_cadence_) return;
+    // CAS: only one thread rebalances at a time. Losers bail (they'll retry
+    // next cadence window; the counter is monotonic so no double-fire).
+    bool expected = false;
+    if (!rebalancing_.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel)) {
+        return;
+    }
+    const double prev_frac = paged_store_->graph_cache_fraction();
+    paged_store_->maybe_rebalance_caches();   // may call BlockCache::resize
+    const double new_frac = paged_store_->graph_cache_fraction();
+    rebalancing_.store(false, std::memory_order_release);
+    // Adaptive cadence: if the split didn't move, back off (steady state).
+    // If it moved, reset to initial (workload shifting — stay responsive).
+    if (std::abs(new_frac - prev_frac) < 1e-6) {
+        rebalance_cadence_ = std::min(kRebalanceCadenceMax,
+                                      rebalance_cadence_ * 2);
+    } else {
+        rebalance_cadence_ = kRebalanceCadenceInitial;
     }
 }
 

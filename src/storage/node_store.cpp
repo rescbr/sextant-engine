@@ -121,6 +121,10 @@ PagedNodeStore::PagedNodeStore(const std::string& graph_path,
         1u, static_cast<uint32_t>(cache_size_bytes / kBlockSize / num_shards));
     cache_controller_ = std::make_unique<CacheController>(
         graph_cache_, code_cache_, num_shards, cache_size_bytes, kBlockSize);
+    // Seed the controller's internal fraction from the actual file-proportional
+    // split (computed in the cache init lambdas above). Without this, the first
+    // rebalance step would jump from the true split to a 0.5-based value.
+    cache_controller_->seed_fraction_from_caches();
     (void)total_blocks_per_shard;  // captured by controller internally
 }
 
@@ -278,6 +282,13 @@ void PagedNodeStore::maybe_rebalance_caches() {
     if (cache_controller_) {
         cache_controller_->maybe_rebalance();
     }
+}
+
+double PagedNodeStore::graph_cache_fraction() const {
+    const uint32_t g = graph_cache_.shard(0).capacity();
+    const uint32_t c = code_cache_.shard(0).capacity();
+    const uint32_t total = g + c;
+    return total > 0 ? static_cast<double>(g) / static_cast<double>(total) : 0.5;
 }
 
 }  // namespace sextant

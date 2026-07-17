@@ -237,6 +237,8 @@ int cmd_search(int argc, char* argv[]) {
         "Original base .fbin for rerank (defaults to none)", false, "");
     p.add<uint64_t>("cache-size", 0,
                      "Search LRU cache size in bytes (0 = auto)", false, 0);
+    p.add("no-cache-rebalance", 0,
+          "Disable adaptive graph/code cache rebalancing (default: enabled in paged mode)");
     p.add<std::string>("log-level", 0,
                        "Log level: debug, info, warn, error", false, "info");
     p.parse_check(argc, argv);
@@ -259,6 +261,9 @@ int cmd_search(int argc, char* argv[]) {
 
     sextant::Engine engine;
     engine.set_cache_size(p.get<uint64_t>("cache-size"));
+    if (p.exist("no-cache-rebalance")) {
+        engine.set_cache_rebalance_enabled(false);
+    }
     engine.open(index);
 
     // Read the query file header.

@@ -139,9 +139,13 @@ public:
     }
 
     /// Periodically rebalance the graph/code cache split based on hit/miss
-    /// ratios. Wired up but NOT called automatically from the hot search loop
-    /// yet (follow-up). Safe to call from any thread.
+    /// ratios. Safe to call from any thread.
     void maybe_rebalance_caches();
+
+    /// Current fraction [0,1] of the total cache budget assigned to graph
+    /// blocks. Diagnostic read for the rebalance controller's cadence logic.
+    /// Reads shard(0) capacities (uniform across shards); atomic loads, no lock.
+    double graph_cache_fraction() const;
 
 private:
     DirectFile graph_file_;

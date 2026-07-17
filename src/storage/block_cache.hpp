@@ -147,7 +147,7 @@ public:
     // --- adaptive-window introspection (atomic reads; lock optional) -------
     uint32_t max_window() const { return max_window_.load(std::memory_order_relaxed); }
     uint32_t max_protected() const { return max_protected_.load(std::memory_order_relaxed); }
-    uint32_t capacity() const { return capacity_; }
+    uint32_t capacity() const { return capacity_.load(std::memory_order_relaxed); }
 
     // --- profiling counters (read under the caller's lock) -------------------
     uint64_t hits_window() const { return hits_window_.load(std::memory_order_relaxed); }
@@ -205,7 +205,11 @@ private:
     BlockBufferPool pool_;
 
     Mutex mu_;
-    uint32_t capacity_;
+    // Atomic so PagedNodeStore::graph_cache_fraction() can read it without
+    // holding the shard lock (diagnostic read from the rebalance cadence
+    // logic). All writes happen under mu_ (resize/constructor), so relaxed
+    // ordering is sufficient.
+    std::atomic<uint32_t> capacity_;
     // Atomic so the cache's hill-climber can update them without holding this
     // shard's lock. maybe_adapt() (under mu_) moves entries to respect them.
     std::atomic<uint32_t> max_window_;
@@ -257,6 +261,9 @@ public:
 
 
     CacheShard& shard(uint64_t block_idx) {
+        return *shards_[block_idx % shards_.size()];
+    }
+    const CacheShard& shard(uint64_t block_idx) const {
         return *shards_[block_idx % shards_.size()];
     }
 

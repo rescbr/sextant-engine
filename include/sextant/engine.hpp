@@ -9,6 +9,7 @@
 #include <sextant/types.hpp>
 #include <sextant/vector_source.hpp>
 #include <sextant/config.hpp>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <functional>
@@ -139,6 +140,12 @@ public:
     /// Set the search cache size override (0 = auto from graph_size/RAM).
     /// Must be called before open().
     void set_cache_size(uint64_t bytes) { cache_size_override_ = bytes; }
+
+    /// Enable/disable adaptive cache rebalance (default: enabled in paged mode).
+    /// When enabled, the two caches (graph/code) are periodically resized based
+    /// on observed hit/miss ratios. Must be called before open(); zero overhead
+    /// when the index is not paged or when disabled.
+    void set_cache_rebalance_enabled(bool enabled) { cache_rebalance_enabled_ = enabled; }
     uint64_t count() const { return count_; }
     Dim dim() const { return dim_; }
 
@@ -198,6 +205,16 @@ private:
     std::unique_ptr<PagedNodeStore> paged_store_;
     std::unique_ptr<MemGraph> memgraph_;
     uint64_t cache_size_override_ = 0;  ///< 0 = auto
+
+    // Adaptive cache rebalance (paged mode only).
+    bool cache_rebalance_enabled_ = true;
+    std::atomic<uint64_t> search_count_{0};
+    std::atomic<bool> rebalancing_{false};
+    static constexpr uint64_t kRebalanceCadenceInitial = 1000;
+    static constexpr uint64_t kRebalanceCadenceMax = 16000;
+    uint64_t rebalance_cadence_ = kRebalanceCadenceInitial;
+    /// Private: per-search adaptive rebalance hook.
+    void maybe_rebalance_();
 
     /// Params loaded by open() (used by flush() to persist post-insert state).
     /// Only meaningful when opened_ && params_loaded_.

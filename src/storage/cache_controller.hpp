@@ -9,14 +9,17 @@
 /// other. The CacheController monitors their relative miss rates and
 /// periodically shifts capacity between them via BlockCache::resize().
 ///
-/// The controller is NOT invoked from the hot search loop automatically
-/// (that's a follow-up). PagedNodeStore::maybe_rebalance_caches() forwards to
-/// it and can be called periodically by the Engine.
+/// Invoked from the Engine search path (every N searches, CAS-guarded so only
+/// one thread rebalances at a time). PagedNodeStore::maybe_rebalance_caches()
+/// forwards here.
 
 #include "storage/block_cache.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 namespace sextant {
 
@@ -36,9 +39,34 @@ public:
               1u, static_cast<uint32_t>(total_budget_bytes /
                                         (static_cast<uint64_t>(num_shards) *
                                          block_size)))),
-          graph_fraction_(0.5) {}
+          graph_fraction_(0.5) {
+        // Tunable without recompile: SEXTANT_CACHE_REBALANCE_THRESHOLD
+        // (default 1.5). Raising to 2.0 makes the controller less trigger-happy
+        // under noisy workloads.
+        double thresh = 1.5;
+        if (const char* env = std::getenv("SEXTANT_CACHE_REBALANCE_THRESHOLD")) {
+            double parsed = std::atof(env);
+            if (parsed >= 1.0 && parsed <= 10.0) thresh = parsed;  // sanity clamp
+        }
+        miss_rate_threshold_ = thresh;
+    }
 
-    /// Called periodically (e.g. after every 10000 searches). Shifts capacity
+    /// Seed graph_fraction_ from the caches' actual current per-shard
+    /// capacities. Called once after construction (the caches are split
+    /// file-size-proportionally; without seeding, the first step would jump
+    /// from the true initial split to a 0.5-based value — a spurious shift).
+    void seed_fraction_from_caches() {
+        const uint32_t g = graph_cache_.shard(0).capacity();
+        const uint32_t c = code_cache_.shard(0).capacity();
+        const uint32_t total = g + c;
+        if (total > 0) {
+            graph_fraction_ = static_cast<double>(g) / static_cast<double>(total);
+            // Clamp to the legal band so the first step starts in-range.
+            graph_fraction_ = std::clamp(graph_fraction_, MIN_FRACTION, MAX_FRACTION);
+        }
+    }
+
+    /// Called periodically (e.g. after every 1000 searches). Shifts capacity
     /// between the two caches based on relative miss rates.
     void maybe_rebalance() {
         const CacheStats g = graph_cache_.stats();
@@ -72,12 +100,48 @@ public:
         const double code_miss_rate =
             static_cast<double>(dc_misses) / static_cast<double>(dc_total);
 
-        // Shift capacity toward the cache with the higher miss rate.
-        if (graph_miss_rate > code_miss_rate * 1.5) {
-            graph_fraction_ = std::min(MAX_FRACTION, graph_fraction_ + 0.05);
-        } else if (code_miss_rate > graph_miss_rate * 1.5) {
-            graph_fraction_ = std::max(MIN_FRACTION, graph_fraction_ - 0.05);
+        // Hysteresis: require 2 consecutive agreeing samples before stepping.
+        // Without this, each resize evicts entries and causes the misses that
+        // trigger the reverse step next round (positive feedback / thrashing).
+        enum class Signal { None, GraphNeedsMore, CodeNeedsMore };
+        Signal sig = Signal::None;
+        if (graph_miss_rate > code_miss_rate * miss_rate_threshold_) {
+            sig = Signal::GraphNeedsMore;
+        } else if (code_miss_rate > graph_miss_rate * miss_rate_threshold_) {
+            sig = Signal::CodeNeedsMore;
         }
+
+        bool step = false;
+        if (sig == Signal::GraphNeedsMore) {
+            if (++trend_graph_needs_more_ >= 2) {
+                graph_fraction_ = std::min(MAX_FRACTION, graph_fraction_ + 0.05);
+                step = true;
+            }
+            trend_code_needs_more_ = 0;
+        } else if (sig == Signal::CodeNeedsMore) {
+            if (++trend_code_needs_more_ >= 2) {
+                graph_fraction_ = std::max(MIN_FRACTION, graph_fraction_ - 0.05);
+                step = true;
+            }
+            trend_graph_needs_more_ = 0;
+        } else {
+            // Signal::None — workload balanced or below threshold. Reset trends
+            // so a future direction must build 2 fresh agreements.
+            trend_graph_needs_more_ = 0;
+            trend_code_needs_more_ = 0;
+        }
+
+        spdlog::debug("[sextant] cache-rebalance: g_miss={:.4f} c_miss={:.4f} "
+                      "ratio={:.2f} thresh={:.2f} sig={} trend_g={} trend_c={} "
+                      "graph_frac={:.3f} step={}",
+                      graph_miss_rate, code_miss_rate,
+                      graph_miss_rate > 0 ? code_miss_rate / graph_miss_rate : 0.0,
+                      miss_rate_threshold_, static_cast<int>(sig),
+                      trend_graph_needs_more_, trend_code_needs_more_,
+                      graph_fraction_, step);
+
+        // Only resize if the fraction actually moved (avoid needless work).
+        if (!step) return;
 
         // Compute new per-shard capacities, clamped to [MIN, MAX] fractions.
         uint32_t graph_blocks = static_cast<uint32_t>(
@@ -112,6 +176,12 @@ private:
     uint64_t prev_code_hits_ = 0, prev_code_misses_ = 0;
     /// Current fraction of total budget assigned to graph (0..1).
     double graph_fraction_ = 0.5;
+    /// Hysteresis trend counters: consecutive agreeing samples. A step fires
+    /// only when the count reaches 2.
+    int trend_graph_needs_more_ = 0;
+    int trend_code_needs_more_ = 0;
+    /// Miss-rate ratio that triggers a step (from env, default 1.5).
+    double miss_rate_threshold_ = 1.5;
 };
 
 }  // namespace sextant

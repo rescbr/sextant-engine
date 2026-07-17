@@ -123,6 +123,8 @@ int main(int argc, char* argv[]) {
                     false, 0);
     p.add<uint64_t>("cache-size", 0,
                      "Search LRU cache size in bytes (0 = auto)", false, 0);
+    p.add("no-cache-rebalance", 0,
+          "Disable adaptive graph/code cache rebalancing (default: enabled in paged mode)");
     p.parse_check(argc, argv);
 
     const std::string index = p.get<std::string>("index");
@@ -146,6 +148,10 @@ int main(int argc, char* argv[]) {
     // Each concurrent search needs ~50-100 blocks in its working set;
     // a shared LRU that's too small causes cross-thread eviction thrashing
     // (4 threads on 32MB can be slower than 1 thread).
+    //
+    // When --cache-size is small enough to force misses, the adaptive
+    // rebalance controller will shift capacity between graph/code caches;
+    // use --no-cache-rebalance to disable for A/B comparison.
     if (cache_size_req > 0 && n_threads_hint > 1) {
         constexpr uint64_t kMinCachePerThread = 32ull * 1024 * 1024;
         const uint64_t recommended = kMinCachePerThread * n_threads_hint;
@@ -160,6 +166,9 @@ int main(int argc, char* argv[]) {
     try {
         sextant::Engine engine;
         engine.set_cache_size(cache_size_req);
+        if (p.exist("no-cache-rebalance")) {
+            engine.set_cache_rebalance_enabled(false);
+        }
         engine.open(index);
         const uint32_t dim = engine.dim();
         const uint64_t n_base = engine.count();

@@ -16,11 +16,12 @@ CacheShard::CacheShard(uint32_t capacity_blocks, uint32_t block_size,
       shard_index_(shard_index),
       pool_(block_size),
       capacity_(capacity_blocks),
-      max_window_(std::max(1u, capacity_ * 1 / 100)),
-      max_protected_((capacity_ - max_window_.load()) * 80 / 100) {
-    if (capacity_ > 0) {
-        map_.reserve(capacity_ + 1);
-        sketch_.ensure_capacity(capacity_);
+      max_window_(std::max(1u, capacity_blocks * 1 / 100)),
+      max_protected_((capacity_blocks - max_window_.load()) * 80 / 100) {
+    const uint32_t cap = capacity_.load(std::memory_order_relaxed);
+    if (cap > 0) {
+        map_.reserve(cap + 1);
+        sketch_.ensure_capacity(cap);
     }
 }
 
@@ -97,14 +98,14 @@ void CacheShard::on_protected_hit(LRUEntry* e) {
 // decrement them here.
 
 void CacheShard::resize(uint32_t new_capacity) {
-    capacity_ = new_capacity;
-    max_window_.store(std::max(1u, capacity_ * 1 / 100),
+    capacity_.store(new_capacity, std::memory_order_relaxed);
+    max_window_.store(std::max(1u, new_capacity * 1 / 100),
                       std::memory_order_relaxed);
-    max_protected_.store((capacity_ - max_window_.load()) * 80 / 100,
+    max_protected_.store((new_capacity - max_window_.load()) * 80 / 100,
                          std::memory_order_relaxed);
 
     // Evict excess entries: window first, then probation, then protected.
-    while (map_.size() > capacity_) {
+    while (map_.size() > new_capacity) {
         LRUEntry* victim = window_.lru();
         if (victim == nullptr) {
             victim = probation_.lru();
@@ -163,7 +164,8 @@ void CacheShard::admit_one_from_window() {
     candidate->status = Status::PROBATION;
     probation_.push_mru(candidate);
 
-    if (static_cast<uint32_t>(map_.size()) > capacity_) {
+    if (static_cast<uint32_t>(map_.size()) >
+        capacity_.load(std::memory_order_relaxed)) {
         LRUEntry* victim = probation_.lru();
         if (victim == nullptr || victim == candidate) {
             // No distinct victim to compare against: the probation space is
@@ -265,7 +267,7 @@ uint8_t* CacheShard::insert(uint64_t block_idx, const uint8_t* data,
     }
 
     // capacity_ == 0: shard holds nothing.
-    if (capacity_ == 0) {
+    if (capacity_.load(std::memory_order_relaxed) == 0) {
         if (cache_) cache_->record_access(/*hit=*/false);
         return nullptr;
     }
