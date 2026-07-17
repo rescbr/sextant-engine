@@ -135,11 +135,11 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
         p.max_occlusion = overrides.max_occlusion;
         spdlog::info("[sextant] max_occlusion = {} [override]", p.max_occlusion);
     } else {
-        // Adaptive: cap the candidate pool at L_build. The old default
-        // (max(750, 4*L_build+R)) never engaged since beam_search returns
-        // ~L_build < 750 candidates. Capping at L_build means the occlusion
-        // loop processes at most L_build² pairs instead of L_build × 750.
-        p.max_occlusion = p.L_build;
+        // max(L_build, R+1): guarantees the overflow pool's R+1 candidates are
+        // never truncated by the occlusion cap. L_build is the beam width (the
+        // usual binding constraint); R+1 is the correctness floor.
+        p.max_occlusion = std::max<uint32_t>(p.L_build,
+                                             static_cast<uint32_t>(p.R) + 1u);
         spdlog::info("[sextant] max_occlusion = {} [auto]", p.max_occlusion);
     }
 
@@ -188,13 +188,23 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     // --- closure_factor (Issue 24: ~15% replication) ---
     // c = (1 - f_target)^{-1/d_eff}, clamped to [1.0, 1.2].
     {
-        constexpr float f_target = 0.15f;
-        constexpr float d_eff = 5.0f;
+        const float f_target = overrides.closure_f_target > 0.0f
+                                   ? overrides.closure_f_target
+                                   : 0.15f;
+        // d_eff: 0 in overrides → default 5.0 (estimate_config may override later
+        // from measured LID; resolve_params is the fast no-sample fallback).
+        const float d_eff = overrides.closure_d_eff > 0.0f
+                                ? overrides.closure_d_eff
+                                : 5.0f;
         float c = std::pow(1.0f - f_target, -1.0f / d_eff);
         if (c < 1.0f) c = 1.0f;
         if (c > 1.2f) c = 1.2f;
         p.closure_factor = c;
-        spdlog::info("[sextant] closure_factor = {:.4f} [auto]", p.closure_factor);
+        spdlog::info("[sextant] closure_factor = {:.4f} [{}] (f_target={:.2f}, "
+                     "d_eff={:.2f})", p.closure_factor,
+                     overrides.closure_f_target > 0.0f || overrides.closure_d_eff > 0.0f
+                         ? "override" : "auto",
+                     f_target, d_eff);
     }
 
     // --- K (partition count) ---

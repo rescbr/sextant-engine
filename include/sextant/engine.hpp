@@ -41,6 +41,21 @@ struct ResolvedParams {
     uint32_t num_threads = 0;
     uint32_t K = 1;             ///< Partition count (K>1 → partitioned build)
     float closure_factor = 1.033f;  ///< Shard overlap radius ratio
+
+    // Diagnostic signals populated by estimate_config (zero when not estimated).
+    // Stored so build logging and --explain can report what drove the choices.
+    double measured_median_lid = 0.0;   ///< MLE LID from probe truth (0 = unmeasured)
+    double measured_avg_degree = 0.0;   ///< R̄ from mini-build (0 = unmeasured)
+    double measured_clustering = 0.0;   ///< clustering coefficient (0 = unmeasured)
+    double measured_dead_end_frac = 0.0;
+};
+
+/// Structural properties of a built graph, measured for parameter estimation.
+struct GraphStats {
+    double avg_degree = 0.0;       ///< mean post-prune degree (R̄)
+    double clustering_coeff = 0.0; ///< sampled triangle fraction
+    double dead_end_frac = 0.0;    ///< fraction of nodes with degree ≤ 1
+    double median_lid = 0.0;       ///< MLE LID from k-NN distances
 };
 
 /// Auto-resolve parameters from dataset properties + machine properties.
@@ -86,6 +101,25 @@ public:
     };
     static PqSelection probe_pq_config(const float* sample, uint64_t n, Dim dim,
                                        const ResolvedParams& params);
+
+    /// Estimate the optimal build configuration from a data sample. Samples the
+    /// source (reservoir), trains PQ, measures LID, builds one or more
+    /// mini-indices (using the canonical Engine::build() path) on the sample at
+    /// candidate (R, alpha) values, measures search quality and graph structure,
+    /// and returns the optimal config for the user's proximity/recall target.
+    ///
+    /// Does NOT modify this Engine's state. Each mini-build uses a fresh local
+    /// Engine instance writing to a temp directory.
+    ///
+    /// Fields in `overrides` that control estimation:
+    ///   - proximity_target / recall_target: quality goal (drives R selection)
+    ///   - pq_max_distortion: PQ quality bound (drives m/bits selection)
+    ///   - R, alpha, L, pq_m, pq_bits: if non-zero, locked (skip estimation)
+    ///   - closure_f_target, closure_d_eff: closure factor inputs (0 = estimated)
+    ///   - max_occlusion: if 0, auto (= max(L_build, R+1))
+    ///
+    /// Implementation lives in src/engine/estimate_config.cpp (Part 2).
+    ResolvedParams estimate_config(VectorSource& source, const BuildConfig& overrides);
 
     /// Load an index from sidecar files for searching.
     void open(const std::string& index_path);

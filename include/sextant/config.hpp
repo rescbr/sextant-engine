@@ -74,7 +74,22 @@ struct BuildConfig {
     uint64_t build_ram_budget = 0;  ///< 0 = auto (50% of physical RAM)
     MetricKind metric = MetricKind::L2Sq;
     uint32_t num_threads = 0;   ///< 0 = hardware_concurrency
-    uint32_t max_occlusion = 0; ///< 0 = auto (max(750, 4*L_build+R))
+    uint32_t max_occlusion = 0; ///< 0 = auto (max(L_build, R+1))
+
+    /// Target proximity (in-band fraction) for auto-parameter estimation.
+    /// 0 = use default (0.95). Drives R selection via OPT-SNG formula in
+    /// estimate_config. Only consulted when R is auto.
+    float proximity_target = 0.0f;
+
+    /// Target recall@k for auto-parameter estimation (alternative to
+    /// proximity_target). 0 = not used. If both set, proximity_target wins.
+    float recall_target = 0.0f;
+
+    /// Closure-factor inputs for auto estimation. 0 = auto-estimated by
+    /// estimate_config (closure_f_target defaults to 0.15; closure_d_eff
+    /// estimated from LID). When non-zero, these lock the closure inputs.
+    float closure_f_target = 0.0f;
+    float closure_d_eff = 0.0f;
 };
 
 /// Result of a build operation.

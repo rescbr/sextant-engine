@@ -14,6 +14,7 @@
 
 #include "build.hpp"
 #include "fbin_source.hpp"
+#include "memory_source.hpp"
 #include "partition.hpp"
 #include "sidecar_io.hpp"
 #include "sextant/engine.hpp"
@@ -1846,6 +1847,24 @@ void Engine::flush() {
     write_manifest_file(params, uuid);
 
     spdlog::info("[sextant] flush: sidecars rewritten (count={})", count_);
+}
+
+// ===========================================================================
+// estimate_config — stub (implementation in Part 2 / estimate_config.cpp).
+// Lives here temporarily so the declaration in engine.hpp links. Part 2 will
+// move this to src/engine/estimate_config.cpp and add that file to meson.build.
+// ===========================================================================
+ResolvedParams Engine::estimate_config(VectorSource& source,
+                                       const BuildConfig& overrides) {
+    (void)source;
+    // Fast fallback: no measurement-based estimation yet. Delegate to the
+    // heuristic resolver so callers (analyze, build --explain) work end-to-end.
+    const uint64_t n = source.count();
+    ResolvedParams p = resolve_params(n, source.dim(), overrides);
+    spdlog::warn("[sextant] estimate_config: stub implementation — returning "
+                 "heuristic resolve_params result (Part 2 will implement the "
+                 "full sample-driven estimation)");
+    return p;
 }
 
 }  // namespace sextant
