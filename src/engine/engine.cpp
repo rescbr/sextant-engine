@@ -1918,12 +1918,14 @@ std::unique_ptr<Engine> Engine::build_mini_(const float* sample,
     mini->dim_ = dim;
     mini->index_path_ = "/dev/null";  // never written; just non-empty
 
-    // Clamp threads: mini-builds are ~20K vectors — spawning a huge pool
-    // wastes time on thread management. Cap at 4 (enough for 20K).
+    // Threads: respect any user override (--threads); otherwise use all
+    // available cores. The construct loop is work-stealing and embarrassingly
+    // parallel — there's no reason to cap below hardware concurrency, and
+    // doing so wastes cores during the ~3-minute analyze sweep.
     ResolvedParams mp = params;
-    const uint32_t hw = std::thread::hardware_concurrency();
-    const uint32_t effective = (mp.num_threads > 0) ? mp.num_threads : hw;
-    mp.num_threads = std::min(4u, effective);
+    if (mp.num_threads == 0) {
+        mp.num_threads = std::thread::hardware_concurrency();
+    }
 
     MemorySource src(sample, sample_n, dim);
 
