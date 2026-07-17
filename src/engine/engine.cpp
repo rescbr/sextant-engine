@@ -233,6 +233,7 @@ struct ProbeTruth {
 /// the pool. Returns ids + true distances (ascending) + per-query band counts.
 ProbeTruth compute_truth(const float* pool, uint32_t pool_n, Dim dim,
                          const std::vector<uint32_t>& qidx) {
+    const auto t_norms_start = std::chrono::steady_clock::now();
     std::vector<float> norms(pool_n);
     for (uint32_t i = 0; i < pool_n; i++) {
         const float* v = pool + static_cast<size_t>(i) * dim;
@@ -240,53 +241,86 @@ ProbeTruth compute_truth(const float* pool, uint32_t pool_n, Dim dim,
         for (uint32_t d = 0; d < dim; d++) acc += double(v[d]) * v[d];
         norms[i] = float(acc);
     }
+    const double norms_sec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_norms_start).count();
+
     ProbeTruth truth;
     truth.ids.resize(qidx.size());
     truth.dists.resize(qidx.size());
     truth.band_counts.resize(qidx.size(), 0);
     truth.band30_counts.resize(qidx.size(), 0);
-    for (size_t qi = 0; qi < qidx.size(); qi++) {
-        const float* q = pool + static_cast<size_t>(qidx[qi]) * dim;
-        double qn = 0.0;
-        for (uint32_t d = 0; d < dim; d++) qn += double(q[d]) * q[d];
-        std::vector<std::pair<float, uint32_t>> ranked;
-        ranked.reserve(pool_n - 1);
-        for (uint32_t i = 0; i < pool_n; i++) {
-            if (i == qidx[qi]) continue;
-            double dot = 0.0;
-            const float* v = pool + static_cast<size_t>(i) * dim;
-            for (uint32_t d = 0; d < dim; d++) dot += double(q[d]) * v[d];
-            ranked.emplace_back(float(norms[i] - 2.0 * dot + qn), i);
-        }
-        // Partial-sort to kProbeRecallK so we have both the kProbeTopk-th and
-        // kProbeRecallK-th NN distances for band counting.
-        const size_t ksort = std::min<size_t>(kProbeRecallK, ranked.size());
-        std::partial_sort(ranked.begin(), ranked.begin() + ksort, ranked.end(),
-                          [](const auto& a, const auto& b){ return a.first < b.first; });
-        const size_t kk = std::min<size_t>(kProbeTopk, ranked.size());
-        for (size_t k = 0; k < kk; k++) {
-            truth.ids[qi].push_back(ranked[k].second);
-            truth.dists[qi].push_back(ranked[k].first);
-        }
-        // Band counts: how many pool vectors are within each radius?
-        // Computed once here (not per-config) since they're dataset properties.
-        const float band_radius = ranked[kk - 1].first;
-        const float band30_radius = ranked[ksort - 1].first;
-        uint32_t bc = 0, bc30 = 0;
-        for (uint32_t i = 0; i < pool_n; i++) {
-            if (i == qidx[qi]) continue;
-            const float* v = pool + static_cast<size_t>(i) * dim;
-            double dot = 0.0;
-            for (uint32_t d = 0; d < dim; d++) dot += double(q[d]) * v[d];
-            const float td = float(norms[i] - 2.0 * dot + qn);
-            if (td <= band30_radius + 1e-6f) {
-                ++bc30;
-                if (td <= band_radius + 1e-6f) ++bc;
+
+    // Parallelize across queries — each query's truth computation is fully
+    // independent: it reads pool/norms/qidx (read-only) and writes only its
+    // own disjoint truth.*[qi] slots. The per-query `ranked` vector is
+    // stack-local. No shared mutable state → no locking needed. Mirrors the
+    // pass2_encode atomic-counter work-stealing pattern (engine.cpp:1030+).
+    const uint32_t nthreads = std::thread::hardware_concurrency();
+    const auto t_qloop_start = std::chrono::steady_clock::now();
+    std::atomic<size_t> next_qi{0};
+    auto worker = [&]() {
+        while (true) {
+            const size_t qi = next_qi.fetch_add(1, std::memory_order_relaxed);
+            if (qi >= qidx.size()) break;
+            const float* q = pool + static_cast<size_t>(qidx[qi]) * dim;
+            double qn = 0.0;
+            for (uint32_t d = 0; d < dim; d++) qn += double(q[d]) * q[d];
+            std::vector<std::pair<float, uint32_t>> ranked;
+            ranked.reserve(pool_n - 1);
+            for (uint32_t i = 0; i < pool_n; i++) {
+                if (i == qidx[qi]) continue;
+                double dot = 0.0;
+                const float* v = pool + static_cast<size_t>(i) * dim;
+                for (uint32_t d = 0; d < dim; d++)
+                    dot += double(q[d]) * v[d];
+                ranked.emplace_back(float(norms[i] - 2.0 * dot + qn), i);
             }
+            // Partial-sort to kProbeRecallK so we have both the kProbeTopk-th
+            // and kProbeRecallK-th NN distances for band counting.
+            const size_t ksort = std::min<size_t>(kProbeRecallK, ranked.size());
+            std::partial_sort(ranked.begin(), ranked.begin() + ksort,
+                              ranked.end(),
+                              [](const auto& a, const auto& b) {
+                                  return a.first < b.first;
+                              });
+            const size_t kk = std::min<size_t>(kProbeTopk, ranked.size());
+            for (size_t k = 0; k < kk; k++) {
+                truth.ids[qi].push_back(ranked[k].second);
+                truth.dists[qi].push_back(ranked[k].first);
+            }
+            // Band counts: how many pool vectors are within each radius?
+            // Computed once here (not per-config) since they're dataset
+            // properties.
+            const float band_radius = ranked[kk - 1].first;
+            const float band30_radius = ranked[ksort - 1].first;
+            uint32_t bc = 0, bc30 = 0;
+            for (uint32_t i = 0; i < pool_n; i++) {
+                if (i == qidx[qi]) continue;
+                const float* v = pool + static_cast<size_t>(i) * dim;
+                double dot = 0.0;
+                for (uint32_t d = 0; d < dim; d++)
+                    dot += double(q[d]) * v[d];
+                const float td = float(norms[i] - 2.0 * dot + qn);
+                if (td <= band30_radius + 1e-6f) {
+                    ++bc30;
+                    if (td <= band_radius + 1e-6f) ++bc;
+                }
+            }
+            truth.band_counts[qi] = bc;
+            truth.band30_counts[qi] = bc30;
         }
-        truth.band_counts[qi] = bc;
-        truth.band30_counts[qi] = bc30;
+    };
+    std::vector<std::thread> thrpool;
+    for (uint32_t t = 0; t < std::min(nthreads, uint32_t(qidx.size())); t++) {
+        thrpool.emplace_back(worker);
     }
+    for (auto& th : thrpool) th.join();
+
+    const double qloop_sec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_qloop_start).count();
+    spdlog::debug("[sextant] compute_truth: norms precompute {:.3f}s, "
+                  "query loop {:.3f}s ({} threads, {} queries)",
+                  norms_sec, qloop_sec, nthreads, qidx.size());
     return truth;
 }
 
