@@ -645,7 +645,20 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     Chunk chunk{};
     uint64_t seen = 0;
     uint64_t filled = 0;
-    while (source.next(chunk)) {
+    // Time I/O (source.next) and compute (the per-vector reservoir update)
+    // separately: I/O scales with dataset size, compute is what we'd consider
+    // parallelizing. Algorithm R is inherently serial (single ordered RNG
+    // stream), so compute parallelism isn't applicable here — but measuring
+    // confirms whether it would matter if it were.
+    double io_sec = 0.0;
+    double compute_sec = 0.0;
+    while (true) {
+        const auto t_io0 = std::chrono::steady_clock::now();
+        const bool got = source.next(chunk);
+        io_sec += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_io0).count();
+        if (!got) break;
+        const auto t_c0 = std::chrono::steady_clock::now();
         for (uint32_t r = 0; r < chunk.count; r++) {
             const float* vec = chunk.vectors + static_cast<size_t>(r) * dim_;
             if (filled < sample_cap) {
@@ -662,11 +675,22 @@ void Engine::pass1_sample_and_train(VectorSource& source,
             }
             seen++;
         }
+        compute_sec += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_c0).count();
     }
 
     const uint64_t actual_sample = filled;
     spdlog::info("[sextant] pass 1: sampled {} / {} vectors", actual_sample,
                  seen);
+    {
+        const double total_sec = io_sec + compute_sec;
+        const double vecs_per_s = (total_sec > 1e-9)
+            ? static_cast<double>(seen) / total_sec : 0.0;
+        spdlog::debug("[sextant] pass 1: reservoir sampling took {:.3f}s "
+                      "(I/O {:.3f}s + compute {:.3f}s); {} vectors scanned "
+                      "({:.0f} vecs/s)",
+                      total_sec, io_sec, compute_sec, seen, vecs_per_s);
+    }
 
     // Build requires explicit pq_m and pq_bits. The probe-based auto-selection
     // belongs in `sextant analyze` (the advisory tool); build is a committed
@@ -2160,6 +2184,7 @@ Engine::SearchQuality Engine::measure_search_(
 
 ResolvedParams Engine::estimate_config(VectorSource& source,
                                         const BuildConfig& overrides) {
+    const auto t_ec_start = std::chrono::steady_clock::now();
     const uint64_t total_n = source.count();
     const Dim dim = source.dim();
     if (total_n == 0 || dim == 0) {
@@ -2224,11 +2249,19 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
 
     spdlog::info("[sextant] estimate_config: computing truth ({} queries)...",
                  nq);
+    const auto t_truth_start = std::chrono::steady_clock::now();
     const ProbeTruth truth =
         compute_truth(sample.data(), static_cast<uint32_t>(sample_n), dim, qidx);
+    const double truth_sec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_truth_start).count();
+    spdlog::debug("[sextant] estimate_config: truth compute took {:.3f}s "
+                  "({} queries x {} pool x {} dim = {:.1f}G FLOPs)",
+                  truth_sec, nq, sample_n, dim,
+                  static_cast<double>(nq) * sample_n * dim / 1e9);
 
     // MLE LID per query: LID = [(1/(k-1)) Σ log(r_k / r_i)]^{-1}.
     // Use the first k=10 true distances.
+    const auto t_lid_start = std::chrono::steady_clock::now();
     std::vector<double> lids;
     lids.reserve(nq);
     const uint32_t lid_k = std::min<uint32_t>(10, kProbeTopk);
@@ -2253,6 +2286,9 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
         median_lid = lids[lids.size() / 2];
     }
     spdlog::info("[sextant] estimate_config: median LID = {:.2f}", median_lid);
+    spdlog::debug("[sextant] estimate_config: LID MLE over {} queries took {:.3f}s",
+                  nq, std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - t_lid_start).count());
 
     // d_eff: from overrides if set, else max(5.0, median_lid / 3.0).
     const double d_eff = overrides.closure_d_eff > 0.0f
@@ -2362,7 +2398,8 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
     } else {
         // --- 7. R sweep validation (only when R is estimated) ---
         // Build 2 more mini-indices at R_full-16 and R_full+16 (clamp ≥32).
-        spdlog::info("[sextant] estimate_config: R validation sweep...");
+         spdlog::info("[sextant] estimate_config: R validation sweep...");
+         const auto t_valid_start = std::chrono::steady_clock::now();
         constexpr uint32_t kValidL = 200;
         constexpr uint32_t kValidK = 10;
         constexpr uint32_t kValidRerank = 10;
@@ -2416,9 +2453,12 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
             spdlog::info("[sextant]   validation: sweep-best R={} differs from "
                          "prediction R={} by >16 → using sweep-best",
                          best_it->R, R_full);
-            R_full = best_it->R;
-        }
-    }
+             R_full = best_it->R;
+         }
+         spdlog::debug("[sextant] estimate_config: R validation sweep took {:.2f}s",
+                       std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - t_valid_start).count());
+     }
 
     // --- 8. Final param resolution ---
     ResolvedParams p;
@@ -2466,8 +2506,11 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
     spdlog::info("[sextant] estimate_config: final → R={} alpha={:.1f} "
                  "pq_m={} pq_bits={} L_build={} K={}",
                  p.R, p.alpha, p.pq_m, static_cast<int>(p.pq_bits), p.L_build,
-                 p.K);
+                  p.K);
 
+    spdlog::info("[sextant] estimate_config: total time {:.1f}s",
+                 std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - t_ec_start).count());
     return p;
 }
 
