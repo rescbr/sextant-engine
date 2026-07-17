@@ -244,6 +244,37 @@ private:
     void write_manifest_file(const ResolvedParams& params,
                              const std::pair<uint64_t, uint64_t>& uuid);
 
+    /// --- estimate_config helpers (in-RAM mini-build + measurement) ---
+
+    /// Build a mini-index in-RAM on `sample` (sample_n × dim floats) at the
+    /// given params. Returns a fresh Engine whose flat buffers + core_ are
+    /// populated and entry points computed (ready to measure). Does NOT flush
+    /// sidecars or write any files. `params` must have pq_m/pq_bits resolved
+    /// (non-zero) — pass1 requires explicit PQ config. num_threads is clamped
+    /// to min(params.num_threads, 4) to avoid spawning huge pools for ~20K
+    /// vectors. `this` is not modified (static — constructs its own Engine).
+    static std::unique_ptr<Engine> build_mini_(const float* sample,
+                                                uint64_t sample_n, Dim dim,
+                                                const ResolvedParams& params);
+
+    /// Measure graph topology (avg degree, dead-end fraction, clustering
+    /// coefficient) from the mini-index's node buffer. LID is NOT computed
+    /// here (it comes from truth distances in estimate_config).
+    static GraphStats measure_graph_stats_(const Engine& mini);
+
+    /// Run production-style search on the mini-index at L, return mean
+    /// recall@k and mean proximity (in-band fraction) against `truth_ids`/
+    /// `truth_dists` (per-query top-k true neighbor ids and true L2sq
+    /// distances, ascending). Reranks search candidates by true L2sq distance
+    /// computed from the FP32 `sample` buffer. `qidx` selects query indices.
+    struct SearchQuality { double recall; double proximity; };
+    static SearchQuality measure_search_(
+        const Engine& mini, const float* sample, uint64_t sample_n, Dim dim,
+        const std::vector<std::vector<uint32_t>>& truth_ids,
+        const std::vector<std::vector<float>>& truth_dists,
+        const std::vector<uint32_t>& qidx,
+        uint32_t L, uint32_t k, uint32_t rerank);
+
     /// Load sidecar files for search.
     void load_sidecars();
 };

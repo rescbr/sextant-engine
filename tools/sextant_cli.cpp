@@ -148,78 +148,61 @@ int cmd_build(int argc, char* argv[]) {
                                   : sextant::MetricKind::L2Sq;
 
     if (p.exist("explain")) {
-        auto resolved = sextant::resolve_params(n, dim, cfg);
+        // If ANY of (R, alpha, pq_m, pq_bits) is auto, run the full
+        // sample-driven estimate_config (it does PQ probe + alpha sweep +
+        // R prediction via mini-builds). If ALL are locked, use the fast
+        // resolve_params path (no sampling needed).
+        const bool any_auto = (cfg.R == 0) || (cfg.alpha == 0.0f) ||
+                              (cfg.pq_m == 0) || (cfg.pq_bits == 0);
+
+        sextant::ResolvedParams resolved;
+        bool used_estimate_config = false;
+        if (any_auto) {
+            sextant::Engine engine;
+            resolved = engine.estimate_config(source, cfg);
+            used_estimate_config = true;
+        } else {
+            resolved = sextant::resolve_params(n, dim, cfg);
+        }
+
         std::cout << "input:      " << input << "\n"
                   << "index:      " << index << "\n"
                   << "n_vectors:  " << n << "\n"
                   << "dim:        " << dim << "\n"
-                  << "R:          " << resolved.R << "\n"
+                  << "R:          " << resolved.R
+                  << (cfg.R != 0 ? "  [locked]\n" : "  [estimated]\n")
                   << "L:          " << resolved.L << "\n"
                   << "L_build:    " << resolved.L_build << "\n"
                   << "alpha:      " << resolved.alpha
-                  << "\n";
+                  << (cfg.alpha != 0.0f ? "  [locked]\n" : "  [estimated]\n");
 
-        const bool need_probe = (resolved.pq_m == 0) || (resolved.pq_bits == 0);
-        if (need_probe) {
-            const uint32_t sample_sz = std::min<uint32_t>(
-                p.get<uint32_t>("probe-sample"), static_cast<uint32_t>(n));
-            // Read a random sample from the .fbin via seek (no full scan).
-            std::ifstream f(input, std::ios::binary);
-            std::mt19937_64 rng(0xC0FFEEULL);
-            std::vector<float> sample(static_cast<size_t>(sample_sz) * dim);
-            const uint64_t vec_bytes = static_cast<uint64_t>(dim) * sizeof(float);
-            for (uint32_t i = 0; i < sample_sz; i++) {
-                const uint64_t idx = rng() % n;
-                f.seekg(8 + idx * vec_bytes);
-                f.read(reinterpret_cast<char*>(sample.data() +
-                         static_cast<size_t>(i) * dim),
-                       static_cast<std::streamsize>(vec_bytes));
-            }
-            const auto sel = sextant::Engine::probe_pq_config(
-                sample.data(), sample_sz, dim, resolved);
-
-            std::cout << "pq_m:       " << sel.m << "  [auto, probed "
-                      << sample_sz << " random vectors]\n";
-            std::cout << "pq_bits:    " << static_cast<int>(sel.bits)
-                      << "  [auto]\n";
-            std::cout << "pq_max_distortion:  " << resolved.pq_max_distortion
-                      << " (bound)\n";
-
-            // Comparison table.
-            std::cout << "\nPQ probe results (distortion = median |1 - pq_dist/true_dist|,"
-                      << " max=" << resolved.pq_max_distortion << "):\n";
-            std::cout << "  m    bits  code   table     distort  band_r  ties@10 ties@30  note\n";
-            std::cout << "  "
-                         "----------------------------------------------------------------"
-                         "------------\n";
-            for (const auto& r : sel.all) {
-                const bool meets = r.distortion <= resolved.pq_max_distortion;
-                const bool selected = (r.m == sel.m && r.bits == sel.bits);
-                std::string note;
-                if (selected) note = "← SELECTED (" + sel.reason + ")";
-                else if (!meets) note = "(above bound)";
-                // Table size: KB if < 1MB, else MB.
-                const double tsize = r.table_bytes / 1024.0;
-                std::cout << "  " << std::left << std::setw(5) << r.m
-                          << std::setw(5) << static_cast<int>(r.bits)
-                          << std::setw(7) << r.code_bytes << "B "
-                          << std::setw(8) << (tsize < 1024 ?
-                              (std::to_string(static_cast<int>(tsize)) + "KB") :
-                              (std::to_string(tsize / 1024.0).substr(0,4) + "MB"))
-                          << std::setw(8) << std::fixed << std::setprecision(4) << r.distortion
-                          << std::setw(7) << std::setprecision(4) << r.band_recall
-                          << std::setw(7) << std::setprecision(2) << r.tie_fraction
-                          << std::setw(8) << std::setprecision(2) << r.tie30_fraction
-                          << note << "\n";
-            }
-            std::cout << "\n";
+        if (used_estimate_config) {
+            std::cout << "pq_m:       " << resolved.pq_m
+                      << (cfg.pq_m != 0 ? "  [locked]\n" : "  [estimated]\n");
+            std::cout << "pq_bits:    " << static_cast<int>(resolved.pq_bits)
+                      << (cfg.pq_bits != 0 ? "  [locked]\n" : "  [estimated]\n");
+            // Show the measured signals that drove the estimation.
+            std::cout << "\n─── Measured signals (estimate_config) ───\n";
+            std::cout << "  median LID:         " << std::fixed
+                      << std::setprecision(2) << resolved.measured_median_lid
+                      << "\n";
+            std::cout << "  avg degree (R̄):     " << std::setprecision(2)
+                      << resolved.measured_avg_degree << "\n";
+            std::cout << "  clustering coeff:   " << std::setprecision(4)
+                      << resolved.measured_clustering << "\n";
+            std::cout << "  dead-end fraction:  " << std::setprecision(4)
+                      << resolved.measured_dead_end_frac << "\n";
+            std::cout << "  closure_factor:     " << std::setprecision(4)
+                      << resolved.closure_factor << "\n";
         } else {
             std::cout << "pq_m:       " << resolved.pq_m << "\n"
-                      << "pq_bits:    " << static_cast<int>(resolved.pq_bits) << "\n"
-                      << "pq_max_distortion:  " << resolved.pq_max_distortion
+                      << "pq_bits:    " << static_cast<int>(resolved.pq_bits)
+                      << "\n";
+            std::cout << "pq_max_distortion:  " << resolved.pq_max_distortion
                       << " (bound; not used — m and bits are explicit)\n";
         }
-        std::cout << "inline_pq:  " << resolved.inline_pq_count << "\n"
+        std::cout << "max_occlusion:  " << resolved.max_occlusion << "\n"
+                  << "inline_pq:  " << resolved.inline_pq_count << "\n"
                   << "threads:    " << resolved.num_threads << "\n"
                   << "build_ram:  " << resolved.build_ram_budget
                   << " bytes\n"

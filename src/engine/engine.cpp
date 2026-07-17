@@ -33,8 +33,10 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #ifdef __linux__
 #include <sys/mman.h>  // madvise(MADV_HUGEPAGE) for TLB-friendly build buffers
@@ -1850,20 +1852,579 @@ void Engine::flush() {
 }
 
 // ===========================================================================
-// estimate_config — stub (implementation in Part 2 / estimate_config.cpp).
-// Lives here temporarily so the declaration in engine.hpp links. Part 2 will
-// move this to src/engine/estimate_config.cpp and add that file to meson.build.
+// estimate_config — sample-driven parameter estimation.
+//
+// Builds one or more mini-indices on a reservoir sample, measures graph
+// topology (OPT-SNG R prediction) and search quality (alpha sweep), and
+// returns the optimal build config. Does NOT write sidecar files — all
+// measurement is in-RAM on fresh Engine instances.
 // ===========================================================================
+namespace {
+/// Sample target for estimate_config mini-builds. Smaller than the production
+/// kSampleTarget (256K) because each candidate (R, alpha) builds a full
+/// mini-index — at 256K, 7 mini-builds would take >10 min. 20K keeps each
+/// build under ~20s while preserving graph topology (degrees, clustering,
+// dead-ends) and search quality (recall is identical at 20K for FlatNodeStore
+// since the cache is 100% hits). Matches kProbePool.
+inline constexpr uint64_t kEstimateSampleTarget = 20000;
+}  // namespace
+
+std::unique_ptr<Engine> Engine::build_mini_(const float* sample,
+                                             uint64_t sample_n, Dim dim,
+                                             const ResolvedParams& params) {
+    auto mini = std::make_unique<Engine>();
+    mini->count_ = sample_n;
+    mini->dim_ = dim;
+    mini->index_path_ = "/dev/null";  // never written; just non-empty
+
+    // Clamp threads: mini-builds are ~20K vectors — spawning a huge pool
+    // wastes time on thread management. Cap at 4 (enough for 20K).
+    ResolvedParams mp = params;
+    const uint32_t hw = std::thread::hardware_concurrency();
+    const uint32_t effective = (mp.num_threads > 0) ? mp.num_threads : hw;
+    mp.num_threads = std::min(4u, effective);
+
+    MemorySource src(sample, sample_n, dim);
+
+    // Mirror build_partitioned K==1 fast path (engine.cpp ~897-1005):
+    mini->pass1_sample_and_train(src, mp);
+    mini->node_size_ = VamanaCore::static_node_size(mp.R, 0, mini->code_size_);
+
+    // Allocate codes_buffer_ + nodes_buffer_ (aligned, zeroed).
+    {
+        const size_t codes_bytes =
+            static_cast<size_t>(sample_n) * mini->code_size_;
+        const size_t nodes_bytes =
+            static_cast<size_t>(sample_n) * mini->node_size_;
+        mini->codes_buffer_ = static_cast<uint8_t*>(
+            aligned_alloc(kDiskAlign, codes_bytes));
+        mini->nodes_buffer_ = static_cast<uint8_t*>(
+            aligned_alloc(kDiskAlign, nodes_bytes));
+        if (!mini->codes_buffer_ || !mini->nodes_buffer_) {
+            throw Error(ErrorCode::OutOfMemory,
+                        "build_mini_: buffer alloc failed");
+        }
+        std::memset(mini->codes_buffer_, 0, codes_bytes);
+        std::memset(mini->nodes_buffer_, 0, nodes_bytes);
+    }
+
+    mini->pass2_encode(src, mp);
+
+    // Load raw vectors as FP16 for the FP16 prune.
+    {
+        const size_t vecs_bytes =
+            static_cast<size_t>(sample_n) * dim * sizeof(float16_t);
+        mini->raw_vecs_buffer_ = static_cast<float16_t*>(
+            aligned_alloc(kDiskAlign, vecs_bytes));
+        if (!mini->raw_vecs_buffer_) {
+            throw Error(ErrorCode::OutOfMemory,
+                        "build_mini_: raw_vecs_buffer_ alloc failed");
+        }
+        for (uint64_t i = 0; i < sample_n; i++) {
+            float16_t* dst =
+                mini->raw_vecs_buffer_ + static_cast<size_t>(i) * dim;
+            const float* svec = sample + static_cast<size_t>(i) * dim;
+            for (uint32_t d = 0; d < dim; d++) {
+                dst[d] = static_cast<float16_t>(svec[d]);
+            }
+        }
+    }
+
+    const uint32_t n = static_cast<uint32_t>(sample_n);
+
+    // Set up core_ + flat_store_ (mirror build_partitioned K==1 lines 984-1000).
+    VamanaParams vp = VamanaParams::from_resolved(mp, dim, 0, 0);
+    mini->core_ = std::make_unique<VamanaCore>(vp, *mini->quantizer_);
+    mini->core_->set_build_codes(mini->codes_buffer_, n);
+    mini->core_->set_build_nodes(mini->nodes_buffer_);
+    mini->core_->prepare_for_build(n);
+    mini->flat_store_ = std::make_unique<FlatNodeStore>(
+        mini->nodes_buffer_, mini->codes_buffer_, mini->node_size_,
+        mini->code_size_);
+    mini->core_->set_store(mini->flat_store_.get());
+    mini->core_->set_build_vecs(mini->raw_vecs_buffer_);
+
+    mini->parallel_construct(mp);
+
+    mini->core_->set_build_vecs(nullptr);
+    mini->core_->compute_entry_points();
+
+    return mini;
+}
+
+GraphStats Engine::measure_graph_stats_(const Engine& mini) {
+    GraphStats stats;
+    const uint32_t n = static_cast<uint32_t>(mini.count_);
+    if (n == 0 || !mini.nodes_buffer_) return stats;
+
+    // avg_degree + dead_end_frac: single pass over all nodes.
+    uint64_t total_degree = 0;
+    uint32_t dead_ends = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t* node =
+            mini.nodes_buffer_ + static_cast<size_t>(i) * mini.node_size_;
+        const uint16_t deg = VamanaCore::get_neighbor_count(node);
+        total_degree += deg;
+        if (deg <= 1) ++dead_ends;
+    }
+    stats.avg_degree = static_cast<double>(total_degree) / n;
+    stats.dead_end_frac = static_cast<double>(dead_ends) / n;
+
+    // clustering_coeff: sample min(1000, N) random nodes. For each sampled
+    // node, get its neighbors, count pairs of neighbors that are also mutual
+    // neighbors (triangle fraction). Bounded by R² per node.
+    std::mt19937 rng(0xABCD1234u);
+    const uint32_t sample_cnt = std::min<uint32_t>(1000, n);
+    double coeff_sum = 0.0;
+    uint32_t coeff_count = 0;
+    for (uint32_t s = 0; s < sample_cnt; s++) {
+        const uint32_t i = (sample_cnt == n) ? s : rng() % n;
+        const uint8_t* node =
+            mini.nodes_buffer_ + static_cast<size_t>(i) * mini.node_size_;
+        const uint16_t deg = VamanaCore::get_neighbor_count(node);
+        if (deg < 2) continue;
+
+        // Collect neighbor IDs into a hash set.
+        std::unordered_set<uint32_t> nbrs;
+        nbrs.reserve(deg);
+        for (uint16_t j = 0; j < deg; j++) {
+            nbrs.insert(VamanaCore::get_neighbor(node, j));
+        }
+
+        // Count connected pairs among neighbors (triangles through node i).
+        uint32_t pairs = 0;
+        uint32_t connected = 0;
+        for (auto it1 = nbrs.begin(); it1 != nbrs.end(); ++it1) {
+            const uint32_t nb1 = *it1;
+            if (nb1 >= n) continue;
+            const uint8_t* nb1_node =
+                mini.nodes_buffer_ + static_cast<size_t>(nb1) * mini.node_size_;
+            const uint16_t nb1_deg =
+                VamanaCore::get_neighbor_count(nb1_node);
+            // Build nb1's neighbor set.
+            std::unordered_set<uint32_t> nb1_nbrs;
+            for (uint16_t j = 0; j < nb1_deg; j++) {
+                nb1_nbrs.insert(
+                    VamanaCore::get_neighbor(nb1_node, j));
+            }
+            auto it2 = it1;
+            ++it2;
+            for (; it2 != nbrs.end(); ++it2) {
+                ++pairs;
+                if (nb1_nbrs.count(*it2)) ++connected;
+            }
+        }
+        if (pairs > 0) {
+            coeff_sum += static_cast<double>(connected) / pairs;
+            ++coeff_count;
+        }
+    }
+    stats.clustering_coeff =
+        coeff_count > 0 ? coeff_sum / coeff_count : 0.0;
+    // median_lid is filled by estimate_config from truth distances.
+    return stats;
+}
+
+Engine::SearchQuality Engine::measure_search_(
+    const Engine& mini, const float* sample, uint64_t sample_n, Dim dim,
+    const std::vector<std::vector<uint32_t>>& truth_ids,
+    const std::vector<std::vector<float>>& truth_dists,
+    const std::vector<uint32_t>& qidx,
+    uint32_t L, uint32_t k, uint32_t rerank) {
+    SearchQuality sq{0.0, 0.0};
+    if (!mini.core_ || !mini.quantizer_ || qidx.empty()) return sq;
+
+    PqQuantizer& q = *mini.quantizer_;
+    std::vector<float> lut(q.lut_size());
+    const uint32_t fetch_k = k + rerank;  // over-fetch for rerank
+
+    double recall_sum = 0.0;
+    uint64_t prox_in = 0, prox_total = 0;
+    constexpr double kEps = 1e-12;
+
+    for (size_t qi = 0; qi < qidx.size(); qi++) {
+        const float* qv = sample + static_cast<size_t>(qidx[qi]) * dim;
+        q.preprocess_query(qv, lut.data());
+
+        // Production-style search: core_->search returns candidates ranked by
+        // PQ LUT distance. We over-fetch k+rerank candidates.
+        auto results = mini.core_->search(lut.data(), fetch_k, L, /*io_limit=*/0);
+        if (results.empty()) continue;
+
+        // Rerank by true L2sq distance computed from the FP32 sample buffer.
+        std::vector<std::pair<float, int32_t>> scored;
+        scored.reserve(results.size());
+        for (const auto& c : results) {
+            if (c.row_id < 0 ||
+                static_cast<uint64_t>(c.row_id) >= sample_n) continue;
+            const float* bv =
+                sample + static_cast<size_t>(c.row_id) * dim;
+            double d = 0.0;
+            for (uint32_t d2 = 0; d2 < dim; d2++) {
+                const double diff = double(qv[d2]) - double(bv[d2]);
+                d += diff * diff;
+            }
+            scored.emplace_back(float(d), c.row_id);
+        }
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first < b.first;
+                  });
+
+        const uint32_t topk = std::min<uint32_t>(k, scored.size());
+        if (topk == 0) continue;
+
+        // Recall@k: fraction of truth_ids[qi][:k] found in top-k.
+        std::unordered_set<uint32_t> result_set;
+        for (uint32_t i = 0; i < topk; i++) {
+            result_set.insert(static_cast<uint32_t>(scored[i].second));
+        }
+        const uint32_t tk =
+            std::min<uint32_t>(k, truth_ids[qi].size());
+        uint32_t hits = 0;
+        for (uint32_t t = 0; t < tk; t++) {
+            if (result_set.count(truth_ids[qi][t])) ++hits;
+        }
+        recall_sum += double(hits) / double(tk > 0 ? tk : 1);
+
+        // Proximity: ratio = d_target / d_result (>=1 = at/inside band).
+        // d_target = the k-th true NN distance (truth_dists[qi][k-1]).
+        const float d_target =
+            (truth_dists[qi].size() >= k) ? truth_dists[qi][k - 1] :
+            (!truth_dists[qi].empty()) ? truth_dists[qi].back() :
+            std::numeric_limits<float>::infinity();
+        for (uint32_t i = 0; i < topk; i++) {
+            const double d = scored[i].first;
+            double ratio;
+            if (d_target <= kEps && d <= kEps) {
+                ratio = 1.0;
+            } else if (d <= kEps) {
+                ratio = 2.0;  // found a closer point
+            } else if (d_target <= kEps) {
+                ratio = 0.0;
+            } else {
+                ratio = double(d_target) / d;
+            }
+            if (ratio >= 1.0) ++prox_in;
+            ++prox_total;
+        }
+    }
+
+    sq.recall = recall_sum / qidx.size();
+    sq.proximity = prox_total > 0 ? double(prox_in) / prox_total : 0.0;
+    return sq;
+}
+
 ResolvedParams Engine::estimate_config(VectorSource& source,
-                                       const BuildConfig& overrides) {
-    (void)source;
-    // Fast fallback: no measurement-based estimation yet. Delegate to the
-    // heuristic resolver so callers (analyze, build --explain) work end-to-end.
-    const uint64_t n = source.count();
-    ResolvedParams p = resolve_params(n, source.dim(), overrides);
-    spdlog::warn("[sextant] estimate_config: stub implementation — returning "
-                 "heuristic resolve_params result (Part 2 will implement the "
-                 "full sample-driven estimation)");
+                                        const BuildConfig& overrides) {
+    const uint64_t total_n = source.count();
+    const Dim dim = source.dim();
+    if (total_n == 0 || dim == 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "estimate_config: empty source (n=" +
+                        std::to_string(total_n) +
+                        ", dim=" + std::to_string(dim) + ")");
+    }
+
+    spdlog::info("[sextant] estimate_config: n={} dim={}", total_n, dim);
+
+    // --- 1. Reservoir sample (reuse pass1's reservoir logic + seed) ---
+    // sample_n = min(kEstimateSampleTarget, total_n). Use the SAME RNG seed
+    // (0xC0DE1234) as pass1_sample_and_train for reproducibility.
+    const uint64_t sample_cap =
+        std::min<uint64_t>(kEstimateSampleTarget, total_n);
+    std::vector<float> sample(static_cast<size_t>(sample_cap) * dim);
+    source.reset();
+    std::mt19937_64 rng(0xC0DE1234ULL);
+    Chunk chunk{};
+    uint64_t seen = 0;
+    uint64_t filled = 0;
+    while (source.next(chunk)) {
+        for (uint32_t r = 0; r < chunk.count; r++) {
+            const float* vec = chunk.vectors + static_cast<size_t>(r) * dim;
+            if (filled < sample_cap) {
+                std::memcpy(sample.data() + filled * dim, vec, dim * sizeof(float));
+                ++filled;
+            } else {
+                std::uniform_int_distribution<uint64_t> dist(0, seen);
+                const uint64_t j = dist(rng);
+                if (j < sample_cap) {
+                    std::memcpy(sample.data() + j * dim, vec, dim * sizeof(float));
+                }
+            }
+            ++seen;
+        }
+    }
+    const uint64_t sample_n = filled;
+    spdlog::info("[sextant] estimate_config: sampled {} / {} vectors",
+                 sample_n, seen);
+
+    // --- 2. PQ config resolution (probe if pq_m or pq_bits auto) ---
+    ResolvedParams base = resolve_params(total_n, dim, overrides);
+    uint16_t pq_m = overrides.pq_m;
+    uint8_t pq_bits = overrides.pq_bits;
+    PqSelection pq_sel{0, 0, {}, ""};
+    if (pq_m == 0 || pq_bits == 0) {
+        spdlog::info("[sextant] estimate_config: probing PQ config...");
+        pq_sel = probe_pq_config(sample.data(), sample_n, dim, base);
+        pq_m = pq_sel.m;
+        pq_bits = pq_sel.bits;
+        spdlog::info("[sextant] estimate_config: PQ → m={}, bits={}", pq_m,
+                     static_cast<int>(pq_bits));
+    }
+
+    // --- 3. Compute truth + LID ---
+    // Query indices: first min(500, sample_n) of the sample.
+    const uint32_t nq = std::min<uint32_t>(500, static_cast<uint32_t>(sample_n));
+    std::vector<uint32_t> qidx(nq);
+    for (uint32_t i = 0; i < nq; i++) qidx[i] = i;
+
+    spdlog::info("[sextant] estimate_config: computing truth ({} queries)...",
+                 nq);
+    const ProbeTruth truth =
+        compute_truth(sample.data(), static_cast<uint32_t>(sample_n), dim, qidx);
+
+    // MLE LID per query: LID = [(1/(k-1)) Σ log(r_k / r_i)]^{-1}.
+    // Use the first k=10 true distances.
+    std::vector<double> lids;
+    lids.reserve(nq);
+    const uint32_t lid_k = std::min<uint32_t>(10, kProbeTopk);
+    for (size_t qi = 0; qi < nq; qi++) {
+        const auto& dists = truth.dists[qi];
+        if (dists.size() < lid_k) continue;
+        const float r_k = dists[lid_k - 1];
+        if (r_k <= 1e-12f) continue;
+        double sum = 0.0;
+        for (uint32_t i = 0; i < lid_k - 1; i++) {
+            if (dists[i] <= 1e-12f) { sum = 0; break; }
+            sum += std::log(double(r_k) / double(dists[i]));
+        }
+        if (sum > 1e-9) {
+            lids.push_back(double(lid_k - 1) / sum);
+        }
+    }
+    double median_lid = 0.0;
+    if (!lids.empty()) {
+        std::nth_element(lids.begin(), lids.begin() + lids.size() / 2,
+                         lids.end());
+        median_lid = lids[lids.size() / 2];
+    }
+    spdlog::info("[sextant] estimate_config: median LID = {:.2f}", median_lid);
+
+    // d_eff: from overrides if set, else max(5.0, median_lid / 3.0).
+    const double d_eff = overrides.closure_d_eff > 0.0f
+                             ? overrides.closure_d_eff
+                             : std::max(5.0, median_lid / 3.0);
+
+    // --- 4. Closure factor from measured d_eff ---
+    const float f_target = overrides.closure_f_target > 0.0f
+                               ? overrides.closure_f_target
+                               : 0.15f;
+    float closure_c = static_cast<float>(
+        std::pow(1.0 - f_target, -1.0 / d_eff));
+    if (closure_c < 1.0f) closure_c = 1.0f;
+    if (closure_c > 1.2f) closure_c = 1.2f;
+    spdlog::info("[sextant] estimate_config: closure_factor={:.4f} "
+                 "(f_target={:.2f}, d_eff={:.2f})",
+                 closure_c, f_target, d_eff);
+
+    // --- 5. Alpha resolution (sweep if alpha auto) ---
+    float alpha_rec = overrides.alpha;
+    if (alpha_rec == 0.0f) {
+        spdlog::info("[sextant] estimate_config: sweeping alpha...");
+        static constexpr std::array<float, 4> kAlphas = {{1.0f, 1.1f, 1.2f, 1.5f}};
+        constexpr uint32_t kAlphaL = 200;
+        constexpr uint32_t kAlphaK = 10;
+        constexpr uint32_t kAlphaRerank = 10;
+
+        ResolvedParams alpha_params = base;
+        alpha_params.R = 64;
+        alpha_params.pq_m = pq_m;
+        alpha_params.pq_bits = pq_bits;
+
+        double best_proximity = -1.0;
+        for (float a : kAlphas) {
+            alpha_params.alpha = a;
+            const auto t0 = std::chrono::steady_clock::now();
+            auto mini = build_mini_(sample.data(), sample_n, dim, alpha_params);
+            const auto sq = measure_search_(
+                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+                qidx, kAlphaL, kAlphaK, kAlphaRerank);
+            const auto t1 = std::chrono::steady_clock::now();
+            const double dt = std::chrono::duration<double>(t1 - t0).count();
+            spdlog::info("[sextant]   alpha={:.1f}  proximity={:.4f}  "
+                         "recall={:.4f}  ({:.1f}s)",
+                         a, sq.proximity, sq.recall, dt);
+            if (sq.proximity > best_proximity) {
+                best_proximity = sq.proximity;
+                alpha_rec = a;
+            }
+        }
+        spdlog::info("[sextant] estimate_config: alpha → {:.1f}", alpha_rec);
+    }
+
+    // --- 6. R resolution (OPT-SNG) ---
+    // Build reference mini-index at R=64, measure graph stats.
+    spdlog::info("[sextant] estimate_config: building reference mini-index "
+                 "(R=64) for R prediction...");
+    ResolvedParams ref_params = base;
+    ref_params.R = 64;
+    ref_params.alpha = alpha_rec;
+    ref_params.pq_m = pq_m;
+    ref_params.pq_bits = pq_bits;
+
+    const auto t_ref0 = std::chrono::steady_clock::now();
+    auto ref_mini = build_mini_(sample.data(), sample_n, dim, ref_params);
+    GraphStats gstats = measure_graph_stats_(*ref_mini);
+    gstats.median_lid = median_lid;
+    const auto t_ref1 = std::chrono::steady_clock::now();
+    spdlog::info("[sextant] estimate_config: reference graph: R̄={:.2f}, "
+                 "clustering={:.4f}, dead_ends={:.4f} ({:.1f}s)",
+                 gstats.avg_degree, gstats.clustering_coeff,
+                 gstats.dead_end_frac,
+                 std::chrono::duration<double>(t_ref1 - t_ref0).count());
+
+    // OPT-SNG: R_predicted = R̄_mini * log(N_full)/log(N_sample) * (alpha_ref/alpha_rec)^2.
+    // The reference build is at alpha_rec (whether locked or swept), so
+    // alpha_ref == alpha_rec and the coupling term is 1. We write it
+    // explicitly for clarity / future extension.
+    const double alpha_coupling =
+        (alpha_rec != 0.0f)
+            ? std::pow(double(alpha_rec) / double(alpha_rec), 2.0)
+            : 1.0;
+    double R_predicted = gstats.avg_degree *
+                         std::log(double(total_n)) / std::log(double(sample_n)) *
+                         alpha_coupling;
+    // Guardrails (exact thresholds from spec).
+    if (gstats.clustering_coeff > 0.12) {
+        R_predicted = std::min(R_predicted, 48.0);
+        spdlog::info("[sextant]   guardrail: clustering {:.4f} > 0.12 → cap "
+                     "R ≤ 48", gstats.clustering_coeff);
+    }
+    if (gstats.dead_end_frac > 0.05) {
+        R_predicted = std::max(R_predicted, 64.0);
+        spdlog::info("[sextant]   guardrail: dead_ends {:.4f} > 0.05 → floor "
+                     "R ≥ 64", gstats.dead_end_frac);
+    }
+
+    uint16_t R_full = static_cast<uint16_t>(
+        std::round(std::clamp(R_predicted, 32.0, 128.0)));
+    spdlog::info("[sextant] estimate_config: R predicted={:.1f} → R_full={}",
+                 R_predicted, R_full);
+
+    // --- 7. R sweep validation ---
+    // Build 2 more mini-indices at R_full-16 and R_full+16 (clamp ≥32).
+    spdlog::info("[sextant] estimate_config: R validation sweep...");
+    constexpr uint32_t kValidL = 200;
+    constexpr uint32_t kValidK = 10;
+    constexpr uint32_t kValidRerank = 10;
+
+    struct RPoint { uint16_t R; double proximity; };
+    std::vector<RPoint> rpoints;
+
+    // Measure the prediction point R_full (reuse ref_mini if R_full==64).
+    if (R_full == 64) {
+        const auto sq = measure_search_(
+            *ref_mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+            qidx, kValidL, kValidK, kValidRerank);
+        rpoints.push_back({R_full, sq.proximity});
+        spdlog::info("[sextant]   R={}  proximity={:.4f}", R_full, sq.proximity);
+    } else {
+        ResolvedParams rp = base;
+        rp.R = R_full; rp.alpha = alpha_rec;
+        rp.pq_m = pq_m; rp.pq_bits = pq_bits;
+        auto mini = build_mini_(sample.data(), sample_n, dim, rp);
+        const auto sq = measure_search_(
+            *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+            qidx, kValidL, kValidK, kValidRerank);
+        rpoints.push_back({R_full, sq.proximity});
+        spdlog::info("[sextant]   R={}  proximity={:.4f}", R_full, sq.proximity);
+    }
+
+    for (int delta : {-16, +16}) {
+        uint16_t r = static_cast<uint16_t>(std::max(32, int(R_full) + delta));
+        ResolvedParams rp = base;
+        rp.R = r; rp.alpha = alpha_rec;
+        rp.pq_m = pq_m; rp.pq_bits = pq_bits;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto mini = build_mini_(sample.data(), sample_n, dim, rp);
+        const auto sq = measure_search_(
+            *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+            qidx, kValidL, kValidK, kValidRerank);
+        const auto t1 = std::chrono::steady_clock::now();
+        rpoints.push_back({r, sq.proximity});
+        spdlog::info("[sextant]   R={}  proximity={:.4f}  ({:.1f}s)", r,
+                     sq.proximity,
+                     std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    // If the sweep-best R differs from R_full by >16, trust the sweep.
+    auto best_it = std::max_element(rpoints.begin(), rpoints.end(),
+        [](const RPoint& a, const RPoint& b) {
+            return a.proximity < b.proximity;
+        });
+    if (best_it != rpoints.end() &&
+        std::abs(int(best_it->R) - int(R_full)) > 16) {
+        spdlog::info("[sextant]   validation: sweep-best R={} differs from "
+                     "prediction R={} by >16 → using sweep-best",
+                     best_it->R, R_full);
+        R_full = best_it->R;
+    }
+
+    if (overrides.R != 0) {
+        R_full = overrides.R;
+        spdlog::info("[sextant] estimate_config: R locked by override → {}",
+                     R_full);
+    }
+
+    // --- 8. Final param resolution ---
+    ResolvedParams p;
+    p.R = R_full;
+    p.alpha = alpha_rec;
+    p.pq_m = pq_m;
+    p.pq_bits = pq_bits;
+    p.L_build = static_cast<uint16_t>(std::max<uint32_t>(2u * p.R, 100u));
+    p.L = p.L_build;
+    p.max_occlusion = (overrides.max_occlusion != 0)
+                           ? overrides.max_occlusion
+                           : std::max<uint32_t>(p.L_build,
+                                                static_cast<uint32_t>(p.R) + 1u);
+    p.closure_factor = closure_c;
+    p.inline_pq_count = 0;  // deprecated
+    p.measured_median_lid = median_lid;
+    p.measured_avg_degree = gstats.avg_degree;
+    p.measured_clustering = gstats.clustering_coeff;
+    p.measured_dead_end_frac = gstats.dead_end_frac;
+    p.build_mode = overrides.build_mode;
+    p.metric = overrides.metric;
+    p.num_threads = base.num_threads;
+    p.build_ram_budget = base.build_ram_budget;
+    p.pq_max_distortion = base.pq_max_distortion;
+
+    // Recompute K from the final R (K depends on per-vec size).
+    {
+        const uint32_t code_sz = static_cast<uint32_t>(p.pq_m);
+        const uint32_t node_sz =
+            ((16u + static_cast<uint32_t>(p.R) * 4u + 7u) & ~7u);
+        const uint64_t per_vec = code_sz + node_sz;
+        uint32_t k = 1;
+        uint64_t max_per_partition = 0;
+        if (per_vec > 0 && p.build_ram_budget > 0) {
+            max_per_partition = p.build_ram_budget / per_vec;
+            if (max_per_partition > 0) {
+                k = static_cast<uint32_t>(
+                    (total_n + max_per_partition - 1) / max_per_partition);
+                if (k < 1) k = 1;
+            }
+        }
+        p.K = k;
+    }
+
+    spdlog::info("[sextant] estimate_config: final → R={} alpha={:.1f} "
+                 "pq_m={} pq_bits={} L_build={} K={}",
+                 p.R, p.alpha, p.pq_m, static_cast<int>(p.pq_bits), p.L_build,
+                 p.K);
+
     return p;
 }
 
