@@ -2312,69 +2312,69 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
     spdlog::info("[sextant] estimate_config: R predicted={:.1f} → R_full={}",
                  R_predicted, R_full);
 
-    // --- 7. R sweep validation ---
-    // Build 2 more mini-indices at R_full-16 and R_full+16 (clamp ≥32).
-    spdlog::info("[sextant] estimate_config: R validation sweep...");
-    constexpr uint32_t kValidL = 200;
-    constexpr uint32_t kValidK = 10;
-    constexpr uint32_t kValidRerank = 10;
-
-    struct RPoint { uint16_t R; double proximity; };
-    std::vector<RPoint> rpoints;
-
-    // Measure the prediction point R_full (reuse ref_mini if R_full==64).
-    if (R_full == 64) {
-        const auto sq = measure_search_(
-            *ref_mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-            qidx, kValidL, kValidK, kValidRerank);
-        rpoints.push_back({R_full, sq.proximity});
-        spdlog::info("[sextant]   R={}  proximity={:.4f}", R_full, sq.proximity);
-    } else {
-        ResolvedParams rp = base;
-        rp.R = R_full; rp.alpha = alpha_rec;
-        rp.pq_m = pq_m; rp.pq_bits = pq_bits;
-        auto mini = build_mini_(sample.data(), sample_n, dim, rp);
-        const auto sq = measure_search_(
-            *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-            qidx, kValidL, kValidK, kValidRerank);
-        rpoints.push_back({R_full, sq.proximity});
-        spdlog::info("[sextant]   R={}  proximity={:.4f}", R_full, sq.proximity);
-    }
-
-    for (int delta : {-16, +16}) {
-        uint16_t r = static_cast<uint16_t>(std::max(32, int(R_full) + delta));
-        ResolvedParams rp = base;
-        rp.R = r; rp.alpha = alpha_rec;
-        rp.pq_m = pq_m; rp.pq_bits = pq_bits;
-        const auto t0 = std::chrono::steady_clock::now();
-        auto mini = build_mini_(sample.data(), sample_n, dim, rp);
-        const auto sq = measure_search_(
-            *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-            qidx, kValidL, kValidK, kValidRerank);
-        const auto t1 = std::chrono::steady_clock::now();
-        rpoints.push_back({r, sq.proximity});
-        spdlog::info("[sextant]   R={}  proximity={:.4f}  ({:.1f}s)", r,
-                     sq.proximity,
-                     std::chrono::duration<double>(t1 - t0).count());
-    }
-
-    // If the sweep-best R differs from R_full by >16, trust the sweep.
-    auto best_it = std::max_element(rpoints.begin(), rpoints.end(),
-        [](const RPoint& a, const RPoint& b) {
-            return a.proximity < b.proximity;
-        });
-    if (best_it != rpoints.end() &&
-        std::abs(int(best_it->R) - int(R_full)) > 16) {
-        spdlog::info("[sextant]   validation: sweep-best R={} differs from "
-                     "prediction R={} by >16 → using sweep-best",
-                     best_it->R, R_full);
-        R_full = best_it->R;
-    }
-
     if (overrides.R != 0) {
         R_full = overrides.R;
-        spdlog::info("[sextant] estimate_config: R locked by override → {}",
-                     R_full);
+        spdlog::info("[sextant] estimate_config: R locked by override → {} "
+                     "(skipping validation sweep)", R_full);
+    } else {
+        // --- 7. R sweep validation (only when R is estimated) ---
+        // Build 2 more mini-indices at R_full-16 and R_full+16 (clamp ≥32).
+        spdlog::info("[sextant] estimate_config: R validation sweep...");
+        constexpr uint32_t kValidL = 200;
+        constexpr uint32_t kValidK = 10;
+        constexpr uint32_t kValidRerank = 10;
+
+        struct RPoint { uint16_t R; double proximity; };
+        std::vector<RPoint> rpoints;
+
+        // Measure the prediction point R_full (reuse ref_mini if R_full==64).
+        if (R_full == 64) {
+            const auto sq = measure_search_(
+                *ref_mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+                qidx, kValidL, kValidK, kValidRerank);
+            rpoints.push_back({R_full, sq.proximity});
+            spdlog::info("[sextant]   R={}  proximity={:.4f}", R_full, sq.proximity);
+        } else {
+            ResolvedParams rp = base;
+            rp.R = R_full; rp.alpha = alpha_rec;
+            rp.pq_m = pq_m; rp.pq_bits = pq_bits;
+            auto mini = build_mini_(sample.data(), sample_n, dim, rp);
+            const auto sq = measure_search_(
+                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+                qidx, kValidL, kValidK, kValidRerank);
+            rpoints.push_back({R_full, sq.proximity});
+            spdlog::info("[sextant]   R={}  proximity={:.4f}", R_full, sq.proximity);
+        }
+
+        for (int delta : {-16, +16}) {
+            uint16_t r = static_cast<uint16_t>(std::max(32, int(R_full) + delta));
+            ResolvedParams rp = base;
+            rp.R = r; rp.alpha = alpha_rec;
+            rp.pq_m = pq_m; rp.pq_bits = pq_bits;
+            const auto t0 = std::chrono::steady_clock::now();
+            auto mini = build_mini_(sample.data(), sample_n, dim, rp);
+            const auto sq = measure_search_(
+                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+                qidx, kValidL, kValidK, kValidRerank);
+            const auto t1 = std::chrono::steady_clock::now();
+            rpoints.push_back({r, sq.proximity});
+            spdlog::info("[sextant]   R={}  proximity={:.4f}  ({:.1f}s)", r,
+                         sq.proximity,
+                         std::chrono::duration<double>(t1 - t0).count());
+        }
+
+        // If the sweep-best R differs from R_full by >16, trust the sweep.
+        auto best_it = std::max_element(rpoints.begin(), rpoints.end(),
+            [](const RPoint& a, const RPoint& b) {
+                return a.proximity < b.proximity;
+            });
+        if (best_it != rpoints.end() &&
+            std::abs(int(best_it->R) - int(R_full)) > 16) {
+            spdlog::info("[sextant]   validation: sweep-best R={} differs from "
+                         "prediction R={} by >16 → using sweep-best",
+                         best_it->R, R_full);
+            R_full = best_it->R;
+        }
     }
 
     // --- 8. Final param resolution ---
