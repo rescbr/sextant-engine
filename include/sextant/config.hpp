@@ -21,7 +21,11 @@ struct BuildConfig {
                                 ///< 0 = auto (1.2). Purely the prune threshold;
                                 ///< build mode is set via `build_mode`.
     BuildMode build_mode = BuildMode::SDC;  ///< SDC (code-distance construct); ADC removed
-    uint16_t inline_pq_count = 0xFFFF; ///< 0xFFFF = auto (balanced preset)
+    /// Inline PQ codes per node. 0 = compact (no inline). DEPRECATED: the
+    /// two-cache search architecture handles code locality without inflating
+    /// node size, so inline PQ provides no benefit. Retained for backward
+    /// compatibility with old indexes; new builds should use 0.
+    uint16_t inline_pq_count = 0;
     uint16_t pq_m = 0;          ///< 0 = auto (reservoir probe)
     uint8_t pq_bits = 8;        ///< 4, 8, or 0 (auto via reservoir probe)
     /// PQ max distortion for auto (m, bits) selection. Used only when pq_m or

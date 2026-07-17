@@ -67,8 +67,8 @@ int cmd_build(int argc, char* argv[]) {
                      "Build RAM budget in bytes (forces partitioning if small)",
                      false, 0);
     p.add<uint32_t>("inline-pq", 0,
-                     "Neighbor PQ codes inlined per node (0=compact, R=all, auto)",
-                     false, 0xFFFF);
+                     "Neighbor PQ codes inlined per node (0=compact, R=all; deprecated)",
+                     false, 0);
     p.add<uint32_t>("max-occlusion", 0,
                      "RobustPrune candidate cap (auto if 0)",
                      false, 0);

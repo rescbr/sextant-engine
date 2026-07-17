@@ -1352,6 +1352,11 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // Shared by both K==1 (graph built directly) and K>1 (merged graph). For
     // K==1, core_ is already wired to nodes_buffer_/codes_buffer_.
     core_->compute_entry_points();
+    if (params.inline_pq_count > 0) {
+        spdlog::warn("[sextant] inline_pq_count={} is deprecated and provides no "
+                     "benefit (two-cache search handles code locality). Set to 0.",
+                     params.inline_pq_count);
+    }
     core_->finalize_inline_codes();
     flush_sidecars(params);
 

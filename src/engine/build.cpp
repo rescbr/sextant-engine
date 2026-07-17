@@ -29,42 +29,6 @@ uint16_t auto_R(uint64_t n) {
     return 128;
 }
 
-/// Auto-resolve the inline-PQ count preset (Issue 25). Phase 1 default is the
-/// "balanced" preset; the override sentinel 0xFFFF means "auto".
-uint16_t resolve_inline_pq(uint16_t override_val, uint64_t n_vectors,
-                            uint16_t R, uint32_t code_size,
-                            uint64_t cache_budget) {
-    if (override_val != 0xFFFF) return override_val;
-
-    // Cache-aware auto-resolution.
-    //
-    // inline_pq inflates each node by inline_pq × code_size bytes. This trades
-    // search I/O (1 read/hop vs 2) for .graph file size. But it also shrinks
-    // the effective cache: a 6× larger node means 6× fewer nodes per cache block.
-    //
-    // Key insight: once a block is cached, there's zero I/O cost difference
-    // between 1 read/hop and 2 reads/hop. The inline benefit only matters for
-    // actual SSD I/O (cache misses). So inline_pq should only be >0 when the
-    // compact (inline_pq=0) graph exceeds the cache budget — i.e., when the
-    // working set doesn't fit and every hop risks a real disk read.
-    //
-    // Resolution:
-    //   1. Compute graph_size at inline_pq=0.
-    //   2. If it fits in the cache budget → inline_pq=0 (compact, cache-friendly).
-    //   3. If not, try inline_pq=R/2, then R, checking SSD space.
-    const uint32_t base_node = ((16u + static_cast<uint32_t>(R) * 4u + 7u) & ~7u);
-    const uint64_t compact_graph = n_vectors * base_node;
-
-    if (compact_graph <= cache_budget) {
-        return 0;  // compact graph fits cache — no inlining needed
-    }
-
-    // Graph doesn't fit cache. Inlining saves a read/hop at the cost of cache
-    // pollution. Use R/2 as a middle ground (partial inline for closest neighbors).
-    return static_cast<uint16_t>(std::min(static_cast<uint32_t>(R) / 2,
-                                          static_cast<uint32_t>(R)));
-}
-
 /// Physical RAM in bytes. Platform-specific with a portable fallback.
 uint64_t physical_ram_bytes() {
 #if defined(__APPLE__)
@@ -180,20 +144,21 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     }
 
     // --- inline_pq_count ---
-    // Cache-aware resolution: inline_pq inflates nodes 6× but saves a read/hop.
-    // Only inline when the compact graph doesn't fit the cache budget (Issue 36).
-    {
-        uint64_t phys_ram = physical_ram_bytes();
-        uint64_t cache_budget = phys_ram > 0 ? phys_ram * 35 / 100 : 0;
-        p.inline_pq_count = resolve_inline_pq(
-            overrides.inline_pq_count, n_vectors, p.R, p.pq_m, cache_budget);
+    // Inline PQ is deprecated (two-cache search makes it redundant). The auto
+    // sentinel (0xFFFF) is removed; default is 0 (compact). Users who explicitly
+    // set >0 get a deprecation warning at flush time.
+    p.inline_pq_count = overrides.inline_pq_count;
+    // Defensive: an old caller/test may still pass the 0xFFFF auto sentinel.
+    // Treat it as 0 (auto → compact).
+    if (p.inline_pq_count == 0xFFFF) {
+        p.inline_pq_count = 0;
     }
-    // Cap to R — you can't inline more neighbor codes than there are neighbors.
+    // Cap to R — can't inline more neighbor codes than neighbors.
     if (p.inline_pq_count > p.R) {
         p.inline_pq_count = p.R;
     }
     spdlog::info("[sextant] inline_pq_count = {} [{}]", p.inline_pq_count,
-                 overrides.inline_pq_count != 0xFFFF ? "override" : "auto");
+                 overrides.inline_pq_count != 0 ? "override" : "default");
 
     // --- metric ---
     p.metric = overrides.metric;
