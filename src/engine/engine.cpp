@@ -641,6 +641,32 @@ void Engine::pass1_sample_and_train(VectorSource& source,
 
     // Algorithm R: keep the first `sample_cap`, then replace index j (j<k)
     // with probability k/i for the i-th seen item.
+    //
+    // rng() % (seen+1) instead of std::uniform_int_distribution: the latter
+    // uses general-purpose rejection sampling (~107M/s); raw modulo is ~5x
+    // faster (~530M/s). At billion scale Phase B (the post-fill steady state)
+    // is ~9s with the distribution vs ~2s with modulo. The modulo bias at
+    // seen ~ 1e9 against the 2^64 range is ~1e-10 — far below the statistical
+    // precision a 20K sample carries, and irrelevant for parameter estimation.
+    // (Phase B does no memcpy in the steady state: replacement probability
+    // drops to sample_cap/seen ~ 2e-5 at 1B, so nearly every iteration is
+    // just RNG + compare.)
+    //
+    // Why not parallelize the sampling? Not because of reproducibility — a
+    // fixed seed gives determinism regardless of iteration order, and nothing
+    // here pins to a specific sample (the result feeds statistical aggregations).
+    // The actual reasons:
+    //   1. The workload is one sequential pass over the base file (large
+    //      6MB chunked reads). On the GCP bench VM's 2-SSD RAID0, the kernel's
+    //      md layer already parallelizes these reads across both devices under
+    //      a single thread (read size >> stripe size), so app-level parallel
+    //      reads wouldn't add bandwidth.
+    //   2. Total I/O dwarfs compute at billion scale (1B × 3KB = 3TB; nothing
+    //      in the sampling loop speeds that up). The only way to go faster is
+    //      to NOT read the whole file — see FOLLOWUP: seek-based sampling.
+    //   3. The modulo swap above already captured the cheap serial CPU win.
+    // Distributed reservoir sampling (per-shard Algorithm R + weighted merge)
+    // is a solved algorithm if we ever shard the input across hosts.
     std::mt19937_64 rng(0xC0DE1234ULL);
     Chunk chunk{};
     uint64_t seen = 0;
@@ -666,8 +692,7 @@ void Engine::pass1_sample_and_train(VectorSource& source,
                             dim_ * sizeof(float));
                 filled++;
             } else {
-                std::uniform_int_distribution<uint64_t> dist(0, seen);
-                const uint64_t j = dist(rng);
+                const uint64_t j = rng() % (seen + 1);
                 if (j < sample_cap) {
                     std::memcpy(reservoir.data() + j * dim_, vec,
                                 dim_ * sizeof(float));
