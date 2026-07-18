@@ -81,12 +81,13 @@ struct VamanaParams {
     float alpha = 1.2f;           ///< Prune distance threshold
     uint16_t inline_pq_count = 0; ///< Neighbor PQ codes inlined per node
     uint16_t n_entry_points = 16;
+    uint16_t n_search_entry_points = 4;  ///< Multi-start: seed top-M entry points per query
     uint32_t max_occlusion = 750; ///< RobustPrune occlusion set size
 
     /// Factory: build VamanaParams from resolved engine params.
     /// `R_override` (0 = use p.R) lets callers pick a per-shard R (e.g. 2R/3).
     /// `inline_pq` is 0 for build cores (flat layout) and the resolved
-    /// inline_pq_count for search cores. n_entry_points is fixed at 16.
+    /// inline_pq_count for search cores. n_entry_points is set from ResolvedParams.
     static VamanaParams from_resolved(const ResolvedParams& p, Dim dim,
                                        uint16_t R_override = 0,
                                        uint16_t inline_pq = 0);

@@ -368,28 +368,51 @@ void VamanaCore::beam_search_into(
             }
         }
     } else {
-        // Pick the entry point closest to the query among entry_points_, or
-        // fall back to node 0 if none are registered (during early build).
-        uint32_t entry_internal = 0;
+        // Multi-start (EP-1): compute distance to all entry points, seed the
+        // frontier with the top-M closest (M = n_search_entry_points). More
+        // starts improve coverage for queries far from any single entry point.
+        // The frontier/W seeding mirrors the forced_entry_points branch above.
         if (!entry_points_.empty()) {
-            entry_internal = entry_points_[0];
-            float best_d = dist_to(entry_internal);
-            for (size_t i = 1; i < entry_points_.size(); i++) {
-                const float d = dist_to(entry_points_[i]);
-                if (d < best_d) {
-                    best_d = d;
-                    entry_internal = entry_points_[i];
+            struct EpDist { float d; uint32_t id; };
+            std::vector<EpDist> ep_dists;
+            ep_dists.reserve(entry_points_.size());
+            for (uint32_t ep_id : entry_points_) {
+                ep_dists.push_back({dist_to(ep_id), ep_id});
+            }
+            const uint32_t M = std::min<uint32_t>(params_.n_search_entry_points,
+                                                  static_cast<uint32_t>(entry_points_.size()));
+            // If M < entry count, partial_sort to get the top-M closest.
+            if (M < entry_points_.size()) {
+                std::partial_sort(ep_dists.begin(), ep_dists.begin() + M,
+                                  ep_dists.end(),
+                                  [](const auto& a, const auto& b) { return a.d < b.d; });
+            }
+            for (uint32_t i = 0; i < M; i++) {
+                const uint32_t ep_id = ep_dists[i].id;
+                if (!is_visited(ep_id)) {
+                    mark_visited(ep_id);
+                    io_count++;
+                    frontier.push_back({ep_dists[i].d, ep_id});
+                    std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+                    W.push_back({ep_dists[i].d, ep_id});
+                    std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                    if (W.size() > L_current) {
+                        std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                        W.pop_back();
+                    }
                 }
             }
-        }
-        if (!is_visited(entry_internal)) {
-            mark_visited(entry_internal);
-            io_count++;
-            const float entry_dist = dist_to(entry_internal);
-            frontier.push_back({entry_dist, entry_internal});
-            std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
-            W.push_back({entry_dist, entry_internal});
-            std::push_heap(W.begin(), W.end(), WorkingCmp{});
+        } else {
+            // No registered entry points (early build) — start from node 0.
+            if (!is_visited(0)) {
+                mark_visited(0);
+                io_count++;
+                const float d = dist_to(0);
+                frontier.push_back({d, 0});
+                std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+                W.push_back({d, 0});
+                std::push_heap(W.begin(), W.end(), WorkingCmp{});
+            }
         }
     }
 

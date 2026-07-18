@@ -93,6 +93,13 @@ struct BuildConfig {
     /// distance is larger than at k=10, so proximity is looser at higher k.
     uint32_t target_topk = 100;
 
+    /// Entry-point count (k-means centroids). 0 = default (16). Higher = better
+    /// coverage for clustered datasets, more startup distance computations.
+    uint16_t n_entry_points = 0;
+    /// Multi-start: number of entry points to seed each search from (top-M
+    /// closest to the query). 0 = default (4).
+    uint16_t n_search_entry_points = 0;
+
     /// Closure-factor inputs for auto estimation. 0 = auto-estimated by
     /// estimate_config (closure_f_target defaults to 0.15; closure_d_eff
     /// estimated from LID). When non-zero, these lock the closure inputs.

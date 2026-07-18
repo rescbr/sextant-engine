@@ -79,7 +79,8 @@ VamanaParams VamanaParams::from_resolved(const ResolvedParams& p, Dim dim,
     v.L_build = p.L_build;
     v.alpha = p.alpha;
     v.inline_pq_count = inline_pq;
-    v.n_entry_points = 16;
+    v.n_entry_points = p.n_entry_points;
+    v.n_search_entry_points = p.n_search_entry_points;
     v.max_occlusion = p.max_occlusion;
     return v;
 }
@@ -1036,6 +1037,83 @@ void Engine::pass1_sample_and_train(VectorSource& source,
                  pq_m, pq_bits, actual_sample);
     quantizer_->train(reservoir.data(), actual_sample);
     spdlog::info("[sextant] pass 1: PQ trained (code_size={})", code_size_);
+
+    // Compute global k-means centroids for entry-point selection (EP-2).
+    // Run on the FP32 reservoir (precise; the reservoir is alive here and
+    // destroyed when this function returns). Centroids are stored in FP32
+    // and snapped to nearest data vectors at flush time (snap_entry_points_).
+    if (actual_sample >= params.n_entry_points) {
+        const uint32_t k = std::min<uint32_t>(params.n_entry_points,
+                                              static_cast<uint32_t>(actual_sample));
+        entry_centroids_.resize(static_cast<size_t>(k) * dim_);
+        // Adapt k-means++ + Lloyd from pq_quantizer.cpp (generic algorithm).
+        // Inline implementation to avoid cross-module linkage issues.
+        std::mt19937_64 rng(0xC0DE1234ULL);
+        // k-means++ seeding.
+        {
+            entry_centroids_.assign(static_cast<size_t>(k) * dim_, 0.0f);
+            std::memcpy(entry_centroids_.data(), reservoir.data(),
+                        static_cast<size_t>(dim_) * sizeof(float));
+            std::vector<float> min_d2(actual_sample,
+                                      std::numeric_limits<float>::max());
+            for (uint32_t c = 1; c < k; c++) {
+                const float* prev = entry_centroids_.data() + static_cast<size_t>(c - 1) * dim_;
+                for (uint64_t i = 0; i < actual_sample; i++) {
+                    double d = 0.0;
+                    const float* v = reservoir.data() + static_cast<size_t>(i) * dim_;
+                    for (uint32_t dd = 0; dd < dim_; dd++) {
+                        const double diff = double(v[dd]) - double(prev[dd]);
+                        d += diff * diff;
+                    }
+                    if (float(d) < min_d2[i]) min_d2[i] = float(d);
+                }
+                std::discrete_distribution<uint64_t> dist(min_d2.begin(), min_d2.end());
+                const uint64_t picked = dist(rng);
+                std::memcpy(entry_centroids_.data() + static_cast<size_t>(c) * dim_,
+                            reservoir.data() + static_cast<size_t>(picked) * dim_,
+                            static_cast<size_t>(dim_) * sizeof(float));
+            }
+        }
+        // Lloyd iterations (10).
+        std::vector<uint32_t> assign(actual_sample, 0);
+        for (uint32_t iter = 0; iter < 10; iter++) {
+            // Assign.
+            for (uint64_t i = 0; i < actual_sample; i++) {
+                const float* v = reservoir.data() + static_cast<size_t>(i) * dim_;
+                float best = std::numeric_limits<float>::infinity();
+                uint32_t best_c = 0;
+                for (uint32_t c = 0; c < k; c++) {
+                    const float* cen = entry_centroids_.data() + static_cast<size_t>(c) * dim_;
+                    double d = 0.0;
+                    for (uint32_t dd = 0; dd < dim_; dd++) {
+                        const double diff = double(v[dd]) - double(cen[dd]);
+                        d += diff * diff;
+                    }
+                    if (float(d) < best) { best = float(d); best_c = c; }
+                }
+                assign[i] = best_c;
+            }
+            // Update.
+            std::vector<double> sum(static_cast<size_t>(k) * dim_, 0.0);
+            std::vector<uint64_t> cnt(k, 0);
+            for (uint64_t i = 0; i < actual_sample; i++) {
+                const float* v = reservoir.data() + static_cast<size_t>(i) * dim_;
+                double* s = sum.data() + static_cast<size_t>(assign[i]) * dim_;
+                for (uint32_t dd = 0; dd < dim_; dd++) s[dd] += double(v[dd]);
+                cnt[assign[i]]++;
+            }
+            for (uint32_t c = 0; c < k; c++) {
+                float* cen = entry_centroids_.data() + static_cast<size_t>(c) * dim_;
+                if (cnt[c] > 0) {
+                    const double* s = sum.data() + static_cast<size_t>(c) * dim_;
+                    for (uint32_t dd = 0; dd < dim_; dd++)
+                        cen[dd] = float(s[dd] / double(cnt[c]));
+                }
+            }
+        }
+        spdlog::info("[sextant] pass 1: computed {} FP32 k-means centroids "
+                     "for entry-point selection", k);
+    }
 }
 
 // ===========================================================================
@@ -1699,7 +1777,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // --- Flush (entry points + final-layout inlining + sidecars) ---
     // Shared by both K==1 (graph built directly) and K>1 (merged graph). For
     // K==1, core_ is already wired to nodes_buffer_/codes_buffer_.
-    core_->compute_entry_points();
+    snap_entry_points_(params);
     if (params.inline_pq_count > 0) {
         spdlog::warn("[sextant] inline_pq_count={} is deprecated and provides no "
                      "benefit (two-cache search handles code locality). Set to 0.",
@@ -1758,8 +1836,57 @@ Engine::BfsReorder Engine::compute_bfs_reorder_(const ResolvedParams& params) co
     for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
         bfs.remap[bfs.order[new_pos]] = new_pos;
     }
-    return bfs;
+     return bfs;
+ }
+
+void Engine::snap_entry_points_(const ResolvedParams& params) {
+    // Snap stored FP32 centroids to nearest data vectors (medoids) and set
+    // them as entry points. Falls back to stride sampling if no centroids.
+    if (entry_centroids_.empty() || !raw_vecs_buffer_ || count_ == 0) {
+        core_->compute_entry_points();  // stride-sampled fallback
+        return;
+    }
+    const uint32_t n = static_cast<uint32_t>(count_);
+    const uint32_t k = static_cast<uint32_t>(entry_centroids_.size() / dim_);
+    // Parallel medoid search: each centroid scans the full FP16 dataset
+    // for its nearest data vector. O(k × N × dim) but embarrassingly
+    // parallel across centroids.
+    std::vector<uint32_t> medoid_ids(k);
+    std::vector<std::thread> pool;
+    auto worker = [&](uint32_t c) {
+        const float* centroid = entry_centroids_.data() + static_cast<size_t>(c) * dim_;
+        // Convert centroid to FP16 for l2sq_f16 comparison.
+        std::vector<float16_t> centroid_f16(dim_);
+        for (uint32_t d = 0; d < dim_; d++)
+            centroid_f16[d] = static_cast<float16_t>(centroid[d]);
+        float best_d = std::numeric_limits<float>::infinity();
+        uint32_t best_id = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const float d = l2sq_f16(centroid_f16.data(),
+                                     raw_vecs_buffer_ + static_cast<size_t>(i) * dim_,
+                                     dim_);
+            if (d < best_d) { best_d = d; best_id = i; }
+        }
+        medoid_ids[c] = best_id;
+    };
+    for (uint32_t c = 0; c < k; c++) pool.emplace_back(worker, c);
+    for (auto& t : pool) t.join();
+    // Dedup (two centroids might snap to the same medoid).
+    std::sort(medoid_ids.begin(), medoid_ids.end());
+    medoid_ids.erase(std::unique(medoid_ids.begin(), medoid_ids.end()),
+                     medoid_ids.end());
+    // Top up with stride-sampled fallbacks if dedup reduced the count.
+    while (medoid_ids.size() < k) {
+        uint32_t id = static_cast<uint32_t>(medoid_ids.size() * n) / k;
+        if (std::find(medoid_ids.begin(), medoid_ids.end(), id) == medoid_ids.end())
+            medoid_ids.push_back(id);
+        else break;
+    }
+    core_->set_entry_points(std::move(medoid_ids));
+    spdlog::info("[sextant] entry points: {} k-means medoids (FP32 centroids, "
+                 "FP16 snap)", core_->entry_points().size());
 }
+
 
 void Engine::write_sidecars_(const std::string& index_path,
                              const BfsReorder& bfs,

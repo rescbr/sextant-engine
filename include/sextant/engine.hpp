@@ -42,6 +42,8 @@ struct ResolvedParams {
     uint32_t num_threads = 0;
     uint32_t K = 1;             ///< Partition count (K>1 → partitioned build)
     float closure_factor = 1.033f;  ///< Shard overlap radius ratio
+    uint16_t n_entry_points = 16;   ///< K-means centroid count for entry-point selection
+    uint16_t n_search_entry_points = 4;  ///< Multi-start: top-M entry points per query
 
     // Diagnostic signals populated by estimate_config (zero when not estimated).
     // Stored so build logging and --explain can report what drove the choices.
@@ -215,6 +217,7 @@ private:
     uint8_t* codes_buffer_ = nullptr;   // count × code_size
     uint8_t* nodes_buffer_ = nullptr;   // count × node_size
     float16_t* raw_vecs_buffer_ = nullptr; // count × dim, FP16 (build prune)
+    std::vector<float> entry_centroids_;  // k × dim, FP32 (k-means centroids for entry points)
     uint32_t code_size_ = 0;
     uint32_t node_size_ = 0;
 
@@ -276,6 +279,12 @@ private:
 
     /// Compute the BFS reorder from the build entry points. Pure.
     BfsReorder compute_bfs_reorder_(const ResolvedParams& params) const;
+
+    /// Snap stored FP32 centroids to nearest data vectors (medoids) in
+    /// raw_vecs_buffer_ and set them as core_->entry_points_. Called at
+    /// flush time when raw_vecs_buffer_ is available. Falls back to stride
+    /// sampling if no centroids were stored.
+    void snap_entry_points_(const ResolvedParams& params);
 
     /// Stream all four sidecars (.codes, .graph, .meta, .manifest) to
     /// `index_path` using the precomputed BFS reorder. Does not mutate buffers.

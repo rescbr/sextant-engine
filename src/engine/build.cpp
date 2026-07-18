@@ -204,8 +204,19 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                      "d_eff={:.2f})", p.closure_factor,
                      overrides.closure_f_target > 0.0f || overrides.closure_d_eff > 0.0f
                          ? "override" : "auto",
-                     f_target, d_eff);
+                      f_target, d_eff);
     }
+
+    // --- n_entry_points / n_search_entry_points ---
+    p.n_entry_points = overrides.n_entry_points > 0 ? overrides.n_entry_points : 16;
+    p.n_search_entry_points = overrides.n_search_entry_points > 0
+                                  ? overrides.n_search_entry_points : 4;
+    spdlog::info("[sextant] n_entry_points = {} [{}], n_search_entry_points = {} [{}]",
+                 p.n_entry_points,
+                 overrides.n_entry_points > 0 ? "override" : "default",
+                 p.n_search_entry_points,
+                 overrides.n_search_entry_points > 0 ? "override" : "default");
+
 
     // --- K (partition count) ---
     // per_vec = code_size + node_size(R, inline_pq=0, code_size).
