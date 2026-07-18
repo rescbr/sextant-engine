@@ -230,10 +230,14 @@ struct ProbeTruth {
     std::vector<uint32_t> band30_counts;         // [qi] → # vectors within kProbeRecallK-th NN dist
 };
 
-/// Compute brute-force true top-kProbeTopk for a set of query indices within
+/// Compute brute-force true top-`truth_k` for a set of query indices within
 /// the pool. Returns ids + true distances (ascending) + per-query band counts.
+/// `truth_k` defaults to kProbeTopk (10) for the PQ probe path; estimate_config
+/// passes its target_topk (e.g. 100) so recall@k and proximity@k are measured
+/// against truth of the right depth. Must have truth_k ≤ pool_n-1.
 ProbeTruth compute_truth(const float* pool, uint32_t pool_n, Dim dim,
-                         const std::vector<uint32_t>& qidx) {
+                         const std::vector<uint32_t>& qidx,
+                         uint32_t truth_k = kProbeTopk) {
     const auto t_norms_start = std::chrono::steady_clock::now();
     std::vector<float> norms(pool_n);
     for (uint32_t i = 0; i < pool_n; i++) {
@@ -276,22 +280,23 @@ ProbeTruth compute_truth(const float* pool, uint32_t pool_n, Dim dim,
                     dot += double(q[d]) * v[d];
                 ranked.emplace_back(float(norms[i] - 2.0 * dot + qn), i);
             }
-            // Partial-sort to kProbeRecallK so we have both the kProbeTopk-th
-            // and kProbeRecallK-th NN distances for band counting.
-            const size_t ksort = std::min<size_t>(kProbeRecallK, ranked.size());
+            // Partial-sort deep enough to cover both the requested truth_k and
+            // the band-count radius (kProbeRecallK). Whichever is larger wins.
+            const size_t ksort = std::min<size_t>(
+                std::max<uint32_t>(truth_k, kProbeRecallK), ranked.size());
             std::partial_sort(ranked.begin(), ranked.begin() + ksort,
                               ranked.end(),
                               [](const auto& a, const auto& b) {
                                   return a.first < b.first;
                               });
-            const size_t kk = std::min<size_t>(kProbeTopk, ranked.size());
+            const size_t kk = std::min<size_t>(truth_k, ranked.size());
             for (size_t k = 0; k < kk; k++) {
                 truth.ids[qi].push_back(ranked[k].second);
                 truth.dists[qi].push_back(ranked[k].first);
             }
             // Band counts: how many pool vectors are within each radius?
             // Computed once here (not per-config) since they're dataset
-            // properties.
+            // properties. kProbeRecallK band is for the PQ probe's tie metric.
             const float band_radius = ranked[kk - 1].first;
             const float band30_radius = ranked[ksort - 1].first;
             uint32_t bc = 0, bc30 = 0;
@@ -2665,11 +2670,12 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
     std::vector<uint32_t> qidx(nq);
     for (uint32_t i = 0; i < nq; i++) qidx[i] = i;
 
-    spdlog::info("[sextant] estimate_config: computing truth ({} queries)...",
-                 nq);
+    spdlog::info("[sextant] estimate_config: computing truth ({} queries, "
+                 "depth {})...", nq, target_k);
     const auto t_truth_start = std::chrono::steady_clock::now();
     const ProbeTruth truth =
-        compute_truth(sample.data(), static_cast<uint32_t>(sample_n), dim, qidx);
+        compute_truth(sample.data(), static_cast<uint32_t>(sample_n), dim,
+                      qidx, /*truth_k=*/target_k);
     const double truth_sec = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_truth_start).count();
     spdlog::debug("[sextant] estimate_config: truth compute took {:.3f}s "
