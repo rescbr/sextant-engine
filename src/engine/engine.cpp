@@ -2418,7 +2418,10 @@ Engine::SearchQuality Engine::measure_search_(
 
     PqQuantizer& q = *mini.quantizer_;
     std::vector<float> lut(q.lut_size());
-    const uint32_t fetch_k = k + rerank;  // over-fetch for rerank
+    // Over-fetch for rerank: k * rerank (matches the production benchmark tool
+    // at benchmark.cpp:225). Previously `k + rerank`, which under-fetched and
+    // made the mini-build recall measurement pessimistic.
+    const uint32_t fetch_k = k * rerank;
 
     double recall_sum = 0.0;
     uint64_t prox_in = 0, prox_total = 0;
@@ -2563,18 +2566,97 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
     spdlog::info("[sextant] estimate_config: sampled {} / {} vectors",
                  sample_n, seen);
 
+    // --- Resolve the measurement k and quality targets ---
+    // target_k: the k at which recall/proximity are measured. Clamp to
+    // [1, min(500, sample_n)] — can't measure recall@k > qidx size (500), and
+    // at k > sample_n the truth set is too shallow for a meaningful measurement.
+    uint32_t target_k = overrides.target_topk > 0 ? overrides.target_topk : 100;
+    {
+        const uint32_t kmax = std::min<uint32_t>(500u, static_cast<uint32_t>(sample_n));
+        if (target_k > kmax) target_k = kmax;
+        if (target_k < 1) target_k = 1;
+    }
+    spdlog::info("[sextant] estimate_config: target_k={} (measurement k for all "
+                 "mini-builds)", target_k);
+
+    // Resolve quality targets. Default recall@0.95 if neither set. Both must be
+    // met when both are set (stricter binds). The +0.03 buffer accounts for the
+    // mini-build overestimating recall@k vs full-scale (the 20K sample is easier
+    // than the full dataset — fewer distractors, shorter graph paths).
+    double recall_thresh = (overrides.recall_target > 0.0f)
+        ? static_cast<double>(overrides.recall_target) + 0.03 : 0.0;
+    double prox_thresh = (overrides.proximity_target > 0.0f)
+        ? static_cast<double>(overrides.proximity_target) : 0.0;
+    if (recall_thresh == 0.0 && prox_thresh == 0.0) {
+        recall_thresh = 0.95 + 0.03;  // default: recall@0.95 (VIBE convention)
+    }
+    spdlog::info("[sextant] estimate_config: quality gate — recall{} "
+                 "proximity{} (stricter binds)",
+                 recall_thresh > 0.0
+                     ? "≥" + std::to_string(recall_thresh) : ": off",
+                 prox_thresh > 0.0
+                     ? "≥" + std::to_string(prox_thresh) : ": off");
+
+    // Lambda: does a SearchQuality measurement meet the dual gate?
+    auto meets_target = [&](const SearchQuality& sq) {
+        return (recall_thresh == 0.0 || sq.recall >= recall_thresh) &&
+               (prox_thresh == 0.0 || sq.proximity >= prox_thresh);
+    };
+
     // --- 2. PQ config resolution (probe if pq_m or pq_bits auto) ---
     ResolvedParams base = resolve_params(total_n, dim, overrides);
     uint16_t pq_m = overrides.pq_m;
     uint8_t pq_bits = overrides.pq_bits;
     PqSelection pq_sel{0, 0, {}, ""};
+    // PQ verify candidates: filled by the probe (section 2), consumed by the
+    // verify (section 3, after truth is computed). Ordered ascending m, then
+    // 4-bit before 8-bit — stepping forward yields higher fidelity.
+    std::vector<ProbedRow> pq_verify_candidates;
+    bool pq_verify_pending = false;
     if (pq_m == 0 || pq_bits == 0) {
-        spdlog::info("[sextant] estimate_config: probing PQ config...");
-        pq_sel = probe_pq_config(sample.data(), sample_n, dim, base);
+        // Distortion recalibration: when recall_target is set, the mini-build
+        // verify (below) is the real gate on recall, so the probe's distortion
+        // filter should be relaxed to admit all reasonable candidates (4-bit and
+        // 8-bit across the m sweep). When only proximity_target (no recall) is
+        // set, keep distortion at its default/current value — distortion is the
+        // only geometric quality signal in that path.
+        ResolvedParams probe_params = base;
+        const bool relax_distortion = (overrides.recall_target > 0.0f);
+        if (relax_distortion) {
+            probe_params.pq_max_distortion = 0.20;
+            spdlog::info("[sextant] estimate_config: probing PQ config "
+                         "(distortion relaxed to 0.20 — recall_target is the "
+                         "gate; mini-build verify at k={} filters by actual "
+                         "recall)...", target_k);
+        } else {
+            spdlog::info("[sextant] estimate_config: probing PQ config...");
+        }
+        pq_sel = probe_pq_config(sample.data(), sample_n, dim, probe_params);
         pq_m = pq_sel.m;
         pq_bits = pq_sel.bits;
-        spdlog::info("[sextant] estimate_config: PQ → m={}, bits={}", pq_m,
-                     static_cast<int>(pq_bits));
+        spdlog::info("[sextant] estimate_config: PQ probe → m={}, bits={}",
+                     pq_m, static_cast<int>(pq_bits));
+
+        // Build the verify candidate list: start from the selected config, then
+        // all configs that come *after* it in the probe's `all` list (higher m,
+        // or 8-bit if 4-bit was selected at the same m). The verify (section 3)
+        // steps through these until one meets the recall/proximity target.
+        if (!pq_sel.all.empty()) {
+            const auto sel_it = std::find_if(
+                pq_sel.all.begin(), pq_sel.all.end(),
+                [&](const ProbedRow& r) {
+                    return r.m == pq_m && r.bits == pq_bits;
+                });
+            if (sel_it != pq_sel.all.end()) {
+                pq_verify_candidates.assign(sel_it, pq_sel.all.end());
+            } else {
+                pq_verify_candidates = pq_sel.all;
+            }
+            pq_verify_pending = true;
+        }
+        spdlog::info("[sextant] estimate_config: PQ → m={}, bits={} "
+                     "(pending verify at k={})", pq_m,
+                     static_cast<int>(pq_bits), target_k);
     }
 
     // --- 3. Compute truth + LID ---
@@ -2643,39 +2725,131 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
                  "(f_target={:.2f}, d_eff={:.2f})",
                  closure_c, f_target, d_eff);
 
+    // --- 4b. PQ verify (mini-build confirm of the probe selection) ---
+    // Runs only when PQ was auto-probed. Steps through the candidate list
+    // (ascending m, 4-bit before 8-bit) until one meets the recall/proximity
+    // target at target_k, else keeps the highest-fidelity candidate as
+    // best-effort. This is the distortion-filter + mini-build verify hybrid.
+    if (pq_verify_pending) {
+        spdlog::info("[sextant] estimate_config: PQ verify (mini-build at "
+                     "k={}, {} candidates)...", target_k,
+                     pq_verify_candidates.size());
+        ResolvedParams verify_params = base;
+        verify_params.R = 64;
+        verify_params.alpha = 1.2f;
+        // L must exceed fetch_k = target_k × rerank for the rerank to have
+        // enough candidates to pick from.
+        const uint32_t verify_L =
+            std::max<uint32_t>(target_k * 10u * 2u, 200u);
+        const uint32_t verify_rerank = 10;
+        bool met = false;
+        for (const auto& cand : pq_verify_candidates) {
+            verify_params.pq_m = cand.m;
+            verify_params.pq_bits = cand.bits;
+            auto mini = build_mini_(sample.data(), sample_n, dim, verify_params);
+            const auto sq = measure_search_(
+                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+                qidx, verify_L, target_k, verify_rerank);
+            const bool meets = meets_target(sq);
+            const bool is_4bit = (cand.bits == 4);
+            spdlog::info("[sextant]   PQ verify: m={} bits={} "
+                         "recall@{}={:.4f} proximity={:.4f}{}{}",
+                         cand.m, static_cast<int>(cand.bits),
+                         target_k, sq.recall, sq.proximity,
+                         meets ? " ✓ meets" : " ✗ below",
+                         is_4bit ? " [4-bit]" : "");
+            if (meets) {
+                if (pq_m != cand.m || pq_bits != cand.bits) {
+                    pq_m = cand.m;
+                    pq_bits = cand.bits;
+                    spdlog::info("[sextant] estimate_config: PQ verify stepped "
+                                 "up → m={}, bits={} (probe selection didn't "
+                                 "meet target)", pq_m,
+                                 static_cast<int>(pq_bits));
+                }
+                if (is_4bit) {
+                    spdlog::info("[sextant] estimate_config: 4-bit PQ selected "
+                                 "(8× smaller codes → faster search) — meets "
+                                 "recall@{}={:.4f}", target_k, sq.recall);
+                }
+                met = true;
+                break;
+            }
+        }
+        if (!met) {
+            const auto& last = pq_verify_candidates.back();
+            pq_m = last.m;
+            pq_bits = last.bits;
+            spdlog::warn("[sextant] estimate_config: no PQ config met the "
+                         "target in verify; using highest-fidelity candidate "
+                         "(m={}, bits={}) as best-effort",
+                         pq_m, static_cast<int>(pq_bits));
+        }
+        spdlog::info("[sextant] estimate_config: PQ → m={}, bits={} "
+                     "[verify complete]", pq_m, static_cast<int>(pq_bits));
+    }
+
     // --- 5. Alpha resolution (sweep if alpha auto) ---
     float alpha_rec = overrides.alpha;
     if (alpha_rec == 0.0f) {
-        spdlog::info("[sextant] estimate_config: sweeping alpha...");
+        spdlog::info("[sextant] estimate_config: sweeping alpha (k={})...",
+                     target_k);
         static constexpr std::array<float, 4> kAlphas = {{1.0f, 1.1f, 1.2f, 1.5f}};
-        constexpr uint32_t kAlphaL = 200;
-        constexpr uint32_t kAlphaK = 10;
         constexpr uint32_t kAlphaRerank = 10;
+        // L (beam width) must exceed fetch_k = k × rerank so the rerank has a
+        // deep enough candidate pool. At target_k=100/rerank=10, fetch_k=1000,
+        // so L = max(target_k × rerank × 2, 200) = 2000.
+        const uint32_t kAlphaL =
+            std::max<uint32_t>(target_k * kAlphaRerank * 2u, 200u);
 
         ResolvedParams alpha_params = base;
         alpha_params.R = 64;
         alpha_params.pq_m = pq_m;
         alpha_params.pq_bits = pq_bits;
 
-        double best_proximity = -1.0;
+        // Dual-gate alpha selection: among alphas that meet the target gate
+        // (recall AND proximity, stricter binds), pick the LOWEST alpha (faster
+        // build). If none meet target, pick the one with the best recall (or
+        // proximity, if recall gate is off) as best-effort and warn.
+        float best_meeting_alpha = 0.0f;  // lowest alpha meeting the gate
+        float best_effort_alpha = kAlphas.front();
+        double best_effort_score = -1.0;  // recall if recall gate, else proximity
+        const bool gate_on_recall = (recall_thresh > 0.0);
         for (float a : kAlphas) {
             alpha_params.alpha = a;
             const auto t0 = std::chrono::steady_clock::now();
             auto mini = build_mini_(sample.data(), sample_n, dim, alpha_params);
             const auto sq = measure_search_(
                 *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-                qidx, kAlphaL, kAlphaK, kAlphaRerank);
+                qidx, kAlphaL, target_k, kAlphaRerank);
             const auto t1 = std::chrono::steady_clock::now();
             const double dt = std::chrono::duration<double>(t1 - t0).count();
-            spdlog::info("[sextant]   alpha={:.1f}  proximity={:.4f}  "
-                         "recall={:.4f}  ({:.1f}s)",
-                         a, sq.proximity, sq.recall, dt);
-            if (sq.proximity > best_proximity) {
-                best_proximity = sq.proximity;
-                alpha_rec = a;
+            const bool meets = meets_target(sq);
+            spdlog::info("[sextant]   alpha={:.1f}  recall@{}={:.4f}  "
+                         "proximity={:.4f}  L={}{}  ({:.1f}s)",
+                         a, target_k, sq.recall, sq.proximity, kAlphaL,
+                         meets ? " ✓" : "", dt);
+            if (meets && best_meeting_alpha == 0.0f) {
+                best_meeting_alpha = a;  // first (lowest) meeting alpha
+            }
+            const double score = gate_on_recall ? sq.recall : sq.proximity;
+            if (score > best_effort_score) {
+                best_effort_score = score;
+                best_effort_alpha = a;
             }
         }
-        spdlog::info("[sextant] estimate_config: alpha → {:.1f}", alpha_rec);
+        if (best_meeting_alpha != 0.0f) {
+            alpha_rec = best_meeting_alpha;
+            spdlog::info("[sextant] estimate_config: alpha → {:.1f} (lowest "
+                         "alpha meeting target gate)", alpha_rec);
+        } else {
+            alpha_rec = best_effort_alpha;
+            spdlog::warn("[sextant] estimate_config: no alpha met target gate; "
+                         "selecting best-effort alpha={:.1f} ({}={:.4f})",
+                         alpha_rec,
+                         gate_on_recall ? "recall" : "proximity",
+                         best_effort_score);
+        }
     }
 
     // --- 6. R resolution (OPT-SNG) ---
@@ -2734,22 +2908,28 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
     } else {
         // --- 7. R sweep validation (only when R is estimated) ---
         // Build 2 more mini-indices at R_full-16 and R_full+16 (clamp ≥32).
-         spdlog::info("[sextant] estimate_config: R validation sweep...");
+        // Dual-gate: the sweep-best is the smallest R meeting the target gate
+        // (cheapest). If none meet, keep the OPT-SNG prediction.
+         spdlog::info("[sextant] estimate_config: R validation sweep (k={})...",
+                      target_k);
          const auto t_valid_start = std::chrono::steady_clock::now();
-        constexpr uint32_t kValidL = 200;
-        constexpr uint32_t kValidK = 10;
         constexpr uint32_t kValidRerank = 10;
+        // L must exceed fetch_k = k × rerank (same rationale as the alpha sweep).
+        const uint32_t kValidL =
+            std::max<uint32_t>(target_k * kValidRerank * 2u, 200u);
 
-        struct RPoint { uint16_t R; double proximity; };
+        struct RPoint { uint16_t R; double proximity; double recall; };
         std::vector<RPoint> rpoints;
 
         // Measure the prediction point R_full (reuse ref_mini if R_full==64).
         if (R_full == 64) {
             const auto sq = measure_search_(
                 *ref_mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-                qidx, kValidL, kValidK, kValidRerank);
-            rpoints.push_back({R_full, sq.proximity});
-            spdlog::info("[sextant]   R={}  proximity={:.4f}", R_full, sq.proximity);
+                qidx, kValidL, target_k, kValidRerank);
+            rpoints.push_back({R_full, sq.proximity, sq.recall});
+            spdlog::info("[sextant]   R={}  recall@{}={:.4f}  proximity={:.4f}{}",
+                         R_full, target_k, sq.recall, sq.proximity,
+                         meets_target(sq) ? " ✓" : "");
         } else {
             ResolvedParams rp = base;
             rp.R = R_full; rp.alpha = alpha_rec;
@@ -2757,9 +2937,11 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
             auto mini = build_mini_(sample.data(), sample_n, dim, rp);
             const auto sq = measure_search_(
                 *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-                qidx, kValidL, kValidK, kValidRerank);
-            rpoints.push_back({R_full, sq.proximity});
-            spdlog::info("[sextant]   R={}  proximity={:.4f}", R_full, sq.proximity);
+                qidx, kValidL, target_k, kValidRerank);
+            rpoints.push_back({R_full, sq.proximity, sq.recall});
+            spdlog::info("[sextant]   R={}  recall@{}={:.4f}  proximity={:.4f}{}",
+                         R_full, target_k, sq.recall, sq.proximity,
+                         meets_target(sq) ? " ✓" : "");
         }
 
         for (int delta : {-16, +16}) {
@@ -2771,26 +2953,38 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
             auto mini = build_mini_(sample.data(), sample_n, dim, rp);
             const auto sq = measure_search_(
                 *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-                qidx, kValidL, kValidK, kValidRerank);
+                qidx, kValidL, target_k, kValidRerank);
             const auto t1 = std::chrono::steady_clock::now();
-            rpoints.push_back({r, sq.proximity});
-            spdlog::info("[sextant]   R={}  proximity={:.4f}  ({:.1f}s)", r,
-                         sq.proximity,
+            rpoints.push_back({r, sq.proximity, sq.recall});
+            spdlog::info("[sextant]   R={}  recall@{}={:.4f}  proximity={:.4f}"
+                         "{}  ({:.1f}s)", r, target_k, sq.recall, sq.proximity,
+                         meets_target(sq) ? " ✓" : "",
                          std::chrono::duration<double>(t1 - t0).count());
         }
 
-        // If the sweep-best R differs from R_full by >16, trust the sweep.
-        auto best_it = std::max_element(rpoints.begin(), rpoints.end(),
-            [](const RPoint& a, const RPoint& b) {
-                return a.proximity < b.proximity;
-            });
-        if (best_it != rpoints.end() &&
-            std::abs(int(best_it->R) - int(R_full)) > 16) {
-            spdlog::info("[sextant]   validation: sweep-best R={} differs from "
-                         "prediction R={} by >16 → using sweep-best",
-                         best_it->R, R_full);
-             R_full = best_it->R;
-         }
+        // Dual-gate selection: among R values meeting the target gate, pick the
+        // smallest (cheapest). If none meet, keep the OPT-SNG prediction.
+        uint16_t smallest_meeting = 0;
+        for (const auto& rp : rpoints) {
+            const bool meets =
+                (recall_thresh == 0.0 || rp.recall >= recall_thresh) &&
+                (prox_thresh == 0.0 || rp.proximity >= prox_thresh);
+            if (meets && (smallest_meeting == 0 || rp.R < smallest_meeting)) {
+                smallest_meeting = rp.R;
+            }
+        }
+        if (smallest_meeting != 0 && smallest_meeting != R_full) {
+            spdlog::info("[sextant]   validation: smallest R meeting target "
+                         "gate = {} (prediction was {}) → using sweep-best",
+                         smallest_meeting, R_full);
+            R_full = smallest_meeting;
+        } else if (smallest_meeting != 0) {
+            spdlog::info("[sextant]   validation: R={} meets target gate "
+                         "(matches prediction)", R_full);
+        } else {
+            spdlog::warn("[sextant]   validation: no R in sweep met target "
+                         "gate; keeping OPT-SNG prediction R={}", R_full);
+        }
          spdlog::debug("[sextant] estimate_config: R validation sweep took {:.2f}s",
                        std::chrono::duration<double>(
                            std::chrono::steady_clock::now() - t_valid_start).count());

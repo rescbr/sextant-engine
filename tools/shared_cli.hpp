@@ -78,8 +78,16 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             false, 0.0f);
         p.add<float>("recall-target", 0,
             "Target recall@k (alternative to proximity-target). 0 = not used. "
-            "If both set, proximity-target wins.",
+            "Set both proximity-target and recall-target to gate on both "
+            "(stricter binds); set just one to gate on that alone.",
             false, 0.0f);
+        p.add<uint32_t>("target-topk", 0,
+            "The k at which recall/proximity targets are measured and "
+            "mini-builds are evaluated. Default 100 (VIBE / modern-retrieval "
+            "convention). Proximity semantics depend on k — at k=100 the k-th "
+            "NN distance is larger than at k=10, so proximity is looser at "
+            "higher k.",
+            false, 100);
     }
     if (mode == Mode::Build || mode == Mode::Autobuild) {
         p.add<uint64_t>("build-ram", 0,
@@ -116,6 +124,11 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
                                   : sextant::MetricKind::L2Sq;
     }
     cfg.build_mode = sextant::BuildMode::SDC;  // SDC only; ADC removed
+    // target-topk is only defined for Analyze/Autobuild modes; guard with
+    // exist() so Build mode (where the flag wasn't added) doesn't throw.
+    if (p.exist("target-topk")) {
+        cfg.target_topk = p.get<uint32_t>("target-topk");
+    }
     return cfg;
 }
 

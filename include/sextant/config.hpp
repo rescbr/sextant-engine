@@ -77,13 +77,21 @@ struct BuildConfig {
     uint32_t max_occlusion = 0; ///< 0 = auto (max(L_build, R+1))
 
     /// Target proximity (in-band fraction) for auto-parameter estimation.
-    /// 0 = use default (0.95). Drives R selection via OPT-SNG formula in
-    /// estimate_config. Only consulted when R is auto.
+    /// 0 = use default (0.95). Measured at target_topk. Drives R selection.
     float proximity_target = 0.0f;
 
-    /// Target recall@k for auto-parameter estimation (alternative to
-    /// proximity_target). 0 = not used. If both set, proximity_target wins.
+    /// Target recall@target_topk for auto-parameter estimation.
+    /// 0 = use default (0.95). Workload-dependent: set BOTH proximity_target and
+    /// recall_target to gate on both (the stricter one binds); set just one to
+    /// gate on that alone. Neither → default recall@0.95.
     float recall_target = 0.0f;
+
+    /// The k at which recall/proximity targets are measured and at which mini-build
+    /// search quality is evaluated. Default 100 (VIBE / modern-retrieval convention).
+    /// Mini-build measurements (alpha sweep, R validation, PQ verify) all run at
+    /// this k. Note: proximity semantics depend on k — at k=100 the k-th NN
+    /// distance is larger than at k=10, so proximity is looser at higher k.
+    uint32_t target_topk = 100;
 
     /// Closure-factor inputs for auto estimation. 0 = auto-estimated by
     /// estimate_config (closure_f_target defaults to 0.15; closure_d_eff

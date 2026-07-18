@@ -114,7 +114,7 @@ int main(int argc, char* argv[]) {
     p.add<std::string>("queries", 0, "Query .fbin file", true);
     p.add<std::string>("base-data", 0, "Original base .fbin for rerank", true);
     p.add<std::string>("ground-truth", 0, "Ground-truth .gt file", true);
-    p.add<uint32_t>("topk", 0, "Number of nearest neighbors to return per query (k in ANN literature)", false, 10);
+    p.add<uint32_t>("topk", 0, "Number of nearest neighbors to return per query (k in ANN literature). Default 100 (VIBE / modern-retrieval convention).", false, 100);
     p.add<uint32_t>("search-beam-width", 0,
         "Search-time beam width (L in Vamana literature). Higher = more accurate, slower.",
         false, 200);

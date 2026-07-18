@@ -142,8 +142,9 @@ int cmd_search(int argc, char* argv[]) {
     p.add<std::string>("index", 0, "Index name/path prefix", true);
     p.add<std::string>("query", 0, "Query .fbin file", true);
     p.add<uint32_t>("topk", 0,
-        "Number of nearest neighbors to return per query (k in ANN literature)",
-        false, 10);
+        "Number of nearest neighbors to return per query (k in ANN literature). "
+        "Default 100 (VIBE / modern-retrieval convention).",
+        false, 100);
     p.add<uint32_t>("search-beam-width", 0,
         "Search-time beam width (L in Vamana literature). Higher = more accurate, "
         "slower. Must be >= topk.",

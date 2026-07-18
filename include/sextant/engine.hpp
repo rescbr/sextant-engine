@@ -118,14 +118,25 @@ public:
     /// source (reservoir), trains PQ, measures LID, builds one or more
     /// mini-indices (using the canonical Engine::build() path) on the sample at
     /// candidate (R, alpha) values, measures search quality and graph structure,
-    /// and returns the optimal config for the user's proximity/recall target.
+    /// and returns the optimal config for the user's recall/proximity target.
     ///
     /// Does NOT modify this Engine's state. Each mini-build uses a fresh local
     /// Engine instance writing to a temp directory.
     ///
     /// Fields in `overrides` that control estimation:
-    ///   - proximity_target / recall_target: quality goal (drives R selection)
-    ///   - pq_max_distortion: PQ quality bound (drives m/bits selection)
+    ///   - target_topk: the k at which recall/proximity are measured and all
+    ///     mini-builds are evaluated (default 100, VIBE convention). Proximity
+    ///     semantics depend on k — at k=100 the k-th NN distance is larger than
+    ///     at k=10, so proximity is looser at higher k.
+    ///   - proximity_target / recall_target: quality goals (drive R and alpha
+    ///     selection). Dual-gate: when BOTH are set, both must be met (the
+    ///     stricter binds); when one is set, only that gates; when neither is
+    ///     set, the default recall@0.95 applies. A +0.03 buffer is added to the
+    ///     recall threshold because the 20K mini-build sample overestimates
+    ///     recall vs the full-scale index (fewer distractors, shorter paths).
+    ///   - pq_max_distortion: PQ quality bound (drives m/bits selection). When
+    ///     recall_target is set, distortion is relaxed to 0.20 and a mini-build
+    ///     verify at target_topk is the real gate.
     ///   - R, alpha, L, pq_m, pq_bits: if non-zero, locked (skip estimation)
     ///   - closure_f_target, closure_d_eff: closure factor inputs (0 = estimated)
     ///   - max_occlusion: if 0, auto (= max(L_build, R+1))
