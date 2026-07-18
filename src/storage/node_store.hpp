@@ -20,6 +20,7 @@
 #include "storage/direct_io.hpp"
 #include "storage/sidecar_header.hpp"
 #include "storage/tl_cache.hpp"
+#include "sextant/types.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -66,6 +67,13 @@ public:
     /// True if this store can serve SSD reads (PagedNodeStore or MemGraph
     /// with a paged backing store). Used to gate DynamicWidth.
     virtual bool is_paged() const = 0;
+
+    /// FP16 vector for this node, if available (MemGraph ball nodes). Returns
+    /// nullptr if no FP16 data is stored for this node (the default —
+    /// PagedNodeStore and FlatNodeStore don't have FP16). When non-null,
+    /// beam_search uses l2sq_f16 instead of PQ lut_distance for this node
+    /// (hybrid precision: FP16 in the approach phase, PQ in the converge phase).
+    virtual const float16_t* fp16_ptr(uint32_t id) const { (void)id; return nullptr; }
 };
 
 /// Flat buffer backing. Used during build and for small indices at search.

@@ -14,6 +14,7 @@ inline constexpr uint64_t kMagicGraph = 0x484d5648'50415247ULL;  // "GRAPHHMV"
 inline constexpr uint64_t kMagicCodes = 0x4f444f43'484d5643ULL;  // "CVMHCODO"
 inline constexpr uint64_t kMagicMeta  = 0x484d564d'4154454dULL;  // "METAMVMH"
 inline constexpr uint64_t kMagicManifest = 0x544e4946'53414d4eULL; // "NMASFNIT"
+inline constexpr uint64_t kMagicVecs    = 0x5356434d'484d56ULL;    // "\0VMHMCVS" (ball-only FP16)
 
 inline constexpr uint32_t kFormatVersion = 1;
 

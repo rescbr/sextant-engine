@@ -63,8 +63,15 @@ std::vector<Candidate> Engine::search(const float* query, uint32_t k,
     }
 
     // VamanaCore::search resolves internal_ids → row_ids for us.
+    // Convert the query to FP16 for the hybrid FP16+PQ distance path
+    // (MemGraph ball nodes use l2sq_f16; the rest use PQ lut_distance).
+    std::vector<float16_t> query_fp16(dim_);
+    for (uint32_t d = 0; d < dim_; d++) {
+        query_fp16[d] = static_cast<float16_t>(query[d]);
+    }
     auto results =
-        core_->search(lut.data(), k, config.L_search, config.io_limit);
+        core_->search(lut.data(), k, config.L_search, config.io_limit,
+                      query_fp16.data());
 
     // Adaptive cache rebalance (paged mode only). Cheap relaxed-atomic add per
     // search; the rare resize is CAS-guarded so only one thread runs it.
@@ -330,8 +337,10 @@ void Engine::load_sidecars() {
         }
         memgraph_ = std::make_unique<MemGraph>(
             index_path_ + ".graph", index_path_ + ".codes",
+            index_path_ + ".vecs",   // FP16 ball sidecar (optional — PQ fallback)
             node_size_, code_size_,
-            static_cast<uint32_t>(count_), eps, /*num_hops=*/3);
+            static_cast<uint32_t>(count_), dim_,
+            eps, /*num_hops=*/3);
         memgraph_->set_backing(paged_store_.get());
 
         const uint64_t cached_bytes =

@@ -261,10 +261,11 @@ std::vector<Candidate> VamanaCore::beam_search(
     const float* query_lut, uint32_t L, uint32_t io_limit, VamanaTLS& tls,
     const std::vector<uint32_t>* forced_entry_points,
     const uint8_t* sdc_anchor,
-    const float* anchor_lut) const {
+    const float* anchor_lut,
+    const float16_t* query_fp16) const {
     std::vector<Candidate> out;
     beam_search_into(out, query_lut, L, io_limit, tls, forced_entry_points,
-                     sdc_anchor, anchor_lut);
+                     sdc_anchor, anchor_lut, query_fp16);
     return out;
 }
 
@@ -272,7 +273,8 @@ void VamanaCore::beam_search_into(
     std::vector<Candidate>& out, const float* query_lut, uint32_t L,
     uint32_t io_limit, VamanaTLS& tls,
     const std::vector<uint32_t>* forced_entry_points,
-    const uint8_t* sdc_anchor, const float* anchor_lut) const {
+    const uint8_t* sdc_anchor, const float* anchor_lut,
+    const float16_t* query_fp16) const {
     out.clear();
     if (count_ == 0 || L == 0) {
         return;
@@ -302,10 +304,18 @@ void VamanaCore::beam_search_into(
         return id < tls.visited_flags.size() && tls.visited_flags[id] == vc;
     };
 
-    // Distance to a candidate node. Priority: anchor_lut (8KB, L1-resident,
-    // contiguous gather) > sdc_anchor (scattered code_distance) > query_lut
-    // (ADC, for the search path).
+    // Distance to a candidate node. Hybrid precision: when `query_fp16` is
+    // available AND the store exposes an FP16 vector for this node (MemGraph
+    // ball nodes), use l2sq_f16 (sequential FP16 compute — prefetcher-friendly,
+    // no LUT gather, no PQ code pin/unpin). Otherwise fall back to the PQ
+    // path. Priority among PQ modes: anchor_lut > sdc_anchor > query_lut.
     auto dist_to = [&](uint32_t id) {
+        if (query_fp16 && store_) {
+            const float16_t* fp16 = store_->fp16_ptr(id);
+            if (fp16) {
+                return l2sq_f16(query_fp16, fp16, params_.dim);
+            }
+        }
         const uint8_t* code_ptr = store_
             ? (store_->pin_code(id).data)
             : (build_codes_ + static_cast<size_t>(id) * code_size_);
@@ -1073,7 +1083,8 @@ void VamanaCore::compute_entry_points() {
 
 std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
                                            uint32_t L_search,
-                                           uint32_t io_limit) const {
+                                           uint32_t io_limit,
+                                           const float16_t* query_fp16) const {
     if (count_ == 0 || k == 0) {
         return {};
     }
@@ -1094,7 +1105,11 @@ std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
         tls_count = count_;
     }
 
-    auto cands = beam_search(query_lut, L_search, io_limit, tls);
+    auto cands = beam_search(query_lut, L_search, io_limit, tls,
+                              /*forced_entry_points=*/nullptr,
+                              /*sdc_anchor=*/nullptr,
+                              /*anchor_lut=*/nullptr,
+                              query_fp16);
     if (cands.size() > k) {
         cands.resize(k);
     }

@@ -154,16 +154,22 @@ public:
                                        uint32_t io_limit, VamanaTLS& tls,
                                        const std::vector<uint32_t>* forced_entry_points = nullptr,
                                        const uint8_t* sdc_anchor = nullptr,
-                                       const float* anchor_lut = nullptr) const;
+                                       const float* anchor_lut = nullptr,
+                                       const float16_t* query_fp16 = nullptr) const;
 
     /// BeamSearch writing into `out` (cleared; capacity retained). Build path
     /// uses this to avoid per-insert heap allocation.
+    ///
+    /// When `query_fp16` is non-null AND the store exposes FP16 vectors for a
+    /// node (NodeStore::fp16_ptr), distances use l2sq_f16 instead of PQ
+    /// lut_distance for that node (hybrid FP16+PQ precision).
     void beam_search_into(std::vector<Candidate>& out,
                           const float* query_lut, uint32_t L,
                           uint32_t io_limit, VamanaTLS& tls,
                           const std::vector<uint32_t>* forced_entry_points = nullptr,
                           const uint8_t* sdc_anchor = nullptr,
-                          const float* anchor_lut = nullptr) const;
+                          const float* anchor_lut = nullptr,
+                          const float16_t* query_fp16 = nullptr) const;
 
     /// RobustPrune: select R neighbors from candidates with occlusion.
     /// Writes the kept candidates into `out` (cleared; capacity retained).
@@ -198,7 +204,8 @@ public:
 
     /// Search: top-k candidates.
     std::vector<Candidate> search(const float* query_lut, uint32_t k,
-                                   uint32_t L_search, uint32_t io_limit) const;
+                                   uint32_t L_search, uint32_t io_limit,
+                                   const float16_t* query_fp16 = nullptr) const;
 
     // --- Node accessors (flat buffer layout) ---
     static RowId get_row_id(const uint8_t* node);

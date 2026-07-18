@@ -41,6 +41,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #ifdef __linux__
 #include <sys/mman.h>  // madvise(MADV_HUGEPAGE) for TLB-friendly build buffers
 #endif
@@ -2053,6 +2054,95 @@ void Engine::write_sidecars_(const std::string& index_path,
             remapped_eps.push_back(ep < n ? bfs.remap[ep] : ep);
         }
         write_meta_file(params, remapped_eps, uuid);
+    }
+
+    // ----- .vecs (FP16 for the MemGraph entry-point ball) -----
+    // Ball-only: stores FP16 vectors for the nodes within 3 hops of the entry
+    // points. At search time, beam_search uses l2sq_f16 for these nodes (high
+    // precision in the approach phase) and PQ for the rest. Scales: the file
+    // size is bounded by ball size (entry_points × R^hops), not N.
+    //
+    // The entries are in the SAME BFS-visit order as MemGraph's `collected_`
+    // vector at open time. The build-time BFS here runs on nodes_buffer_
+    // (build-order, neighbors in build-order); the open-time BFS runs on the
+    // .graph file (disk-order, neighbors remapped via bfs.remap). The visit
+    // ORDER is identical because the remap preserves neighbor-list ordering
+    // (only IDs change, not positions). So .vecs position i == MemGraph local
+    // index i.
+    {
+        const std::string path = index_path + ".vecs";
+        constexpr uint32_t kVecsNumHops = 3;
+        // Run the same BFS MemGraph runs at open time: from the (build-order)
+        // entry points, 3 hops, on nodes_buffer_ (build-order). Collect
+        // build-order IDs in BFS-visit order.
+        std::vector<uint8_t> visited(n, 0);
+        struct BfsItem { uint32_t id; uint32_t hop; };
+        std::deque<BfsItem> bfs_queue;
+        std::vector<uint32_t> ball_ids;
+        const auto& eps = core_->entry_points();  // build-order IDs
+        for (uint32_t ep : eps) {
+            if (ep < n && !visited[ep]) {
+                visited[ep] = 1;
+                bfs_queue.push_back({ep, 0});
+            }
+        }
+        while (!bfs_queue.empty()) {
+            const BfsItem it = bfs_queue.front();
+            bfs_queue.pop_front();
+            ball_ids.push_back(it.id);
+            if (it.hop >= kVecsNumHops) continue;
+            const uint8_t* node =
+                nodes_buffer_ + static_cast<size_t>(it.id) * build_node_size;
+            const uint16_t ncount = VamanaCore::get_neighbor_count(node);
+            for (uint16_t i = 0; i < ncount; i++) {
+                const uint32_t nb = VamanaCore::get_neighbor(node, i);
+                if (nb < n && !visited[nb]) {
+                    visited[nb] = 1;
+                    bfs_queue.push_back({nb, it.hop + 1});
+                }
+            }
+        }
+
+        // Write .vecs: header + ball_ids.size() × dim × float16_t, streamed
+        // through a block-aligned ring buffer (like .codes above) to amortize
+        // syscalls.
+        DirectFile f(path, true);
+        SidecarHeader h;
+        fill_header(h, kMagicVecs, ball_ids.size(), dim_, uuid);
+        write_padded(f, &h, sizeof(h), 0);
+
+        const size_t vec_bytes = static_cast<size_t>(dim_) * sizeof(float16_t);
+        const size_t block_cap = kBlockSize;  // 256KB
+        const uint32_t vecs_per_block =
+            std::max<uint32_t>(1u, static_cast<uint32_t>(block_cap / vec_bytes));
+        const size_t buf_cap = static_cast<size_t>(vecs_per_block) * vec_bytes;
+        uint8_t* ring = static_cast<uint8_t*>(aligned_alloc(kDiskAlign, buf_cap));
+        if (!ring) {
+            throw Error(ErrorCode::OutOfMemory,
+                        "write_sidecars_: .vecs ring alloc failed");
+        }
+        uint64_t write_off = sizeof(h);
+        uint32_t in_block = 0;
+        for (uint32_t bid : ball_ids) {
+            const float16_t* vec =
+                raw_vecs_buffer_ + static_cast<size_t>(bid) * dim_;
+            std::memcpy(ring + static_cast<size_t>(in_block) * vec_bytes,
+                        vec, vec_bytes);
+            if (++in_block >= vecs_per_block) {
+                write_padded(f, ring,
+                             static_cast<size_t>(in_block) * vec_bytes, write_off);
+                write_off += static_cast<size_t>(in_block) * vec_bytes;
+                in_block = 0;
+            }
+        }
+        if (in_block > 0) {
+            write_padded(f, ring,
+                         static_cast<size_t>(in_block) * vec_bytes, write_off);
+        }
+        aligned_free(ring);
+        f.sync();
+        spdlog::info("[sextant] wrote {} ({} FP16 vectors, {} bytes each)",
+                     path, ball_ids.size(), dim_ * sizeof(float16_t));
     }
 
     // ----- .manifest (atomic commit — written LAST via temp + rename) -----

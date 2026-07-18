@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <vector>
 
@@ -39,18 +40,23 @@ inline uint32_t node_neighbor(const uint8_t* node, uint32_t i) {
     return v;
 }
 
-// Read `count` bytes of payload starting just after the SidecarHeader from a
-// sidecar DirectFile, via an aligned staging buffer (O_DIRECT requirement).
-// Mirrors engine_detail::read_exact but stays within the storage layer.
-void read_payload(DirectFile& f, uint8_t* dst, size_t count) {
+// Read `count` bytes of payload starting at `offset` from a sidecar DirectFile,
+// via an aligned staging buffer (O_DIRECT requirement). Mirrors
+// engine_detail::read_exact but stays within the storage layer.
+void read_at(DirectFile& f, uint8_t* dst, size_t count, uint64_t offset) {
     if (count == 0) return;
     const size_t aligned =
         (count + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
     void* stage = aligned_alloc(kDiskAlign, aligned);
     std::memset(stage, 0, aligned);
-    f.pread_aligned(stage, aligned, sizeof(SidecarHeader));
+    f.pread_aligned(stage, aligned, offset);
     std::memcpy(dst, stage, count);
     aligned_free(stage);
+}
+
+// Read `count` bytes of payload starting just after the SidecarHeader.
+void read_payload(DirectFile& f, uint8_t* dst, size_t count) {
+    read_at(f, dst, count, sizeof(SidecarHeader));
 }
 
 }  // namespace
@@ -73,11 +79,14 @@ MemGraph::MemGraph(const uint8_t* all_nodes, const uint8_t* all_codes,
 }
 
 MemGraph::MemGraph(const std::string& graph_path, const std::string& codes_path,
+                   const std::string& vecs_path,
                    uint32_t node_size, uint32_t code_size, uint32_t total_count,
+                   uint32_t dim,
                    const std::vector<uint32_t>& entry_points, uint32_t num_hops)
     : node_size_(node_size),
       code_size_(code_size),
-      total_count_(total_count) {
+      total_count_(total_count),
+      dim_(dim) {
     if (node_size_ == 0) {
         throw Error(ErrorCode::InvalidParam, "MemGraph: node_size must be > 0");
     }
@@ -111,6 +120,31 @@ MemGraph::MemGraph(const std::string& graph_path, const std::string& codes_path,
     }
 
     materialize(graph_buf.data(), codes_buf.data());
+
+    // Optionally load the `.vecs` FP16 sidecar (ball-only vectors in the same
+    // collected/local-index order produced by materialize). Enables the hybrid
+    // FP16+PQ distance path in beam_search. Absent or mismatched → PQ-only.
+    if (!vecs_path.empty()) {
+        std::error_code ec;
+        if (std::filesystem::exists(vecs_path, ec)) {
+            DirectFile f(vecs_path, /*create=*/false);
+            SidecarHeader h;
+            read_at(f, reinterpret_cast<uint8_t*>(&h), sizeof(h), 0);
+            const uint32_t ball_count = static_cast<uint32_t>(h.n_vectors);
+            if (h.dim == dim_ && ball_count == cached_count_) {
+                fp16_data_.resize(static_cast<size_t>(ball_count) * dim_);
+                read_payload(f, reinterpret_cast<uint8_t*>(fp16_data_.data()),
+                             static_cast<size_t>(ball_count) * dim_ *
+                                 sizeof(float16_t));
+                spdlog::info("[sextant] MemGraph: loaded {} FP16 vectors from {}",
+                             ball_count, vecs_path);
+            } else {
+                spdlog::warn("[sextant] MemGraph: .vecs dim={}/ball_count={} != "
+                             "expected dim={}/cached_count={}, skipping FP16",
+                             h.dim, ball_count, dim_, cached_count_);
+            }
+        }
+    }
 }
 
 void MemGraph::collect_neighborhood(const uint8_t* nodes, uint32_t total_count,
@@ -192,6 +226,15 @@ void MemGraph::materialize(const uint8_t* nodes, const uint8_t* codes) {
     // Free the BFS scratch; collected_ is no longer needed after materialize.
     collected_.clear();
     collected_.shrink_to_fit();
+}
+
+const float16_t* MemGraph::fp16_ptr(uint32_t id) const {
+    if (fp16_data_.empty() || dim_ == 0) return nullptr;
+    const uint32_t local = (id < id_to_local_.size())
+        ? id_to_local_[id]
+        : std::numeric_limits<uint32_t>::max();
+    if (local == std::numeric_limits<uint32_t>::max()) return nullptr;
+    return fp16_data_.data() + static_cast<size_t>(local) * dim_;
 }
 
 // ===========================================================================

@@ -21,6 +21,7 @@
 
 #include "storage/node_store.hpp"
 #include "storage/sidecar_header.hpp"
+#include "sextant/types.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -42,9 +43,15 @@ public:
 
     /// Open a MemGraph from sidecar files. Reads the BFS neighborhood from
     /// .graph and .codes into RAM. `graph_path`/`codes_path` are the full
-    /// sidecar paths (each begins with a SidecarHeader).
+    /// sidecar paths (each begins with a SidecarHeader). `vecs_path`, if
+    /// non-empty and present, is an OPTIONAL `.vecs` sidecar of FP16 vectors
+    /// for the ball nodes (in collected/local-index order); enables the
+    /// hybrid FP16+PQ distance path. `dim` is the vector dimensionality
+    /// (needed for `.vecs` indexing and validation).
     MemGraph(const std::string& graph_path, const std::string& codes_path,
+             const std::string& vecs_path,
              uint32_t node_size, uint32_t code_size, uint32_t total_count,
+             uint32_t dim,
              const std::vector<uint32_t>& entry_points,
              uint32_t num_hops = 3);
 
@@ -66,6 +73,10 @@ public:
 
     /// How many nodes are in the MemGraph.
     uint32_t cached_count() const { return cached_count_; }
+
+    /// FP16 vector for a cached node (ball node), or nullptr if not cached /
+    /// no `.vecs` data loaded. Override of NodeStore::fp16_ptr.
+    const float16_t* fp16_ptr(uint32_t id) const override;
 
     /// True if `id` is in the MemGraph.
     bool is_cached(uint32_t id) const {
@@ -95,8 +106,15 @@ private:
     uint32_t node_size_;
     uint32_t code_size_;
     uint32_t total_count_;
+    uint32_t dim_ = 0;
     uint32_t cached_count_ = 0;
     NodeStore* backing_ = nullptr;
+
+    // FP16 ball vectors loaded from the `.vecs` sidecar. Empty if no `.vecs`
+    // was supplied / present (PQ-only fallback). When non-empty, holds
+    // cached_count_ × dim_ float16_t in collected/local-index order — position
+    // i is the FP16 vector for the node at local index i.
+    std::vector<float16_t> fp16_data_;
 
     // Collected during BFS, consumed by materialize().
     std::vector<uint32_t> collected_;
