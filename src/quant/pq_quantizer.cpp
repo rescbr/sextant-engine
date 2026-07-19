@@ -402,6 +402,66 @@ std::vector<float> anisotropic_scale(const float* sub_buffer, uint64_t n,
     return scale;
 }
 
+/// Compute the OPQ PCA rotation R (dim × dim, row-major float) from a training
+/// sample.
+///
+/// `samples` is `n × dim` row-major. Returns R = V^T where C = V Λ V^T is the
+/// eigendecomposition of the sample covariance. In the rotated basis (R·x),
+/// dimensions are decorrelated and ordered by eigenvalue, which aligns the PQ
+/// dimension-split with the principal components. On failure (degenerate
+/// covariance, n < 2), returns an empty vector (caller treats as no rotation).
+std::vector<float> compute_pca_rotation(const float* samples, uint64_t n,
+                                        uint32_t dim) {
+    if (n < 2 || dim == 0) return {};
+    // Mean.
+    std::vector<double> mean(dim, 0.0);
+    for (uint64_t i = 0; i < n; i++) {
+        const float* v = samples + i * dim;
+        for (uint32_t d = 0; d < dim; d++) mean[d] += v[d];
+    }
+    for (uint32_t d = 0; d < dim; d++) mean[d] /= static_cast<double>(n);
+
+    // Covariance (upper triangle, then mirror).
+    std::vector<double> cov(size_t(dim) * dim, 0.0);
+    for (uint64_t i = 0; i < n; i++) {
+        const float* v = samples + i * dim;
+        for (uint32_t a = 0; a < dim; a++) {
+            const double da = static_cast<double>(v[a]) - mean[a];
+            for (uint32_t b = a; b < dim; b++) {
+                const double db = static_cast<double>(v[b]) - mean[b];
+                cov[a * dim + b] += da * db;
+            }
+        }
+    }
+    const double inv_df = 1.0 / static_cast<double>(n - 1);
+    bool nonzero = false;
+    for (uint32_t a = 0; a < dim; a++) {
+        cov[a * dim + a] *= inv_df;
+        if (cov[a * dim + a] > 1e-15) nonzero = true;
+        for (uint32_t b = a + 1; b < dim; b++) {
+            cov[a * dim + b] *= inv_df;
+            cov[b * dim + a] = cov[a * dim + b];
+        }
+    }
+    if (!nonzero) return {};  // degenerate
+
+    std::vector<double> eigvals, eigvecs;
+    jacobi_eigen(cov, dim, eigvals, &eigvecs);
+
+    // Build rotation R = V^T. jacobi_eigen stores eigvecs such that
+    // eigvecs[d*dim + j] is the d-th component of eigenvector j — i.e. column j
+    // of V is eigenvector j (V[d][j] = eigvecs[d*dim + j]). R = V^T means
+    // R[r][c] = V[c][r] = eigvecs[c*dim + r]. Applying R to x projects x onto
+    // each eigenvector: rotated[r] = Σ_c V[c][r]·x[c] = eigvec_r · x.
+    std::vector<float> rotation(size_t(dim) * dim);
+    for (uint32_t r = 0; r < dim; r++) {
+        for (uint32_t c = 0; c < dim; c++) {
+            rotation[r * dim + c] = static_cast<float>(eigvecs[c * dim + r]);
+        }
+    }
+    return rotation;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -444,6 +504,42 @@ void PqQuantizer::train(const float* samples, uint64_t n) {
     }
     codebook_.assign(static_cast<size_t>(m_) * K_ * sub_dim_, 0.0f);
 
+    // OPQ: compute the d×d PCA rotation from the training sample and apply it
+    // before PQ k-means. The rotation decorrelates dimensions so the PQ split
+    // aligns with the data's principal components (lower reconstruction MSE).
+    // The same R is applied at encode/search time, so all of PQ operates in
+    // the rotated basis. `train_ptr`/`train_n` point at the data k-means sees.
+    const float* train_ptr = samples;
+    std::vector<float> rotated;
+    if (opq_enabled_ && !has_rotation_) {
+        rotation_ = compute_pca_rotation(samples, n, dim_);
+        has_rotation_ = !rotation_.empty();
+    }
+    if (has_rotation_) {
+        const uint32_t dim = dim_;
+        const float* R = rotation_.data();
+        rotated.resize(size_t(n) * dim);
+        // rotated[i][r] = Σ_c R[r*dim + c] · samples[i][c]  (one dot per row).
+        // Parallelized across vectors (each is dim independent dot_f32 calls).
+        const uint32_t hw_rot = std::max(1u, std::thread::hardware_concurrency());
+        const uint32_t n_threads_rot = std::min(hw_rot, static_cast<uint32_t>(n));
+        std::atomic<uint64_t> next{0};
+        auto worker = [&]() {
+            uint64_t i;
+            while ((i = next.fetch_add(1, std::memory_order_relaxed)) < n) {
+                const float* src = samples + i * dim;
+                float* dst = rotated.data() + i * dim;
+                for (uint32_t r = 0; r < dim; r++) {
+                    dst[r] = dot_f32(R + r * dim, src, dim);
+                }
+            }
+        };
+        std::vector<std::thread> pool;
+        for (uint32_t t = 0; t < n_threads_rot; t++) pool.emplace_back(worker);
+        for (auto& th : pool) th.join();
+        train_ptr = rotated.data();
+    }
+
     // Each segment's k-means++ is fully independent (disjoint codebook
     // region, disjoint sub_buffer). Parallelize across segments.
     const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
@@ -461,7 +557,7 @@ void PqQuantizer::train(const float* samples, uint64_t n) {
             // Gather sub-vectors for this segment.
             for (uint64_t i = 0; i < n; i++) {
                 std::memcpy(sub_buffer.data() + i * sub_dim_,
-                            samples + i * dim_ + s * sub_dim_,
+                            train_ptr + i * dim_ + s * sub_dim_,
                             sub_dim_ * sizeof(float));
             }
             const uint64_t slot_seed =
@@ -535,9 +631,20 @@ void PqQuantizer::build_cross_distance_table() {
 
 void PqQuantizer::encode(const float* vec, uint8_t* code_out) const {
     std::memset(code_out, 0, code_size());
+    const float* v = vec;
+    std::vector<float> rotated;
+    if (has_rotation_) {
+        // Apply R: rotated[r] = Σ_c R[r*dim + c] · vec[c].
+        rotated.resize(dim_);
+        const float* R = rotation_.data();
+        for (uint32_t r = 0; r < dim_; r++) {
+            rotated[r] = dot_f32(R + r * dim_, vec, dim_);
+        }
+        v = rotated.data();
+    }
     for (uint32_t s = 0; s < m_; s++) {
         const uint32_t cid =
-            nearest_centroid(codebook_.data(), s, vec + s * sub_dim_,
+            nearest_centroid(codebook_.data(), s, v + s * sub_dim_,
                              K_, sub_dim_);
         write_code(code_out, bits_, s, cid);
     }
@@ -551,8 +658,19 @@ void PqQuantizer::preprocess_query(const float* query, float* out) const {
     // PQ LUT: out[s * K + c] = d(query_sub_s, centroid[s][c]).
     //   L2SQ: L2 squared distance.
     //   IP:   -dot(query_sub, centroid).
+    const float* q = query;
+    std::vector<float> rotated;
+    if (has_rotation_) {
+        // Apply R: rotated[r] = Σ_c R[r*dim + c] · query[c].
+        rotated.resize(dim_);
+        const float* R = rotation_.data();
+        for (uint32_t r = 0; r < dim_; r++) {
+            rotated[r] = dot_f32(R + r * dim_, query, dim_);
+        }
+        q = rotated.data();
+    }
     for (uint32_t s = 0; s < m_; s++) {
-        const float* q_sub = query + s * sub_dim_;
+        const float* q_sub = q + s * sub_dim_;
         const float* slot_book =
             codebook_.data() + size_t(s) * K_ * sub_dim_;
         float* row = out + s * K_;
@@ -821,10 +939,14 @@ void PqQuantizer::lut_distance_batch4(const uint8_t* code_b0,
 // ---------------------------------------------------------------------------
 
 void PqQuantizer::serialize(std::vector<uint8_t>& out) const {
-    // Layout: {metric:u8, m:u16 LE, bits:u8, dim:u32 LE, codebook:float32[m*K*sub_dim]}
+    // Layout:
+    //   {metric:u8, m:u16 LE, bits:u8, dim:u32 LE, codebook:float32[m*K*sub_dim]}
+    //   {has_rotation:u8, [if 1: rotation:float32[dim*dim]]}
     const size_t header = sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint32_t);
     const size_t book_bytes = codebook_.size() * sizeof(float);
-    out.resize(header + book_bytes);
+    const size_t rot_bytes =
+        has_rotation_ ? size_t(dim_) * dim_ * sizeof(float) : 0;
+    out.resize(header + book_bytes + 1 + rot_bytes);
     uint8_t* ptr = out.data();
     ptr[0] = static_cast<uint8_t>(metric_);
     uint16_t m = m_;
@@ -834,6 +956,11 @@ void PqQuantizer::serialize(std::vector<uint8_t>& out) const {
     std::memcpy(ptr + 4, &d, sizeof(d));
     if (book_bytes > 0) {
         std::memcpy(ptr + header, codebook_.data(), book_bytes);
+    }
+    uint8_t* rot_flag = ptr + header + book_bytes;
+    rot_flag[0] = has_rotation_ ? 1u : 0u;
+    if (has_rotation_ && rot_bytes > 0) {
+        std::memcpy(rot_flag + 1, rotation_.data(), rot_bytes);
     }
 }
 
@@ -859,7 +986,31 @@ void PqQuantizer::deserialize(const uint8_t* in, size_t size) {
     sub_dim_ = dim_ / m_;
     const size_t book_floats = static_cast<size_t>(m_) * K_ * sub_dim_;
     const size_t book_bytes = book_floats * sizeof(float);
-    if (size != header + book_bytes) {
+
+    // Backward compatibility: old blobs are exactly header + book_bytes (no
+    // rotation trailer). New blobs append {has_rotation:u8, [rotation...]}.
+    has_rotation_ = false;
+    rotation_.clear();
+    opq_enabled_ = false;
+    const size_t trailer_min = header + book_bytes + 1;
+    if (size == header + book_bytes) {
+        // Legacy format — no rotation.
+    } else if (size >= trailer_min) {
+        const uint8_t* rot_flag = in + header + book_bytes;
+        if (rot_flag[0] != 0u) {
+            const size_t rot_bytes = size_t(dim_) * dim_ * sizeof(float);
+            if (size != trailer_min + rot_bytes) {
+                throw Error(ErrorCode::CorruptIndex,
+                            "PQ deserialize: rotation size mismatch");
+            }
+            rotation_.resize(size_t(dim_) * dim_);
+            std::memcpy(rotation_.data(), rot_flag + 1, rot_bytes);
+            has_rotation_ = true;
+        } else if (size != trailer_min) {
+            throw Error(ErrorCode::CorruptIndex,
+                        "PQ deserialize: size mismatch (no rotation, trailing bytes)");
+        }
+    } else {
         throw Error(ErrorCode::CorruptIndex, "PQ deserialize: size mismatch");
     }
     codebook_.assign(book_floats, 0.0f);

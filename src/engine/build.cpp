@@ -140,6 +140,16 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                      "(covariance-based anisotropic codebook training ENABLED)");
     }
 
+    // --- pq_opq (OPQ PCA rotation) ---
+    // 0 = disabled (plain PQ). >0 = enabled: learn a d×d PCA rotation from
+    // the training-sample covariance and apply it at train/encode/search time.
+    // Pure pass-through: no auto value; defaults to disabled.
+    p.pq_opq = overrides.pq_opq;
+    if (p.pq_opq > 0.0f) {
+        spdlog::info("[sextant] pq_opq = on [override] "
+                     "(OPQ PCA rotation ENABLED)");
+    }
+
     // --- max_occlusion ---
     if (overrides.max_occlusion != 0) {
         p.max_occlusion = overrides.max_occlusion;

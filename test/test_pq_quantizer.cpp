@@ -316,5 +316,141 @@ TEST(PqQuantizer, PreprocessQueryLUTShape) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OPQ (PCA rotation)
+// ---------------------------------------------------------------------------
+
+TEST(PqQuantizer, OpqTrainComputesRotation) {
+    // With OPQ enabled, train() must populate the rotation matrix.
+    const uint32_t dim = 32;
+    const uint8_t m = 4;
+    const uint8_t bits = 8;
+    PqQuantizer q(MetricKind::L2Sq, dim, m, bits);
+    q.enable_opq();
+    EXPECT_TRUE(q.opq_enabled());
+    EXPECT_FALSE(q.has_rotation());  // before train
+
+    auto data = make_clustered_data(300, dim, 8, 7);
+    q.train(data.data(), 300);
+
+    ASSERT_TRUE(q.has_rotation());
+    const float* R = q.rotation();
+    // R must be orthonormal: R R^T == I.
+    for (uint32_t i = 0; i < dim; i++) {
+        for (uint32_t j = 0; j < dim; j++) {
+            double acc = 0.0;
+            for (uint32_t k = 0; k < dim; k++) {
+                acc += double(R[i * dim + k]) * double(R[j * dim + k]);
+            }
+            const double expected = (i == j) ? 1.0 : 0.0;
+            EXPECT_NEAR(expected, acc, 1e-4)
+                << "R R^T not identity at (" << i << "," << j << ")";
+        }
+    }
+}
+
+TEST(PqQuantizer, OpqDisabledNoRotation) {
+    // Without OPQ, train() must leave rotation empty.
+    const uint32_t dim = 32;
+    const uint8_t m = 4;
+    PqQuantizer q(MetricKind::L2Sq, dim, m, 8);
+    auto data = make_clustered_data(200, dim, 6, 5);
+    q.train(data.data(), 200);
+    EXPECT_FALSE(q.has_rotation());
+}
+
+TEST(PqQuantizer, OpqSerializeDeserializeRoundTrip) {
+    const uint32_t dim = 32;
+    const uint8_t m = 4;
+    const uint8_t bits = 8;
+    PqQuantizer q(MetricKind::L2Sq, dim, m, bits, 4242);
+    q.enable_opq();
+    auto data = make_clustered_data(250, dim, 8, 11);
+    q.train(data.data(), 250);
+    ASSERT_TRUE(q.has_rotation());
+
+    std::vector<uint8_t> blob;
+    q.serialize(blob);
+    ASSERT_GT(blob.size(), 0u);
+
+    PqQuantizer q2(MetricKind::L2Sq, dim, m, bits, 1);
+    q2.deserialize(blob.data(), blob.size());
+    ASSERT_TRUE(q2.has_rotation());
+
+    // Rotation must be byte-exact after round-trip.
+    const size_t rot_n = size_t(dim) * dim;
+    EXPECT_EQ(0, std::memcmp(q.rotation(), q2.rotation(),
+                             rot_n * sizeof(float)));
+
+    // Encode + preprocess_query must produce identical results: same rotated
+    // vector → same code, same LUT.
+    for (uint64_t i = 0; i < 20; i++) {
+        const float* vec = data.data() + (i * 13 % 250) * dim;
+        std::vector<uint8_t> c1(q.code_size(), 0), c2(q.code_size(), 0);
+        q.encode(vec, c1.data());
+        q2.encode(vec, c2.data());
+        EXPECT_EQ(0, std::memcmp(c1.data(), c2.data(), q.code_size()))
+            << "code mismatch at " << i;
+
+        std::vector<float> lut1(q.lut_size()), lut2(q.lut_size());
+        q.preprocess_query(vec, lut1.data());
+        q2.preprocess_query(vec, lut2.data());
+        for (size_t e = 0; e < lut1.size(); e++) {
+            EXPECT_NEAR(lut1[e], lut2[e], 1e-5f);
+        }
+    }
+}
+
+TEST(PqQuantizer, OpqEncodeAppliesRotation) {
+    // Directly verify that encode() rotates: manually apply R, find nearest
+    // centroids in the codebook, and confirm the resulting code matches
+    // encode() on the original (un-rotated) vector.
+    const uint32_t dim = 32;
+    const uint8_t m = 4;
+    const uint8_t bits = 8;
+    const uint32_t sub_dim = dim / m;
+    PqQuantizer q(MetricKind::L2Sq, dim, m, bits, 99);
+    q.enable_opq();
+    auto data = make_clustered_data(250, dim, 8, 11);
+    q.train(data.data(), 250);
+    ASSERT_TRUE(q.has_rotation());
+
+    const float* R = q.rotation();
+    for (uint64_t i = 0; i < 10; i++) {
+        const float* vec = data.data() + (i * 31 % 250) * dim;
+        std::vector<uint8_t> code_direct(q.code_size(), 0);
+        q.encode(vec, code_direct.data());
+
+        // Manually rotate: rotated[r] = sum_c R[r*dim+c] * vec[c].
+        std::vector<float> rotated(dim);
+        for (uint32_t r = 0; r < dim; r++) {
+            double acc = 0.0;
+            for (uint32_t c = 0; c < dim; c++) {
+                acc += double(R[r * dim + c]) * double(vec[c]);
+            }
+            rotated[r] = float(acc);
+        }
+        // Nearest centroid per segment from the rotated vector + codebook.
+        for (uint32_t s = 0; s < m; s++) {
+            const float* sub = rotated.data() + s * sub_dim;
+            const float* book = q.codebook() + size_t(s) * q.K() * sub_dim;
+            uint32_t best = 0;
+            float best_d = std::numeric_limits<float>::infinity();
+            for (uint32_t c = 0; c < q.K(); c++) {
+                const float* cen = book + c * sub_dim;
+                float d = 0.0f;
+                for (uint32_t d2 = 0; d2 < sub_dim; d2++) {
+                    const float diff = sub[d2] - cen[d2];
+                    d += diff * diff;
+                }
+                if (d < best_d) { best_d = d; best = c; }
+            }
+            // code_direct is 8-bit packed (one byte per segment).
+            EXPECT_EQ(best, uint32_t(code_direct[s]))
+                << "segment " << s << " vector " << i;
+        }
+    }
+}
+
 }  // namespace
 }  // namespace sextant

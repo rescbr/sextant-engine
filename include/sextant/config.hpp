@@ -121,6 +121,14 @@ struct BuildConfig {
     /// Only affects codebook training; encoding, search, and the serialized
     /// codebook format are unchanged. One-time build-time cost.
     float pq_anisotropy_lambda = 0.0f;
+
+    /// OPQ (PCA rotation) — 0 = disabled, >0 = enabled. When enabled, a d×d
+    /// PCA rotation is learned from the training-sample covariance and applied
+    /// to vectors before PQ encoding and to queries before LUT construction,
+    /// so PQ splits align with principal components. The rotation matrix is
+    /// serialized with the quantizer. Boolean flag (value ignored). Adds a
+    /// one-time ~20s eigendecomposition at d=768 to the build.
+    float pq_opq = 0.0f;
 };
 
 /// Result of a build operation.

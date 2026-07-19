@@ -1037,10 +1037,16 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     if (params.pq_anisotropy_lambda > 0.0f) {
         quantizer_->set_anisotropy(params.pq_anisotropy_lambda);
     }
+    if (params.pq_opq > 0.0f) {
+        quantizer_->enable_opq();
+    }
     code_size_ = quantizer_->code_size();
     std::string aniso_note;
     if (params.pq_anisotropy_lambda > 0.0f) {
         aniso_note = std::string(", anisotropy=on (covariance-based)");
+    }
+    if (params.pq_opq > 0.0f) {
+        aniso_note += ", opq=on (PCA rotation)";
     }
     spdlog::info("[sextant] pass 1: training PQ (m={}, bits={}{}) on {} samples",
                  pq_m, pq_bits, aniso_note, actual_sample);

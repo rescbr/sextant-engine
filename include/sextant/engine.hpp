@@ -47,6 +47,7 @@ struct ResolvedParams {
     float target_recall = 0.0f;     ///< Recall target the index was built for (0 = unspecified). Drives search early-exit.
     uint32_t early_exit_patience = 0;  ///< Search early-exit: terminate after N stalled pops post-convergence (0 = disabled; set by resolve_params when recall_target is set)
     float pq_anisotropy_lambda = 0.0f;  ///< PQ covariance-based anisotropic codebook training (0 = disabled, >0 = enabled). Threaded into PqQuantizer::train.
+    float pq_opq = 0.0f;  ///< OPQ PCA rotation (0 = disabled, >0 = enabled). Threaded into PqQuantizer::train.
 
     // Diagnostic signals populated by estimate_config (zero when not estimated).
     // Stored so build logging and --explain can report what drove the choices.

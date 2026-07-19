@@ -50,6 +50,29 @@ public:
     float anisotropy_lambda() const { return anisotropy_lambda_; }
     bool anisotropic() const { return anisotropic_; }
 
+    /// Request OPQ (PCA rotation) training. Must be called BEFORE train():
+    /// train() computes the d×d PCA rotation from the training-sample
+    /// covariance and applies it to the sample before PQ k-means. The
+    /// resulting rotation_ is then applied at encode/search time.
+    void enable_opq() { opq_enabled_ = true; }
+    bool opq_enabled() const { return opq_enabled_; }
+
+    /// OPQ (Optimized Product Quantization) via PCA rotation.
+    ///
+    /// Sets the d×d rotation matrix R (row-major). When set, R is applied to
+    /// every vector before PQ encoding and to every query before LUT
+    /// construction, so PQ operates in the rotated (decorrelated) basis where
+    /// dimensions are ordered by variance. This lets the PQ split align with
+    /// the data's principal components, lowering reconstruction MSE. Must be
+    /// called BEFORE train() (train() consumes rotation_ to rotate the
+    /// training sample).
+    void set_rotation(std::vector<float> r) {
+        rotation_ = std::move(r);
+        has_rotation_ = !rotation_.empty();
+    }
+    const float* rotation() const { return rotation_.data(); }
+    bool has_rotation() const { return has_rotation_; }
+
     /// Encode a single vector into `code_out` (must be code_size() bytes).
     void encode(const float* vec, uint8_t* code_out) const;
 
@@ -119,6 +142,16 @@ private:
     /// weights) before k-means, then centroids are unscaled. Off by default.
     bool anisotropic_ = false;
     float anisotropy_lambda_ = 0.0f;
+
+    /// OPQ rotation matrix (d × d, row-major). Identity-equivalent when empty
+    /// (has_rotation_ == false). Applied to vectors before PQ encoding and to
+    /// queries before LUT construction. Computed in train() from the PCA of
+    /// the training-sample covariance when set_opq() was requested.
+    std::vector<float> rotation_;  // rotation_[r*dim + c] = R[r][c]
+    bool has_rotation_ = false;
+    /// When true, train() computes the PCA rotation from the training sample
+    /// and applies it before PQ k-means. Set via enable_opq(); off by default.
+    bool opq_enabled_ = false;
 
     /// Codebook: m segments × K centroids × sub_dim floats.
     std::vector<float> codebook_;
