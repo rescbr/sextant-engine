@@ -237,144 +237,169 @@ void kmeans_pp(const float* data, uint64_t n, uint32_t dim, uint32_t k,
     }
 }
 
-/// Anisotropic k-means: same structure as `kmeans_pp`, but the *assignment*
-/// step uses ScaNN-style anisotropic distance instead of plain L2sq.
+// ---------------------------------------------------------------------------
+// Covariance-based anisotropic PQ training (scale-transform k-means)
+// ---------------------------------------------------------------------------
+//
+// The previous prototype used a per-vector direction proxy (ScaNN-style
+// d = ||x-c||² + λ·((x-c)·x̂)²), which *degraded* recall on arxiv100k. The
+// data is genuinely anisotropic (top-10 dims carry 30.7% of variance), so the
+// failure was in the formulation, not the premise.
+//
+// The correct formulation weights each *dimension* by its variance, using the
+// subspace covariance. The anisotropic distance:
+//
+//     d_aniso(x, c) = Σ_d  w_d · (x_d - c_d)²
+//
+// is exactly standard L2sq in a scaled space where x'_d = √w_d · x_d. So we
+// scale the sub-vectors, run the *unchanged* `kmeans_pp` on the scaled data,
+// then unscale the centroids by dividing by √w_d. No new distance function,
+// no SIMD changes — only data preprocessing.
+//
+// The weights come from the covariance eigenvalues:
+//     w_d = eigenvalue_d / mean(eigenvalues)
+// normalized to mean=1 (preserves overall distance scale), clamped to
+// [0.1, 10] to avoid degenerate weights on near-zero-variance dims.
+
+/// Jacobi eigenvalue algorithm for a small symmetric `dim`×`dim` matrix.
 ///
-/// d_aniso(x, c) = ||x - c||² + λ × ((x - c) · x̂)²
-/// where x̂ = x / ||x||. Expanding the parallel-error term:
-///   ((x - c) · x̂)² = ((||x||² - c·x)² / ||x||²)
-/// so the penalty is λ × (norm_sq - dot(c, x))² / norm_sq.
+/// Computes all eigenvalues (and optionally eigenvectors) of a real symmetric
+/// matrix via cyclic Jacobi rotations. Stable, ~40 lines, no external deps.
+/// Cost is O(dim³) per sweep with ~5-10 sweeps to convergence — negligible at
+/// sub_dim ≤ 16.
 ///
-/// This penalizes reconstruction error *along the vector's own direction* (a
-/// proxy for the query direction under in-distribution queries) more than
-/// perpendicular error. The centroid update (mean of assigned points) is
-/// unchanged — only the assignment distance differs.
+/// `a` is row-major `dim`×`dim` (modified in place to the diagonal form).
+/// `eigvals` receives the `dim` eigenvalues (unordered). `eigvecs` (may be
+/// null) receives the `dim`×`dim` eigenvector matrix as columns (row-major:
+/// eigvecs[d*dim + j] is the d-th component of eigenvector j).
+void jacobi_eigen(std::vector<double>& a, uint32_t dim,
+                  std::vector<double>& eigvals,
+                  std::vector<double>* eigvecs = nullptr) {
+    // Initialize eigvecs to identity (if requested).
+    if (eigvecs) {
+        eigvecs->assign(size_t(dim) * dim, 0.0);
+        for (uint32_t i = 0; i < dim; i++) (*eigvecs)[i * dim + i] = 1.0;
+    }
+
+    for (uint32_t sweep = 0; sweep < 50; sweep++) {
+        // Sum of off-diagonal magnitudes — convergence criterion.
+        double off = 0.0;
+        for (uint32_t p = 0; p < dim; p++) {
+            for (uint32_t q = p + 1; q < dim; q++) {
+                off += std::fabs(a[p * dim + q]);
+            }
+        }
+        if (off < 1e-12) break;
+
+        for (uint32_t p = 0; p < dim; p++) {
+            for (uint32_t q = p + 1; q < dim; q++) {
+                const double apq = a[p * dim + q];
+                if (std::fabs(apq) < 1e-15) continue;
+                const double app = a[p * dim + p];
+                const double aqq = a[q * dim + q];
+                // Rotation angle: tan(2θ) = 2·apq / (app - aqq).
+                double theta = (aqq - app) / (2.0 * apq);
+                double t;
+                if (std::fabs(theta) > 1e15) {
+                    t = 1.0 / (2.0 * theta);  // ~0 for huge denominator
+                } else {
+                    t = (theta >= 0.0 ? 1.0 : -1.0) /
+                        (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
+                }
+                const double c = 1.0 / std::sqrt(t * t + 1.0);
+                const double s = t * c;
+
+                // Apply rotation to A: zero out a[p,q] and a[q,p].
+                a[p * dim + p] = app - t * apq;
+                a[q * dim + q] = aqq + t * apq;
+                a[p * dim + q] = 0.0;
+                a[q * dim + p] = 0.0;
+                for (uint32_t i = 0; i < dim; i++) {
+                    if (i == p || i == q) continue;
+                    const double aip = a[i * dim + p];
+                    const double aiq = a[i * dim + q];
+                    a[i * dim + p] = c * aip - s * aiq;
+                    a[p * dim + i] = a[i * dim + p];
+                    a[i * dim + q] = s * aip + c * aiq;
+                    a[q * dim + i] = a[i * dim + q];
+                }
+                // Accumulate eigenvectors: V = V · R(p,q,θ).
+                if (eigvecs) {
+                    for (uint32_t i = 0; i < dim; i++) {
+                        const double vip = (*eigvecs)[i * dim + p];
+                        const double viq = (*eigvecs)[i * dim + q];
+                        (*eigvecs)[i * dim + p] = c * vip - s * viq;
+                        (*eigvecs)[i * dim + q] = s * vip + c * viq;
+                    }
+                }
+            }
+        }
+    }
+
+    eigvals.resize(dim);
+    for (uint32_t i = 0; i < dim; i++) eigvals[i] = a[i * dim + i];
+}
+
+/// Compute per-dimension anisotropic scale factors `√w_d` for one subspace.
 ///
-/// `sub_norms[i]` must hold the precomputed ||x_i||² for each data vector
-/// (computed once per segment in PqQuantizer::train via a self-dot). When
-/// `anisotropy_lambda <= 0` or a sub-vector norm is ~0, this reduces exactly
-/// to plain L2sq assignment.
-void anisotropic_kmeans_pp(const float* data, const float* sub_norms,
-                           uint64_t n, uint32_t dim, uint32_t k,
-                           uint64_t seed, uint32_t max_iters,
-                           float anisotropy_lambda, float* centroids_out) {
-    if (k == 0 || dim == 0) {
-        throw Error(ErrorCode::InvalidParam,
-                    "anisotropic k-means: dim and k must be positive");
+/// `sub_buffer` is `n × sub_dim` row-major sub-vectors. Returns `scale`
+/// (length `sub_dim`) where `scale[d] = √w_d`, `w_d = eigval_d / mean(eigval)`
+/// clamped to [0.1, 10]. On failure (e.g. zero covariance), returns all 1.0
+/// (identity → standard k-means).
+std::vector<float> anisotropic_scale(const float* sub_buffer, uint64_t n,
+                                     uint32_t sub_dim) {
+    std::vector<float> scale(sub_dim, 1.0f);
+    if (n < 2 || sub_dim == 0) return scale;
+
+    // Mean of sub-vectors.
+    std::vector<double> mean(sub_dim, 0.0);
+    for (uint64_t i = 0; i < n; i++) {
+        const float* sv = sub_buffer + i * sub_dim;
+        for (uint32_t d = 0; d < sub_dim; d++) mean[d] += sv[d];
     }
-    if (n == 0) {
-        std::memset(centroids_out, 0, size_t(k) * dim * sizeof(float));
-        return;
-    }
+    for (uint32_t d = 0; d < sub_dim; d++) mean[d] /= static_cast<double>(n);
 
-    std::mt19937_64 rng(seed);
-
-    if (n < k) {
-        for (uint32_t c = 0; c < k; c++) {
-            std::memcpy(centroids_out + c * dim,
-                        data + (c % n) * dim, dim * sizeof(float));
-        }
-    } else {
-        kmeans_pp_seed(data, n, dim, k, rng, centroids_out);
-    }
-
-    // Hot flag: when lambda is non-positive, the anisotropic term vanishes and
-    // this function is numerically identical to kmeans_pp. Dispatch the plain
-    // path in that case (no per-point norm guards in the inner loop).
-    const bool use_aniso = anisotropy_lambda > 0.0f;
-
-    std::vector<uint32_t> assign(n, 0);
-    std::vector<double> sum_vec(size_t(k) * dim, 0.0);
-    std::vector<uint64_t> count(k, 0);
-
-    for (uint32_t iter = 0; iter < max_iters; iter++) {
-        // 1) Assign every sample to its nearest centroid.
-        uint64_t changed = 0;
-        for (uint64_t i = 0; i < n; i++) {
-            const float* xi = data + i * dim;
-            float best = std::numeric_limits<float>::infinity();
-            uint32_t best_c = 0;
-            if (use_aniso) {
-                const float norm_sq = sub_norms[i];
-                // norm_sq is ||x_i||² >= 0; guard against the degenerate
-                // zero vector (falls back to plain L2sq for that point).
-                const bool point_aniso = norm_sq > 1e-12f;
-                const float inv_norm = point_aniso ? (1.0f / norm_sq) : 0.0f;
-                for (uint32_t c = 0; c < k; c++) {
-                    const float* cen = centroids_out + c * dim;
-                    const float l2sq = l2sq_f32(xi, cen, dim);
-                    float d = l2sq;
-                    if (point_aniso) {
-                        // parallel_err = (||x||² - c·x)² / ||x||²
-                        const float dot_val = dot_f32(cen, xi, dim);
-                        const float diff = norm_sq - dot_val;
-                        d = l2sq + anisotropy_lambda * (diff * diff) * inv_norm;
-                    }
-                    if (d < best) {
-                        best = d;
-                        best_c = c;
-                    }
-                }
-            } else {
-                for (uint32_t c = 0; c < k; c++) {
-                    const float d = l2sq_f32(xi, centroids_out + c * dim, dim);
-                    if (d < best) {
-                        best = d;
-                        best_c = c;
-                    }
-                }
-            }
-            if (assign[i] != best_c) {
-                changed++;
-                assign[i] = best_c;
+    // Covariance (sub_dim × sub_dim).
+    std::vector<double> cov(size_t(sub_dim) * sub_dim, 0.0);
+    for (uint64_t i = 0; i < n; i++) {
+        const float* sv = sub_buffer + i * sub_dim;
+        for (uint32_t a = 0; a < sub_dim; a++) {
+            const double da = static_cast<double>(sv[a]) - mean[a];
+            for (uint32_t b = a; b < sub_dim; b++) {
+                const double db = static_cast<double>(sv[b]) - mean[b];
+                cov[a * sub_dim + b] += da * db;
             }
         }
-
-        // 2) Recompute centroids as the mean of their assigned points
-        //    (UNCHANGED from kmeans_pp — only the assignment distance differs).
-        std::fill(sum_vec.begin(), sum_vec.end(), 0.0);
-        std::fill(count.begin(), count.end(), 0);
-        for (uint64_t i = 0; i < n; i++) {
-            const uint32_t c = assign[i];
-            count[c]++;
-            const float* v = data + i * dim;
-            double* acc = sum_vec.data() + size_t(c) * dim;
-            for (uint32_t d = 0; d < dim; d++) {
-                acc[d] += v[d];
-            }
-        }
-        for (uint32_t c = 0; c < k; c++) {
-            if (count[c] > 0) {
-                double inv = 1.0 / double(count[c]);
-                float* cen = centroids_out + c * dim;
-                double* acc = sum_vec.data() + size_t(c) * dim;
-                for (uint32_t d = 0; d < dim; d++) {
-                    cen[d] = float(acc[d] * inv);
-                }
-            } else {
-                // Empty cluster: reseed from the point farthest from its
-                // assigned centroid (using plain L2sq, as in kmeans_pp).
-                float worst = -1.0f;
-                uint64_t worst_i = 0;
-                for (uint64_t i = 0; i < n; i++) {
-                    const float d = l2sq_f32(
-                        data + i * dim,
-                        centroids_out + assign[i] * dim, dim);
-                    if (d > worst) {
-                        worst = d;
-                        worst_i = i;
-                    }
-                }
-                std::memcpy(centroids_out + c * dim,
-                            data + worst_i * dim, dim * sizeof(float));
-            }
-        }
-
-        // Early stop: <1% of points changed assignment.
-        if (iter > 0 && changed * 100 < n) {
-            break;
+    }
+    const double inv_df = 1.0 / static_cast<double>(n - 1);
+    for (uint32_t a = 0; a < sub_dim; a++) {
+        cov[a * sub_dim + a] *= inv_df;
+        for (uint32_t b = a + 1; b < sub_dim; b++) {
+            cov[a * sub_dim + b] *= inv_df;
+            cov[b * sub_dim + a] = cov[a * sub_dim + b];  // symmetric
         }
     }
+
+    // Eigenvalues of the symmetric covariance.
+    std::vector<double> eigvals;
+    jacobi_eigen(cov, sub_dim, eigvals, /*eigvecs=*/nullptr);
+
+    double mean_eig = 0.0;
+    for (uint32_t d = 0; d < sub_dim; d++) {
+        // Numerical safety: covariance is PSD, but tiny negative eigenvalues
+        // can appear from roundoff — clamp to 0.
+        eigvals[d] = std::max(eigvals[d], 0.0);
+        mean_eig += eigvals[d];
+    }
+    mean_eig /= static_cast<double>(sub_dim);
+    if (mean_eig < 1e-12) return scale;  // degenerate: leave as identity
+
+    for (uint32_t d = 0; d < sub_dim; d++) {
+        double w = eigvals[d] / mean_eig;
+        w = std::clamp(w, 0.1, 10.0);
+        scale[d] = static_cast<float>(std::sqrt(w));
+    }
+    return scale;
 }
 
 }  // namespace
@@ -427,7 +452,10 @@ void PqQuantizer::train(const float* samples, uint64_t n) {
     std::atomic<uint32_t> next_seg{0};
     auto worker = [&]() {
         std::vector<float> sub_buffer(size_t(n) * sub_dim_);
-        std::vector<float> sub_norms(size_t(n), 0.0f);
+        std::vector<float> scaled_buffer;  // reused across segments if aniso
+        if (anisotropic_) {
+            scaled_buffer.resize(size_t(n) * sub_dim_);
+        }
         uint32_t s;
         while ((s = next_seg.fetch_add(1, std::memory_order_relaxed)) < m_) {
             // Gather sub-vectors for this segment.
@@ -440,16 +468,28 @@ void PqQuantizer::train(const float* samples, uint64_t n) {
                 seed_ ^ (0x9E3779B97F4A7C15ULL * (uint64_t(s) + 1));
             float* book_out = codebook_.data() + size_t(s) * K_ * sub_dim_;
             if (anisotropic_) {
-                // Precompute ||x_sub||² for each sub-vector (self-dot,
-                // NumKong-accelerated). Reused across all k-means iterations.
+                // Covariance-based scale-transform: scale sub-vectors by √w_d
+                // (w_d = eigval_d / mean(eigval), clamped), run standard
+                // k-means on the scaled data, then unscale the centroids.
+                const std::vector<float> scale = anisotropic_scale(
+                    sub_buffer.data(), n, sub_dim_);
+                const float* sp = scale.data();
                 for (uint64_t i = 0; i < n; i++) {
                     const float* sv = sub_buffer.data() + i * sub_dim_;
-                    sub_norms[i] = dot_f32(sv, sv, sub_dim_);
+                    float* dst = scaled_buffer.data() + i * sub_dim_;
+                    for (uint32_t d = 0; d < sub_dim_; d++) {
+                        dst[d] = sv[d] * sp[d];
+                    }
                 }
-                anisotropic_kmeans_pp(sub_buffer.data(), sub_norms.data(),
-                                      n, sub_dim_, K_, slot_seed,
-                                      /*max_iters=*/25, anisotropy_lambda_,
-                                      book_out);
+                kmeans_pp(scaled_buffer.data(), n, sub_dim_, K_, slot_seed,
+                          /*max_iters=*/25, book_out);
+                // Unscale centroids back to the original data space.
+                for (uint32_t c = 0; c < K_; c++) {
+                    float* cen = book_out + size_t(c) * sub_dim_;
+                    for (uint32_t d = 0; d < sub_dim_; d++) {
+                        cen[d] /= sp[d];
+                    }
+                }
             } else {
                 kmeans_pp(sub_buffer.data(), n, sub_dim_, K_, slot_seed,
                           /*max_iters=*/25, book_out);

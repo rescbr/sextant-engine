@@ -130,14 +130,14 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                      overrides.pq_max_distortion > 0.0f ? "override" : "default");
     }
 
-    // --- pq_anisotropy_lambda (ScaNN-style anisotropic codebook training) ---
-    // 0 = disabled (plain L2sq k-means). >0 = anisotropic assignment step.
+    // --- pq_anisotropy_lambda (covariance-based anisotropic codebook training) ---
+    // 0 = disabled (plain L2sq k-means). >0 = enabled: each subspace's dims
+    // are scaled by √(eigval/mean_eigval) before k-means (scale-transform).
     // Pure pass-through: no auto value; defaults to disabled.
     p.pq_anisotropy_lambda = overrides.pq_anisotropy_lambda;
     if (p.pq_anisotropy_lambda > 0.0f) {
-        spdlog::info("[sextant] pq_anisotropy_lambda = {:.2f} [override] "
-                     "(anisotropic codebook training ENABLED)",
-                     p.pq_anisotropy_lambda);
+        spdlog::info("[sextant] pq_anisotropy = on [override] "
+                     "(covariance-based anisotropic codebook training ENABLED)");
     }
 
     // --- max_occlusion ---

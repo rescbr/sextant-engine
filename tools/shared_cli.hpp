@@ -62,11 +62,12 @@ inline void add_common_flags(cmdline::parser& p) {
         "selection. 0 = default (0.05).",
         false, 0.0f);
     p.add<float>("pq-anisotropy", 0,
-        "PQ anisotropic codebook training strength (0 = disabled, ~2.0 = "
-        "ScaNN-like). Raises the PQ-only recall ceiling by penalizing "
-        "reconstruction error along the vector's own direction (a proxy for "
-        "the query direction). Build-time only; encoding/search/format "
-        "unchanged.",
+        "Enable covariance-based anisotropic PQ codebook training (0 = off, "
+        ">0 = on). Each subspace's dims are scaled by √(eigval/mean_eigval) "
+        "of the subspace covariance before k-means (scale-transform trick), "
+        "so high-variance dims get more weight. Build-time only; "
+        "encoding/search/format unchanged. The value is a boolean "
+        "(0/off vs 1/on); the covariance determines the per-dim weights.",
         false, 0.0f);
     p.add<uint32_t>("threads", 0,
         "Threads for build/mini-builds (0 = hardware_concurrency).",

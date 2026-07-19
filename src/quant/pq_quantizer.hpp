@@ -30,12 +30,19 @@ public:
     /// `samples` is `n × dim` float32, row-major.
     void train(const float* samples, uint64_t n);
 
-    /// Enable/disable anisotropic codebook training and set the anisotropy
-    /// strength λ. When enabled, the k-means assignment step uses ScaNN-style
-    /// anisotropic distance (penalizes reconstruction error along the vector's
-    /// own direction). λ = 0 disables it (plain L2sq k-means). ~2.0 is a
-    /// ScaNN-like strength. Must be called BEFORE train(). No effect on an
-    /// already-trained codebook.
+    /// Enable/disable covariance-based anisotropic codebook training.
+    ///
+    /// When enabled, each subspace's dimensions are scaled by √w_d before
+    /// k-means, where w_d = eigenvalue_d / mean(eigenvalues) of the subspace
+    /// covariance (clamped to [0.1, 10]). High-variance dims get w>1 (more
+    /// important), low-variance get w<1. This makes standard k-means minimize
+    /// the anisotropic distance Σ_d w_d·(x_d-c_d)² implicitly — the k-means
+    /// code itself is unchanged (scale-transform trick). After k-means the
+    /// centroids are unscaled back to the original data space.
+    ///
+    /// λ > 0 enables it; λ = 0 disables (plain L2sq k-means). The λ value is
+    /// ignored (covariance determines the weights); kept as a float for CLI
+    /// compatibility. Must be called BEFORE train().
     void set_anisotropy(float lambda) {
         anisotropic_ = (lambda > 0.0f);
         anisotropy_lambda_ = lambda;
@@ -107,8 +114,9 @@ private:
     uint32_t K_;           ///< 2^bits centroids per segment
     uint32_t sub_dim_;     ///< dim / m
 
-    /// Anisotropic (ScaNN-style) codebook training. When true, the k-means
-    /// assignment step uses d_aniso = ||x-c||² + λ·((x-c)·x̂)². Off by default.
+    /// Anisotropic (covariance-based scale-transform) codebook training. When
+    /// true, each subspace's dims are scaled by √w_d (covariance eigenvalue
+    /// weights) before k-means, then centroids are unscaled. Off by default.
     bool anisotropic_ = false;
     float anisotropy_lambda_ = 0.0f;
 
