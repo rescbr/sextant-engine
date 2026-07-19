@@ -45,7 +45,7 @@ struct ResolvedParams {
     uint16_t n_entry_points = 16;   ///< K-means centroid count for entry-point selection
     uint16_t n_search_entry_points = 4;  ///< Multi-start: top-M entry points per query
     float target_recall = 0.0f;     ///< Recall target the index was built for (0 = unspecified). Drives search early-exit.
-    uint32_t early_exit_patience = 5;  ///< Search early-exit: terminate after N stalled pops post-convergence (0 = disabled)
+    uint32_t early_exit_patience = 0;  ///< Search early-exit: terminate after N stalled pops post-convergence (0 = disabled; set by resolve_params when recall_target is set)
 
     // Diagnostic signals populated by estimate_config (zero when not estimated).
     // Stored so build logging and --explain can report what drove the choices.
