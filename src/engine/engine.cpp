@@ -82,6 +82,7 @@ VamanaParams VamanaParams::from_resolved(const ResolvedParams& p, Dim dim,
     v.inline_pq_count = inline_pq;
     v.n_entry_points = p.n_entry_points;
     v.n_search_entry_points = p.n_search_entry_points;
+    v.early_exit_patience = p.early_exit_patience;
     v.max_occlusion = p.max_occlusion;
     return v;
 }
@@ -2801,17 +2802,15 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
     spdlog::info("[sextant] estimate_config: target_k={} (measurement k for all "
                  "mini-builds)", target_k);
 
-    // Resolve quality targets. Default recall@0.95 if neither set. Both must be
-    // met when both are set (stricter binds). The +0.03 buffer accounts for the
-    // mini-build overestimating recall@k vs full-scale (the 20K sample is easier
-    // than the full dataset — fewer distractors, shorter graph paths).
+    // Resolve quality targets. Default: no gate (pick highest-recall config).
+    // Both must be met when both are set (stricter binds). No buffer — the
+    // mini-build's scale gap (20K sample overestimates recall vs full-scale)
+    // is compensated by the search early-exit at runtime, not by over-building.
     double recall_thresh = (overrides.recall_target > 0.0f)
-        ? static_cast<double>(overrides.recall_target) + 0.03 : 0.0;
+        ? static_cast<double>(overrides.recall_target) : 0.0;
     double prox_thresh = (overrides.proximity_target > 0.0f)
         ? static_cast<double>(overrides.proximity_target) : 0.0;
-    if (recall_thresh == 0.0 && prox_thresh == 0.0) {
-        recall_thresh = 0.95 + 0.03;  // default: recall@0.95 (VIBE convention)
-    }
+    // If neither set, no gate — pick the config with the highest recall/proximity.
     spdlog::info("[sextant] estimate_config: quality gate — recall{} "
                  "proximity{} (stricter binds)",
                  recall_thresh > 0.0

@@ -348,6 +348,13 @@ void VamanaCore::beam_search_into(
     // Convergence heuristic: track the best distance in the working set W.
     // If it hasn't improved by more than 1% for several pops, we've entered
     // the converge phase.
+    //
+    // Early-exit (target-recall-driven): after convergence + widening, if the
+    // working set W's worst distance (W.front()) hasn't improved for
+    // early_exit_patience pops, the neighborhood is saturated — terminate.
+    // This trades a small recall risk for throughput, matching the index's
+    // target_recall. When early_exit_patience=0 (no target_recall set), the
+    // early-exit is disabled (exhaustive search as before).
     // -----------------------------------------------------------------------
     constexpr uint32_t kConvergePatience = 5;     // pops w/o improvement
     constexpr float kConvergeImprovRatio = 0.99f; // <1% improvement
@@ -358,6 +365,11 @@ void VamanaCore::beam_search_into(
     bool converged = !use_dynamic_width;
     uint32_t no_improvement_count = 0;
     float prev_best_dist = std::numeric_limits<float>::max();
+
+    // Early-exit: post-convergence stall tracking.
+    const bool use_early_exit = params_.early_exit_patience > 0;
+    uint32_t post_converge_stall = 0;
+    float prev_w_front_dist = std::numeric_limits<float>::max();
 
     // Seed entry points.
     if (forced_entry_points && !forced_entry_points->empty()) {
@@ -437,11 +449,6 @@ void VamanaCore::beam_search_into(
 
         // DynamicWidth: track convergence and widen the beam when it stalls.
         if (!converged) {
-            // Track convergence using W's best distance (the closest candidate
-            // found so far), not the popped node's distance. W.top() is the
-            // FARTHEST in the max-heap (worst of the top-L). The best is the
-            // minimum in the frontier. We approximate by checking if the popped
-            // node (which is the closest unexpanded) is improving.
             if (best.dist < prev_best_dist * kConvergeImprovRatio) {
                 no_improvement_count = 0;
             } else {
@@ -451,6 +458,22 @@ void VamanaCore::beam_search_into(
             if (no_improvement_count >= kConvergePatience) {
                 converged = true;
                 L_current = L;
+            }
+        }
+
+        // Early-exit: after convergence, track whether W's worst distance
+        // (W.front()) is still improving. If not for early_exit_patience
+        // pops, the neighborhood is saturated — terminate early.
+        if (use_early_exit && converged && !W.empty()) {
+            const float w_front = W.front().dist;
+            if (w_front < prev_w_front_dist * kConvergeImprovRatio) {
+                post_converge_stall = 0;
+            } else {
+                post_converge_stall++;
+            }
+            prev_w_front_dist = w_front;
+            if (post_converge_stall >= params_.early_exit_patience) {
+                break;  // W is saturated; further pops won't improve results
             }
         }
 

@@ -82,6 +82,7 @@ struct VamanaParams {
     uint16_t inline_pq_count = 0; ///< Neighbor PQ codes inlined per node
     uint16_t n_entry_points = 16;
     uint16_t n_search_entry_points = 4;  ///< Multi-start: seed top-M entry points per query
+    uint32_t early_exit_patience = 0;    ///< Search early-exit: terminate after N stalled pops post-convergence (0 = disabled)
     uint32_t max_occlusion = 750; ///< RobustPrune occlusion set size
 
     /// Factory: build VamanaParams from resolved engine params.

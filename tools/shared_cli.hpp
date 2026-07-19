@@ -98,6 +98,10 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             "Cap on the robust-prune candidate pool (max-occlusion in "
             "DiskANN). 0 = auto (= max(L_build, R+1)).",
             false, 0);
+        p.add<uint32_t>("n-search-entry-points", 0,
+            "Multi-start: number of entry points to seed each search from "
+            "(top-M closest to the query). 0 = default (4).",
+            false, 0);
     }
 }
 
@@ -125,10 +129,21 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     }
     cfg.build_mode = sextant::BuildMode::SDC;  // SDC only; ADC removed
     // target-topk is only defined for Analyze/Autobuild modes; guard with
-    // exist() so Build mode (where the flag wasn't added) doesn't throw.
-    if (p.exist("target-topk")) {
-        cfg.target_topk = p.get<uint32_t>("target-topk");
+    // a try-catch because cmdline::parser::exist() throws if the flag wasn't
+    // registered (it doesn't return false for undefined flags).
+    try {
+        if (p.exist("target-topk")) {
+            cfg.target_topk = p.get<uint32_t>("target-topk");
+        }
+    } catch (...) {
+        // Flag not registered for this mode — leave default.
     }
+    // n-search-entry-points: same guard (only on Build/Autobuild).
+    try {
+        if (p.exist("n-search-entry-points")) {
+            cfg.n_search_entry_points = p.get<uint32_t>("n-search-entry-points");
+        }
+    } catch (...) {}
     return cfg;
 }
 

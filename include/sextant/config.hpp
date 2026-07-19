@@ -99,6 +99,10 @@ struct BuildConfig {
     /// Multi-start: number of entry points to seed each search from (top-M
     /// closest to the query). 0 = default (4).
     uint16_t n_search_entry_points = 0;
+    // NOTE: recall_target (defined above) also serves as the search early-exit
+    // target. When set (e.g. 0.95), estimate_config picks the cheapest config
+    // meeting it AND beam_search terminates early when convergence is detected.
+    // No separate target_recall field needed.
 
     /// Closure-factor inputs for auto estimation. 0 = auto-estimated by
     /// estimate_config (closure_f_target defaults to 0.15; closure_d_eff

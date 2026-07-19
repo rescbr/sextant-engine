@@ -207,15 +207,22 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                       f_target, d_eff);
     }
 
-    // --- n_entry_points / n_search_entry_points ---
+    // --- n_entry_points / n_search_entry_points / target_recall ---
     p.n_entry_points = overrides.n_entry_points > 0 ? overrides.n_entry_points : 16;
     p.n_search_entry_points = overrides.n_search_entry_points > 0
                                   ? overrides.n_search_entry_points : 4;
-    spdlog::info("[sextant] n_entry_points = {} [{}], n_search_entry_points = {} [{}]",
+    p.target_recall = overrides.recall_target;
+    // Enable search early-exit when a target_recall is set (default patience 5).
+    p.early_exit_patience = (overrides.recall_target > 0.0f) ? 5 : 0;
+    spdlog::info("[sextant] n_entry_points = {} [{}], n_search_entry_points = {} [{}], "
+                 "target_recall = {} [{}], early_exit_patience = {}",
                  p.n_entry_points,
                  overrides.n_entry_points > 0 ? "override" : "default",
                  p.n_search_entry_points,
-                 overrides.n_search_entry_points > 0 ? "override" : "default");
+                 overrides.n_search_entry_points > 0 ? "override" : "default",
+                 p.target_recall > 0 ? std::to_string(p.target_recall) : "off",
+                 overrides.recall_target > 0.0f ? "override" : "default",
+                 p.early_exit_patience);
 
 
     // --- K (partition count) ---
