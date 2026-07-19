@@ -61,6 +61,13 @@ inline void add_common_flags(cmdline::parser& p) {
         "Max PQ distortion (median |1 - pq_dist/true_dist|) for auto (m,bits) "
         "selection. 0 = default (0.05).",
         false, 0.0f);
+    p.add<float>("pq-anisotropy", 0,
+        "PQ anisotropic codebook training strength (0 = disabled, ~2.0 = "
+        "ScaNN-like). Raises the PQ-only recall ceiling by penalizing "
+        "reconstruction error along the vector's own direction (a proxy for "
+        "the query direction). Build-time only; encoding/search/format "
+        "unchanged.",
+        false, 0.0f);
     p.add<uint32_t>("threads", 0,
         "Threads for build/mini-builds (0 = hardware_concurrency).",
         false, 0);
@@ -121,6 +128,7 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
         else throw std::runtime_error("--pq-bits must be 4, 8, or auto");
     }
     cfg.pq_max_distortion = p.get<float>("pq-max-distortion");
+    cfg.pq_anisotropy_lambda = p.get<float>("pq-anisotropy");
     cfg.num_threads       = p.get<uint32_t>("threads");
     {
         const std::string m = p.get<std::string>("metric");

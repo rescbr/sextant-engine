@@ -111,6 +111,14 @@ struct BuildConfig {
     /// estimated from LID). When non-zero, these lock the closure inputs.
     float closure_f_target = 0.0f;
     float closure_d_eff = 0.0f;
+
+    /// PQ anisotropic codebook training strength λ (0 = disabled, ~2.0 =
+    /// ScaNN-like). Raises the PQ-only recall ceiling by penalizing
+    /// reconstruction error along the vector's own direction (a proxy for the
+    /// query direction under in-distribution queries). Only affects the
+    /// codebook training (k-means assignment step); encoding, search, and the
+    /// serialized codebook format are unchanged. One-time build-time cost.
+    float pq_anisotropy_lambda = 0.0f;
 };
 
 /// Result of a build operation.

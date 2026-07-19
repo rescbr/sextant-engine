@@ -1034,9 +1034,17 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     // Construct + train the quantizer at the resolved params.
     quantizer_ = std::make_unique<PqQuantizer>(
         params.metric, dim_, pq_m, pq_bits);
+    if (params.pq_anisotropy_lambda > 0.0f) {
+        quantizer_->set_anisotropy(params.pq_anisotropy_lambda);
+    }
     code_size_ = quantizer_->code_size();
-    spdlog::info("[sextant] pass 1: training PQ (m={}, bits={}) on {} samples",
-                 pq_m, pq_bits, actual_sample);
+    std::string aniso_note;
+    if (params.pq_anisotropy_lambda > 0.0f) {
+        aniso_note = std::string(", anisotropy lambda=") +
+                     std::to_string(params.pq_anisotropy_lambda);
+    }
+    spdlog::info("[sextant] pass 1: training PQ (m={}, bits={}{}) on {} samples",
+                 pq_m, pq_bits, aniso_note, actual_sample);
     quantizer_->train(reservoir.data(), actual_sample);
     spdlog::info("[sextant] pass 1: PQ trained (code_size={})", code_size_);
 

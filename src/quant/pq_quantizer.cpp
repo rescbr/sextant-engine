@@ -237,6 +237,146 @@ void kmeans_pp(const float* data, uint64_t n, uint32_t dim, uint32_t k,
     }
 }
 
+/// Anisotropic k-means: same structure as `kmeans_pp`, but the *assignment*
+/// step uses ScaNN-style anisotropic distance instead of plain L2sq.
+///
+/// d_aniso(x, c) = ||x - c||² + λ × ((x - c) · x̂)²
+/// where x̂ = x / ||x||. Expanding the parallel-error term:
+///   ((x - c) · x̂)² = ((||x||² - c·x)² / ||x||²)
+/// so the penalty is λ × (norm_sq - dot(c, x))² / norm_sq.
+///
+/// This penalizes reconstruction error *along the vector's own direction* (a
+/// proxy for the query direction under in-distribution queries) more than
+/// perpendicular error. The centroid update (mean of assigned points) is
+/// unchanged — only the assignment distance differs.
+///
+/// `sub_norms[i]` must hold the precomputed ||x_i||² for each data vector
+/// (computed once per segment in PqQuantizer::train via a self-dot). When
+/// `anisotropy_lambda <= 0` or a sub-vector norm is ~0, this reduces exactly
+/// to plain L2sq assignment.
+void anisotropic_kmeans_pp(const float* data, const float* sub_norms,
+                           uint64_t n, uint32_t dim, uint32_t k,
+                           uint64_t seed, uint32_t max_iters,
+                           float anisotropy_lambda, float* centroids_out) {
+    if (k == 0 || dim == 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "anisotropic k-means: dim and k must be positive");
+    }
+    if (n == 0) {
+        std::memset(centroids_out, 0, size_t(k) * dim * sizeof(float));
+        return;
+    }
+
+    std::mt19937_64 rng(seed);
+
+    if (n < k) {
+        for (uint32_t c = 0; c < k; c++) {
+            std::memcpy(centroids_out + c * dim,
+                        data + (c % n) * dim, dim * sizeof(float));
+        }
+    } else {
+        kmeans_pp_seed(data, n, dim, k, rng, centroids_out);
+    }
+
+    // Hot flag: when lambda is non-positive, the anisotropic term vanishes and
+    // this function is numerically identical to kmeans_pp. Dispatch the plain
+    // path in that case (no per-point norm guards in the inner loop).
+    const bool use_aniso = anisotropy_lambda > 0.0f;
+
+    std::vector<uint32_t> assign(n, 0);
+    std::vector<double> sum_vec(size_t(k) * dim, 0.0);
+    std::vector<uint64_t> count(k, 0);
+
+    for (uint32_t iter = 0; iter < max_iters; iter++) {
+        // 1) Assign every sample to its nearest centroid.
+        uint64_t changed = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            const float* xi = data + i * dim;
+            float best = std::numeric_limits<float>::infinity();
+            uint32_t best_c = 0;
+            if (use_aniso) {
+                const float norm_sq = sub_norms[i];
+                // norm_sq is ||x_i||² >= 0; guard against the degenerate
+                // zero vector (falls back to plain L2sq for that point).
+                const bool point_aniso = norm_sq > 1e-12f;
+                const float inv_norm = point_aniso ? (1.0f / norm_sq) : 0.0f;
+                for (uint32_t c = 0; c < k; c++) {
+                    const float* cen = centroids_out + c * dim;
+                    const float l2sq = l2sq_f32(xi, cen, dim);
+                    float d = l2sq;
+                    if (point_aniso) {
+                        // parallel_err = (||x||² - c·x)² / ||x||²
+                        const float dot_val = dot_f32(cen, xi, dim);
+                        const float diff = norm_sq - dot_val;
+                        d = l2sq + anisotropy_lambda * (diff * diff) * inv_norm;
+                    }
+                    if (d < best) {
+                        best = d;
+                        best_c = c;
+                    }
+                }
+            } else {
+                for (uint32_t c = 0; c < k; c++) {
+                    const float d = l2sq_f32(xi, centroids_out + c * dim, dim);
+                    if (d < best) {
+                        best = d;
+                        best_c = c;
+                    }
+                }
+            }
+            if (assign[i] != best_c) {
+                changed++;
+                assign[i] = best_c;
+            }
+        }
+
+        // 2) Recompute centroids as the mean of their assigned points
+        //    (UNCHANGED from kmeans_pp — only the assignment distance differs).
+        std::fill(sum_vec.begin(), sum_vec.end(), 0.0);
+        std::fill(count.begin(), count.end(), 0);
+        for (uint64_t i = 0; i < n; i++) {
+            const uint32_t c = assign[i];
+            count[c]++;
+            const float* v = data + i * dim;
+            double* acc = sum_vec.data() + size_t(c) * dim;
+            for (uint32_t d = 0; d < dim; d++) {
+                acc[d] += v[d];
+            }
+        }
+        for (uint32_t c = 0; c < k; c++) {
+            if (count[c] > 0) {
+                double inv = 1.0 / double(count[c]);
+                float* cen = centroids_out + c * dim;
+                double* acc = sum_vec.data() + size_t(c) * dim;
+                for (uint32_t d = 0; d < dim; d++) {
+                    cen[d] = float(acc[d] * inv);
+                }
+            } else {
+                // Empty cluster: reseed from the point farthest from its
+                // assigned centroid (using plain L2sq, as in kmeans_pp).
+                float worst = -1.0f;
+                uint64_t worst_i = 0;
+                for (uint64_t i = 0; i < n; i++) {
+                    const float d = l2sq_f32(
+                        data + i * dim,
+                        centroids_out + assign[i] * dim, dim);
+                    if (d > worst) {
+                        worst = d;
+                        worst_i = i;
+                    }
+                }
+                std::memcpy(centroids_out + c * dim,
+                            data + worst_i * dim, dim * sizeof(float));
+            }
+        }
+
+        // Early stop: <1% of points changed assignment.
+        if (iter > 0 && changed * 100 < n) {
+            break;
+        }
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -287,6 +427,7 @@ void PqQuantizer::train(const float* samples, uint64_t n) {
     std::atomic<uint32_t> next_seg{0};
     auto worker = [&]() {
         std::vector<float> sub_buffer(size_t(n) * sub_dim_);
+        std::vector<float> sub_norms(size_t(n), 0.0f);
         uint32_t s;
         while ((s = next_seg.fetch_add(1, std::memory_order_relaxed)) < m_) {
             // Gather sub-vectors for this segment.
@@ -297,9 +438,22 @@ void PqQuantizer::train(const float* samples, uint64_t n) {
             }
             const uint64_t slot_seed =
                 seed_ ^ (0x9E3779B97F4A7C15ULL * (uint64_t(s) + 1));
-            kmeans_pp(sub_buffer.data(), n, sub_dim_, K_, slot_seed,
-                      /*max_iters=*/25,
-                      codebook_.data() + size_t(s) * K_ * sub_dim_);
+            float* book_out = codebook_.data() + size_t(s) * K_ * sub_dim_;
+            if (anisotropic_) {
+                // Precompute ||x_sub||² for each sub-vector (self-dot,
+                // NumKong-accelerated). Reused across all k-means iterations.
+                for (uint64_t i = 0; i < n; i++) {
+                    const float* sv = sub_buffer.data() + i * sub_dim_;
+                    sub_norms[i] = dot_f32(sv, sv, sub_dim_);
+                }
+                anisotropic_kmeans_pp(sub_buffer.data(), sub_norms.data(),
+                                      n, sub_dim_, K_, slot_seed,
+                                      /*max_iters=*/25, anisotropy_lambda_,
+                                      book_out);
+            } else {
+                kmeans_pp(sub_buffer.data(), n, sub_dim_, K_, slot_seed,
+                          /*max_iters=*/25, book_out);
+            }
         }
     };
 

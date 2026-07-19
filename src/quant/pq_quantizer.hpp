@@ -30,6 +30,19 @@ public:
     /// `samples` is `n × dim` float32, row-major.
     void train(const float* samples, uint64_t n);
 
+    /// Enable/disable anisotropic codebook training and set the anisotropy
+    /// strength λ. When enabled, the k-means assignment step uses ScaNN-style
+    /// anisotropic distance (penalizes reconstruction error along the vector's
+    /// own direction). λ = 0 disables it (plain L2sq k-means). ~2.0 is a
+    /// ScaNN-like strength. Must be called BEFORE train(). No effect on an
+    /// already-trained codebook.
+    void set_anisotropy(float lambda) {
+        anisotropic_ = (lambda > 0.0f);
+        anisotropy_lambda_ = lambda;
+    }
+    float anisotropy_lambda() const { return anisotropy_lambda_; }
+    bool anisotropic() const { return anisotropic_; }
+
     /// Encode a single vector into `code_out` (must be code_size() bytes).
     void encode(const float* vec, uint8_t* code_out) const;
 
@@ -93,6 +106,11 @@ private:
 
     uint32_t K_;           ///< 2^bits centroids per segment
     uint32_t sub_dim_;     ///< dim / m
+
+    /// Anisotropic (ScaNN-style) codebook training. When true, the k-means
+    /// assignment step uses d_aniso = ||x-c||² + λ·((x-c)·x̂)². Off by default.
+    bool anisotropic_ = false;
+    float anisotropy_lambda_ = 0.0f;
 
     /// Codebook: m segments × K centroids × sub_dim floats.
     std::vector<float> codebook_;
