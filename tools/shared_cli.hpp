@@ -127,7 +127,7 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
         cfg.metric = (m == "ip") ? sextant::MetricKind::InnerProduct
                                   : sextant::MetricKind::L2Sq;
     }
-    cfg.build_mode = sextant::BuildMode::SDC;  // SDC only; ADC removed
+    cfg.build_mode = sextant::BuildMode::HDC;  // HDC only; raw-vector construct removed
     // target-topk is only defined for Analyze/Autobuild modes; guard with
     // a try-catch because cmdline::parser::exist() throws if the flag wasn't
     // registered (it doesn't return false for undefined flags).

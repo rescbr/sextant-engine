@@ -37,7 +37,7 @@ public:
     /// Called after train(). Stored internally.
     void build_cross_distance_table();
 
-    /// Preprocess a query vector into a LUT for ADC distance estimation.
+    /// Preprocess a query vector into a LUT for PQ distance estimation.
     /// `out` must hold lut_size() floats.
     void preprocess_query(const float* query, float* out) const;
 
@@ -53,7 +53,7 @@ public:
     uint32_t K() const { return K_; }
     uint32_t sub_dim() const { return sub_dim_; }
 
-    /// Build a LUT from a PQ code (for SDC build mode).
+    /// Build a LUT from a PQ code (for HDC build mode).
     bool build_code_lut(const uint8_t* code, float* out) const;
 
     /// Code-to-code distance via the cross-distance table.

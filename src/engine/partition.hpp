@@ -4,7 +4,7 @@
 /// PartitionInfo: k-means partitioning on PQ codes (Step 11).
 ///
 /// Partitions the dataset into K shards by running k-means on the PQ codes
-/// using SDC (symmetric distance via the quantizer's cross-distance table).
+/// using PQ code distance (symmetric distance via the quantizer's cross-distance table).
 /// Each vector is assigned to its nearest centroid, plus any centroid within
 /// `closure_factor × d_best` — this creates ~15% overlap so boundary nodes
 /// appear in multiple shards, keeping the merged graph connected.
@@ -36,7 +36,7 @@ struct PartitionAssignment {
 
 /// Run k-means on PQ codes and assign vectors to shards with closure overlap.
 ///
-/// @param quantizer   Trained PQ quantizer (provides SDC code_distance).
+/// @param quantizer   Trained PQ quantizer (provides PQ code_distance).
 /// @param codes       Flat PQ codes buffer (n × code_size), indexed by global ID.
 /// @param n           Number of vectors.
 /// @param code_size   Bytes per PQ code.

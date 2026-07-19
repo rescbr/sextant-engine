@@ -8,10 +8,12 @@
 
 namespace sextant {
 
-/// Build mode. ADC (raw-vector construct) has been removed — the FP16 prune
-/// hybrid made it redundant (only +0.0003 recall at 1.4× build cost). The enum
-/// is retained with SDC as the sole value for API compatibility.
-enum class BuildMode : uint8_t { SDC = 0 };
+/// Build mode. The raw-vector construct mode has been removed — the FP16
+/// prune hybrid made it redundant (only +0.0003 recall at 1.4× build cost). The
+/// enum is retained with HDC as the sole value for API compatibility. HDC
+/// (Hybrid Distance Calculation) uses PQ codes for cheap navigation and FP16
+/// vectors for precise pruning.
+enum class BuildMode : uint8_t { HDC = 0 };
 
 /// Build configuration. Fields set to 0/default are auto-resolved.
 struct BuildConfig {
@@ -20,7 +22,7 @@ struct BuildConfig {
     float alpha = 0.0f;         ///< Vamana prune threshold: alpha * d(p,pp) <= d(q,pp).
                                 ///< 0 = auto (1.2). Purely the prune threshold;
                                 ///< build mode is set via `build_mode`.
-    BuildMode build_mode = BuildMode::SDC;  ///< SDC (code-distance construct); ADC removed
+    BuildMode build_mode = BuildMode::HDC;  ///< HDC (PQ-distance construct)
     /// Inline PQ codes per node. 0 = compact (no inline). DEPRECATED: the
     /// two-cache search architecture handles code locality without inflating
     /// node size, so inline PQ provides no benefit. Retained for backward
@@ -49,7 +51,7 @@ struct BuildConfig {
     ///          table residency: L2 ≈ 1.0, L3 ≈ 1.5, RAM ≈ 1.9. These are
     ///          empirically calibrated (not raw cycle counts) because hardware
     ///          prefetching and temporal locality dilute the cache cliff. The
-    ///          search path uses the ADC LUT (m×K×4 bytes, always L2-resident),
+    ///          search path uses the PQ LUT (m×K×4 bytes, always L2-resident),
     ///          so residency affects only the build path (code_distance from
     ///          the m×K²×4 cross-distance table).
     ///

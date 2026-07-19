@@ -55,7 +55,7 @@ std::vector<Candidate> Engine::search(const float* query, uint32_t k,
         return {};
     }
 
-    // Preprocess the query into an ADC LUT.
+    // Preprocess the query into a PQ LUT.
     const uint32_t lut_sz = quantizer_->lut_size();
     std::vector<float> lut(lut_sz > 0 ? lut_sz : 1, 0.0f);
     if (lut_sz > 0) {

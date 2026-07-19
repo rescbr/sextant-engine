@@ -741,16 +741,16 @@ TEST(Engine, OpenRejectsMissingIndex) {
 }
 
 // ---------------------------------------------------------------------------
-// ADC build mode (build_mode=ADC): build with raw-vector construct and verify
+// HDC build mode: build with PQ-distance construct and verify
 // the index is valid and searchable.
 // ---------------------------------------------------------------------------
-TEST(Engine, BuildSDCMode) {
+TEST(Engine, BuildHDCMode) {
     const uint32_t n = 800;
     const uint32_t dim = 64;
     const std::string fbin =
-        write_random_fbin("engine_sdc_data.fbin", n, dim);
+        write_random_fbin("engine_hdc_data.fbin", n, dim);
     const std::string index_path =
-        (std::filesystem::temp_directory_path() / "engine_sdc_idx").string();
+        (std::filesystem::temp_directory_path() / "engine_hdc_idx").string();
     remove_sidecars(index_path);
 
     {
@@ -761,7 +761,7 @@ TEST(Engine, BuildSDCMode) {
 
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        cfg.build_mode = BuildMode::SDC;  // SDC build mode (code-distance construct)
+        cfg.build_mode = BuildMode::HDC;  // HDC build mode (PQ-distance construct)
         BuildResult result = engine.build(source, index_path, cfg);
         EXPECT_EQ(static_cast<uint64_t>(n), result.n_vectors);
         EXPECT_EQ(dim, result.dim);
@@ -777,7 +777,7 @@ TEST(Engine, BuildSDCMode) {
             << "empty sidecar: " << p;
     }
 
-    // Open and search — basic smoke test that the SDC-built graph works.
+    // Open and search — basic smoke test that the HDC-built graph works.
     {
         Engine engine;
         engine.open(index_path);

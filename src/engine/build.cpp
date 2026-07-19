@@ -1,5 +1,5 @@
 // Build pipeline — parameter resolution (Issue 37).
-// The two-pass streaming + parallel SDC construct lives in engine.cpp; this
+// The two-pass streaming + parallel HDC construct lives in engine.cpp; this
 // translation unit owns the auto-default resolution logic.
 
 #include "build.hpp"
@@ -91,7 +91,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     } else {
         p.alpha = 1.2f;
     }
-    // --- build_mode (SDC only; ADC removed) ---
+    // --- build_mode (HDC only; raw-vector construct removed) ---
     p.build_mode = overrides.build_mode;
     spdlog::info("[sextant] alpha = {:.2f} [{}]", p.alpha,
                  overrides.alpha != 0.0f ? "override" : "auto");

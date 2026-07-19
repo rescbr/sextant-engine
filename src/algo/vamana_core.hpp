@@ -104,7 +104,7 @@ struct VamanaTLS {
     std::vector<Candidate> connect_buffer;  // connect_and_prune overflow candidate pool
     std::vector<Candidate> recip_targets;   // snapshot of selected for reciprocal loop
     std::vector<float> lut_buffer;  // Reusable PQ distance LUT (m*K floats).
-    /// Per-anchor LUT for SDC build: anchor_lut[s*K+cid] = cross_table[s*K*K + anchor_code[s]*K + cid].
+    /// Per-anchor LUT for HDC build: anchor_lut[s*K+cid] = cross_table[s*K*K + anchor_code[s]*K + cid].
     /// Built once per insert_build_from_code; 8KB (m=32,K=256), L1-resident.
     std::vector<float> anchor_lut;
     std::vector<uint8_t> removed_flags;  // robust_prune removed bitset (bytes, not bools)
@@ -131,7 +131,7 @@ public:
     /// Prepare for building `count` nodes.
     void prepare_for_build(uint32_t count);
 
-    /// Insert a node during parallel build (SDC mode: LUT from PQ code).
+    /// Insert a node during parallel build (HDC mode: LUT from PQ code).
     /// Each thread calls this for disjoint node-ID ranges.
     void insert_build_from_code(uint32_t internal_id, RowId row_id,
                                 VamanaTLS& tls);
@@ -143,18 +143,18 @@ public:
     void insert_build_core(uint32_t internal_id, RowId row_id, VamanaTLS& tls);
 
     /// BeamSearch from entry points. Returns candidates.
-    /// When `sdc_anchor` is non-null, distances are computed via direct
+    /// When `hdc_anchor` is non-null, distances are computed via direct
     /// code-to-code lookup (code_distance) instead of the materialized LUT.
     /// This skips the 32KB LUT gather, trading scattered table reads for
-    /// zero memcpy. Only valid in SDC build mode (anchor is a PQ code).
+    /// zero memcpy. Only valid in HDC build mode (anchor is a PQ code).
     ///
     /// When `anchor_lut` is non-null, it takes priority over both `query_lut`
-    /// and `sdc_anchor`: distances are gathered from the 8KB per-anchor LUT
+    /// and `hdc_anchor`: distances are gathered from the 8KB per-anchor LUT
     /// (L1-resident) via lut_distance, which is contiguous and cache-friendly.
     std::vector<Candidate> beam_search(const float* query_lut, uint32_t L,
                                        uint32_t io_limit, VamanaTLS& tls,
                                        const std::vector<uint32_t>* forced_entry_points = nullptr,
-                                       const uint8_t* sdc_anchor = nullptr,
+                                       const uint8_t* hdc_anchor = nullptr,
                                        const float* anchor_lut = nullptr,
                                        const float16_t* query_fp16 = nullptr) const;
 
@@ -168,7 +168,7 @@ public:
                           const float* query_lut, uint32_t L,
                           uint32_t io_limit, VamanaTLS& tls,
                           const std::vector<uint32_t>* forced_entry_points = nullptr,
-                          const uint8_t* sdc_anchor = nullptr,
+                           const uint8_t* hdc_anchor = nullptr,
                           const float* anchor_lut = nullptr,
                           const float16_t* query_fp16 = nullptr) const;
 

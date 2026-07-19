@@ -1,6 +1,6 @@
 // PartitionInfo: k-means partitioning on PQ codes (Step 11).
 //
-// K-means runs entirely on PQ codes using SDC distance (code-to-code via the
+// K-means runs entirely on PQ codes using PQ code distance (code-to-code via the
 // quantizer's cross-distance table). Centroids are represented as PQ codes.
 // Assignment uses closure_factor overlap so boundary vectors land in multiple
 // shards, keeping the merged graph connected.
@@ -22,7 +22,7 @@ namespace sextant {
 
 namespace {
 
-/// Compute SDC distance from a code to all K centroids.
+/// Compute PQ code distance from a code to all K centroids.
 /// Returns the nearest distance in `best_d` (if non-null) and fills `dists`
 /// (length K) with all centroid distances.
 inline void centroid_distances(const PqQuantizer& q,
@@ -108,7 +108,7 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
         }
 
         // Update pass: new centroid = element-wise medoid (the member whose
-        // sum of SDC distances to all other members is smallest). For PQ codes
+        // sum of PQ distances to all other members is smallest). For PQ codes
         // a true mean isn't defined, so medoid is the natural choice.
         for (uint32_t k = 0; k < K; k++) {
             if (clusters[k].empty()) {

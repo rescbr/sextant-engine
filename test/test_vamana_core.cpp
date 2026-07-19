@@ -173,7 +173,7 @@ TEST(VamanaCore, BuildGraphConnected) {
 }
 
 // ---------------------------------------------------------------------------
-// SDC build path (insert_build_from_code) — structural invariant.
+// HDC build path (insert_build_from_code) — structural invariant.
 // ---------------------------------------------------------------------------
 
 TEST(VamanaCore, InsertBuildFromCode) {

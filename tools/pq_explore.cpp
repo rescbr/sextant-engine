@@ -260,7 +260,7 @@ ConfigResult run_config(const std::vector<float>& sample, uint32_t n,
                   codes.data() + static_cast<size_t>(i) * cs);
     }
 
-    // PQ top-recall_k for each query via ADC LUT.
+    // PQ top-recall_k for each query via PQ LUT.
     std::vector<float> lut(pq.lut_size());
     const uint32_t nq = static_cast<uint32_t>(query_idx.size());
 

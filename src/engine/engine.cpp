@@ -6,7 +6,7 @@
 //   2. allocate flat codes + nodes buffers
 //   3. Pass 1: reservoir sample (256K) + PQ train
 //   4. Pass 2: encode all vectors → codes_buffer_
-//   5. Parallel SDC construct via CTPL (disjoint node ranges)
+//   5. Parallel HDC construct via CTPL (disjoint node ranges)
 //   6. Finalize: compute_entry_points + finalize_inline_codes
 //   7. Flush sidecars (.graph/.codes/.meta/.manifest)
 //
@@ -1178,7 +1178,7 @@ void Engine::pass2_encode(VectorSource& source,
 }
 
 // ===========================================================================
-// Parallel construct (SDC, Issue 29 Mode C)
+// Parallel construct (HDC, Issue 29 Mode C)
 // ===========================================================================
 
 void Engine::parallel_construct(const ResolvedParams& params) {
@@ -1205,7 +1205,7 @@ void Engine::construct_into(VamanaCore& core, uint32_t count,
                             const char* label) {
     if (count == 0) return;
     nthreads = std::max(1u, nthreads);
-    spdlog::info("[sextant] {}: {} nodes across {} threads (SDC)", label, count,
+    spdlog::info("[sextant] {}: {} nodes across {} threads (HDC)", label, count,
                  nthreads);
 
     // The very first insert must be serialized before spawning tasks: it
@@ -1301,7 +1301,7 @@ void Engine::construct_into(VamanaCore& core, uint32_t count,
 //   3. Per-shard build: each shard builds at R_shard = 2R/3, referencing a
 //      contiguous copy of its members' PQ codes. Nodes store GLOBAL row_ids.
 //   4. Merge: union neighbor lists per global node, remap shard-local IDs →
-//      global IDs, truncate to R by SDC code distance.
+//      global IDs, truncate to R by PQ code distance.
 //   5. Flush: standard write_sidecars_ (merged graph + global codes).
 // ===========================================================================
 
@@ -1312,7 +1312,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     using engine_detail::fill_header;
     using engine_detail::read_exact;
 
-    // Partitioned build uses SDC shard construct exclusively — RAM savings
+    // Partitioned build uses HDC shard construct exclusively — RAM savings
     // matter more than marginal quality at large scale.
 
     spdlog::info("[sextant] build: N={} K={} closure_factor={:.4f}",
@@ -1357,7 +1357,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
 #endif
     }
 
-    // Encode (pass2). The quantizer needs its cross-distance table for SDC;
+    // Encode (pass2). The quantizer needs its cross-distance table for HDC;
     // PqQuantizer builds it during train() in pass1.
     pass2_encode(source, params);
 
@@ -1378,7 +1378,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                         "build_partitioned: raw_vecs_buffer_ alloc failed");
         }
         spdlog::info("[sextant] loading raw vectors as FP16 ({:.1f}MB) for "
-                     "SDC (FP16 prune)",
+                      "HDC (FP16 prune)",
                      vecs_bytes / 1e6);
         source.reset();
         Chunk chunk{};
@@ -1529,7 +1529,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // --- 4. Merge ---
     // For each global node, collect neighbor lists from all shards that
     // contain it (remapping shard-local IDs → global IDs), union, dedup,
-    // truncate to R by SDC distance.
+    // truncate to R by PQ distance.
     // Merge is a three-phase streaming pass:
     //   (a) Gather each global node's candidates from its shard neighbor lists
     //       (shard-local IDs remapped to global IDs).
@@ -1537,7 +1537,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     //       This makes the merged graph undirected and guarantees connectivity
     //       (each shard's Vamana build is internally connected via the shared
     //       entry-point seed, and closure_factor overlap bridges shards).
-    //   (c) For each node: dedup + truncate to R by SDC distance, write out.
+    //   (c) For each node: dedup + truncate to R by PQ distance, write out.
     spdlog::info("[sextant] merging {} shards into global graph (R={})", K,
                  params.R);
 
@@ -1572,7 +1572,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         }
     }
 
-    // (c) Dedup + truncate to R by SDC distance, write to nodes_buffer_.
+    // (c) Dedup + truncate to R by PQ distance, write to nodes_buffer_.
     std::vector<uint32_t> seen(n, 0);
     uint32_t visit_token = 0;
     for (uint32_t gid = 0; gid < n; gid++) {
@@ -1607,7 +1607,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         // Free the adjacency now that we've consumed it.
         std::vector<uint32_t>().swap(adj[gid]);
 
-        // Truncate to R: keep the R closest by SDC distance.
+        // Truncate to R: keep the R closest by PQ distance.
         if (cands.size() > params.R) {
             std::nth_element(
                 cands.begin(), cands.begin() + params.R, cands.end(),
@@ -1635,7 +1635,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // connected components when closure_factor overlap is low on tightly-
     // clustered data. Union-Find detects components; we bridge each minor
     // component to the largest one with a single bidirectional edge between
-    // the SDC-closest pair. This guarantees a single connected component.
+    // the PQ-closest pair. This guarantees a single connected component.
     {
         std::vector<uint32_t> parent(n);
         for (uint32_t i = 0; i < n; i++) parent[i] = i;
@@ -1674,7 +1674,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
             spdlog::warn("[sextant] merge: {} components (largest={}); "
                          "bridging", comp_map.size(), root_size);
 
-            // For each minor component, bridge to the root via the SDC-nearest
+            // For each minor component, bridge to the root via the PQ-nearest
             // pair (greedy O(|comp| × |root|) is too costly for large roots;
             // we sample the root side to 1024 candidates).
             std::vector<uint32_t> root_sample;

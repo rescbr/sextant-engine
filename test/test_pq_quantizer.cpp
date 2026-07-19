@@ -135,7 +135,7 @@ TEST(PqQuantizer, EncodeRoundTripErrorBounded) {
 
         // Reconstruct from code: for each segment, look up the centroid.
         // We can't access the codebook directly, so measure the encoding
-        // via the ADC LUT: preprocess_query on the vector itself, then
+        // via the PQ LUT: preprocess_query on the vector itself, then
         // lut_distance gives the sum of sub-distances to assigned centroids
         // = the total squared quantization error.
         std::vector<float> lut(q.lut_size(), 0.0f);
@@ -226,7 +226,7 @@ TEST(PqQuantizer, SerializeDeserialize4Bit) {
 // ---------------------------------------------------------------------------
 
 TEST(PqQuantizer, LUTDistanceMatchesCodeDistance) {
-    // For the SDC (symmetric) path:
+    // For the PQ (symmetric) path:
     //   build_code_lut(code_a) → lut, then lut_distance(code_b, lut)
     //   should equal code_distance(code_a, code_b).
     const uint64_t n = 300;
@@ -238,7 +238,7 @@ TEST(PqQuantizer, LUTDistanceMatchesCodeDistance) {
     PqQuantizer q(MetricKind::L2Sq, dim, m, bits, /*seed=*/222);
     q.train(data.data(), n);
 
-    // Pick a few pairs and verify SDC LUT path matches direct code_distance.
+    // Pick a few pairs and verify the LUT path matches direct code_distance.
     for (uint64_t pair = 0; pair < 20; pair++) {
         const float* va = data.data() + (pair * 13 % n) * dim;
         const float* vb = data.data() + (pair * 29 % n) * dim;
@@ -253,7 +253,7 @@ TEST(PqQuantizer, LUTDistanceMatchesCodeDistance) {
         const float via_lut = q.lut_distance(cb.data(), lut.data());
 
         EXPECT_FLOAT_EQ(direct, via_lut)
-            << "SDC LUT mismatch for pair " << pair;
+            << "PQ LUT mismatch for pair " << pair;
     }
 }
 
@@ -293,7 +293,7 @@ TEST(PqQuantizer, CodeDistanceSymmetric) {
 }
 
 // ---------------------------------------------------------------------------
-// ADC LUT: preprocess_query → lut_distance consistency
+// PQ LUT: preprocess_query → lut_distance consistency
 // ---------------------------------------------------------------------------
 
 TEST(PqQuantizer, PreprocessQueryLUTShape) {

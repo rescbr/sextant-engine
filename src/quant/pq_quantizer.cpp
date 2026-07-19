@@ -350,11 +350,11 @@ void PqQuantizer::encode(const float* vec, uint8_t* code_out) const {
 }
 
 // ---------------------------------------------------------------------------
-// Query preprocessing (ADC LUT)
+// Query preprocessing (PQ LUT)
 // ---------------------------------------------------------------------------
 
 void PqQuantizer::preprocess_query(const float* query, float* out) const {
-    // ADC table: out[s * K + c] = d(query_sub_s, centroid[s][c]).
+    // PQ LUT: out[s * K + c] = d(query_sub_s, centroid[s][c]).
     //   L2SQ: L2 squared distance.
     //   IP:   -dot(query_sub, centroid).
     for (uint32_t s = 0; s < m_; s++) {
@@ -390,7 +390,7 @@ float PqQuantizer::lut_distance(const uint8_t* code, const float* lut) const {
 }
 
 // ---------------------------------------------------------------------------
-// SDC code LUT (build mode)
+// PQ code LUT (HDC build mode)
 // ---------------------------------------------------------------------------
 
 bool PqQuantizer::build_code_lut(const uint8_t* code, float* out) const {
@@ -450,7 +450,7 @@ float PqQuantizer::code_distance(const uint8_t* code_a,
 }
 
 // ---------------------------------------------------------------------------
-// Batch distance: 4 candidates against a fixed anchor (SDC) or fixed LUT.
+// Batch distance: 4 candidates against a fixed anchor (PQ code) or fixed LUT.
 //
 // The inner loop is gather-limited (data-dependent table lookups). Processing
 // 4 candidates simultaneously gives the CPU 4 independent load streams,
