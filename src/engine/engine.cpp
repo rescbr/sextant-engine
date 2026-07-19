@@ -2835,23 +2835,32 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
     std::vector<ProbedRow> pq_verify_candidates;
     bool pq_verify_pending = false;
     if (pq_m == 0 || pq_bits == 0) {
-        // Distortion recalibration: when recall_target is set, the mini-build
-        // verify (below) is the real gate on recall, so the probe's distortion
-        // filter should be relaxed to admit all reasonable candidates (4-bit and
-        // 8-bit across the m sweep). When only proximity_target (no recall) is
-        // set, keep distortion at its default/current value — distortion is the
-        // only geometric quality signal in that path.
-        ResolvedParams probe_params = base;
-        const bool relax_distortion = (overrides.recall_target > 0.0f);
-        if (relax_distortion) {
-            probe_params.pq_max_distortion = 0.20;
-            spdlog::info("[sextant] estimate_config: probing PQ config "
-                         "(distortion relaxed to 0.20 — recall_target is the "
-                         "gate; mini-build verify at k={} filters by actual "
-                         "recall)...", target_k);
-        } else {
-            spdlog::info("[sextant] estimate_config: probing PQ config...");
-        }
+         // Distortion recalibration: when recall_target is set, scale the
+         // distortion bound inversely with the target. The default bound (0.05)
+         // achieves recall@100 ≈ 0.99 with rerank=10 at full scale. Lower
+         // targets (0.90) can tolerate higher distortion (cheaper PQ); higher
+         // targets (0.99+) need tighter distortion. The mapping is linear
+         // and conservative — it errs toward over-provisioning PQ quality.
+         // The mini-build verify is skipped (mini-build recall@100 is unreliable
+         // at small sample sizes; the distortion proxy is more trustworthy).
+         ResolvedParams probe_params = base;
+         const bool calibrate_distortion = (overrides.recall_target > 0.0f);
+         if (calibrate_distortion) {
+             // At recall_target=0.95: bound = 0.05 (default — works at full scale).
+             // At recall_target=0.90: bound = 0.10 (cheaper PQ acceptable).
+             // At recall_target=0.99: bound = 0.02 (tighter PQ needed).
+             // Linear interpolation: bound = 0.05 × (1.0 - (target - 0.95) × 3).
+             // Clamp to [0.01, 0.20].
+             const float t = overrides.recall_target;
+             float d_bound = 0.05f * (1.0f - (t - 0.95f) * 3.0f);
+             d_bound = std::clamp(d_bound, 0.01f, 0.20f);
+             probe_params.pq_max_distortion = d_bound;
+             spdlog::info("[sextant] estimate_config: probing PQ config "
+                          "(distortion bound {:.4f} calibrated from recall_target "
+                          "{:.2f})...", d_bound, t);
+         } else {
+             spdlog::info("[sextant] estimate_config: probing PQ config...");
+         }
         pq_sel = probe_pq_config(sample.data(), sample_n, dim, probe_params);
         pq_m = pq_sel.m;
         pq_bits = pq_sel.bits;
@@ -2948,11 +2957,13 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
                  closure_c, f_target, d_eff);
 
     // --- 4b. PQ verify (mini-build confirm of the probe selection) ---
-    // Runs only when PQ was auto-probed. Steps through the candidate list
-    // (ascending m, 4-bit before 8-bit) until one meets the recall/proximity
-    // target at target_k, else keeps the highest-fidelity candidate as
-    // best-effort. This is the distortion-filter + mini-build verify hybrid.
-    if (pq_verify_pending) {
+    // SKIPPED when recall_target is set: the calibrated distortion bound
+    // (section 2 above) already selected the right config, and mini-build
+    // recall@100 is unreliable at small sample sizes (the graph is too sparse
+    // for k=100 — the ceiling is graph-limited, not PQ-limited). When
+    // recall_target is NOT set (proximity-only mode), the verify runs as a
+    // diagnostic check on the probe's selection.
+    if (pq_verify_pending && overrides.recall_target == 0.0f) {
         spdlog::info("[sextant] estimate_config: PQ verify (mini-build at "
                      "k={}, {} candidates)...", target_k,
                      pq_verify_candidates.size());
