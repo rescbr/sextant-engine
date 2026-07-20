@@ -39,6 +39,7 @@ public:
     /// Auto-resolves params from `config` via resolve_params() (any field
     /// set to 0/auto in `config` is resolved heuristically — but pq_m and
     /// pq_bits MUST be explicit; pass1 throws otherwise).
+    /// Phase B: thin delegator; the real work is in Builder.
     BuildResult build(VectorSource& source, const std::string& index_path,
                       const BuildConfig& config);
 
@@ -49,32 +50,6 @@ public:
     /// stays in-process (no string serialization round-trip).
     BuildResult build(VectorSource& source, const std::string& index_path,
                       const ResolvedParams& params);
-
-    /// Probe PQ (m, bits) selection on a sample. Runs the full auto-selection
-    /// policy (recall floor + cache-band preference) on `sample` (n × dim
-    /// floats) and returns the resolved (m, bits). Used by the build path
-    /// (pass1) and by --explain (dry-run preview without building).
-    /// `pq_m`/`pq_bits` in `params`: 0 = auto, else fixed. Does not modify
-    /// engine state.
-    struct ProbedRow {
-        uint16_t m;
-        uint8_t bits;
-        uint32_t code_bytes;
-        uint32_t table_bytes;
-        double distortion;       ///< median |1 - pq_dist/true_dist| (≥0; 0 = perfect)
-        double band_recall;      ///< cluster-aware recall (diagnostic)
-        double tie_fraction;     ///< frac queries with >topk tied at @k (diagnostic)
-        double tie30_fraction;   ///< frac queries with >30 tied at @30 (diagnostic)
-        double cost;
-    };
-    struct PqSelection {
-        uint16_t m;
-        uint8_t bits;
-        std::vector<ProbedRow> all;     ///< every probed config (for display)
-        std::string reason;             ///< selection rationale
-    };
-    static PqSelection probe_pq_config(const float* sample, uint64_t n, Dim dim,
-                                       const ResolvedParams& params);
 
     /// Estimate the optimal build configuration from a data sample. Samples the
     /// source (reservoir), trains PQ, measures LID, builds one or more
@@ -169,9 +144,6 @@ private:
     std::string index_path_;  ///< Set by open()/build() before index_ exists.
     std::unique_ptr<Index> index_;
 
-    // Build-only scratch (not part of the post-build Index handoff).
-    std::vector<float> entry_centroids_;  // k × dim, FP32 (k-means centroids for entry points)
-
     uint64_t cache_size_override_ = 0;  ///< 0 = auto
 
     // Adaptive cache rebalance (paged mode only).
@@ -184,76 +156,12 @@ private:
     /// Private: per-search adaptive rebalance hook.
     void maybe_rebalance_();
 
-    /// Build helpers.
-    /// pass1 fills the reservoir, resolves pq_bits (if auto, via global probe),
-    /// constructs + trains the quantizer. After return, code_size_ is valid.
-    void pass1_sample_and_train(VectorSource& source,
-                                 const ResolvedParams& params);
-    void pass2_encode(VectorSource& source, const ResolvedParams& params);
-    void parallel_construct(const ResolvedParams& params);
-
-    /// Core construct loop: chunked work-stealing + T5 dynamic L_build + progress
-    /// logger. Shared by K==1 (full graph) and K>1 (per-shard). The row-id mapper
-    /// translates local construct IDs to global RowIds (identity for K==1,
-    /// shard membership table for K>1).
-    void construct_into(VamanaCore& core, uint32_t count,
-                        const std::function<RowId(uint32_t)>& row_id_at,
-                        uint32_t lut_sz, uint32_t nthreads,
-                        const char* label);
-
-    /// Unified build (K==1 fast path + K>1 partitioned): partition → per-shard
-    /// build → merge → flush. K==1 builds the full graph directly (no
-    /// partition/merge) and is bit-identical to the former monolithic path.
-    BuildResult build_partitioned(VectorSource& source,
-                                   const std::string& index_path,
-                                   const ResolvedParams& params);
-
-    /// BFS reorder of build IDs → disk positions (PageShuffle). Pure: does not
-    /// mutate nodes_buffer_. Computed once per build, consumed by write_sidecars_.
-    struct BfsReorder {
-        std::vector<uint32_t> order;  // order[new_pos] = old_id
-        std::vector<uint32_t> remap;  // remap[old_id]  = new_pos
-    };
-
-    /// Compute the BFS reorder from the build entry points. Pure.
-    BfsReorder compute_bfs_reorder_(const ResolvedParams& params) const;
-
-    /// Snap stored FP32 centroids to nearest data vectors (medoids) in
-    /// raw_vecs_buffer_ and set them as core_->entry_points_. Called at
-    /// flush time when raw_vecs_buffer_ is available. Falls back to stride
-    /// sampling if no centroids were stored.
-    void snap_entry_points_(const ResolvedParams& params);
-
-    /// Stream all four sidecars (.codes, .graph, .meta, .manifest) to
-    /// `index_path` using the precomputed BFS reorder. Does not mutate buffers.
-    /// Replaces the former monolithic flush; the .codes write is now
-    /// streamed (was a full N×code_size transient allocation — 96GB at 1B).
-    void write_sidecars_(const std::string& index_path,
-                         const BfsReorder& bfs,
-                         const ResolvedParams& params);
-
-    /// Write the .meta sidecar (serialized quantizer + entry points + params).
-    /// `entry_points` is already in final disk layout (BFS-remapped by the
-    /// build path, verbatim by the post-insert path). Shared by write_sidecars_
-    /// and flush.
-    void write_meta_file(const ResolvedParams& params,
-                         const std::vector<uint32_t>& entry_points,
-                         const std::pair<uint64_t, uint64_t>& uuid);
-
-    /// Write the .manifest sidecar (atomic commit point). Shared by
-    /// write_sidecars_ and flush.
-    void write_manifest_file(const ResolvedParams& params,
-                             const std::pair<uint64_t, uint64_t>& uuid);
-
     /// --- estimate_config helpers (in-RAM mini-build + measurement) ---
 
     /// Build a mini-index in-RAM on `sample` (sample_n × dim floats) at the
-    /// given params. Returns a fresh Engine whose flat buffers + core_ are
-    /// populated and entry points computed (ready to measure). Does NOT flush
-    /// sidecars or write any files. `params` must have pq_m/pq_bits resolved
-    /// (non-zero) — pass1 requires explicit PQ config. num_threads is clamped
-    /// to min(params.num_threads, 4) to avoid spawning huge pools for ~20K
-    /// vectors. `this` is not modified (static — constructs its own Engine).
+    /// given params. Returns a fresh Engine whose Index is populated and
+    /// entry points computed (ready to measure). Does NOT flush sidecars or
+    /// write any files. `params` must have pq_m/pq_bits resolved (non-zero).
     static std::unique_ptr<Engine> build_mini_(const float* sample,
                                                 uint64_t sample_n, Dim dim,
                                                 const ResolvedParams& params);
