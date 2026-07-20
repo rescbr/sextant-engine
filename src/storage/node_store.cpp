@@ -19,6 +19,9 @@ namespace sextant {
 thread_local std::unordered_map<const PagedNodeStore*, PagedNodeStore::L1Counters>
     PagedNodeStore::tl_l1_counters_;
 
+// Per-thread fast-path cache (see comment in node_store.hpp).
+thread_local PagedNodeStore::TLFastPath PagedNodeStore::tl_fast_;
+
 namespace {
 
 struct alignas(kDiskAlign) AlignedStaging {
@@ -138,6 +141,17 @@ PagedNodeStore::~PagedNodeStore() {
     // instance_id_, which is never reused, so they can never be matched by a
     // future store. They're freed when those threads exit.
     g_tl_caches.erase(instance_id_);
+    // Clear the current thread's fast-path pointer if it points at us.
+    // Other threads' fast-path pointers may still alias our address — if a
+    // new store later reuses this address, they will read stale l1/counters
+    // pointers. Mitigated by instance_id_ being monotonic for the L1 map
+    // itself, but the fast-path doesn't check instance_id_. Acceptable for
+    // engine-lifetime coupling; see comment on TLFastPath in node_store.hpp.
+    if (tl_fast_.owner == this) {
+        tl_fast_.owner = nullptr;
+        tl_fast_.l1 = nullptr;
+        tl_fast_.counters = nullptr;
+    }
 }
 
 TLBlockCache& PagedNodeStore::tl_cache() const {
@@ -166,14 +180,25 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
     // (block_idx for graph, block_idx | kCodeL1KeyBit for code). The epoch is
     // read once here; if an eviction occurs during this call the epoch changes
     // and the L1 entry (if any) is treated as stale.
-    TLBlockCache& l1 = tl_cache();
+    //
+    // Fast path: cache the per-store TLBlockCache* and L1Counters* in a
+    // thread_local so we skip two hash lookups per call. Falls back to the
+    // slow path (re-hash both maps) when the calling thread switches stores.
+    TLFastPath& fp = tl_fast_;
+    if (fp.owner != this) [[unlikely]] {
+        fp.owner = this;
+        fp.l1 = &g_tl_caches[instance_id_];
+        fp.counters = &tl_l1_counters_[this];
+    }
+    TLBlockCache& l1 = *fp.l1;
+    L1Counters& c = *fp.counters;
+
     const uint64_t epoch = cache.shard_epoch(block_idx);
     if (const uint8_t* hit = l1.lookup(key_base, epoch)) {
         ++l1.hits;
         // Per-thread accumulation; flush every 64 calls. See comment on
         // tl_l1_counters_ in node_store.hpp — per-call fetch_add on the
         // shared atomic was the dominant scaling villain (~30% of 8t cycles).
-        L1Counters& c = tl_l1_counters_[this];
         c.local_hits++;
         if (!((c.local_hits + c.local_misses) & kL1FlushMask)) {
             tl_hits_.fetch_add(c.local_hits, std::memory_order_relaxed);
@@ -183,7 +208,6 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
         return {hit, false};  // L1 hit — no I/O, no L2 lock
     }
     ++l1.misses;
-    L1Counters& c = tl_l1_counters_[this];
     c.local_misses++;
     if (!((c.local_hits + c.local_misses) & kL1FlushMask)) {
         tl_hits_.fetch_add(c.local_hits, std::memory_order_relaxed);
@@ -192,13 +216,14 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
     }
 
     // Step 1–2: check the requested block's shard under a READ lock.
-    // lookup() is now read-only (LRU bumps dropped, sketch atomic, counters
-    // atomic) so multiple readers proceed in parallel. The write lock is still
-    // taken by insert() below for actual mutations.
+    // lookup_unlocked() is safe because we already hold the read lock —
+    // calling lookup() here would re-acquire the read lock recursively,
+    // which can deadlock under nsync's writer-preference fairness when a
+    // writer is waiting (intermittent 8t hangs).
     {
         CacheShard& shard = cache.shard(block_idx);
         ScopedReadLock lock(shard.mutex());
-        uint8_t* hit = shard.lookup(block_idx);
+        uint8_t* hit = shard.lookup_unlocked(block_idx);
         if (hit) {
             // L2 hit — cache the L2-owned pointer (NO COPY). Re-read the
             // epoch AFTER the L2 op to capture the latest value (the lookup

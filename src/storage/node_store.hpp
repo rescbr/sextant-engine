@@ -240,6 +240,31 @@ private:
     mutable std::atomic<uint64_t> tl_hits_{0};
     mutable std::atomic<uint64_t> tl_misses_{0};
 
+    // --- per-thread fast-path cache (avoids 2 hash lookups per L1 access) ----
+    // The hot path of batched_read() used to call tl_cache() (one hash lookup
+    // in g_tl_caches) AND access tl_l1_counters_[this] (another hash lookup)
+    // on every L1 access. Together these added ~9% of 8t cycles and caused
+    // the 1t regression seen after step 1 (-2% to -4% depending on config).
+    // We cache both pointers in a single thread_local struct, invalidated
+    // only when the calling thread switches stores. The slow path runs once
+    // per thread per store.
+    //
+    // Lifetime coupling: the cached pointers are valid only while the owning
+    // PagedNodeStore lives. In practice stores outlive all search threads
+    // (engine-lifetime objects); if a store is destroyed while a thread still
+    // holds a stale pointer, the next identity check (`fp.owner != this`)
+    // catches the switch and re-hashes. A subtle aliasing risk remains if a
+    // new store reuses the address of a destroyed one AND the same thread
+    // accessed the old one — then owner==this matches but the pointers are
+    // stale. Mitigated by instance_id_ being monotonic, but the fast path
+    // doesn't check instance_id_. Acceptable for engine-lifetime coupling.
+    struct TLFastPath {
+        const PagedNodeStore* owner = nullptr;
+        TLBlockCache* l1 = nullptr;
+        L1Counters* counters = nullptr;
+    };
+    static thread_local TLFastPath tl_fast_;
+
     /// Returns this thread's TLBlockCache for this store (lazily allocated).
     TLBlockCache& tl_cache() const;
 
