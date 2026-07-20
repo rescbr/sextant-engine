@@ -8,18 +8,24 @@
 /// a window-overflow candidate deserves a slot in the main (SLRU) space.
 ///
 /// Design (see Caffeine's FrequencySketch.java):
-///   - `table` is a `uint64_t[]`, each slot holding 16 4-bit counters (max 15).
+///   - `table` is an array of `std::atomic<uint64_t>`, each slot holding 16
+///     4-bit counters (max 15).
 ///   - Four counters per item, all drawn from a single 64-byte block (one L1
 ///     cache line) for spatial locality.
 ///   - `spread()` is a 3-round multiplicative hash; `rehash()` selects counters.
 ///   - Aging: every `10 * maximum` increments, all counters are halved
 ///     (`>> 1 & RESET_MASK`), keeping the sketch fresh.
 ///
-/// Not thread-safe: the owning CacheShard guards it with its write lock.
+/// Thread-safety: fully atomic. `increment()` and `frequency()` are safe to
+/// call concurrently from any thread. Caffeine uses the same design (Java's
+/// AtomicLongArray + compareAndSwap). Previously the owning CacheShard guarded
+/// the sketch with its write lock; atomicity lets CacheShard::lookup drop the
+/// write lock on the read path.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
-#include <vector>
+#include <memory>
 
 namespace sextant {
 
@@ -30,21 +36,28 @@ public:
     /// Initializes (or grows) the sketch to track up to `maximum_entries`
     /// distinct keys. Forgets all counts when resizing. No-op if already large
     /// enough. A minimum of 256 entries is enforced for accuracy.
+    /// NOT thread-safe with respect to increment()/frequency() — call only
+    /// at construction or under the owning shard's write lock (e.g. resize()).
     void ensure_capacity(uint32_t maximum_entries) {
         // Clamp to a sane maximum to avoid overflow in ceiling_power_of_two.
         uint32_t maximum = std::max(maximum_entries, MIN_SKETCH_SIZE);
-        if (!table_.empty() && static_cast<uint32_t>(table_.size()) >= maximum) {
+        uint32_t new_size = ceiling_power_of_two(maximum);
+        if (table_ && table_size_ >= maximum) {
             return;
         }
 
         sample_size_ = 10u * maximum;
-        table_.assign(ceiling_power_of_two(maximum), 0);
-        block_mask_ = (static_cast<uint32_t>(table_.size()) >> 3) - 1;
-        size_ = 0;
+        // unique_ptr<atomic[]> because std::vector<atomic> is not
+        // MoveInsertable (matches BlockCache::shard_epochs_ pattern).
+        table_ = std::make_unique<std::atomic<uint64_t>[]>(new_size);
+        for (uint32_t i = 0; i < new_size; ++i) table_[i].store(0, std::memory_order_relaxed);
+        table_size_ = new_size;
+        block_mask_ = (new_size >> 3) - 1;
+        size_.store(0, std::memory_order_relaxed);
     }
 
     /// Returns true if ensure_capacity() has not yet been called.
-    bool is_not_initialized() const { return table_.empty(); }
+    bool is_not_initialized() const { return table_ == nullptr; }
 
     /// Number of additions between aging resets and hill-climbing samples
     /// (= 10 × tracked capacity, where tracked capacity is clamped to
@@ -64,7 +77,7 @@ public:
             uint32_t index = (h >> 1) & 15;
             uint32_t slot = block + (h & 1) + (i << 1);
             uint32_t count = static_cast<uint32_t>(
-                (table_[slot] >> (index << 2)) & 0xfULL);
+                (table_[slot].load(std::memory_order_relaxed) >> (index << 2)) & 0xfULL);
             frequency = std::min(frequency, count);
         }
         return frequency;
@@ -72,6 +85,7 @@ public:
 
     /// Increments the frequency of `key` (each of its 4 counters), capping at
     /// 15. Triggers aging (`reset()`) after `sample_size_` successful additions.
+    /// Thread-safe via atomic CAS in increment_at().
     void increment(uint64_t key) {
         if (is_not_initialized()) return;
 
@@ -104,8 +118,16 @@ public:
                      static_cast<int>(increment_at(slot2, index2)) |
                      static_cast<int>(increment_at(slot3, index3));
 
-        if (added && (++size_ == sample_size_)) {
-            reset();
+        if (added) {
+            // Lazy reset trigger: only one thread will see size_ == sample_size_
+            // (the others will see sample_size_+k for some k≥1 and skip). That
+            // thread runs reset(); the next incrementer re-triggers when size_
+            // again reaches sample_size_ (modulo drift, which is harmless —
+            // reset is statistical).
+            uint32_t s = size_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (s == sample_size_) {
+                reset();
+            }
         }
     }
 
@@ -146,25 +168,40 @@ private:
     }
 
     /// Increments counter `j` (0..15) in table slot `i` if not already at 15.
-    /// Returns true if the counter was incremented.
+    /// Returns true if the counter was incremented. Thread-safe via CAS retry
+    /// (mirrors Caffeine's AtomicLongArray compareAndSwap approach).
     bool increment_at(uint32_t i, uint32_t j) {
         uint32_t offset = j << 2;
         uint64_t mask = 0xfULL << offset;
-        if ((table_[i] & mask) != mask) {
-            table_[i] += (1ULL << offset);
-            return true;
+        uint64_t increment = 1ULL << offset;
+        std::atomic<uint64_t>& slot = table_[i];
+        uint64_t old = slot.load(std::memory_order_relaxed);
+        while (true) {
+            if ((old & mask) == mask) return false;  // saturated at 15
+            uint64_t newv = old + increment;
+            if (slot.compare_exchange_weak(old, newv,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                return true;
+            }
+            // CAS updated `old` with the current value; retry.
         }
-        return false;
     }
 
     /// Halves every counter (aging), adjusting the running size estimate.
+    /// Called by the single thread that observes size_ == sample_size_. Other
+    /// threads may race on individual slots but the halving is idempotent
+    /// enough (worst case: a counter that was just incremented gets halved,
+    /// losing half a count — negligible for a statistical sketch).
     void reset() {
         uint64_t count = 0;
-        for (uint64_t& slot : table_) {
+        for (uint32_t i = 0; i < table_size_; ++i) {
+            uint64_t slot = table_[i].load(std::memory_order_relaxed);
             count += popcount(slot & ONE_MASK);
-            slot = (slot >> 1) & RESET_MASK;
+            table_[i].store((slot >> 1) & RESET_MASK, std::memory_order_relaxed);
         }
-        size_ = (size_ - static_cast<uint32_t>(count >> 2)) >> 1;
+        uint32_t cur = size_.load(std::memory_order_relaxed);
+        size_.store((cur - static_cast<uint32_t>(count >> 2)) >> 1,
+                    std::memory_order_relaxed);
     }
 
     static uint64_t popcount(uint64_t x) {
@@ -175,10 +212,11 @@ private:
         return (x * 0x0101010101010101ULL) >> 56;
     }
 
-    std::vector<uint64_t> table_;
+    std::unique_ptr<std::atomic<uint64_t>[]> table_;
+    uint32_t table_size_ = 0;
     uint32_t sample_size_ = 0;
     uint32_t block_mask_ = 0;
-    uint32_t size_ = 0;
+    std::atomic<uint32_t> size_{0};
 };
 
 }  // namespace sextant

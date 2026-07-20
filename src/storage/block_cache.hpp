@@ -103,9 +103,16 @@ struct LRUList {
 
 /// A single W-TinyLFU shard. BlockCache owns N of these.
 ///
-/// Locking contract: the caller MUST hold the shard's write lock
-/// (`ScopedWriteLock lock(shard.mutex())`) around every call to lookup(),
-/// insert(), and mark_dirty().
+/// Locking contract:
+///   - lookup() takes a READ lock (via ScopedReadLock). It no longer mutates
+///     LRU lists (the W-TinyLFU recency bump on hit was dropped — see
+///     CacheShard::lookup comment). The frequency sketch and profiling
+///     counters are atomic, so concurrent readers proceed in parallel.
+///   - insert() and mark_dirty() take a WRITE lock (via ScopedWriteLock).
+///     They mutate the LRU lists / entry fields.
+///   - maybe_adapt() (which reconciles the shard's window/protected sizes
+///     with the cache's atomic limits) runs only under the write lock, called
+///     from insert().
 ///
 /// The window / main split is **adaptive**, but the hill-climbing optimizer
 /// lives on the owning BlockCache (it aggregates samples across all
@@ -129,9 +136,15 @@ public:
     BlockBufferPool& pool() { return pool_; }
 
     /// Look up a block. Returns pointer to block data if hit, nullptr if miss.
-    /// Updates the frequency sketch on every call and promotes the entry
-    /// according to W-TinyLFU rules on a hit.
+    /// Updates the frequency sketch on every call. Read-locked internally —
+    /// safe to call concurrently from any thread.
     uint8_t* lookup(uint64_t block_idx);
+
+    /// Same as lookup() but assumes the caller already holds the shard's lock
+    /// (either read or write). Used by tests that batch insert+lookup under a
+    /// single write-lock scope to model atomic operations. Production code
+    /// should call lookup() instead.
+    uint8_t* lookup_unlocked(uint64_t block_idx);
 
     /// Insert a block (data is copied into the shard's own buffer). New blocks
     /// enter the window; overflow is subject to TinyLFU admission into main.

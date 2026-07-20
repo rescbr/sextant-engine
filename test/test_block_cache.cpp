@@ -22,8 +22,10 @@ TEST(ShardedLRU, BasicInsertLookup) {
     std::vector<uint8_t> data = make_block(42);
 
     auto& shard = cache.shard(0);
-    ScopedWriteLock lock(shard.mutex());
-    shard.insert(0, data.data(), kBlockSize);
+    {
+        ScopedWriteLock lock(shard.mutex());
+        shard.insert(0, data.data(), kBlockSize);
+    }
     uint8_t* ptr = shard.lookup(0);
     ASSERT_NE(nullptr, ptr);
     EXPECT_EQ(42, ptr[0]);
@@ -39,7 +41,6 @@ TEST(ShardedLRU, AtCapacityNoEviction) {
     // Route all inserts to a single shard by choosing indices that map there.
     // With 2 shards, even indices go to shard 0.
     auto& shard = cache.shard(0);
-    ScopedWriteLock lock(shard.mutex());
 
     for (uint64_t i = 0; i < 8; ++i) {
         std::vector<uint8_t> data = make_block(static_cast<uint8_t>(i));
@@ -80,11 +81,8 @@ TEST(ShardedLRU, EvictionRespectsCapacityAndFrequency) {
         }
     }
     // Touch block 0 a few times so it has high historic frequency.
-    {
-        ScopedWriteLock lock(shard.mutex());
-        for (int n = 0; n < 4; ++n) {
-            ASSERT_NE(nullptr, shard.lookup(0));
-        }
+    for (int n = 0; n < 4; ++n) {
+        ASSERT_NE(nullptr, shard.lookup(0));
     }
 
     // Flood with one-time blocks (indices 6, 8, 10, 12). These all have
@@ -100,11 +98,8 @@ TEST(ShardedLRU, EvictionRespectsCapacityAndFrequency) {
     // Capacity invariant: never more than 3 blocks resident. We can't read the
     // shard size directly, but we can confirm block 0 (high frequency) is
     // retained while at least one scan block was evicted.
-    {
-        ScopedWriteLock lock(shard.mutex());
-        EXPECT_NE(nullptr, shard.lookup(0))
-            << "high-frequency block 0 should survive the scan flood";
-    }
+    EXPECT_NE(nullptr, shard.lookup(0))
+        << "high-frequency block 0 should survive the scan flood";
 }
 
 // ---------------------------------------------------------------------------
@@ -121,12 +116,9 @@ TEST(ShardedLRU, InsertUpdatesExisting) {
         std::vector<uint8_t> b = make_block(2);
         shard.insert(0, b.data(), kBlockSize);  // overwrite
     }
-    {
-        ScopedWriteLock lock(shard.mutex());
-        uint8_t* p = shard.lookup(0);
-        ASSERT_NE(nullptr, p);
-        EXPECT_EQ(2, p[0]);
-    }
+    uint8_t* p = shard.lookup(0);
+    ASSERT_NE(nullptr, p);
+    EXPECT_EQ(2, p[0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -147,9 +139,12 @@ TEST(ShardedLRU, ConcurrentStress) {
             // Cycle through many block indices so they spread across shards.
             uint64_t idx = static_cast<uint64_t>(i);
             CacheShard& s = cache.shard(idx);
-            ScopedWriteLock lock(s.mutex());
+            // Read-then-write pattern: lookup takes its own read lock; insert
+            // (only on miss) takes the write lock. Models the production access
+            // pattern where multiple readers proceed in parallel.
             uint8_t* p = s.lookup(idx);
             if (p == nullptr) {
+                ScopedWriteLock lock(s.mutex());
                 p = s.insert(idx, data.data(), kBlockSize);
             }
             ASSERT_NE(nullptr, p);

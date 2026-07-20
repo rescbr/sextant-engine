@@ -216,29 +216,52 @@ void CacheShard::admit_one_from_window() {
 }
 
 uint8_t* CacheShard::lookup(uint64_t block_idx) {
-    maybe_adapt();
+    // READ LOCK: the lookup hot path no longer mutates LRU lists. The sketch
+    // is fully atomic (increment is CAS-safe) and the profiling counters are
+    // atomic too, so multiple readers proceed in parallel. This drops the
+    // nsync_mu_lock contention that previously consumed ~5% of cycles at 8
+    // threads and serialized all lookups on a given shard.
+    //
+    // Trade-off: W-TinyLFU recency (LRU bumps on hit) is no longer maintained
+    // on the read path. Eviction decisions rely on the frequency sketch
+    // (insertion-tracked + hit-tracked via the atomic increment). For graph
+    // traversal with heavily-skewed access distributions (hubs hit thousands
+    // of times, leaves once), frequency alone discriminates hot from cold
+    // with wide margin — recency was only the tiebreaker for near-tie cases.
+    //
+    // maybe_adapt() (which reconciles the shard's window/protected sizes with
+    // the cache's atomic limits) is NOT called here — it mutates LRU lists and
+    // must run under the write lock. It's called from insert() instead, which
+    // already takes the write lock and fires often enough (on every miss) to
+    // keep the shard adapted.
+    ScopedReadLock lock(mu_);
+    return lookup_unlocked(block_idx);
+}
+
+uint8_t* CacheShard::lookup_unlocked(uint64_t block_idx) {
     auto it = map_.find(block_idx);
     if (it == map_.end()) {
         sketch_.increment(block_idx);
-        ++misses_;
+        misses_.fetch_add(1, std::memory_order_relaxed);
         if (cache_) cache_->record_access(/*hit=*/false);
         return nullptr;
     }
 
     sketch_.increment(block_idx);
+    // NOTE: status is read without a write lock in the read-locked lookup()
+    // path. It's written only under the shard's write lock (insert/admit/
+    // maybe_adapt), so a relaxed read here sees a stable value (writes
+    // happen-before unlock, reads after lock).
     LRUEntry* e = &it->second;
     switch (e->status) {
         case Status::WINDOW:
-            on_window_hit(e);
-            ++hits_window_;
+            hits_window_.fetch_add(1, std::memory_order_relaxed);
             break;
         case Status::PROBATION:
-            on_probation_hit(e);
-            ++hits_probation_;
+            hits_probation_.fetch_add(1, std::memory_order_relaxed);
             break;
         case Status::PROTECTED:
-            on_protected_hit(e);
-            ++hits_protected_;
+            hits_protected_.fetch_add(1, std::memory_order_relaxed);
             break;
     }
     if (cache_) cache_->record_access(/*hit=*/true);

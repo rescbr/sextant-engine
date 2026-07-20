@@ -191,10 +191,13 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
         c.local_hits = c.local_misses = 0;
     }
 
-    // Step 1–2: check the requested block's shard under its write lock.
+    // Step 1–2: check the requested block's shard under a READ lock.
+    // lookup() is now read-only (LRU bumps dropped, sketch atomic, counters
+    // atomic) so multiple readers proceed in parallel. The write lock is still
+    // taken by insert() below for actual mutations.
     {
         CacheShard& shard = cache.shard(block_idx);
-        ScopedWriteLock lock(shard.mutex());
+        ScopedReadLock lock(shard.mutex());
         uint8_t* hit = shard.lookup(block_idx);
         if (hit) {
             // L2 hit — cache the L2-owned pointer (NO COPY). Re-read the
@@ -235,7 +238,7 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
         const uint64_t key_i = block_idx + i;
         CacheShard& shard = cache.shard(key_i);
         ScopedWriteLock lock(shard.mutex());
-        if (shard.lookup(key_i) != nullptr) {
+        if (shard.lookup_unlocked(key_i) != nullptr) {
             continue;  // raced — another thread cached it first
         }
         shard.insert(key_i, g_staging.data + i * block_size, block_size);
@@ -245,7 +248,7 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
     {
         CacheShard& shard = cache.shard(block_idx);
         ScopedWriteLock lock(shard.mutex());
-        uint8_t* stored = shard.lookup(block_idx);
+        uint8_t* stored = shard.lookup_unlocked(block_idx);
         // stored is non-null: we just inserted it in the loop above (or a
         // racing thread did). Fallback to a single-block read guards against
         // a pathological eviction between insert and lookup.

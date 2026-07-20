@@ -99,7 +99,7 @@ TEST(WTinyLFU, BasicInsertLookup) {
     auto& shard = cache.shard(0);
     ScopedWriteLock lock(shard.mutex());
     shard.insert(0, data.data(), kBlockSize);
-    uint8_t* ptr = shard.lookup(0);
+    uint8_t* ptr = shard.lookup_unlocked(0);
     ASSERT_NE(nullptr, ptr);
     EXPECT_EQ(42, ptr[0]);
 }
@@ -117,7 +117,7 @@ TEST(WTinyLFU, AtCapacityAllResident) {
         shard.insert(i * 2, data.data(), kBlockSize);
     }
     for (uint64_t i = 0; i < 8; ++i) {
-        uint8_t* p = shard.lookup(i * 2);
+        uint8_t* p = shard.lookup_unlocked(i * 2);
         ASSERT_NE(nullptr, p) << "block " << i << " evicted at capacity";
         EXPECT_EQ(static_cast<uint8_t>(i), p[0]);
     }
@@ -138,7 +138,7 @@ TEST(WTinyLFU, InsertUpdatesExisting) {
     }
     {
         ScopedWriteLock lock(shard.mutex());
-        uint8_t* p = shard.lookup(0);
+        uint8_t* p = shard.lookup_unlocked(0);
         ASSERT_NE(nullptr, p);
         EXPECT_EQ(2, p[0]);
     }
@@ -153,7 +153,7 @@ TEST(WTinyLFU, ZeroCapacityReturnsNull) {
     ScopedWriteLock lock(shard.mutex());
     std::vector<uint8_t> data = make_block(1);
     EXPECT_EQ(nullptr, shard.insert(0, data.data(), kBlockSize));
-    EXPECT_EQ(nullptr, shard.lookup(0));
+    EXPECT_EQ(nullptr, shard.lookup_unlocked(0));
 }
 
 // ===========================================================================
@@ -177,7 +177,7 @@ TEST(WTinyLFU, ScanResistance) {
         for (uint64_t k = 0; k < 4; ++k) {
             std::vector<uint8_t> data = make_block(static_cast<uint8_t>(k));
             shard.insert(k, data.data(), kBlockSize);
-            shard.lookup(k);
+            shard.lookup_unlocked(k);
         }
     }
 
@@ -193,7 +193,7 @@ TEST(WTinyLFU, ScanResistance) {
     // The entire working set must survive the scan.
     ScopedWriteLock lock(shard.mutex());
     for (uint64_t k = 0; k < 4; ++k) {
-        EXPECT_NE(nullptr, shard.lookup(k))
+        EXPECT_NE(nullptr, shard.lookup_unlocked(k))
             << "working-set block " << k << " evicted by scan";
     }
 }
@@ -224,7 +224,7 @@ TEST(WTinyLFU, FrequentBlockAdmittedOverOneTime) {
     {
         ScopedWriteLock lock(shard.mutex());
         for (int n = 0; n < 5; ++n) {
-            ASSERT_NE(nullptr, shard.lookup(0));
+            ASSERT_NE(nullptr, shard.lookup_unlocked(0));
         }
     }
     // Insert several one-time scan blocks; block 0 should survive.
@@ -237,7 +237,7 @@ TEST(WTinyLFU, FrequentBlockAdmittedOverOneTime) {
     }
     {
         ScopedWriteLock lock(shard.mutex());
-        EXPECT_NE(nullptr, shard.lookup(0))
+        EXPECT_NE(nullptr, shard.lookup_unlocked(0))
             << "hot block 0 should survive one-time inserts";
     }
 
@@ -263,7 +263,7 @@ TEST(WTinyLFU, CapacityNeverExceeded) {
         shard.insert(k, data.data(), kBlockSize);
         // Touch a "hot" range repeatedly.
         if (k % 7 == 0) {
-            for (uint64_t h = 0; h < 8; ++h) shard.lookup(h);
+            for (uint64_t h = 0; h < 8; ++h) shard.lookup_unlocked(h);
         }
     }
 
@@ -274,7 +274,7 @@ TEST(WTinyLFU, CapacityNeverExceeded) {
     // <= kCap (a shard cannot hold more than its capacity).
     uint32_t resident_tail = 0;
     for (uint64_t k = 200 - (kCap + 4); k < 200; ++k) {
-        if (shard.lookup(k) != nullptr) ++resident_tail;
+        if (shard.lookup_unlocked(k) != nullptr) ++resident_tail;
     }
     EXPECT_LE(resident_tail, kCap);
 }
@@ -308,7 +308,7 @@ TEST(WTinyLFU, AdmissionFallback) {
     // The cache should be full and all 4 blocks resident: none were rejected
     // because there was no distinct victim to lose against.
     for (uint64_t k = 0; k < 4; ++k) {
-        EXPECT_NE(nullptr, shard.lookup(k))
+        EXPECT_NE(nullptr, shard.lookup_unlocked(k))
             << "block " << k << " should be admitted at capacity (no victim)";
     }
 
@@ -356,7 +356,7 @@ TEST(WTinyLFU, AdaptiveConvergence) {
         {
             CacheShard& s = cache.shard(hot);
             ScopedWriteLock lock(s.mutex());
-            if (s.lookup(hot) == nullptr) {
+            if (s.lookup_unlocked(hot) == nullptr) {
                 s.insert(hot, data.data(), kBlockSize);
             }
         }
@@ -365,7 +365,7 @@ TEST(WTinyLFU, AdaptiveConvergence) {
         {
             CacheShard& s = cache.shard(scan);
             ScopedWriteLock lock(s.mutex());
-            if (s.lookup(scan) == nullptr) {
+            if (s.lookup_unlocked(scan) == nullptr) {
                 s.insert(scan, data.data(), kBlockSize);
             }
         }
