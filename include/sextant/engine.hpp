@@ -9,6 +9,7 @@
 #include <sextant/types.hpp>
 #include <sextant/vector_source.hpp>
 #include <sextant/config.hpp>
+#include <sextant/index.hpp>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -25,66 +26,11 @@ class FlatNodeStore;
 class PagedNodeStore;
 class MemGraph;
 
-/// Adaptive parameters resolved from dataset/machine properties (Issue 37).
-struct ResolvedParams {
-    uint16_t R = 64;
-    uint16_t L = 100;
-    uint16_t L_build = 100;
-    float alpha = 1.2f;
-    uint16_t pq_m = 32;
-    uint8_t pq_bits = 8;          ///< 0 = auto (resolved by reservoir probe in pass1)
-    float pq_max_distortion = 0.0f;   ///< 0 = default (1.20); max acceptable PQ distortion
-    uint32_t max_occlusion = 750;
-    MetricKind metric = MetricKind::L2Sq;
-    uint64_t build_ram_budget = 0;
-    uint32_t num_threads = 0;
-    uint32_t partition_count = 1; ///< Partition count (>1 → partitioned build)
-    float closure_factor = 1.033f;  ///< Shard overlap radius ratio
-    uint16_t n_entry_points = 16;   ///< K-means centroid count for entry-point selection
-    uint16_t n_search_entry_points = 4;  ///< Multi-start: top-M entry points per query
-    float target_recall = 0.0f;     ///< Recall target the index was built for (0 = unspecified). Drives search early-exit.
-    uint32_t early_exit_patience = 0;  ///< Search early-exit: terminate after N stalled pops post-convergence (0 = disabled; set by resolve_params when recall_target is set)
-    bool pq_anisotropy = false;  ///< PQ covariance-based anisotropic codebook training. Threaded into PqQuantizer::train.
-    bool pq_opq = false;          ///< OPQ PCA rotation. Threaded into PqQuantizer::train.
-};
-
-/// Estimation diagnostics produced by `Engine::estimate_config` (and the
-/// Estimator in the post-refactor world). Display-only — they do NOT influence
-/// the build (the inputs that drove the resolved params are already in
-/// `ResolvedParams`) and are NOT serialized to `.meta`. Kept in a separate
-/// struct so the build-input `ResolvedParams` stays pure.
-struct EstimationDiagnostics {
-    double median_lid = 0.0;       ///< MLE LID from probe truth (0 = unmeasured)
-    double avg_degree = 0.0;       ///< R̄ from mini-build (0 = unmeasured)
-    double clustering_coeff = 0.0; ///< clustering coefficient (0 = unmeasured)
-    double dead_end_frac = 0.0;    ///< fraction of nodes with degree ≤ 1
-};
-
-/// Result of `Engine::estimate_config`: resolved build inputs + the measured
-/// signals that informed them (for display / `--explain`).
-struct EstimateResult {
-    ResolvedParams params;
-    EstimationDiagnostics diag;
-};
-
-/// Structural properties of a built graph, measured for parameter estimation.
-struct GraphStats {
-    double avg_degree = 0.0;       ///< mean post-prune degree (R̄)
-    double clustering_coeff = 0.0; ///< sampled triangle fraction
-    double dead_end_frac = 0.0;    ///< fraction of nodes with degree ≤ 1
-    double median_lid = 0.0;       ///< MLE LID from k-NN distances
-};
-
-/// Auto-resolve parameters from dataset properties + machine properties.
-/// If any field in `overrides` is non-zero/non-default, it takes precedence.
-ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
-                               const BuildConfig& overrides);
-
 /// The Sextant engine. Owns the index state.
 class Engine {
 public:
-    Engine();
-    ~Engine();
+    Engine() = default;
+    ~Engine() = default;
 
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
@@ -184,12 +130,12 @@ public:
     /// on observed hit/miss ratios. Must be called before open(); zero overhead
     /// when the index is not paged or when disabled.
     void set_cache_rebalance_enabled(bool enabled) { cache_rebalance_enabled_ = enabled; }
-    uint64_t count() const { return count_; }
-    Dim dim() const { return dim_; }
+    uint64_t count() const { return index_ ? index_->count : 0; }
+    Dim dim() const { return index_ ? index_->dim : 0; }
 
     /// True when the engine is in SSD-resident (paged) mode — flat RAM buffers
     /// are NOT loaded. Used by tests to verify the low-idle-RAM invariant.
-    bool is_paged() const { return paged_store_ != nullptr; }
+    bool is_paged() const { return index_ && index_->is_paged(); }
 
     /// Cache diagnostics (only valid when is_paged()).
     uint64_t cache_graph_reads() const;
@@ -216,33 +162,16 @@ public:
     /// Number of nodes held in the MemGraph neighborhood cache (0 if none).
     uint32_t memgraph_cached_count() const;
     /// True when flat buffers are resident in RAM (build or post-insert).
-    bool has_flat_buffers() const { return nodes_buffer_ != nullptr; }
+    bool has_flat_buffers() const { return index_ && index_->has_flat_buffers(); }
 
 private:
     bool opened_ = false;
-    std::string index_path_;
-    uint64_t count_ = 0;
-    Dim dim_ = 0;
+    std::string index_path_;  ///< Set by open()/build() before index_ exists.
+    std::unique_ptr<Index> index_;
 
-    std::unique_ptr<PqQuantizer> quantizer_;
-    std::unique_ptr<VamanaCore> core_;
-
-    // Flat-in-RAM build buffers (owned by Engine during build).
-    uint8_t* codes_buffer_ = nullptr;   // count × code_size
-    uint8_t* nodes_buffer_ = nullptr;   // count × node_size
-    float16_t* raw_vecs_buffer_ = nullptr; // count × dim, FP16 (build prune)
+    // Build-only scratch (not part of the post-build Index handoff).
     std::vector<float> entry_centroids_;  // k × dim, FP32 (k-means centroids for entry points)
-    uint32_t code_size_ = 0;
-    uint32_t node_size_ = 0;
 
-    // NodeStore backings. flat_store_ wraps the flat buffers (build + insert).
-    // paged_store_ is the SSD-resident search backend. At most one is active
-    // on the core at a time. memgraph_ sits atop paged_store_ when paged search
-    // is active — it caches the entry-point BFS neighborhood in RAM and
-    // delegates cold nodes to paged_store_.
-    std::unique_ptr<FlatNodeStore> flat_store_;
-    std::unique_ptr<PagedNodeStore> paged_store_;
-    std::unique_ptr<MemGraph> memgraph_;
     uint64_t cache_size_override_ = 0;  ///< 0 = auto
 
     // Adaptive cache rebalance (paged mode only).
@@ -254,11 +183,6 @@ private:
     uint64_t rebalance_cadence_ = kRebalanceCadenceInitial;
     /// Private: per-search adaptive rebalance hook.
     void maybe_rebalance_();
-
-    /// Params loaded by open() (used by flush() to persist post-insert state).
-    /// Only meaningful when opened_ && params_loaded_.
-    ResolvedParams loaded_params_;
-    bool params_loaded_ = false;
 
     /// Build helpers.
     /// pass1 fills the reservoir, resolves pq_bits (if auto, via global probe),

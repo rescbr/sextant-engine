@@ -107,6 +107,7 @@ engine_sources = [
     'src/engine/resolve_params.cpp',
     'src/engine/search.cpp',
     'src/engine/engine.cpp',
+    'src/engine/index.cpp',
     'src/engine/fbin_source.cpp',
     'src/engine/partition.cpp',
     'src/logging.cpp',

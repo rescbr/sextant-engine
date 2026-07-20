@@ -5,7 +5,7 @@
 //   1. resolve_params (auto-defaults from N, dim)
 //   2. allocate flat codes + nodes buffers
 //   3. Pass 1: reservoir sample (256K) + PQ train
-//   4. Pass 2: encode all vectors → codes_buffer_
+//   4. Pass 2: encode all vectors → index_->codes_buffer
 //   5. Parallel HDC construct via CTPL (disjoint node ranges)
 //   6. Finalize: compute_entry_points
 //   7. Flush sidecars (.graph/.codes/.meta/.manifest)
@@ -154,18 +154,9 @@ std::vector<uint32_t> compute_bfs_order(
 }  // namespace
 
 // ===========================================================================
-// Construction / destruction
+// Construction / destruction: defaults (header). Engine is a thin orchestrator
+// over Index; the destructor is trivial because Index owns the heavy state.
 // ===========================================================================
-
-Engine::Engine() {
-    // Default logger is spdlog's global; callers may init_logging() first.
-}
-
-Engine::~Engine() {
-    if (codes_buffer_) aligned_free(codes_buffer_);
-    if (nodes_buffer_) aligned_free(nodes_buffer_);
-    if (raw_vecs_buffer_) aligned_free(raw_vecs_buffer_);
-}
 
 // ===========================================================================
 // build()
@@ -175,27 +166,30 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
                           const BuildConfig& config) {
     // Resolve params, then forward to the ResolvedParams overload which does
     // the count/dim/index_path setup, build_partitioned, and timing.
-    count_ = source.count();
-    dim_ = source.dim();
-    return build(source, index_path, resolve_params(count_, dim_, config));
+    if (!index_) index_ = std::make_unique<Index>();
+    index_->count = source.count();
+    index_->dim = source.dim();
+    return build(source, index_path, resolve_params(index_->count, index_->dim, config));
 }
 
 BuildResult Engine::build(VectorSource& source, const std::string& index_path,
                           const ResolvedParams& params) {
     const auto t0 = std::chrono::steady_clock::now();
 
-    count_ = source.count();
-    dim_ = source.dim();
-    if (count_ == 0) {
+    if (!index_) index_ = std::make_unique<Index>();
+    index_->count = source.count();
+    index_->dim = source.dim();
+    if (index_->count == 0) {
         throw Error(ErrorCode::InvalidParam, "Engine::build: source is empty");
     }
-    if (dim_ == 0) {
+    if (index_->dim == 0) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::build: source has dim=0");
     }
     index_path_ = index_path;
+    index_->path = index_path;
 
-    spdlog::info("[sextant] build: n={} dim={} → '{}'", count_, dim_,
+    spdlog::info("[sextant] build: n={} dim={} → '{}'", index_->count, index_->dim,
                  index_path);
 
     auto result = build_partitioned(source, index_path, params);
@@ -891,12 +885,12 @@ void Engine::pass1_sample_and_train(VectorSource& source,
 
     // Reservoir sampling (Algorithm R). We sample floats directly.
     const uint64_t sample_cap =
-        std::min<uint64_t>(kSampleTarget, count_);
+        std::min<uint64_t>(kSampleTarget, index_->count);
     if (sample_cap == 0) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::pass1: cannot sample from empty source");
     }
-    std::vector<float> reservoir(static_cast<size_t>(sample_cap) * dim_);
+    std::vector<float> reservoir(static_cast<size_t>(sample_cap) * index_->dim);
     uint64_t actual_sample = 0;
     uint64_t seen = 0;
 
@@ -918,17 +912,17 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     const std::string src_path = source.path();
     constexpr uint64_t kSeekRatioThreshold = 30;
     const bool seek_eligible = !src_path.empty() &&
-                               count_ > kSeekRatioThreshold * sample_cap;
+                               index_->count > kSeekRatioThreshold * sample_cap;
 
     if (seek_eligible) {
         spdlog::info("[sextant] pass 1: seek-based sampling ({} of {} vectors; "
-                     "ratio {:.1f}:1, threshold {}:1)", sample_cap, count_,
-                     static_cast<double>(count_) /
+                     "ratio {:.1f}:1, threshold {}:1)", sample_cap, index_->count,
+                     static_cast<double>(index_->count) /
                          static_cast<double>(sample_cap),
                      kSeekRatioThreshold);
-        reservoir = draw_random_sample(src_path, count_, dim_, sample_cap);
+        reservoir = draw_random_sample(src_path, index_->count, index_->dim, sample_cap);
         actual_sample = sample_cap;
-        seen = count_;
+        seen = index_->count;
     } else {
         spdlog::info("[sextant] pass 1: reservoir sample (target {} vectors)",
                      kSampleTarget);
@@ -981,16 +975,16 @@ void Engine::pass1_sample_and_train(VectorSource& source,
         if (!got) break;
         const auto t_c0 = std::chrono::steady_clock::now();
         for (uint32_t r = 0; r < chunk.count; r++) {
-            const float* vec = chunk.vectors + static_cast<size_t>(r) * dim_;
+            const float* vec = chunk.vectors + static_cast<size_t>(r) * index_->dim;
             if (filled < sample_cap) {
-                std::memcpy(reservoir.data() + filled * dim_, vec,
-                            dim_ * sizeof(float));
+                std::memcpy(reservoir.data() + filled * index_->dim, vec,
+                            index_->dim * sizeof(float));
                 filled++;
             } else {
                 const uint64_t j = rng() % (seen + 1);
                 if (j < sample_cap) {
-                    std::memcpy(reservoir.data() + j * dim_, vec,
-                                dim_ * sizeof(float));
+                    std::memcpy(reservoir.data() + j * index_->dim, vec,
+                                index_->dim * sizeof(float));
                 }
             }
             seen++;
@@ -1030,15 +1024,15 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     }
 
     // Construct + train the quantizer at the resolved params.
-    quantizer_ = std::make_unique<PqQuantizer>(
-        params.metric, dim_, pq_m, pq_bits);
+    index_->quantizer = std::make_unique<PqQuantizer>(
+        params.metric, index_->dim, pq_m, pq_bits);
     if (params.pq_anisotropy) {
-        quantizer_->set_anisotropy(1.0f);
+        index_->quantizer->set_anisotropy(1.0f);
     }
     if (params.pq_opq) {
-        quantizer_->enable_opq();
+        index_->quantizer->enable_opq();
     }
-    code_size_ = quantizer_->code_size();
+    index_->code_size = index_->quantizer->code_size();
     std::string aniso_note;
     if (params.pq_anisotropy) {
         aniso_note = std::string(", anisotropy=on (covariance-based)");
@@ -1048,8 +1042,8 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     }
     spdlog::info("[sextant] pass 1: training PQ (m={}, bits={}{}) on {} samples",
                  pq_m, pq_bits, aniso_note, actual_sample);
-    quantizer_->train(reservoir.data(), actual_sample);
-    spdlog::info("[sextant] pass 1: PQ trained (code_size={})", code_size_);
+    index_->quantizer->train(reservoir.data(), actual_sample);
+    spdlog::info("[sextant] pass 1: PQ trained (code_size={})", index_->code_size);
 
     // Compute global k-means centroids for entry-point selection (EP-2).
     // Run on the FP32 reservoir (precise; the reservoir is alive here and
@@ -1058,23 +1052,23 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     if (actual_sample >= params.n_entry_points) {
         const uint32_t k = std::min<uint32_t>(params.n_entry_points,
                                               static_cast<uint32_t>(actual_sample));
-        entry_centroids_.resize(static_cast<size_t>(k) * dim_);
+        entry_centroids_.resize(static_cast<size_t>(k) * index_->dim);
         // Adapt k-means++ + Lloyd from pq_quantizer.cpp (generic algorithm).
         // Inline implementation to avoid cross-module linkage issues.
         std::mt19937_64 rng(0xC0DE1234ULL);
         // k-means++ seeding.
         {
-            entry_centroids_.assign(static_cast<size_t>(k) * dim_, 0.0f);
+            entry_centroids_.assign(static_cast<size_t>(k) * index_->dim, 0.0f);
             std::memcpy(entry_centroids_.data(), reservoir.data(),
-                        static_cast<size_t>(dim_) * sizeof(float));
+                        static_cast<size_t>(index_->dim) * sizeof(float));
             std::vector<float> min_d2(actual_sample,
                                       std::numeric_limits<float>::max());
             for (uint32_t c = 1; c < k; c++) {
-                const float* prev = entry_centroids_.data() + static_cast<size_t>(c - 1) * dim_;
+                const float* prev = entry_centroids_.data() + static_cast<size_t>(c - 1) * index_->dim;
                 for (uint64_t i = 0; i < actual_sample; i++) {
                     double d = 0.0;
-                    const float* v = reservoir.data() + static_cast<size_t>(i) * dim_;
-                    for (uint32_t dd = 0; dd < dim_; dd++) {
+                    const float* v = reservoir.data() + static_cast<size_t>(i) * index_->dim;
+                    for (uint32_t dd = 0; dd < index_->dim; dd++) {
                         const double diff = double(v[dd]) - double(prev[dd]);
                         d += diff * diff;
                     }
@@ -1082,9 +1076,9 @@ void Engine::pass1_sample_and_train(VectorSource& source,
                 }
                 std::discrete_distribution<uint64_t> dist(min_d2.begin(), min_d2.end());
                 const uint64_t picked = dist(rng);
-                std::memcpy(entry_centroids_.data() + static_cast<size_t>(c) * dim_,
-                            reservoir.data() + static_cast<size_t>(picked) * dim_,
-                            static_cast<size_t>(dim_) * sizeof(float));
+                std::memcpy(entry_centroids_.data() + static_cast<size_t>(c) * index_->dim,
+                            reservoir.data() + static_cast<size_t>(picked) * index_->dim,
+                            static_cast<size_t>(index_->dim) * sizeof(float));
             }
         }
         // Lloyd iterations (10).
@@ -1092,13 +1086,13 @@ void Engine::pass1_sample_and_train(VectorSource& source,
         for (uint32_t iter = 0; iter < 10; iter++) {
             // Assign.
             for (uint64_t i = 0; i < actual_sample; i++) {
-                const float* v = reservoir.data() + static_cast<size_t>(i) * dim_;
+                const float* v = reservoir.data() + static_cast<size_t>(i) * index_->dim;
                 float best = std::numeric_limits<float>::infinity();
                 uint32_t best_c = 0;
                 for (uint32_t c = 0; c < k; c++) {
-                    const float* cen = entry_centroids_.data() + static_cast<size_t>(c) * dim_;
+                    const float* cen = entry_centroids_.data() + static_cast<size_t>(c) * index_->dim;
                     double d = 0.0;
-                    for (uint32_t dd = 0; dd < dim_; dd++) {
+                    for (uint32_t dd = 0; dd < index_->dim; dd++) {
                         const double diff = double(v[dd]) - double(cen[dd]);
                         d += diff * diff;
                     }
@@ -1107,19 +1101,19 @@ void Engine::pass1_sample_and_train(VectorSource& source,
                 assign[i] = best_c;
             }
             // Update.
-            std::vector<double> sum(static_cast<size_t>(k) * dim_, 0.0);
+            std::vector<double> sum(static_cast<size_t>(k) * index_->dim, 0.0);
             std::vector<uint64_t> cnt(k, 0);
             for (uint64_t i = 0; i < actual_sample; i++) {
-                const float* v = reservoir.data() + static_cast<size_t>(i) * dim_;
-                double* s = sum.data() + static_cast<size_t>(assign[i]) * dim_;
-                for (uint32_t dd = 0; dd < dim_; dd++) s[dd] += double(v[dd]);
+                const float* v = reservoir.data() + static_cast<size_t>(i) * index_->dim;
+                double* s = sum.data() + static_cast<size_t>(assign[i]) * index_->dim;
+                for (uint32_t dd = 0; dd < index_->dim; dd++) s[dd] += double(v[dd]);
                 cnt[assign[i]]++;
             }
             for (uint32_t c = 0; c < k; c++) {
-                float* cen = entry_centroids_.data() + static_cast<size_t>(c) * dim_;
+                float* cen = entry_centroids_.data() + static_cast<size_t>(c) * index_->dim;
                 if (cnt[c] > 0) {
-                    const double* s = sum.data() + static_cast<size_t>(c) * dim_;
-                    for (uint32_t dd = 0; dd < dim_; dd++)
+                    const double* s = sum.data() + static_cast<size_t>(c) * index_->dim;
+                    for (uint32_t dd = 0; dd < index_->dim; dd++)
                         cen[dd] = float(s[dd] / double(cnt[c]));
                 }
             }
@@ -1130,7 +1124,7 @@ void Engine::pass1_sample_and_train(VectorSource& source,
 }
 
 // ===========================================================================
-// Pass 2: encode all vectors → codes_buffer_
+// Pass 2: encode all vectors → index_->codes_buffer
 // ===========================================================================
 
 void Engine::pass2_encode(VectorSource& source,
@@ -1139,11 +1133,11 @@ void Engine::pass2_encode(VectorSource& source,
                                   ? params.num_threads
                                   : std::thread::hardware_concurrency();
 
-    spdlog::info("[sextant] pass 2: encoding {} vectors ({} threads)", count_,
+    spdlog::info("[sextant] pass 2: encoding {} vectors ({} threads)", index_->count,
                  nthreads);
 
     // Streaming encode: pull vectors one chunk at a time and parallel-encode
-    // each chunk directly into codes_buffer_ at the vector's row_id slot.
+    // each chunk directly into index_->codes_buffer at the vector's row_id slot.
     // This avoids materializing the full dataset into a transient flat buffer
     // (peak RAM is now chunk_size × dim × 4, not N × dim × 4).
     source.reset();
@@ -1156,23 +1150,23 @@ void Engine::pass2_encode(VectorSource& source,
 
         // Parallel encode with atomic-counter work-stealing (same pattern as
         // parallel_construct). Each thread encodes disjoint row_ids into the
-        // appropriate slot of codes_buffer_. encode() is const (reads only the
+        // appropriate slot of index_->codes_buffer. encode() is const (reads only the
         // codebook, writes only its disjoint output slot) → thread-safe.
         std::atomic<uint32_t> next_r{0};
         auto worker = [this, &chunk, chunk_n, &next_r]() {
-            const PqQuantizer& q = *quantizer_;
+            const PqQuantizer& q = *index_->quantizer;
             uint32_t r;
             while ((r = next_r.fetch_add(1, std::memory_order_relaxed))
                    < chunk_n) {
                 const RowId rid = chunk.row_ids[r];
-                if (rid < 0 || static_cast<uint64_t>(rid) >= count_) {
+                if (rid < 0 || static_cast<uint64_t>(rid) >= index_->count) {
                     throw Error(ErrorCode::InvalidParam,
                                 "Engine::pass2: row_id out of range");
                 }
                 const float* vec =
-                    chunk.vectors + static_cast<size_t>(r) * dim_;
+                    chunk.vectors + static_cast<size_t>(r) * index_->dim;
                 q.encode(vec,
-                         codes_buffer_ + static_cast<size_t>(rid) * code_size_);
+                         index_->codes_buffer + static_cast<size_t>(rid) * index_->code_size);
             }
         };
 
@@ -1193,12 +1187,12 @@ void Engine::pass2_encode(VectorSource& source,
 // ===========================================================================
 
 void Engine::parallel_construct(const ResolvedParams& params) {
-    const uint32_t n = static_cast<uint32_t>(count_);
+    const uint32_t n = static_cast<uint32_t>(index_->count);
     const uint32_t nthreads = params.num_threads > 0
                                   ? params.num_threads
                                   : std::thread::hardware_concurrency();
-    const uint32_t lut_sz = quantizer_ ? quantizer_->lut_size() : 0;
-    construct_into(*core_, n,
+    const uint32_t lut_sz = index_->quantizer ? index_->quantizer->lut_size() : 0;
+    construct_into(*index_->core, n,
                    [](uint32_t id) { return static_cast<RowId>(id); },
                    lut_sz, nthreads, "construct");
 }
@@ -1307,7 +1301,7 @@ void Engine::construct_into(VamanaCore& core, uint32_t count,
 // Partitioned build (Step 11)
 //
 // Phases:
-//   1. Global PQ train + encode all vectors → codes_buffer_ (global codebook).
+//   1. Global PQ train + encode all vectors → index_->codes_buffer (global codebook).
 //   2. K-means on PQ codes → K shards with closure_factor overlap.
 //   3. Per-shard build: each shard builds at R_shard = 2R/3, referencing a
 //      contiguous copy of its members' PQ codes. Nodes store GLOBAL row_ids.
@@ -1327,40 +1321,40 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // matter more than marginal quality at large scale.
 
     spdlog::info("[sextant] build: N={} K={} closure_factor={:.4f}",
-                 count_, params.partition_count, params.closure_factor);
+                 index_->count, params.partition_count, params.closure_factor);
 
     // --- 1. Quantizer (global): train via pass1 (resolves pq_bits if auto) ---
     // pass1 fills the reservoir, runs the global probe if pq_bits==0, then
-    // constructs + trains the quantizer. After it, code_size_ is valid.
+    // constructs + trains the quantizer. After it, index_->code_size is valid.
     pass1_sample_and_train(source, params);
 
     // node_size for the build buffer (flat neighbor lists).
-    // Shards build at R_shard, but the merged result lands in nodes_buffer_
+    // Shards build at R_shard, but the merged result lands in index_->nodes_buffer
     // at full R.
-    node_size_ = VamanaCore::static_node_size(params.R, code_size_);
+    index_->node_size = VamanaCore::static_node_size(params.R, index_->code_size);
 
     // Allocate global flat buffers.
     {
-        const size_t codes_bytes = static_cast<size_t>(count_) * code_size_;
-        const size_t nodes_bytes = static_cast<size_t>(count_) * node_size_;
-        codes_buffer_ = static_cast<uint8_t*>(
+        const size_t codes_bytes = static_cast<size_t>(index_->count) * index_->code_size;
+        const size_t nodes_bytes = static_cast<size_t>(index_->count) * index_->node_size;
+        index_->codes_buffer = static_cast<uint8_t*>(
             aligned_alloc(kDiskAlign, codes_bytes));
-        nodes_buffer_ = static_cast<uint8_t*>(
+        index_->nodes_buffer = static_cast<uint8_t*>(
             aligned_alloc(kDiskAlign, nodes_bytes));
-        if (!codes_buffer_ || !nodes_buffer_) {
+        if (!index_->codes_buffer || !index_->nodes_buffer) {
             throw Error(ErrorCode::OutOfMemory,
                         "build_partitioned: buffer alloc failed");
         }
-        std::memset(codes_buffer_, 0, codes_bytes);
-        std::memset(nodes_buffer_, 0, nodes_bytes);
+        std::memset(index_->codes_buffer, 0, codes_bytes);
+        std::memset(index_->nodes_buffer, 0, nodes_bytes);
 #ifdef __linux__
         // Same THP hint as the single-partition build path (see Engine::build).
-        if (codes_bytes > 0 && madvise(codes_buffer_, codes_bytes,
+        if (codes_bytes > 0 && madvise(index_->codes_buffer, codes_bytes,
                                        MADV_HUGEPAGE) != 0) {
             spdlog::debug("[sextant] huge pages unavailable for codes buffer "
                           "(partitioned), using standard pages");
         }
-        if (nodes_bytes > 0 && madvise(nodes_buffer_, nodes_bytes,
+        if (nodes_bytes > 0 && madvise(index_->nodes_buffer, nodes_bytes,
                                        MADV_HUGEPAGE) != 0) {
             spdlog::debug("[sextant] huge pages unavailable for nodes buffer "
                           "(partitioned), using standard pages");
@@ -1372,7 +1366,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // PqQuantizer builds it during train() in pass1.
     pass2_encode(source, params);
 
-    const uint32_t n = static_cast<uint32_t>(count_);
+    const uint32_t n = static_cast<uint32_t>(index_->count);
 
     // Load raw vectors as FP16 for the FP16 prune. Used by BOTH K=1 (full
     // graph) and K>1 (per-shard copy). They enable the FP16 prune (exact FP16
@@ -1381,12 +1375,12 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // conversion.
     {
         const size_t vecs_bytes =
-            static_cast<size_t>(count_) * dim_ * sizeof(float16_t);
-        raw_vecs_buffer_ = static_cast<float16_t*>(
+            static_cast<size_t>(index_->count) * index_->dim * sizeof(float16_t);
+        index_->raw_vecs_buffer = static_cast<float16_t*>(
             aligned_alloc(kDiskAlign, vecs_bytes));
-        if (!raw_vecs_buffer_) {
+        if (!index_->raw_vecs_buffer) {
             throw Error(ErrorCode::OutOfMemory,
-                        "build_partitioned: raw_vecs_buffer_ alloc failed");
+                        "build_partitioned: index_->raw_vecs_buffer alloc failed");
         }
         spdlog::info("[sextant] loading raw vectors as FP16 ({:.1f}MB) for "
                       "HDC (FP16 prune)",
@@ -1397,12 +1391,12 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         while (source.next(chunk)) {
             for (uint32_t r = 0; r < chunk.count; r++) {
                 const RowId rid = chunk.row_ids[r];
-                if (rid >= 0 && static_cast<uint64_t>(rid) < count_) {
-                    float16_t* dst = raw_vecs_buffer_ +
-                                  static_cast<size_t>(rid) * dim_;
+                if (rid >= 0 && static_cast<uint64_t>(rid) < index_->count) {
+                    float16_t* dst = index_->raw_vecs_buffer +
+                                  static_cast<size_t>(rid) * index_->dim;
                     const float* src = chunk.vectors +
-                                       static_cast<size_t>(r) * dim_;
-                    for (uint32_t d = 0; d < dim_; d++) {
+                                       static_cast<size_t>(r) * index_->dim;
+                    for (uint32_t d = 0; d < index_->dim; d++) {
                         dst[d] = static_cast<float16_t>(src[d]);
                     }
                     loaded++;
@@ -1422,33 +1416,33 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     if (params.partition_count == 1) {
         // K==1 full-graph build core (flat build layout).
         VamanaParams vp_full =
-            VamanaParams::from_resolved(params, dim_);
+            VamanaParams::from_resolved(params, index_->dim);
 
-        core_ = std::make_unique<VamanaCore>(vp_full, *quantizer_);
-        core_->set_build_codes(codes_buffer_, n);
-        core_->set_build_nodes(nodes_buffer_);
-        core_->prepare_for_build(n);
+        index_->core = std::make_unique<VamanaCore>(vp_full, *index_->quantizer);
+        index_->core->set_build_codes(index_->codes_buffer, n);
+        index_->core->set_build_nodes(index_->nodes_buffer);
+        index_->core->prepare_for_build(n);
 
         // FlatNodeStore over the flat buffers so beam_search (used in
         // insert_build_from_code) goes through the store interface.
-        flat_store_ = std::make_unique<FlatNodeStore>(
-            nodes_buffer_, codes_buffer_, node_size_, code_size_);
-        core_->set_store(flat_store_.get());
+        index_->flat_store = std::make_unique<FlatNodeStore>(
+            index_->nodes_buffer, index_->codes_buffer, index_->node_size, index_->code_size);
+        index_->core->set_store(index_->flat_store.get());
 
-        core_->set_build_vecs(raw_vecs_buffer_);
+        index_->core->set_build_vecs(index_->raw_vecs_buffer);
 
         parallel_construct(params);
 
         // Raw vectors are no longer needed after construct (for K=1).
-        core_->set_build_vecs(nullptr);
+        index_->core->set_build_vecs(nullptr);
     } else {
     // =====================================================================
     // K>1 partitioned path: partition → per-shard build (R_shard=2R/3) → merge.
     // =====================================================================
 
     // --- 2. Partition via k-means on PQ codes ---
-    auto assignment = partition_codes(*quantizer_, codes_buffer_, n,
-                                      code_size_, params.partition_count,
+    auto assignment = partition_codes(*index_->quantizer, index_->codes_buffer, n,
+                                      index_->code_size, params.partition_count,
                                       params.closure_factor);
     const uint32_t K = static_cast<uint32_t>(assignment.shards.size());
 
@@ -1461,7 +1455,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                  params.R);
 
     const uint32_t shard_node_size =
-        VamanaCore::static_node_size(R_shard, code_size_);
+        VamanaCore::static_node_size(R_shard, index_->code_size);
 
     // Store each shard's node buffer + local→global map for the merge.
     std::vector<std::vector<uint8_t>> shard_node_bufs(K);
@@ -1470,7 +1464,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // Build a single VamanaParams template; R/L per shard.
     // R_shard is the per-shard degree (2R/3); flat build layout.
     VamanaParams vp_shard =
-        VamanaParams::from_resolved(params, dim_, R_shard);
+        VamanaParams::from_resolved(params, index_->dim, R_shard);
 
     for (uint32_t k = 0; k < K; k++) {
         auto& members = assignment.shards[k];
@@ -1483,29 +1477,29 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                      "{} threads)",
                      k, K, shard_n,
                      (static_cast<double>(shard_n) *
-                          (code_size_ + shard_node_size +
-                           static_cast<size_t>(dim_) * sizeof(float16_t))) /
+                          (index_->code_size + shard_node_size +
+                           static_cast<size_t>(index_->dim) * sizeof(float16_t))) /
                          1e6,
                      params.num_threads);
 
         // Contiguous shard codes: local index i → members[i]'s global code.
         std::vector<uint8_t> shard_codes(
-            static_cast<size_t>(shard_n) * code_size_, 0);
+            static_cast<size_t>(shard_n) * index_->code_size, 0);
         // Contiguous shard FP16 vectors: same mapping, for the FP16 prune.
         std::vector<float16_t> shard_vecs(
-            static_cast<size_t>(shard_n) * dim_, 0);
+            static_cast<size_t>(shard_n) * index_->dim, 0);
         shard_local_to_global[k].resize(shard_n);
         for (uint32_t i = 0; i < shard_n; i++) {
             const uint32_t gid = members[i];
             shard_local_to_global[k][i] = gid;
             std::memcpy(shard_codes.data() +
-                            static_cast<size_t>(i) * code_size_,
-                        codes_buffer_ + static_cast<size_t>(gid) * code_size_,
-                        code_size_);
+                            static_cast<size_t>(i) * index_->code_size,
+                        index_->codes_buffer + static_cast<size_t>(gid) * index_->code_size,
+                        index_->code_size);
             std::memcpy(shard_vecs.data() +
-                            static_cast<size_t>(i) * dim_,
-                        raw_vecs_buffer_ + static_cast<size_t>(gid) * dim_,
-                        dim_ * sizeof(float16_t));
+                            static_cast<size_t>(i) * index_->dim,
+                        index_->raw_vecs_buffer + static_cast<size_t>(gid) * index_->dim,
+                        index_->dim * sizeof(float16_t));
         }
 
         // Shard node buffer (aligned for direct-IO reuse).
@@ -1516,7 +1510,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         uint8_t* shard_codes_ptr = shard_codes.data();
 
         // Build a fresh VamanaCore for this shard.
-        VamanaCore core(vp_shard, *quantizer_);
+        VamanaCore core(vp_shard, *index_->quantizer);
         core.set_build_codes(shard_codes_ptr, shard_n);
         core.set_build_nodes(shard_nodes);
         core.set_build_vecs(shard_vecs.data());
@@ -1524,7 +1518,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
 
         // Parallel construct via the canonical loop (chunked work-stealing,
         // T5 dynamic L_build, progress logger). Row IDs remapped to global.
-        const uint32_t shard_lut_sz = quantizer_ ? quantizer_->lut_size() : 0;
+        const uint32_t shard_lut_sz = index_->quantizer ? index_->quantizer->lut_size() : 0;
         const uint32_t nthreads = params.num_threads > 0
                                       ? params.num_threads
                                       : std::thread::hardware_concurrency();
@@ -1582,12 +1576,12 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         }
     }
 
-    // (c) Dedup + truncate to R by PQ distance, write to nodes_buffer_.
+    // (c) Dedup + truncate to R by PQ distance, write to index_->nodes_buffer.
     std::vector<uint32_t> seen(n, 0);
     uint32_t visit_token = 0;
     for (uint32_t gid = 0; gid < n; gid++) {
         uint8_t* out_node =
-            nodes_buffer_ + static_cast<size_t>(gid) * node_size_;
+            index_->nodes_buffer + static_cast<size_t>(gid) * index_->node_size;
         std::memset(out_node, 0,
                     kNeighborArrayOffset +
                         static_cast<size_t>(params.R) * sizeof(uint32_t));
@@ -1599,18 +1593,18 @@ BuildResult Engine::build_partitioned(VectorSource& source,
          std::vector<std::pair<float, uint32_t>> cands;
          cands.reserve(adj[gid].size());
          const float16_t* my_vec =
-             raw_vecs_buffer_ + static_cast<size_t>(gid) * dim_;
+             index_->raw_vecs_buffer + static_cast<size_t>(gid) * index_->dim;
          for (uint32_t gnb : adj[gid]) {
              if (gnb == gid) continue;
              if (seen[gnb] == visit_token) continue;  // dedup
              seen[gnb] = visit_token;
              const float16_t* nb_vec =
-                 raw_vecs_buffer_ + static_cast<size_t>(gnb) * dim_;
-             const float d = raw_vecs_buffer_
-                 ? l2sq_f16(my_vec, nb_vec, dim_)
-                 : quantizer_->code_distance(
-                       codes_buffer_ + static_cast<size_t>(gid) * code_size_,
-                       codes_buffer_ + static_cast<size_t>(gnb) * code_size_);
+                 index_->raw_vecs_buffer + static_cast<size_t>(gnb) * index_->dim;
+             const float d = index_->raw_vecs_buffer
+                 ? l2sq_f16(my_vec, nb_vec, index_->dim)
+                 : index_->quantizer->code_distance(
+                       index_->codes_buffer + static_cast<size_t>(gid) * index_->code_size,
+                       index_->codes_buffer + static_cast<size_t>(gnb) * index_->code_size);
              cands.emplace_back(d, gnb);
          }
         // Free the adjacency now that we've consumed it.
@@ -1660,7 +1654,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         };
         for (uint32_t a = 0; a < n; a++) {
             const uint8_t* node =
-                nodes_buffer_ + static_cast<size_t>(a) * node_size_;
+                index_->nodes_buffer + static_cast<size_t>(a) * index_->node_size;
             const uint16_t deg = VamanaCore::get_neighbor_count(node);
             for (uint16_t i = 0; i < deg; i++) {
                 uni(a, VamanaCore::get_neighbor(node, i));
@@ -1707,15 +1701,15 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                  uint32_t best_r = root_sample[0];
                  for (uint32_t c : members) {
                      const float16_t* cv =
-                         raw_vecs_buffer_ + static_cast<size_t>(c) * dim_;
+                         index_->raw_vecs_buffer + static_cast<size_t>(c) * index_->dim;
                      for (uint32_t r : root_sample) {
                          const float16_t* rv =
-                             raw_vecs_buffer_ + static_cast<size_t>(r) * dim_;
-                         const float d = raw_vecs_buffer_
-                             ? l2sq_f16(cv, rv, dim_)
-                             : quantizer_->code_distance(
-                                 codes_buffer_ + static_cast<size_t>(c) * code_size_,
-                                 codes_buffer_ + static_cast<size_t>(r) * code_size_);
+                             index_->raw_vecs_buffer + static_cast<size_t>(r) * index_->dim;
+                         const float d = index_->raw_vecs_buffer
+                             ? l2sq_f16(cv, rv, index_->dim)
+                             : index_->quantizer->code_distance(
+                                 index_->codes_buffer + static_cast<size_t>(c) * index_->code_size,
+                                 index_->codes_buffer + static_cast<size_t>(r) * index_->code_size);
                          if (d < best_d) {
                              best_d = d;
                              best_c = c;
@@ -1728,8 +1722,8 @@ BuildResult Engine::build_partitioned(VectorSource& source,
                 // final R may be full). We overwrite the last neighbor slot if
                 // full to guarantee the bridge edge exists.
                 auto append_edge = [&](uint32_t from, uint32_t to) {
-                    uint8_t* node = nodes_buffer_ +
-                                    static_cast<size_t>(from) * node_size_;
+                    uint8_t* node = index_->nodes_buffer +
+                                    static_cast<size_t>(from) * index_->node_size;
                     uint16_t deg = VamanaCore::get_neighbor_count(node);
                     uint16_t slot = deg;
                     // Check if 'to' already a neighbor.
@@ -1761,7 +1755,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         uint64_t max_deg = 0;
         for (uint32_t gid = 0; gid < n; gid++) {
             const uint8_t* node =
-                nodes_buffer_ + static_cast<size_t>(gid) * node_size_;
+                index_->nodes_buffer + static_cast<size_t>(gid) * index_->node_size;
             const uint16_t d = VamanaCore::get_neighbor_count(node);
             if (d == 0) zero_deg++;
             total_edges += d;
@@ -1773,20 +1767,20 @@ BuildResult Engine::build_partitioned(VectorSource& source,
 
     spdlog::info("[sextant] merge complete; flushing sidecars");
 
-    // Set up the master VamanaCore (full R) over the merged nodes_buffer_ for
-    // entry-point computation during flush. (K==1 already has core_ set up
+    // Set up the master VamanaCore (full R) over the merged index_->nodes_buffer for
+    // entry-point computation during flush. (K==1 already has index_->core set up
     // over the global buffers in the fast path above.)
     VamanaParams vp_full =
-        VamanaParams::from_resolved(params, dim_);
-    core_ = std::make_unique<VamanaCore>(vp_full, *quantizer_);
-    core_->set_build_codes(codes_buffer_, n);
-    core_->set_build_nodes(nodes_buffer_);
-    core_->prepare_for_build(n);
+        VamanaParams::from_resolved(params, index_->dim);
+    index_->core = std::make_unique<VamanaCore>(vp_full, *index_->quantizer);
+    index_->core->set_build_codes(index_->codes_buffer, n);
+    index_->core->set_build_nodes(index_->nodes_buffer);
+    index_->core->prepare_for_build(n);
     }  // end K>1 partitioned branch
 
     // --- Flush (entry points + final-layout inlining + sidecars) ---
     // Shared by both K==1 (graph built directly) and K>1 (merged graph). For
-    // K==1, core_ is already wired to nodes_buffer_/codes_buffer_.
+    // K==1, index_->core is already wired to index_->nodes_buffer/index_->codes_buffer.
     snap_entry_points_(params);
     auto bfs = compute_bfs_reorder_(params);
     write_sidecars_(index_path_, bfs, params);
@@ -1797,31 +1791,31 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // it (left flat buffers resident and no paged store), which was an
     // asymmetry vs the monolithic path.
     const uint32_t final_node_size =
-        VamanaCore::static_node_size(params.R, code_size_);
-    node_size_ = final_node_size;
-    flat_store_.reset();  // disconnect store before freeing buffers
-    core_->set_store(nullptr);
-    if (codes_buffer_) { aligned_free(codes_buffer_); codes_buffer_ = nullptr; }
-    if (nodes_buffer_) { aligned_free(nodes_buffer_); nodes_buffer_ = nullptr; }
-    if (raw_vecs_buffer_) { aligned_free(raw_vecs_buffer_); raw_vecs_buffer_ = nullptr; }
+        VamanaCore::static_node_size(params.R, index_->code_size);
+    index_->node_size = final_node_size;
+    index_->flat_store.reset();  // disconnect store before freeing buffers
+    index_->core->set_store(nullptr);
+    if (index_->codes_buffer) { aligned_free(index_->codes_buffer); index_->codes_buffer = nullptr; }
+    if (index_->nodes_buffer) { aligned_free(index_->nodes_buffer); index_->nodes_buffer = nullptr; }
+    if (index_->raw_vecs_buffer) { aligned_free(index_->raw_vecs_buffer); index_->raw_vecs_buffer = nullptr; }
 
-    paged_store_ = std::make_unique<PagedNodeStore>(
+    index_->paged_store = std::make_unique<PagedNodeStore>(
         index_path_ + ".graph", index_path_ + ".codes",
-        final_node_size, code_size_,
+        final_node_size, index_->code_size,
         std::max(1u, std::thread::hardware_concurrency()),
         /*cache_size_bytes=*/64ull * 1024 * 1024);  // 64MB default cache
-    core_->set_store(paged_store_.get());
+    index_->core->set_store(index_->paged_store.get());
 
     opened_ = true;
 
     BuildResult result;
     result.index_path = index_path;
-    result.n_vectors = count_;
-    result.dim = dim_;
+    result.n_vectors = index_->count;
+    result.dim = index_->dim;
     result.R = params.R;
     result.L_build = params.L_build;
-    result.pq_m = quantizer_ ? quantizer_->m() : params.pq_m;
-    result.pq_bits = quantizer_ ? quantizer_->bits() : params.pq_bits;
+    result.pq_m = index_->quantizer ? index_->quantizer->m() : params.pq_m;
+    result.pq_bits = index_->quantizer ? index_->quantizer->bits() : params.pq_bits;
     return result;
 }
 
@@ -1831,11 +1825,11 @@ BuildResult Engine::build_partitioned(VectorSource& source,
 // ===========================================================================
 
 Engine::BfsReorder Engine::compute_bfs_reorder_(const ResolvedParams& params) const {
-    const uint32_t n = static_cast<uint32_t>(count_);
-    const uint32_t build_node_size = node_size_;  // flat build layout
-    const auto& raw_entry_points = core_->entry_points();
+    const uint32_t n = static_cast<uint32_t>(index_->count);
+    const uint32_t build_node_size = index_->node_size;  // flat build layout
+    const auto& raw_entry_points = index_->core->entry_points();
     BfsReorder bfs;
-    bfs.order = compute_bfs_order(nodes_buffer_, n, build_node_size, raw_entry_points);
+    bfs.order = compute_bfs_order(index_->nodes_buffer, n, build_node_size, raw_entry_points);
     bfs.remap.resize(n);
     for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
         bfs.remap[bfs.order[new_pos]] = new_pos;
@@ -1846,29 +1840,29 @@ Engine::BfsReorder Engine::compute_bfs_reorder_(const ResolvedParams& params) co
 void Engine::snap_entry_points_(const ResolvedParams& params) {
     // Snap stored FP32 centroids to nearest data vectors (medoids) and set
     // them as entry points. Falls back to stride sampling if no centroids.
-    if (entry_centroids_.empty() || !raw_vecs_buffer_ || count_ == 0) {
-        core_->compute_entry_points();  // stride-sampled fallback
+    if (entry_centroids_.empty() || !index_->raw_vecs_buffer || index_->count == 0) {
+        index_->core->compute_entry_points();  // stride-sampled fallback
         return;
     }
-    const uint32_t n = static_cast<uint32_t>(count_);
-    const uint32_t k = static_cast<uint32_t>(entry_centroids_.size() / dim_);
+    const uint32_t n = static_cast<uint32_t>(index_->count);
+    const uint32_t k = static_cast<uint32_t>(entry_centroids_.size() / index_->dim);
     // Parallel medoid search: each centroid scans the full FP16 dataset
     // for its nearest data vector. O(k × N × dim) but embarrassingly
     // parallel across centroids.
     std::vector<uint32_t> medoid_ids(k);
     std::vector<std::thread> pool;
     auto worker = [&](uint32_t c) {
-        const float* centroid = entry_centroids_.data() + static_cast<size_t>(c) * dim_;
+        const float* centroid = entry_centroids_.data() + static_cast<size_t>(c) * index_->dim;
         // Convert centroid to FP16 for l2sq_f16 comparison.
-        std::vector<float16_t> centroid_f16(dim_);
-        for (uint32_t d = 0; d < dim_; d++)
+        std::vector<float16_t> centroid_f16(index_->dim);
+        for (uint32_t d = 0; d < index_->dim; d++)
             centroid_f16[d] = static_cast<float16_t>(centroid[d]);
         float best_d = std::numeric_limits<float>::infinity();
         uint32_t best_id = 0;
         for (uint32_t i = 0; i < n; i++) {
             const float d = l2sq_f16(centroid_f16.data(),
-                                     raw_vecs_buffer_ + static_cast<size_t>(i) * dim_,
-                                     dim_);
+                                     index_->raw_vecs_buffer + static_cast<size_t>(i) * index_->dim,
+                                     index_->dim);
             if (d < best_d) { best_d = d; best_id = i; }
         }
         medoid_ids[c] = best_id;
@@ -1886,9 +1880,9 @@ void Engine::snap_entry_points_(const ResolvedParams& params) {
             medoid_ids.push_back(id);
         else break;
     }
-    core_->set_entry_points(std::move(medoid_ids));
+    index_->core->set_entry_points(std::move(medoid_ids));
     spdlog::info("[sextant] entry points: {} k-means medoids (FP32 centroids, "
-                 "FP16 snap)", core_->entry_points().size());
+                 "FP16 snap)", index_->core->entry_points().size());
 }
 
 
@@ -1896,23 +1890,23 @@ void Engine::write_sidecars_(const std::string& index_path,
                              const BfsReorder& bfs,
                              const ResolvedParams& params) {
     const auto uuid = make_uuid();
-    const uint32_t n = static_cast<uint32_t>(count_);
+    const uint32_t n = static_cast<uint32_t>(index_->count);
 
     // Final node layout: same as build layout (flat neighbor lists, single
     // node_size for the whole index).
     const uint32_t final_node_size =
-        VamanaCore::static_node_size(params.R, code_size_);
-    const uint32_t build_node_size = node_size_;
+        VamanaCore::static_node_size(params.R, index_->code_size);
+    const uint32_t build_node_size = index_->node_size;
 
     // ----- .codes (reordered to BFS order, STREAMED) -----
     {
         const std::string path = index_path + ".codes";
         DirectFile f(path, true);
         SidecarHeader h;
-        fill_header(h, kMagicCodes, count_, dim_, uuid);
+        fill_header(h, kMagicCodes, index_->count, index_->dim, uuid);
         write_padded(f, &h, sizeof(h), 0);
 
-        const size_t codes_bytes = static_cast<size_t>(n) * code_size_;
+        const size_t codes_bytes = static_cast<size_t>(n) * index_->code_size;
         // Stream the reorder through a block-aligned ring buffer (256KB) instead
         // of materializing the full N×code_size in RAM. At 1B×96B the old path
         // allocated 96GB transiently here.
@@ -1923,12 +1917,12 @@ void Engine::write_sidecars_(const std::string& index_path,
         // which is what keeps the on-disk layout byte-identical to the old path.
         const size_t block_cap = kBlockSize;  // 256KB
         const uint32_t align_step =
-            kDiskAlign / std::gcd(kDiskAlign, code_size_);
+            kDiskAlign / std::gcd(kDiskAlign, index_->code_size);
         uint32_t codes_per_block =
-            static_cast<uint32_t>(block_cap / code_size_);
+            static_cast<uint32_t>(block_cap / index_->code_size);
         codes_per_block -= codes_per_block % align_step;  // round down
         codes_per_block = std::max<uint32_t>(codes_per_block, align_step);
-        const size_t buf_cap = static_cast<size_t>(codes_per_block) * code_size_;
+        const size_t buf_cap = static_cast<size_t>(codes_per_block) * index_->code_size;
         uint8_t* ring = static_cast<uint8_t*>(aligned_alloc(kDiskAlign, buf_cap));
         if (!ring) {
             throw Error(ErrorCode::OutOfMemory,
@@ -1939,19 +1933,19 @@ void Engine::write_sidecars_(const std::string& index_path,
         uint32_t in_block = 0;
         for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
             const uint32_t old_id = bfs.order[new_pos];
-            std::memcpy(ring + static_cast<size_t>(in_block) * code_size_,
-                        codes_buffer_ + static_cast<size_t>(old_id) * code_size_,
-                        code_size_);
+            std::memcpy(ring + static_cast<size_t>(in_block) * index_->code_size,
+                        index_->codes_buffer + static_cast<size_t>(old_id) * index_->code_size,
+                        index_->code_size);
             if (++in_block >= codes_per_block) {
                 write_padded(f, ring,
-                             static_cast<size_t>(in_block) * code_size_, write_off);
-                write_off += static_cast<size_t>(in_block) * code_size_;
+                             static_cast<size_t>(in_block) * index_->code_size, write_off);
+                write_off += static_cast<size_t>(in_block) * index_->code_size;
                 in_block = 0;
             }
         }
         if (in_block > 0) {
             write_padded(f, ring,
-                         static_cast<size_t>(in_block) * code_size_, write_off);
+                         static_cast<size_t>(in_block) * index_->code_size, write_off);
         }
         aligned_free(ring);
         f.sync();
@@ -1964,7 +1958,7 @@ void Engine::write_sidecars_(const std::string& index_path,
         const std::string path = index_path + ".graph";
         DirectFile f(path, true);
         SidecarHeader h;
-        fill_header(h, kMagicGraph, count_, dim_, uuid);
+        fill_header(h, kMagicGraph, index_->count, index_->dim, uuid);
         // Stash the final node_size in the checksum_algo field? No — keep
         // header clean; the reader recomputes final_node_size from params.
         write_padded(f, &h, sizeof(h), 0);
@@ -1987,7 +1981,7 @@ void Engine::write_sidecars_(const std::string& index_path,
             // PageShuffle: emit nodes in BFS order. The node at disk position
             // new_pos is the build node whose old_id = bfs.order[new_pos].
             const uint32_t old_id = bfs.order[new_pos];
-            const uint8_t* src = nodes_buffer_ +
+            const uint8_t* src = index_->nodes_buffer +
                                  static_cast<size_t>(old_id) * build_node_size;
             uint8_t* dst = ring + static_cast<size_t>(in_block) * final_node_size;
 
@@ -2032,7 +2026,7 @@ void Engine::write_sidecars_(const std::string& index_path,
     // PageShuffle: remap entry points from build (old) IDs to BFS (new) IDs
     // so the search path starts at the correct disk positions.
     {
-        const auto& eps = core_->entry_points();
+        const auto& eps = index_->core->entry_points();
         std::vector<uint32_t> remapped_eps;
         remapped_eps.reserve(eps.size());
         for (uint32_t ep : eps) {
@@ -2048,7 +2042,7 @@ void Engine::write_sidecars_(const std::string& index_path,
     // size is bounded by ball size (entry_points × R^hops), not N.
     //
     // The entries are in the SAME BFS-visit order as MemGraph's `collected_`
-    // vector at open time. The build-time BFS here runs on nodes_buffer_
+    // vector at open time. The build-time BFS here runs on index_->nodes_buffer
     // (build-order, neighbors in build-order); the open-time BFS runs on the
     // .graph file (disk-order, neighbors remapped via bfs.remap). The visit
     // ORDER is identical because the remap preserves neighbor-list ordering
@@ -2058,13 +2052,13 @@ void Engine::write_sidecars_(const std::string& index_path,
         const std::string path = index_path + ".ball";
         constexpr uint32_t kVecsNumHops = 3;
         // Run the same BFS MemGraph runs at open time: from the (build-order)
-        // entry points, 3 hops, on nodes_buffer_ (build-order). Collect
+        // entry points, 3 hops, on index_->nodes_buffer (build-order). Collect
         // build-order IDs in BFS-visit order.
         std::vector<uint8_t> visited(n, 0);
         struct BfsItem { uint32_t id; uint32_t hop; };
         std::deque<BfsItem> bfs_queue;
         std::vector<uint32_t> ball_ids;
-        const auto& eps = core_->entry_points();  // build-order IDs
+        const auto& eps = index_->core->entry_points();  // build-order IDs
         for (uint32_t ep : eps) {
             if (ep < n && !visited[ep]) {
                 visited[ep] = 1;
@@ -2077,7 +2071,7 @@ void Engine::write_sidecars_(const std::string& index_path,
             ball_ids.push_back(it.id);
             if (it.hop >= kVecsNumHops) continue;
             const uint8_t* node =
-                nodes_buffer_ + static_cast<size_t>(it.id) * build_node_size;
+                index_->nodes_buffer + static_cast<size_t>(it.id) * build_node_size;
             const uint16_t ncount = VamanaCore::get_neighbor_count(node);
             for (uint16_t i = 0; i < ncount; i++) {
                 const uint32_t nb = VamanaCore::get_neighbor(node, i);
@@ -2093,10 +2087,10 @@ void Engine::write_sidecars_(const std::string& index_path,
         // syscalls.
         DirectFile f(path, true);
         SidecarHeader h;
-        fill_header(h, kMagicVecs, ball_ids.size(), dim_, uuid);
+        fill_header(h, kMagicVecs, ball_ids.size(), index_->dim, uuid);
         write_padded(f, &h, sizeof(h), 0);
 
-        const size_t vec_bytes = static_cast<size_t>(dim_) * sizeof(float16_t);
+        const size_t vec_bytes = static_cast<size_t>(index_->dim) * sizeof(float16_t);
         const size_t block_cap = kBlockSize;  // 256KB
         const uint32_t vecs_per_block =
             std::max<uint32_t>(1u, static_cast<uint32_t>(block_cap / vec_bytes));
@@ -2110,7 +2104,7 @@ void Engine::write_sidecars_(const std::string& index_path,
         uint32_t in_block = 0;
         for (uint32_t bid : ball_ids) {
             const float16_t* vec =
-                raw_vecs_buffer_ + static_cast<size_t>(bid) * dim_;
+                index_->raw_vecs_buffer + static_cast<size_t>(bid) * index_->dim;
             std::memcpy(ring + static_cast<size_t>(in_block) * vec_bytes,
                         vec, vec_bytes);
             if (++in_block >= vecs_per_block) {
@@ -2127,7 +2121,7 @@ void Engine::write_sidecars_(const std::string& index_path,
         aligned_free(ring);
         f.sync();
         spdlog::info("[sextant] wrote {} ({} FP16 vectors, {} bytes each)",
-                     path, ball_ids.size(), dim_ * sizeof(float16_t));
+                     path, ball_ids.size(), index_->dim * sizeof(float16_t));
     }
 
     // ----- .manifest (atomic commit — written LAST via temp + rename) -----
@@ -2141,7 +2135,7 @@ void Engine::write_sidecars_(const std::string& index_path,
 // .meta payload (serialized quantizer + entry points + ResolvedParams) and the
 // same .manifest commit point. The only caller-specific detail is the entry-
 // point vector: write_sidecars_ BFS-remaps build IDs to disk positions, while
-// flush passes core_->entry_points() verbatim (buffers are already final).
+// flush passes index_->core->entry_points() verbatim (buffers are already final).
 // Callers prepare the entry-point vector and pass it in.
 // ===========================================================================
 
@@ -2151,14 +2145,14 @@ void Engine::write_meta_file(const ResolvedParams& params,
     const std::string path = index_path_ + ".meta";
     DirectFile f(path, true);
     SidecarHeader h;
-    fill_header(h, kMagicMeta, count_, dim_, uuid);
+    fill_header(h, kMagicMeta, index_->count, index_->dim, uuid);
     write_padded(f, &h, sizeof(h), 0);
 
     // Serialize the quantizer.
     std::vector<uint8_t> qblob;
-    quantizer_->serialize(qblob);
+    index_->quantizer->serialize(qblob);
     uint64_t qsize = qblob.size();
-    // Payload layout: [u64 quantizer_size][quantizer_bytes]
+    // Payload layout: [u64 index_->quantizersize][index_->quantizerbytes]
     //                 [u16 entry_point_count][entry_point_count × u32]
     //                 [ResolvedParams POD block]
     std::vector<uint8_t> payload;
@@ -2197,14 +2191,14 @@ void Engine::write_manifest_file(const ResolvedParams& params,
     {
         DirectFile f(tmp, true);
         SidecarHeader h;
-        fill_header(h, kMagicManifest, count_, dim_, uuid);
+        fill_header(h, kMagicManifest, index_->count, index_->dim, uuid);
         write_padded(f, &h, sizeof(h), 0);
         // The manifest is the commit point. We record the four sidecar
         // basenames + a "ready" marker.
         std::string commit =
             std::string("ready\n") +
-            std::to_string(count_) + "\n" +
-            std::to_string(dim_) + "\n" +
+            std::to_string(index_->count) + "\n" +
+            std::to_string(index_->dim) + "\n" +
             std::to_string(params.R) + "\n" +
             std::to_string(params.pq_m) + "\n";
         write_padded(f, commit.data(), commit.size(), sizeof(h));
@@ -2240,7 +2234,7 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::insert: index not opened");
     }
-    if (!quantizer_ || !core_) {
+    if (!index_->quantizer || !index_->core) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::insert: quantizer/core not initialized");
     }
@@ -2248,11 +2242,11 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::insert: null vector");
     }
-    if (dim != dim_) {
+    if (dim != index_->dim) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::insert: dim mismatch");
     }
-    if (code_size_ == 0 || node_size_ == 0) {
+    if (index_->code_size == 0 || index_->node_size == 0) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::insert: code/node size not initialized");
     }
@@ -2262,7 +2256,7 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
     // sidecar files on first insert. The FlatNodeStore is (re)created after the
     // reallocs below so it always points at the live buffers.
     // This is O(N) I/O but acceptable because insert is NOT the hot path.
-    if (paged_store_ && !codes_buffer_) {
+    if (index_->paged_store && !index_->codes_buffer) {
         spdlog::info("[sextant] insert: materializing flat buffers from sidecars "
                      "for mutable insert");
         // Codes.
@@ -2270,34 +2264,34 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
             const std::string path = index_path_ + ".codes";
             DirectFile f(path, false);
             const size_t codes_bytes =
-                static_cast<size_t>(count_) * code_size_;
-            codes_buffer_ = static_cast<uint8_t*>(
+                static_cast<size_t>(index_->count) * index_->code_size;
+            index_->codes_buffer = static_cast<uint8_t*>(
                 aligned_alloc(kDiskAlign, codes_bytes));
-            std::memset(codes_buffer_, 0, codes_bytes);
-            read_exact(f, codes_buffer_, codes_bytes, sizeof(SidecarHeader));
+            std::memset(index_->codes_buffer, 0, codes_bytes);
+            read_exact(f, index_->codes_buffer, codes_bytes, sizeof(SidecarHeader));
         }
         // Nodes.
         {
             const std::string path = index_path_ + ".graph";
             DirectFile f(path, false);
             const size_t nodes_bytes =
-                static_cast<size_t>(count_) * node_size_;
-            nodes_buffer_ = static_cast<uint8_t*>(
+                static_cast<size_t>(index_->count) * index_->node_size;
+            index_->nodes_buffer = static_cast<uint8_t*>(
                 aligned_alloc(kDiskAlign, nodes_bytes));
-            std::memset(nodes_buffer_, 0, nodes_bytes);
-            read_exact(f, nodes_buffer_, nodes_bytes, sizeof(SidecarHeader));
+            std::memset(index_->nodes_buffer, 0, nodes_bytes);
+            read_exact(f, index_->nodes_buffer, nodes_bytes, sizeof(SidecarHeader));
         }
-        paged_store_.reset();
-        core_->set_store(nullptr);  // cleared; recreated below
+        index_->paged_store.reset();
+        index_->core->set_store(nullptr);  // cleared; recreated below
     }
 
-    const uint32_t new_internal = static_cast<uint32_t>(count_);
-    const uint64_t new_count = count_ + 1;
+    const uint32_t new_internal = static_cast<uint32_t>(index_->count);
+    const uint64_t new_count = index_->count + 1;
 
     // --- 1. Grow the codes buffer by one code (O(N) copy). ---
     {
-        const size_t old_bytes = static_cast<size_t>(count_) * code_size_;
-        const size_t new_bytes = static_cast<size_t>(new_count) * code_size_;
+        const size_t old_bytes = static_cast<size_t>(index_->count) * index_->code_size;
+        const size_t new_bytes = static_cast<size_t>(new_count) * index_->code_size;
         const size_t alloc_bytes = (new_bytes + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
         uint8_t* nb =
             static_cast<uint8_t*>(aligned_alloc(kDiskAlign, alloc_bytes));
@@ -2305,17 +2299,17 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
             throw Error(ErrorCode::OutOfMemory,
                         "Engine::insert: codes realloc failed");
         }
-        std::memcpy(nb, codes_buffer_, old_bytes);
+        std::memcpy(nb, index_->codes_buffer, old_bytes);
         // Encode the new vector into the appended slot.
-        quantizer_->encode(vec, nb + old_bytes);
-        aligned_free(codes_buffer_);
-        codes_buffer_ = nb;
+        index_->quantizer->encode(vec, nb + old_bytes);
+        aligned_free(index_->codes_buffer);
+        index_->codes_buffer = nb;
     }
 
     // --- 2. Grow the nodes buffer by one node (O(N) copy). ---
     {
-        const size_t old_bytes = static_cast<size_t>(count_) * node_size_;
-        const size_t new_bytes = static_cast<size_t>(new_count) * node_size_;
+        const size_t old_bytes = static_cast<size_t>(index_->count) * index_->node_size;
+        const size_t new_bytes = static_cast<size_t>(new_count) * index_->node_size;
         const size_t alloc_bytes = (new_bytes + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
         uint8_t* nb =
             static_cast<uint8_t*>(aligned_alloc(kDiskAlign, alloc_bytes));
@@ -2323,29 +2317,29 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
             throw Error(ErrorCode::OutOfMemory,
                         "Engine::insert: nodes realloc failed");
         }
-        std::memcpy(nb, nodes_buffer_, old_bytes);
-        std::memset(nb + old_bytes, 0, node_size_);
-        aligned_free(nodes_buffer_);
-        nodes_buffer_ = nb;
+        std::memcpy(nb, index_->nodes_buffer, old_bytes);
+        std::memset(nb + old_bytes, 0, index_->node_size);
+        aligned_free(index_->nodes_buffer);
+        index_->nodes_buffer = nb;
     }
 
     // --- 3. Publish the grown buffers + new count to the core. ---
-    count_ = new_count;
-    core_->set_build_codes(codes_buffer_, static_cast<uint32_t>(count_));
-    core_->set_build_nodes(nodes_buffer_);
+    index_->count = new_count;
+    index_->core->set_build_codes(index_->codes_buffer, static_cast<uint32_t>(index_->count));
+    index_->core->set_build_nodes(index_->nodes_buffer);
 
     // (Re)create the FlatNodeStore over the (possibly realloc'd) live buffers
     // so beam_search inside insert_build_from_code reads current data.
-    flat_store_ = std::make_unique<FlatNodeStore>(
-        nodes_buffer_, codes_buffer_,
-        node_size_, code_size_);
-    core_->set_store(flat_store_.get());
+    index_->flat_store = std::make_unique<FlatNodeStore>(
+        index_->nodes_buffer, index_->codes_buffer,
+        index_->node_size, index_->code_size);
+    index_->core->set_store(index_->flat_store.get());
 
-    // --- 3b. Grow raw_vecs_buffer_ by one FP16 vector (O(N) copy). ---
+    // --- 3b. Grow index_->raw_vecs_buffer by one FP16 vector (O(N) copy). ---
     // Needed so build_vec_ptr(new_internal) works for the FP16 prune.
     {
-        const size_t old_bytes = static_cast<size_t>(count_ - 1) * dim_ * sizeof(float16_t);
-        const size_t new_bytes = static_cast<size_t>(count_) * dim_ * sizeof(float16_t);
+        const size_t old_bytes = static_cast<size_t>(index_->count - 1) * index_->dim * sizeof(float16_t);
+        const size_t new_bytes = static_cast<size_t>(index_->count) * index_->dim * sizeof(float16_t);
         const size_t alloc_bytes = (new_bytes + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
         float16_t* nb =
             static_cast<float16_t*>(aligned_alloc(kDiskAlign, alloc_bytes));
@@ -2353,52 +2347,52 @@ void Engine::insert(const float* vec, Dim dim, RowId row_id) {
             throw Error(ErrorCode::OutOfMemory,
                         "Engine::insert: raw_vecs realloc failed");
         }
-        if (raw_vecs_buffer_) {
-            std::memcpy(nb, raw_vecs_buffer_, old_bytes);
-            aligned_free(raw_vecs_buffer_);
+        if (index_->raw_vecs_buffer) {
+            std::memcpy(nb, index_->raw_vecs_buffer, old_bytes);
+            aligned_free(index_->raw_vecs_buffer);
         }
-        float16_t* dst = nb + static_cast<size_t>(new_internal) * dim_;
-        for (uint32_t d = 0; d < dim_; d++) {
+        float16_t* dst = nb + static_cast<size_t>(new_internal) * index_->dim;
+        for (uint32_t d = 0; d < index_->dim; d++) {
             dst[d] = static_cast<float16_t>(vec[d]);
         }
-        raw_vecs_buffer_ = nb;
+        index_->raw_vecs_buffer = nb;
     }
-    core_->set_build_vecs(raw_vecs_buffer_);
+    index_->core->set_build_vecs(index_->raw_vecs_buffer);
 
     // --- 4. Drive the Vamana insert flow (single-thread). ---
     //    insert_build_from_code handles the first-node case (becomes an entry
     //    point) and the general case (beam_search → robust_prune →
-    //    connect_and_prune). It also bumps core_->count_ to internal_id + 1.
+    //    connect_and_prune). It also bumps index_->core->index_->count to internal_id + 1.
     //    build_vecs_ is set above so the prune uses FP16 L2sq.
     VamanaTLS tls;
-    tls.resize(static_cast<uint32_t>(count_));
-    tls.resize_lut(quantizer_ ? quantizer_->lut_size() : 0);
-    core_->insert_build_from_code(new_internal, row_id, tls);
+    tls.resize(static_cast<uint32_t>(index_->count));
+    tls.resize_lut(index_->quantizer ? index_->quantizer->lut_size() : 0);
+    index_->core->insert_build_from_code(new_internal, row_id, tls);
 
     spdlog::info("[sextant] insert: row_id={} internal_id={} (count now {})",
-                 row_id, new_internal, count_);
+                 row_id, new_internal, index_->count);
 }
 
 void Engine::flush() {
     // After build(), all sidecars are already written synchronously.
     // flush() is meaningful after open() + insert(): it rewrites the sidecars
     // with the grown buffers (already in final layout, so no reformatting).
-    if (!opened_ || !params_loaded_) {
+    if (!opened_) {
         return;  // nothing pending
     }
-    if (count_ == 0) {
+    if (index_->count == 0) {
         return;
     }
-    if (!quantizer_ || !core_) {
+    if (!index_->quantizer || !index_->core) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::flush: quantizer/core not initialized");
     }
 
     const auto uuid = make_uuid();
-    const ResolvedParams& params = loaded_params_;
-    const uint32_t n = static_cast<uint32_t>(count_);
+    const ResolvedParams& params = index_->params;
+    const uint32_t n = static_cast<uint32_t>(index_->count);
 
-    // After open(), nodes_buffer_ is already in final layout (node_size_
+    // After open(), index_->nodes_buffer is already in final layout (index_->node_size
     // single node_size layout), so we write it verbatim — no reformat pass.
     spdlog::info("[sextant] flush: persisting {} vectors to '{}'", n,
                  index_path_);
@@ -2408,10 +2402,10 @@ void Engine::flush() {
         const std::string path = index_path_ + ".codes";
         DirectFile f(path, true);
         SidecarHeader h;
-        fill_header(h, kMagicCodes, count_, dim_, uuid);
+        fill_header(h, kMagicCodes, index_->count, index_->dim, uuid);
         write_padded(f, &h, sizeof(h), 0);
-        const size_t codes_bytes = static_cast<size_t>(n) * code_size_;
-        write_padded(f, codes_buffer_, codes_bytes, sizeof(h));
+        const size_t codes_bytes = static_cast<size_t>(n) * index_->code_size;
+        write_padded(f, index_->codes_buffer, codes_bytes, sizeof(h));
         f.sync();
     }
 
@@ -2420,22 +2414,22 @@ void Engine::flush() {
         const std::string path = index_path_ + ".graph";
         DirectFile f(path, true);
         SidecarHeader h;
-        fill_header(h, kMagicGraph, count_, dim_, uuid);
+        fill_header(h, kMagicGraph, index_->count, index_->dim, uuid);
         write_padded(f, &h, sizeof(h), 0);
-        const size_t nodes_bytes = static_cast<size_t>(n) * node_size_;
-        write_padded(f, nodes_buffer_, nodes_bytes, sizeof(h));
+        const size_t nodes_bytes = static_cast<size_t>(n) * index_->node_size;
+        write_padded(f, index_->nodes_buffer, nodes_bytes, sizeof(h));
         f.sync();
     }
 
     // ----- .meta (quantizer + entry points + params) -----
     // Post-insert: entry points are already in final disk layout, so pass
     // them verbatim.
-    write_meta_file(params, core_->entry_points(), uuid);
+    write_meta_file(params, index_->core->entry_points(), uuid);
 
     // ----- .manifest (atomic commit) -----
     write_manifest_file(params, uuid);
 
-    spdlog::info("[sextant] flush: sidecars rewritten (count={})", count_);
+    spdlog::info("[sextant] flush: sidecars rewritten (count={})", index_->count);
 }
 
 // ===========================================================================
@@ -2460,8 +2454,9 @@ std::unique_ptr<Engine> Engine::build_mini_(const float* sample,
                                              uint64_t sample_n, Dim dim,
                                              const ResolvedParams& params) {
     auto mini = std::make_unique<Engine>();
-    mini->count_ = sample_n;
-    mini->dim_ = dim;
+    mini->index_ = std::make_unique<Index>();
+    mini->index_->count = sample_n;
+    mini->index_->dim = dim;
     mini->index_path_ = "/dev/null";  // never written; just non-empty
 
     // Threads: respect any user override (--threads); otherwise use all
@@ -2477,24 +2472,24 @@ std::unique_ptr<Engine> Engine::build_mini_(const float* sample,
 
     // Mirror build_partitioned K==1 fast path (engine.cpp ~897-1005):
     mini->pass1_sample_and_train(src, mp);
-    mini->node_size_ = VamanaCore::static_node_size(mp.R, mini->code_size_);
+    mini->index_->node_size = VamanaCore::static_node_size(mp.R, mini->index_->code_size);
 
-    // Allocate codes_buffer_ + nodes_buffer_ (aligned, zeroed).
+    // Allocate index_->codes_buffer + index_->nodes_buffer (aligned, zeroed).
     {
         const size_t codes_bytes =
-            static_cast<size_t>(sample_n) * mini->code_size_;
+            static_cast<size_t>(sample_n) * mini->index_->code_size;
         const size_t nodes_bytes =
-            static_cast<size_t>(sample_n) * mini->node_size_;
-        mini->codes_buffer_ = static_cast<uint8_t*>(
+            static_cast<size_t>(sample_n) * mini->index_->node_size;
+        mini->index_->codes_buffer = static_cast<uint8_t*>(
             aligned_alloc(kDiskAlign, codes_bytes));
-        mini->nodes_buffer_ = static_cast<uint8_t*>(
+        mini->index_->nodes_buffer = static_cast<uint8_t*>(
             aligned_alloc(kDiskAlign, nodes_bytes));
-        if (!mini->codes_buffer_ || !mini->nodes_buffer_) {
+        if (!mini->index_->codes_buffer || !mini->index_->nodes_buffer) {
             throw Error(ErrorCode::OutOfMemory,
                         "build_mini_: buffer alloc failed");
         }
-        std::memset(mini->codes_buffer_, 0, codes_bytes);
-        std::memset(mini->nodes_buffer_, 0, nodes_bytes);
+        std::memset(mini->index_->codes_buffer, 0, codes_bytes);
+        std::memset(mini->index_->nodes_buffer, 0, nodes_bytes);
     }
 
     mini->pass2_encode(src, mp);
@@ -2503,15 +2498,15 @@ std::unique_ptr<Engine> Engine::build_mini_(const float* sample,
     {
         const size_t vecs_bytes =
             static_cast<size_t>(sample_n) * dim * sizeof(float16_t);
-        mini->raw_vecs_buffer_ = static_cast<float16_t*>(
+        mini->index_->raw_vecs_buffer = static_cast<float16_t*>(
             aligned_alloc(kDiskAlign, vecs_bytes));
-        if (!mini->raw_vecs_buffer_) {
+        if (!mini->index_->raw_vecs_buffer) {
             throw Error(ErrorCode::OutOfMemory,
-                        "build_mini_: raw_vecs_buffer_ alloc failed");
+                        "build_mini_: index_->raw_vecs_buffer alloc failed");
         }
         for (uint64_t i = 0; i < sample_n; i++) {
             float16_t* dst =
-                mini->raw_vecs_buffer_ + static_cast<size_t>(i) * dim;
+                mini->index_->raw_vecs_buffer + static_cast<size_t>(i) * dim;
             const float* svec = sample + static_cast<size_t>(i) * dim;
             for (uint32_t d = 0; d < dim; d++) {
                 dst[d] = static_cast<float16_t>(svec[d]);
@@ -2521,37 +2516,37 @@ std::unique_ptr<Engine> Engine::build_mini_(const float* sample,
 
     const uint32_t n = static_cast<uint32_t>(sample_n);
 
-    // Set up core_ + flat_store_ (mirror build_partitioned K==1 lines 984-1000).
+    // Set up index_->core + index_->flat_store (mirror build_partitioned K==1 lines 984-1000).
     VamanaParams vp = VamanaParams::from_resolved(mp, dim);
-    mini->core_ = std::make_unique<VamanaCore>(vp, *mini->quantizer_);
-    mini->core_->set_build_codes(mini->codes_buffer_, n);
-    mini->core_->set_build_nodes(mini->nodes_buffer_);
-    mini->core_->prepare_for_build(n);
-    mini->flat_store_ = std::make_unique<FlatNodeStore>(
-        mini->nodes_buffer_, mini->codes_buffer_, mini->node_size_,
-        mini->code_size_);
-    mini->core_->set_store(mini->flat_store_.get());
-    mini->core_->set_build_vecs(mini->raw_vecs_buffer_);
+    mini->index_->core = std::make_unique<VamanaCore>(vp, *mini->index_->quantizer);
+    mini->index_->core->set_build_codes(mini->index_->codes_buffer, n);
+    mini->index_->core->set_build_nodes(mini->index_->nodes_buffer);
+    mini->index_->core->prepare_for_build(n);
+    mini->index_->flat_store = std::make_unique<FlatNodeStore>(
+        mini->index_->nodes_buffer, mini->index_->codes_buffer, mini->index_->node_size,
+        mini->index_->code_size);
+    mini->index_->core->set_store(mini->index_->flat_store.get());
+    mini->index_->core->set_build_vecs(mini->index_->raw_vecs_buffer);
 
     mini->parallel_construct(mp);
 
-    mini->core_->set_build_vecs(nullptr);
-    mini->core_->compute_entry_points();
+    mini->index_->core->set_build_vecs(nullptr);
+    mini->index_->core->compute_entry_points();
 
     return mini;
 }
 
 GraphStats Engine::measure_graph_stats_(const Engine& mini) {
     GraphStats stats;
-    const uint32_t n = static_cast<uint32_t>(mini.count_);
-    if (n == 0 || !mini.nodes_buffer_) return stats;
+    const uint32_t n = static_cast<uint32_t>(mini.index_->count);
+    if (n == 0 || !mini.index_->nodes_buffer) return stats;
 
     // avg_degree + dead_end_frac: single pass over all nodes.
     uint64_t total_degree = 0;
     uint32_t dead_ends = 0;
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t* node =
-            mini.nodes_buffer_ + static_cast<size_t>(i) * mini.node_size_;
+            mini.index_->nodes_buffer + static_cast<size_t>(i) * mini.index_->node_size;
         const uint16_t deg = VamanaCore::get_neighbor_count(node);
         total_degree += deg;
         if (deg <= 1) ++dead_ends;
@@ -2569,7 +2564,7 @@ GraphStats Engine::measure_graph_stats_(const Engine& mini) {
     for (uint32_t s = 0; s < sample_cnt; s++) {
         const uint32_t i = (sample_cnt == n) ? s : rng() % n;
         const uint8_t* node =
-            mini.nodes_buffer_ + static_cast<size_t>(i) * mini.node_size_;
+            mini.index_->nodes_buffer + static_cast<size_t>(i) * mini.index_->node_size;
         const uint16_t deg = VamanaCore::get_neighbor_count(node);
         if (deg < 2) continue;
 
@@ -2587,7 +2582,7 @@ GraphStats Engine::measure_graph_stats_(const Engine& mini) {
             const uint32_t nb1 = *it1;
             if (nb1 >= n) continue;
             const uint8_t* nb1_node =
-                mini.nodes_buffer_ + static_cast<size_t>(nb1) * mini.node_size_;
+                mini.index_->nodes_buffer + static_cast<size_t>(nb1) * mini.index_->node_size;
             const uint16_t nb1_deg =
                 VamanaCore::get_neighbor_count(nb1_node);
             // Build nb1's neighbor set.
@@ -2621,9 +2616,9 @@ Engine::SearchQuality Engine::measure_search_(
     const std::vector<uint32_t>& qidx,
     uint32_t L, uint32_t k, uint32_t rerank) {
     SearchQuality sq{0.0, 0.0};
-    if (!mini.core_ || !mini.quantizer_ || qidx.empty()) return sq;
+    if (!mini.index_->core || !mini.index_->quantizer || qidx.empty()) return sq;
 
-    PqQuantizer& q = *mini.quantizer_;
+    PqQuantizer& q = *mini.index_->quantizer;
     std::vector<float> lut(q.lut_size());
     // Over-fetch for rerank: k * rerank (matches the production benchmark tool
     // at benchmark.cpp:225). Previously `k + rerank`, which under-fetched and
@@ -2638,9 +2633,9 @@ Engine::SearchQuality Engine::measure_search_(
         const float* qv = sample + static_cast<size_t>(qidx[qi]) * dim;
         q.preprocess_query(qv, lut.data());
 
-        // Production-style search: core_->search returns candidates ranked by
+        // Production-style search: index_->core->search returns candidates ranked by
         // PQ LUT distance. We over-fetch k+rerank candidates.
-        auto results = mini.core_->search(lut.data(), fetch_k, L, /*io_limit=*/0);
+        auto results = mini.index_->core->search(lut.data(), fetch_k, L, /*io_limit=*/0);
         if (results.empty()) continue;
 
         // Rerank by true L2sq distance computed from the FP32 sample buffer.

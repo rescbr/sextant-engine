@@ -1,6 +1,6 @@
 // Search pipeline — open() + search() for the Engine facade.
 //
-// Phase 1 strategy: after build, the flat nodes_buffer_ + codes_buffer_ stay
+// Phase 1 strategy: after build, the flat index_->nodes_buffer + index_->codes_buffer stay
 // resident. After open(), the .graph and .codes sidecars are read back into
 // those same buffers. The VamanaCore reads from them transparently via
 // node_ptr(). The LRU-paged search path is deferred to a later phase.
@@ -43,7 +43,7 @@ std::vector<Candidate> Engine::search(const float* query, uint32_t k,
         throw Error(ErrorCode::InvalidParam,
                     "Engine::search: index not opened");
     }
-    if (!quantizer_ || !core_) {
+    if (!index_->quantizer || !index_->core) {
         throw Error(ErrorCode::InvalidParam,
                     "Engine::search: quantizer/core not initialized");
     }
@@ -52,26 +52,26 @@ std::vector<Candidate> Engine::search(const float* query, uint32_t k,
     }
 
     // Preprocess the query into a PQ LUT.
-    const uint32_t lut_sz = quantizer_->lut_size();
+    const uint32_t lut_sz = index_->quantizer->lut_size();
     std::vector<float> lut(lut_sz > 0 ? lut_sz : 1, 0.0f);
     if (lut_sz > 0) {
-        quantizer_->preprocess_query(query, lut.data());
+        index_->quantizer->preprocess_query(query, lut.data());
     }
 
     // VamanaCore::search resolves internal_ids → row_ids for us.
     // Convert the query to FP16 for the hybrid FP16+PQ distance path
     // (MemGraph ball nodes use l2sq_f16; the rest use PQ lut_distance).
-    std::vector<float16_t> query_fp16(dim_);
-    for (uint32_t d = 0; d < dim_; d++) {
+    std::vector<float16_t> query_fp16(index_->dim);
+    for (uint32_t d = 0; d < index_->dim; d++) {
         query_fp16[d] = static_cast<float16_t>(query[d]);
     }
     auto results =
-        core_->search(lut.data(), k, config.L_search, config.io_limit,
+        index_->core->search(lut.data(), k, config.L_search, config.io_limit,
                       query_fp16.data());
 
     // Adaptive cache rebalance (paged mode only). Cheap relaxed-atomic add per
     // search; the rare resize is CAS-guarded so only one thread runs it.
-    if (paged_store_ && cache_rebalance_enabled_) {
+    if (index_->paged_store && cache_rebalance_enabled_) {
         maybe_rebalance_();
     }
     return results;
@@ -113,20 +113,15 @@ void Engine::open(const std::string& index_path) {
                         "' not found (no .manifest or sidecar files)");
     }
 
-    // Release any previous buffers/stores.
-    if (codes_buffer_) { aligned_free(codes_buffer_); codes_buffer_ = nullptr; }
-    if (nodes_buffer_) { aligned_free(nodes_buffer_); nodes_buffer_ = nullptr; }
-    flat_store_.reset();
-    paged_store_.reset();
-    memgraph_.reset();
-    core_.reset();
-    quantizer_.reset();
-    params_loaded_ = false;
+    // Construct a fresh Index. Any previous Index state is dropped (Engine::open
+    // is destructive by design — see architecture audit §10.2).
+    index_ = std::make_unique<Index>();
+    index_->path = index_path;
 
     load_sidecars();
     opened_ = true;
     spdlog::info("[sextant] opened index '{}' (n={} dim={})", index_path,
-                 count_, dim_);
+                 index_->count, index_->dim);
 }
 
 // ===========================================================================
@@ -139,7 +134,7 @@ void Engine::open(const std::string& index_path) {
 void Engine::load_sidecars() {
     // --- .meta ---
     // Payload layout (written by write_sidecars_):
-    //   [u64 quantizer_size][quantizer_bytes]
+    //   [u64 index_->quantizersize][index_->quantizerbytes]
     //   [u16 entry_point_count][entry_point_count × u32]
     //   [ResolvedParams POD block]
     std::vector<ResolvedParams> params_holder(1);
@@ -160,8 +155,8 @@ void Engine::load_sidecars() {
             throw Error(ErrorCode::CorruptIndex,
                         "Engine::open: .meta bad magic");
         }
-        count_ = h.n_vectors;
-        dim_ = h.dim;
+        index_->count = h.n_vectors;
+        index_->dim = h.dim;
 
         // Read the payload (everything after the header). The on-disk size was
         // padded up to kDiskAlign; we only need the leading payload bytes, but
@@ -186,11 +181,11 @@ void Engine::load_sidecars() {
         }
 
         // Deserialize the quantizer from the blob.
-        quantizer_ = std::make_unique<PqQuantizer>(
-            MetricKind::L2Sq, dim_, /*m=*/1, /*bits=*/8);  // placeholder ctor
-        quantizer_->deserialize(p, static_cast<size_t>(qsize));
+        index_->quantizer = std::make_unique<PqQuantizer>(
+            MetricKind::L2Sq, index_->dim, /*m=*/1, /*bits=*/8);  // placeholder ctor
+        index_->quantizer->deserialize(p, static_cast<size_t>(qsize));
         p += qsize;
-        code_size_ = quantizer_->code_size();
+        index_->code_size = index_->quantizer->code_size();
 
         // Entry points.
         uint16_t ep_count = 0;
@@ -221,8 +216,7 @@ void Engine::load_sidecars() {
     }
 
     // Remember the loaded params so flush() can persist post-insert state.
-    loaded_params_ = params;
-    params_loaded_ = true;
+    index_->params = params;
 
     // Verify the .codes and .graph sidecars are present and readable (validate
     // magic), but do NOT load them into flat RAM — the PagedNodeStore reads
@@ -249,12 +243,12 @@ void Engine::load_sidecars() {
     }
 
     // Reconstruct the final node size from the resolved params.
-    node_size_ = VamanaCore::static_node_size(params.R, code_size_);
+    index_->node_size = VamanaCore::static_node_size(params.R, index_->code_size);
 
     // Reconstruct the search VamanaCore with the loaded params.
-    VamanaParams vparams = VamanaParams::from_resolved(params, dim_);
-    core_ = std::make_unique<VamanaCore>(vparams, *quantizer_);
-    core_->prepare_for_build(static_cast<uint32_t>(count_));
+    VamanaParams vparams = VamanaParams::from_resolved(params, index_->dim);
+    index_->core = std::make_unique<VamanaCore>(vparams, *index_->quantizer);
+    index_->core->prepare_for_build(static_cast<uint32_t>(index_->count));
 
     // Install a PagedNodeStore over the sidecar files. The core reads nodes
     // and codes on demand through the LRU cache — idle RAM stays ~1MB (.meta)
@@ -264,12 +258,12 @@ void Engine::load_sidecars() {
     // The graph_size is n × node_size (final layout). physical_ram from sysconf.
     {
         const uint64_t graph_size =
-            static_cast<uint64_t>(count_) * node_size_;
+            static_cast<uint64_t>(index_->count) * index_->node_size;
         // codes_size: n × code_size (the .codes sidecar payload). Previously
         // the budget considered only graph_size, under-provisioning the code
         // cache — now both files are accounted for.
         const uint64_t codes_size =
-            static_cast<uint64_t>(count_) * code_size_;
+            static_cast<uint64_t>(index_->count) * index_->code_size;
         const uint64_t total_index_size = graph_size + codes_size;
         const uint64_t phys_ram = sextant::physical_ram_bytes();
         uint64_t cache_bytes;
@@ -296,9 +290,9 @@ void Engine::load_sidecars() {
                      cache_bytes / 1e6, graph_size / 1e6,
                      codes_size / 1e6, phys_ram / 1e6);
 
-        paged_store_ = std::make_unique<PagedNodeStore>(
+        index_->paged_store = std::make_unique<PagedNodeStore>(
             index_path_ + ".graph", index_path_ + ".codes",
-            node_size_, code_size_,
+            index_->node_size, index_->code_size,
             std::max(1u, std::thread::hardware_concurrency()),
             cache_bytes);
     }
@@ -309,47 +303,47 @@ void Engine::load_sidecars() {
     {
         // Fall back to a deterministic single entry point if .meta had none.
         std::vector<uint32_t> eps = entry_points;
-        if (eps.empty() && count_ > 0) {
+        if (eps.empty() && index_->count > 0) {
             eps.push_back(0);
         }
-        memgraph_ = std::make_unique<MemGraph>(
+        index_->memgraph = std::make_unique<MemGraph>(
             index_path_ + ".graph", index_path_ + ".codes",
             index_path_ + ".ball",   // FP16 ball sidecar (optional — PQ fallback)
-            node_size_, code_size_,
-            static_cast<uint32_t>(count_), dim_,
+            index_->node_size, index_->code_size,
+            static_cast<uint32_t>(index_->count), index_->dim,
             eps, /*num_hops=*/3);
-        memgraph_->set_backing(paged_store_.get());
+        index_->memgraph->set_backing(index_->paged_store.get());
 
         const uint64_t cached_bytes =
-            static_cast<uint64_t>(memgraph_->cached_count()) *
-            (node_size_ + code_size_);
+            static_cast<uint64_t>(index_->memgraph->cached_count()) *
+            (index_->node_size + index_->code_size);
         spdlog::info("[sextant] MemGraph: {} nodes cached ({:.1f}MB), 3 hops",
-                     memgraph_->cached_count(), cached_bytes / 1e6);
+                     index_->memgraph->cached_count(), cached_bytes / 1e6);
     }
-    core_->set_store(memgraph_.get());
+    index_->core->set_store(index_->memgraph.get());
 
     // Restore entry points from .meta if present; otherwise compute a
     // deterministic fallback set. `entry_points` is moved into the core here;
     // it must not be used after this point (its last prior use was the
     // MemGraph fallback copy above).
     if (!entry_points.empty()) {
-        core_->set_entry_points(std::move(entry_points));
+        index_->core->set_entry_points(std::move(entry_points));
     } else {
-        core_->compute_entry_points();
+        index_->core->compute_entry_points();
     }
 }
 
 uint64_t Engine::cache_graph_reads() const {
-    return paged_store_ ? paged_store_->graph_reads() : 0;
+    return index_->paged_store ? index_->paged_store->graph_reads() : 0;
 }
 
 uint64_t Engine::cache_code_reads() const {
-    return paged_store_ ? paged_store_->code_reads() : 0;
+    return index_->paged_store ? index_->paged_store->code_reads() : 0;
 }
 
 Engine::AdmissionStats Engine::cache_admission_stats() const {
-    if (!paged_store_) return {};
-    const auto cs = paged_store_->cache_stats();
+    if (!index_->paged_store) return {};
+    const auto cs = index_->paged_store->cache_stats();
     return {
         cs.graph.hits_window + cs.code.hits_window,
         cs.graph.hits_probation + cs.code.hits_probation,
@@ -361,8 +355,8 @@ Engine::AdmissionStats Engine::cache_admission_stats() const {
 }
 
 void Engine::rebalance_caches() {
-    if (paged_store_) {
-        paged_store_->maybe_rebalance_caches();
+    if (index_->paged_store) {
+        index_->paged_store->maybe_rebalance_caches();
     }
 }
 
@@ -376,9 +370,9 @@ void Engine::maybe_rebalance_() {
             std::memory_order_acq_rel)) {
         return;
     }
-    const double prev_frac = paged_store_->graph_cache_fraction();
-    paged_store_->maybe_rebalance_caches();   // may call BlockCache::resize
-    const double new_frac = paged_store_->graph_cache_fraction();
+    const double prev_frac = index_->paged_store->graph_cache_fraction();
+    index_->paged_store->maybe_rebalance_caches();   // may call BlockCache::resize
+    const double new_frac = index_->paged_store->graph_cache_fraction();
     rebalancing_.store(false, std::memory_order_release);
     // Adaptive cadence: if the split didn't move, back off (steady state).
     // If it moved, reset to initial (workload shifting — stay responsive).
@@ -391,15 +385,15 @@ void Engine::maybe_rebalance_() {
 }
 
 uint32_t Engine::memgraph_cached_count() const {
-    return memgraph_ ? memgraph_->cached_count() : 0;
+    return index_->memgraph ? index_->memgraph->cached_count() : 0;
 }
 
 uint64_t Engine::tl_hits() const {
-    return paged_store_ ? paged_store_->tl_hits() : 0;
+    return index_->paged_store ? index_->paged_store->tl_hits() : 0;
 }
 
 uint64_t Engine::tl_misses() const {
-    return paged_store_ ? paged_store_->tl_misses() : 0;
+    return index_->paged_store ? index_->paged_store->tl_misses() : 0;
 }
 
 }  // namespace sextant
