@@ -321,23 +321,19 @@ TEST(PagedSearch, NodeStoreReadsAndCaches) {
         // Pin node 0 — first access reads from disk.
         PinResult pr1 = store.pin_node(0); const uint8_t* n0_first = pr1.data;
         ASSERT_NE(n0_first, nullptr);
-        store.unpin_node(0);
         EXPECT_EQ(store.graph_reads(), 1u);
 
         // Pin node 0 again — should hit the cache (no new graph reads).
         PinResult pr2 = store.pin_node(0); const uint8_t* n0_again = pr2.data;
-        store.unpin_node(0);
         EXPECT_EQ(store.graph_reads(), 1u);  // still 1 — cache hit
 
         // Pin node 0's code — first code access reads from disk.
         PinResult pr3 = store.pin_code(0); const uint8_t* c0 = pr3.data;
         ASSERT_NE(c0, nullptr);
-        store.unpin_code(0);
         EXPECT_EQ(store.code_reads(), 1u);
 
         // Pin node 0's code again — cache hit.
         store.pin_code(0);
-        store.unpin_code(0);
         EXPECT_EQ(store.code_reads(), 1u);
     }
 
@@ -390,28 +386,23 @@ TEST(PagedSearch, CacheHitsAndMisses) {
 
     // First pin of node 0 → one read.
     store.pin_node(0);
-    store.unpin_node(0);
     const uint64_t reads_after_first = store.graph_reads();
     EXPECT_GE(reads_after_first, 1u);
 
     // Second pin of node 0 → cache hit, no new read.
     store.pin_node(0);
-    store.unpin_node(0);
     EXPECT_EQ(store.graph_reads(), reads_after_first);
 
     // Pin node 1 (same block as node 0 since kBlockSize >> node_size).
     // Should also be a cache hit.
     store.pin_node(1);
-    store.unpin_node(1);
     EXPECT_EQ(store.graph_reads(), reads_after_first);
 
     // Pin node 0's code → first code read.
     store.pin_code(0);
-    store.unpin_code(0);
     EXPECT_EQ(store.code_reads(), 1u);
     // Pin code 0 again → cache hit.
     store.pin_code(0);
-    store.unpin_code(0);
     EXPECT_EQ(store.code_reads(), 1u);
 
     remove_sidecars(index_path);
@@ -517,7 +508,6 @@ TEST(PagedSearch, BatchedPreReadPopulatesCache) {
 
     // Pin a node in block 0 → cache miss → batched read (1 syscall).
     store.pin_node(0);
-    store.unpin_node(0);
     EXPECT_EQ(store.graph_reads(), 1u);
 
     // Pin a node in block 1. With kBlocksPerRead=4 this block was pre-read
@@ -525,14 +515,12 @@ TEST(PagedSearch, BatchedPreReadPopulatesCache) {
     // graph_reads must NOT increase.
     const uint32_t node_in_block_1 = nodes_per_block;  // first node of block 1
     store.pin_node(node_in_block_1);
-    store.unpin_node(node_in_block_1);
     EXPECT_EQ(store.graph_reads(), 1u)
         << "block 1 should have been pre-read by the batched miss for block 0";
 
     // A block well beyond the batch window (e.g. block 10) must miss again.
     const uint32_t node_in_block_10 = 10 * nodes_per_block;
     store.pin_node(node_in_block_10);
-    store.unpin_node(node_in_block_10);
     EXPECT_EQ(store.graph_reads(), 2u)
         << "block 10 is outside the batch window and must trigger a new read";
 

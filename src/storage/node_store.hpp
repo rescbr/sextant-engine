@@ -51,18 +51,8 @@ public:
     /// Read a graph node. Returns pointer + whether it caused I/O.
     virtual PinResult pin_node(uint32_t internal_id) = 0;
 
-    /// Release a pinned node. No-op for flat; refcount for paged.
-    virtual void unpin_node(uint32_t internal_id) = 0;
-
     /// Read a PQ code. Returns pointer + whether it caused I/O.
     virtual PinResult pin_code(uint32_t internal_id) = 0;
-
-    /// Release a pinned code.
-    virtual void unpin_code(uint32_t internal_id) = 0;
-
-    /// Write access (build mode). Only FlatNodeStore supports this.
-    virtual uint8_t* mutable_node(uint32_t internal_id) = 0;
-    virtual uint8_t* mutable_code(uint32_t internal_id) = 0;
 
     /// True if this store can serve SSD reads (PagedNodeStore or MemGraph
     /// with a paged backing store). Used to gate DynamicWidth.
@@ -83,11 +73,7 @@ public:
                   uint32_t node_size, uint32_t code_size);
 
     PinResult pin_node(uint32_t id) override;
-    void unpin_node(uint32_t) override {}
     PinResult pin_code(uint32_t id) override;
-    void unpin_code(uint32_t) override {}
-    uint8_t* mutable_node(uint32_t id) override;
-    uint8_t* mutable_code(uint32_t id) override;
     bool is_paged() const override { return false; }
 
 private:
@@ -108,11 +94,7 @@ public:
     ~PagedNodeStore();
 
     PinResult pin_node(uint32_t internal_id) override;
-    void unpin_node(uint32_t) override;
     PinResult pin_code(uint32_t internal_id) override;
-    void unpin_code(uint32_t) override;
-    uint8_t* mutable_node(uint32_t) override;
-    uint8_t* mutable_code(uint32_t) override;
     bool is_paged() const override { return true; }
 
     /// Number of blocks to read per cache miss (requested + neighbors).

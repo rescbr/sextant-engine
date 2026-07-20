@@ -63,15 +63,6 @@ PinResult FlatNodeStore::pin_code(uint32_t id) {
     return {codes_ + static_cast<size_t>(id) * code_size_, false};
 }
 
-uint8_t* FlatNodeStore::mutable_node(uint32_t id) {
-    return nodes_ + static_cast<size_t>(id) * node_size_;
-}
-
-uint8_t* FlatNodeStore::mutable_code(uint32_t id) {
-    return const_cast<uint8_t*>(codes_) +
-           static_cast<size_t>(id) * code_size_;
-}
-
 // ===========================================================================
 // PagedNodeStore
 // ===========================================================================
@@ -304,25 +295,11 @@ PinResult PagedNodeStore::pin_node(uint32_t id) {
     return {pr.data + off_in_block, pr.from_ssd};
 }
 
-void PagedNodeStore::unpin_node(uint32_t) {}
-
 PinResult PagedNodeStore::pin_code(uint32_t id) {
     const uint64_t block_idx = id / codes_per_block_;
     const uint32_t off_in_block = (id % codes_per_block_) * code_size_;
     PinResult pr = get_code_block(block_idx);
     return {pr.data + off_in_block, pr.from_ssd};
-}
-
-void PagedNodeStore::unpin_code(uint32_t) {}
-
-uint8_t* PagedNodeStore::mutable_node(uint32_t) {
-    throw Error(ErrorCode::NotImplemented,
-                "PagedNodeStore does not support mutable_node (build-only)");
-}
-
-uint8_t* PagedNodeStore::mutable_code(uint32_t) {
-    throw Error(ErrorCode::NotImplemented,
-                "PagedNodeStore does not support mutable_code (build-only)");
 }
 
 void PagedNodeStore::maybe_rebalance_caches() {

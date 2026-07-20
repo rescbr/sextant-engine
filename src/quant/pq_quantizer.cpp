@@ -987,31 +987,28 @@ void PqQuantizer::deserialize(const uint8_t* in, size_t size) {
     const size_t book_floats = static_cast<size_t>(m_) * K_ * sub_dim_;
     const size_t book_bytes = book_floats * sizeof(float);
 
-    // Backward compatibility: old blobs are exactly header + book_bytes (no
-    // rotation trailer). New blobs append {has_rotation:u8, [rotation...]}.
+    // Trailer: {has_rotation:u8, [if 1: rotation:float32[dim*dim]]}.
+    // The trailer is mandatory in the clean-slate format.
     has_rotation_ = false;
     rotation_.clear();
     opq_enabled_ = false;
     const size_t trailer_min = header + book_bytes + 1;
-    if (size == header + book_bytes) {
-        // Legacy format — no rotation.
-    } else if (size >= trailer_min) {
-        const uint8_t* rot_flag = in + header + book_bytes;
-        if (rot_flag[0] != 0u) {
-            const size_t rot_bytes = size_t(dim_) * dim_ * sizeof(float);
-            if (size != trailer_min + rot_bytes) {
-                throw Error(ErrorCode::CorruptIndex,
-                            "PQ deserialize: rotation size mismatch");
-            }
-            rotation_.resize(size_t(dim_) * dim_);
-            std::memcpy(rotation_.data(), rot_flag + 1, rot_bytes);
-            has_rotation_ = true;
-        } else if (size != trailer_min) {
-            throw Error(ErrorCode::CorruptIndex,
-                        "PQ deserialize: size mismatch (no rotation, trailing bytes)");
-        }
-    } else {
+    if (size < trailer_min) {
         throw Error(ErrorCode::CorruptIndex, "PQ deserialize: size mismatch");
+    }
+    const uint8_t* rot_flag = in + header + book_bytes;
+    if (rot_flag[0] != 0u) {
+        const size_t rot_bytes = size_t(dim_) * dim_ * sizeof(float);
+        if (size != trailer_min + rot_bytes) {
+            throw Error(ErrorCode::CorruptIndex,
+                        "PQ deserialize: rotation size mismatch");
+        }
+        rotation_.resize(size_t(dim_) * dim_);
+        std::memcpy(rotation_.data(), rot_flag + 1, rot_bytes);
+        has_rotation_ = true;
+    } else if (size != trailer_min) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "PQ deserialize: size mismatch (no rotation, trailing bytes)");
     }
     codebook_.assign(book_floats, 0.0f);
     if (book_bytes > 0) {

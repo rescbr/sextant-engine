@@ -44,10 +44,10 @@ public:
     /// Open a MemGraph from sidecar files. Reads the BFS neighborhood from
     /// .graph and .codes into RAM. `graph_path`/`codes_path` are the full
     /// sidecar paths (each begins with a SidecarHeader). `vecs_path`, if
-    /// non-empty and present, is an OPTIONAL `.vecs` sidecar of FP16 vectors
+    /// non-empty and present, is an OPTIONAL `.ball` sidecar of FP16 vectors
     /// for the ball nodes (in collected/local-index order); enables the
     /// hybrid FP16+PQ distance path. `dim` is the vector dimensionality
-    /// (needed for `.vecs` indexing and validation).
+    /// (needed for `.ball` indexing and validation).
     MemGraph(const std::string& graph_path, const std::string& codes_path,
              const std::string& vecs_path,
              uint32_t node_size, uint32_t code_size, uint32_t total_count,
@@ -57,11 +57,7 @@ public:
 
     // NodeStore interface
     PinResult pin_node(uint32_t id) override;
-    void unpin_node(uint32_t) override;
     PinResult pin_code(uint32_t id) override;
-    void unpin_code(uint32_t) override;
-    uint8_t* mutable_node(uint32_t) override;   // throws
-    uint8_t* mutable_code(uint32_t) override;   // throws
     /// MemGraph wraps a paged backing store. Returns true so DynamicWidth
     /// can activate. PageSearch is gated per-pin via PinResult.from_ssd
     /// instead — only fires on actual cache misses.
@@ -75,7 +71,7 @@ public:
     uint32_t cached_count() const { return cached_count_; }
 
     /// FP16 vector for a cached node (ball node), or nullptr if not cached /
-    /// no `.vecs` data loaded. Override of NodeStore::fp16_ptr.
+    /// no `.ball` data loaded. Override of NodeStore::fp16_ptr.
     const float16_t* fp16_ptr(uint32_t id) const override;
 
     /// True if `id` is in the MemGraph.
@@ -110,7 +106,7 @@ private:
     uint32_t cached_count_ = 0;
     NodeStore* backing_ = nullptr;
 
-    // FP16 ball vectors loaded from the `.vecs` sidecar. Empty if no `.vecs`
+    // FP16 ball vectors loaded from the `.ball` sidecar. Empty if no `.ball`
     // was supplied / present (PQ-only fallback). When non-empty, holds
     // cached_count_ × dim_ float16_t in collected/local-index order — position
     // i is the FP16 vector for the node at local index i.

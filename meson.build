@@ -104,7 +104,7 @@ engine_sources = [
     'src/storage/memgraph.cpp',
     'src/quant/pq_quantizer.cpp',
     'src/algo/vamana_core.cpp',
-    'src/engine/build.cpp',
+    'src/engine/resolve_params.cpp',
     'src/engine/search.cpp',
     'src/engine/engine.cpp',
     'src/engine/fbin_source.cpp',

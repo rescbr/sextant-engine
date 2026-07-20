@@ -1,8 +1,8 @@
-// Build pipeline — parameter resolution (Issue 37).
+// resolve_params — auto-default parameter resolution (Issue 37).
 // The two-pass streaming + parallel HDC construct lives in engine.cpp; this
 // translation unit owns the auto-default resolution logic.
 
-#include "build.hpp"
+#include "resolve_params.hpp"
 #include "sextant/error.hpp"
 #include "sextant/system.hpp"
 

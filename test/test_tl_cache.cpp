@@ -192,14 +192,12 @@ TEST(TLBlockCache, IntegrationL1ServesRepeatedPins) {
     // First pin of node 0 → L1 miss → L2 miss → disk read.
     PinResult pr1 = store.pin_node(0);
     ASSERT_NE(pr1.data, nullptr);
-    store.unpin_node(0);
     const uint64_t reads_after_first = store.graph_reads();
     EXPECT_GE(reads_after_first, 1u);
 
     // Second pin of node 0 → L1 hit (no new read).
     PinResult pr2 = store.pin_node(0);
     ASSERT_NE(pr2.data, nullptr);
-    store.unpin_node(0);
     EXPECT_EQ(store.graph_reads(), reads_after_first)
         << "repeated pin should be served from L1 without a new disk read";
 
@@ -259,14 +257,12 @@ TEST(TLBlockCache, PerInstanceIsolation) {
 
     // Pin node 0 in store A → its L1 misses, reads from disk.
     store_a.pin_node(0);
-    store_a.unpin_node(0);
     EXPECT_EQ(store_a.graph_reads(), 1u);
     EXPECT_EQ(store_a.tl_misses(), 1u);
     EXPECT_EQ(store_a.tl_hits(), 0u);
 
     // Pin node 0 in store B → its L1 must ALSO miss (independent cache).
     store_b.pin_node(0);
-    store_b.unpin_node(0);
     EXPECT_EQ(store_b.graph_reads(), 1u)
         << "store B must read from disk — its L1 is independent of store A's";
     EXPECT_EQ(store_b.tl_misses(), 1u);

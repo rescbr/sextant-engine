@@ -314,7 +314,6 @@ void VamanaCore::beam_search_into(
         } else {
             d = quantizer_.lut_distance(code_ptr, query_lut);
         }
-        if (store_) store_->unpin_code(id);
         return d;
     };
 
@@ -491,7 +490,6 @@ void VamanaCore::beam_search_into(
                             pr.data + kNeighborArrayOffset,
                             n * sizeof(uint32_t));
             }
-            store_->unpin_node(best.internal_id);
         } else {
             const uint8_t* node = node_ptr(best.internal_id);
             n = get_neighbor_count(node);
@@ -629,9 +627,8 @@ void VamanaCore::beam_search_into(
                                             i)
                             : get_neighbor(
                                 node_ptr(best.internal_id), i));
-                if (store_ && !nb_ptr) {
-                    store_->unpin_node(best.internal_id);
-                }
+                // (no per-pin cleanup — NodeStore::unpin_* removed: all
+                // implementations were no-ops; the cache outlives the call.)
                 if (is_visited(nb_internal)) {
                     continue;
                 }
@@ -1094,7 +1091,6 @@ std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
             if (store_) {
                 PinResult pr = store_->pin_node(iid);
                 const RowId rid = get_row_id(pr.data);
-                store_->unpin_node(iid);
                 c.row_id = rid;
             } else {
                 c.row_id = get_row_id(node_ptr(iid));

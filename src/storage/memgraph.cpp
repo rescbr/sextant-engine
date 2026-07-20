@@ -121,7 +121,7 @@ MemGraph::MemGraph(const std::string& graph_path, const std::string& codes_path,
 
     materialize(graph_buf.data(), codes_buf.data());
 
-    // Optionally load the `.vecs` FP16 sidecar (ball-only vectors in the same
+    // Optionally load the `.ball` FP16 sidecar (ball-only vectors in the same
     // collected/local-index order produced by materialize). Enables the hybrid
     // FP16+PQ distance path in beam_search. Absent or mismatched → PQ-only.
     if (!vecs_path.empty()) {
@@ -139,7 +139,7 @@ MemGraph::MemGraph(const std::string& graph_path, const std::string& codes_path,
                 spdlog::info("[sextant] MemGraph: loaded {} FP16 vectors from {}",
                              ball_count, vecs_path);
             } else {
-                spdlog::warn("[sextant] MemGraph: .vecs dim={}/ball_count={} != "
+                spdlog::warn("[sextant] MemGraph: .ball dim={}/ball_count={} != "
                              "expected dim={}/cached_count={}, skipping FP16",
                              h.dim, ball_count, dim_, cached_count_);
             }
@@ -252,12 +252,6 @@ PinResult MemGraph::pin_node(uint32_t id) {
     return backing_ ? backing_->pin_node(id) : PinResult{};
 }
 
-void MemGraph::unpin_node(uint32_t id) {
-    if (backing_ && !is_cached(id)) {
-        backing_->unpin_node(id);
-    }
-}
-
 PinResult MemGraph::pin_code(uint32_t id) {
     if (id < id_to_local_.size() &&
         id_to_local_[id] != std::numeric_limits<uint32_t>::max()) {
@@ -266,22 +260,6 @@ PinResult MemGraph::pin_code(uint32_t id) {
                 false};
     }
     return backing_ ? backing_->pin_code(id) : PinResult{};
-}
-
-void MemGraph::unpin_code(uint32_t id) {
-    if (backing_ && !is_cached(id)) {
-        backing_->unpin_code(id);
-    }
-}
-
-uint8_t* MemGraph::mutable_node(uint32_t) {
-    throw Error(ErrorCode::NotImplemented,
-                "MemGraph does not support mutable_node (build-only)");
-}
-
-uint8_t* MemGraph::mutable_code(uint32_t) {
-    throw Error(ErrorCode::NotImplemented,
-                "MemGraph does not support mutable_code (build-only)");
 }
 
 }  // namespace sextant

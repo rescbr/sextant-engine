@@ -115,16 +115,12 @@ TEST(MemGraph, PinReturnsRamPointersAndDelegatesCold) {
     EXPECT_NE(mg_p, bk_p);
     // But the contents must match (same node data).
     EXPECT_EQ(std::memcmp(mg_p, bk_p, node_size), 0);
-    mg.unpin_node(50);
-    backing.unpin_node(50);
 
     // Cached code 50 likewise differs but matches.
     PinResult mg_cr = mg.pin_code(50); const uint8_t* mg_c = mg_cr.data;
     PinResult bk_cr = backing.pin_code(50); const uint8_t* bk_c = bk_cr.data;
     EXPECT_NE(mg_c, bk_c);
     EXPECT_EQ(std::memcmp(mg_c, bk_c, code_size), 0);
-    mg.unpin_code(50);
-    backing.unpin_code(50);
 
     // Cold node (far away): MemGraph delegates — pointer equals backing's.
     const uint32_t cold = 0;  // entry 50 ±2 covers {48..52}; 0 is cold
@@ -132,24 +128,6 @@ TEST(MemGraph, PinReturnsRamPointersAndDelegatesCold) {
     PinResult bk_cold_pr = backing.pin_node(cold); const uint8_t* bk_cold = bk_cold_pr.data;
     ASSERT_NE(mg_cold, nullptr);
     EXPECT_EQ(mg_cold, bk_cold);
-    mg.unpin_node(cold);
-    backing.unpin_node(cold);
-}
-
-// ---------------------------------------------------------------------------
-// Mutable accessors throw (MemGraph is read-only).
-// ---------------------------------------------------------------------------
-TEST(MemGraph, MutableAccessorsThrow) {
-    const uint32_t n = 50;
-    const uint32_t node_size = 32;
-    const uint8_t code_size = 8;
-    auto nodes = make_ring_nodes(n, node_size);
-    std::vector<uint8_t> codes(static_cast<size_t>(n) * code_size, 0);
-
-    MemGraph mg(nodes.data(), codes.data(), node_size, code_size, n,
-                {0}, /*num_hops=*/1);
-    EXPECT_THROW(mg.mutable_node(0), Error);
-    EXPECT_THROW(mg.mutable_code(0), Error);
 }
 
 // ---------------------------------------------------------------------------

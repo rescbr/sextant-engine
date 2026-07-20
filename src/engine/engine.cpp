@@ -12,7 +12,7 @@
 //
 // The search/load path is in search.cpp.
 
-#include "build.hpp"
+#include "resolve_params.hpp"
 #include "fbin_source.hpp"
 #include "memory_source.hpp"
 #include "partition.hpp"
@@ -2041,7 +2041,7 @@ void Engine::write_sidecars_(const std::string& index_path,
         write_meta_file(params, remapped_eps, uuid);
     }
 
-    // ----- .vecs (FP16 for the MemGraph entry-point ball) -----
+    // ----- .ball (FP16 for the MemGraph entry-point ball) -----
     // Ball-only: stores FP16 vectors for the nodes within 3 hops of the entry
     // points. At search time, beam_search uses l2sq_f16 for these nodes (high
     // precision in the approach phase) and PQ for the rest. Scales: the file
@@ -2052,10 +2052,10 @@ void Engine::write_sidecars_(const std::string& index_path,
     // (build-order, neighbors in build-order); the open-time BFS runs on the
     // .graph file (disk-order, neighbors remapped via bfs.remap). The visit
     // ORDER is identical because the remap preserves neighbor-list ordering
-    // (only IDs change, not positions). So .vecs position i == MemGraph local
+    // (only IDs change, not positions). So .ball position i == MemGraph local
     // index i.
     {
-        const std::string path = index_path + ".vecs";
+        const std::string path = index_path + ".ball";
         constexpr uint32_t kVecsNumHops = 3;
         // Run the same BFS MemGraph runs at open time: from the (build-order)
         // entry points, 3 hops, on nodes_buffer_ (build-order). Collect
@@ -2088,7 +2088,7 @@ void Engine::write_sidecars_(const std::string& index_path,
             }
         }
 
-        // Write .vecs: header + ball_ids.size() × dim × float16_t, streamed
+        // Write .ball: header + ball_ids.size() × dim × float16_t, streamed
         // through a block-aligned ring buffer (like .codes above) to amortize
         // syscalls.
         DirectFile f(path, true);
@@ -2104,7 +2104,7 @@ void Engine::write_sidecars_(const std::string& index_path,
         uint8_t* ring = static_cast<uint8_t*>(aligned_alloc(kDiskAlign, buf_cap));
         if (!ring) {
             throw Error(ErrorCode::OutOfMemory,
-                        "write_sidecars_: .vecs ring alloc failed");
+                        "write_sidecars_: .ball ring alloc failed");
         }
         uint64_t write_off = sizeof(h);
         uint32_t in_block = 0;

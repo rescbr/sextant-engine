@@ -314,7 +314,7 @@ void Engine::load_sidecars() {
         }
         memgraph_ = std::make_unique<MemGraph>(
             index_path_ + ".graph", index_path_ + ".codes",
-            index_path_ + ".vecs",   // FP16 ball sidecar (optional — PQ fallback)
+            index_path_ + ".ball",   // FP16 ball sidecar (optional — PQ fallback)
             node_size_, code_size_,
             static_cast<uint32_t>(count_), dim_,
             eps, /*num_hops=*/3);
