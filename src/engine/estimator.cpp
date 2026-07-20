@@ -620,12 +620,25 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
         spdlog::info("[sextant] estimate_config: sweeping alpha (k={})...",
                      target_k);
         static constexpr std::array<float, 4> kAlphas = {{1.0f, 1.1f, 1.2f, 1.5f}};
-        constexpr uint32_t kAlphaRerank = 10;
-        // L (beam width) must exceed fetch_k = k × rerank so the rerank has a
-        // deep enough candidate pool. At target_k=100/rerank=10, fetch_k=1000,
-        // so L = max(target_k × rerank × 2, 200) = 2000.
+        // Production-realistic rerank and beam width. The previous values
+        // (rerank=10, L=target_k*10*2=2000) probed the mini-build with a beam
+        // 5× deeper than production search (L=400 at k=100/rr=2), which masked
+        // alpha differences — every alpha looked equally good and the sweep
+        // defaulted to the cheapest (alpha=1.0), collapsing recall in half.
+        // Match the production default (rr=2 → fetch_k=200 → L=400) so the
+        // sweep sees what the user will actually see.
+        constexpr uint32_t kAlphaRerank = 2;
         const uint32_t kAlphaL =
             std::max<uint32_t>(target_k * kAlphaRerank * 2u, 200u);
+        // Note: even at production L, the 20K mini-build can't reliably
+        // discriminate alpha — small-scale navigation doesn't expose the
+        // alpha<1.2 failure mode that surfaces at production N. So when no
+        // explicit quality gate is set, skip the sweep and use the documented
+        // default (alpha=1.2). The sweep is still useful when the user pins
+        // a quality target with --recall-target or --proximity-target — in
+        // that case we honor the gate even if the mini-build can't really
+        // see the difference (best-effort).
+        const bool gate_active = (recall_thresh > 0.0 || prox_thresh > 0.0);
 
         ResolvedParams alpha_params = base;
         alpha_params.R = 64;
@@ -640,6 +653,15 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
         float best_effort_alpha = kAlphas.front();
         double best_effort_score = -1.0;  // recall if recall gate, else proximity
         const bool gate_on_recall = (recall_thresh > 0.0);
+        if (!gate_active) {
+            // No user-supplied quality gate: the alpha sweep is uninformative
+            // because the 20K mini-build can't expose production-scale alpha
+            // effects. Use the documented default (1.2). Matches the
+            // resolve_params auto-default and the --prune-threshold docstring.
+            spdlog::info("[sextant] estimate_config: alpha → 1.2 "
+                         "(no quality gate set; mini-build can't discriminate)");
+            alpha_rec = 1.2f;
+        } else {
         for (float a : kAlphas) {
             alpha_params.alpha = a;
             const auto t0 = std::chrono::steady_clock::now();
@@ -675,6 +697,7 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
                          gate_on_recall ? "recall" : "proximity",
                          best_effort_score);
         }
+        }  // end if (gate_active)
     }
 
     // --- 6. R resolution (OPT-SNG) ---
