@@ -10,6 +10,7 @@
 #include <sextant/vector_source.hpp>
 #include <sextant/config.hpp>
 #include <sextant/index.hpp>
+#include <sextant/searcher.hpp>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -85,6 +86,7 @@ public:
     void open(const std::string& index_path);
 
     /// Search for k nearest neighbors. Returns candidate row_ids.
+    /// Phase C: thin delegator; the real work is in Searcher.
     std::vector<Candidate> search(const float* query, uint32_t k,
                                    const SearchConfig& config);
 
@@ -101,10 +103,12 @@ public:
     void set_cache_size(uint64_t bytes) { cache_size_override_ = bytes; }
 
     /// Enable/disable adaptive cache rebalance (default: enabled in paged mode).
-    /// When enabled, the two caches (graph/code) are periodically resized based
-    /// on observed hit/miss ratios. Must be called before open(); zero overhead
-    /// when the index is not paged or when disabled.
-    void set_cache_rebalance_enabled(bool enabled) { cache_rebalance_enabled_ = enabled; }
+    /// Stored on Engine until the Searcher is constructed (post-build/open),
+    /// then propagated. Must be called before open()/build().
+    void set_cache_rebalance_enabled(bool enabled) {
+        cache_rebalance_enabled_ = enabled;
+        if (searcher_) searcher_->set_cache_rebalance_enabled(enabled);
+    }
     uint64_t count() const { return index_ ? index_->count : 0; }
     Dim dim() const { return index_ ? index_->dim : 0; }
 
@@ -112,30 +116,35 @@ public:
     /// are NOT loaded. Used by tests to verify the low-idle-RAM invariant.
     bool is_paged() const { return index_ && index_->is_paged(); }
 
-    /// Cache diagnostics (only valid when is_paged()).
-    uint64_t cache_graph_reads() const;
-    uint64_t cache_code_reads() const;
-    /// W-TinyLFU admission stats: {window, probation, protected} hit counts,
-    /// misses, and admission decisions. All zero when not paged.
-    struct AdmissionStats {
-        uint64_t hits_window = 0;
-        uint64_t hits_probation = 0;
-        uint64_t hits_protected = 0;
-        uint64_t misses = 0;
-        uint64_t evictions_admitted = 0;
-        uint64_t evictions_rejected = 0;
-    };
-    AdmissionStats cache_admission_stats() const;
+    /// Cache diagnostics (only valid when is_paged()). Phase C: delegate to
+    /// Searcher.
+    uint64_t cache_graph_reads() const {
+        return searcher_ ? searcher_->cache_graph_reads() : 0;
+    }
+    uint64_t cache_code_reads() const {
+        return searcher_ ? searcher_->cache_code_reads() : 0;
+    }
+    /// W-TinyLFU admission stats. Mirrors Searcher::AdmissionStats.
+    using AdmissionStats = Searcher::AdmissionStats;
+    AdmissionStats cache_admission_stats() const {
+        return searcher_ ? searcher_->cache_admission_stats() : AdmissionStats{};
+    }
 
-    /// Periodically rebalance the graph/code cache split based on hit/miss
-    /// ratios. No-op if not in paged mode. Wired up but NOT called
-    /// automatically from the hot search loop yet (follow-up).
-    void rebalance_caches();
+    /// Force a rebalance now. No-op if not in paged mode.
+    void rebalance_caches() {
+        if (searcher_) searcher_->rebalance_caches();
+    }
     /// Thread-local L1 cache hit/miss counters.
-    uint64_t tl_hits() const;
-    uint64_t tl_misses() const;
+    uint64_t tl_hits() const {
+        return searcher_ ? searcher_->tl_hits() : 0;
+    }
+    uint64_t tl_misses() const {
+        return searcher_ ? searcher_->tl_misses() : 0;
+    }
     /// Number of nodes held in the MemGraph neighborhood cache (0 if none).
-    uint32_t memgraph_cached_count() const;
+    uint32_t memgraph_cached_count() const {
+        return searcher_ ? searcher_->memgraph_cached_count() : 0;
+    }
     /// True when flat buffers are resident in RAM (build or post-insert).
     bool has_flat_buffers() const { return index_ && index_->has_flat_buffers(); }
 
@@ -143,18 +152,10 @@ private:
     bool opened_ = false;
     std::string index_path_;  ///< Set by open()/build() before index_ exists.
     std::unique_ptr<Index> index_;
+    std::unique_ptr<Searcher> searcher_;  ///< Lazily constructed over index_.
 
     uint64_t cache_size_override_ = 0;  ///< 0 = auto
-
-    // Adaptive cache rebalance (paged mode only).
-    bool cache_rebalance_enabled_ = true;
-    std::atomic<uint64_t> search_count_{0};
-    std::atomic<bool> rebalancing_{false};
-    static constexpr uint64_t kRebalanceCadenceInitial = 1000;
-    static constexpr uint64_t kRebalanceCadenceMax = 16000;
-    uint64_t rebalance_cadence_ = kRebalanceCadenceInitial;
-    /// Private: per-search adaptive rebalance hook.
-    void maybe_rebalance_();
+    bool cache_rebalance_enabled_ = true;  ///< Propagated to searcher_ on construct.
 
     /// --- estimate_config helpers (in-RAM mini-build + measurement) ---
 

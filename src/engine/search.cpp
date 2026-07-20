@@ -34,50 +34,6 @@ using engine_detail::read_exact;
 using engine_detail::write_padded;
 
 // ===========================================================================
-// search()
-// ===========================================================================
-
-std::vector<Candidate> Engine::search(const float* query, uint32_t k,
-                                      const SearchConfig& config) {
-    if (!opened_) {
-        throw Error(ErrorCode::InvalidParam,
-                    "Engine::search: index not opened");
-    }
-    if (!index_->quantizer || !index_->core) {
-        throw Error(ErrorCode::InvalidParam,
-                    "Engine::search: quantizer/core not initialized");
-    }
-    if (k == 0) {
-        return {};
-    }
-
-    // Preprocess the query into a PQ LUT.
-    const uint32_t lut_sz = index_->quantizer->lut_size();
-    std::vector<float> lut(lut_sz > 0 ? lut_sz : 1, 0.0f);
-    if (lut_sz > 0) {
-        index_->quantizer->preprocess_query(query, lut.data());
-    }
-
-    // VamanaCore::search resolves internal_ids → row_ids for us.
-    // Convert the query to FP16 for the hybrid FP16+PQ distance path
-    // (MemGraph ball nodes use l2sq_f16; the rest use PQ lut_distance).
-    std::vector<float16_t> query_fp16(index_->dim);
-    for (uint32_t d = 0; d < index_->dim; d++) {
-        query_fp16[d] = static_cast<float16_t>(query[d]);
-    }
-    auto results =
-        index_->core->search(lut.data(), k, config.L_search, config.io_limit,
-                      query_fp16.data());
-
-    // Adaptive cache rebalance (paged mode only). Cheap relaxed-atomic add per
-    // search; the rare resize is CAS-guarded so only one thread runs it.
-    if (index_->paged_store && cache_rebalance_enabled_) {
-        maybe_rebalance_();
-    }
-    return results;
-}
-
-// ===========================================================================
 // open()
 // ===========================================================================
 
@@ -119,6 +75,8 @@ void Engine::open(const std::string& index_path) {
     index_->path = index_path;
 
     load_sidecars();
+    searcher_ = std::make_unique<Searcher>(*index_);
+    searcher_->set_cache_rebalance_enabled(cache_rebalance_enabled_);
     opened_ = true;
     spdlog::info("[sextant] opened index '{}' (n={} dim={})", index_path,
                  index_->count, index_->dim);
@@ -332,68 +290,4 @@ void Engine::load_sidecars() {
         index_->core->compute_entry_points();
     }
 }
-
-uint64_t Engine::cache_graph_reads() const {
-    return index_->paged_store ? index_->paged_store->graph_reads() : 0;
-}
-
-uint64_t Engine::cache_code_reads() const {
-    return index_->paged_store ? index_->paged_store->code_reads() : 0;
-}
-
-Engine::AdmissionStats Engine::cache_admission_stats() const {
-    if (!index_->paged_store) return {};
-    const auto cs = index_->paged_store->cache_stats();
-    return {
-        cs.graph.hits_window + cs.code.hits_window,
-        cs.graph.hits_probation + cs.code.hits_probation,
-        cs.graph.hits_protected + cs.code.hits_protected,
-        cs.graph.misses + cs.code.misses,
-        cs.graph.evictions_admitted + cs.code.evictions_admitted,
-        cs.graph.evictions_rejected + cs.code.evictions_rejected,
-    };
-}
-
-void Engine::rebalance_caches() {
-    if (index_->paged_store) {
-        index_->paged_store->maybe_rebalance_caches();
-    }
-}
-
-void Engine::maybe_rebalance_() {
-    const uint64_t n = search_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n < rebalance_cadence_) return;
-    // CAS: only one thread rebalances at a time. Losers bail (they'll retry
-    // next cadence window; the counter is monotonic so no double-fire).
-    bool expected = false;
-    if (!rebalancing_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel)) {
-        return;
-    }
-    const double prev_frac = index_->paged_store->graph_cache_fraction();
-    index_->paged_store->maybe_rebalance_caches();   // may call BlockCache::resize
-    const double new_frac = index_->paged_store->graph_cache_fraction();
-    rebalancing_.store(false, std::memory_order_release);
-    // Adaptive cadence: if the split didn't move, back off (steady state).
-    // If it moved, reset to initial (workload shifting — stay responsive).
-    if (std::abs(new_frac - prev_frac) < 1e-6) {
-        rebalance_cadence_ = std::min(kRebalanceCadenceMax,
-                                      rebalance_cadence_ * 2);
-    } else {
-        rebalance_cadence_ = kRebalanceCadenceInitial;
-    }
-}
-
-uint32_t Engine::memgraph_cached_count() const {
-    return index_->memgraph ? index_->memgraph->cached_count() : 0;
-}
-
-uint64_t Engine::tl_hits() const {
-    return index_->paged_store ? index_->paged_store->tl_hits() : 0;
-}
-
-uint64_t Engine::tl_misses() const {
-    return index_->paged_store ? index_->paged_store->tl_misses() : 0;
-}
-
 }  // namespace sextant

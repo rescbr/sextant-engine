@@ -103,6 +103,8 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     if (!index_) index_ = std::make_unique<Index>();
     Builder b(*index_);
     auto result = b.build(source, index_path, config);
+    searcher_ = std::make_unique<Searcher>(*index_);
+    searcher_->set_cache_rebalance_enabled(cache_rebalance_enabled_);
     opened_ = true;
     return result;
 }
@@ -112,6 +114,8 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     if (!index_) index_ = std::make_unique<Index>();
     Builder b(*index_);
     auto result = b.build(source, index_path, params);
+    searcher_ = std::make_unique<Searcher>(*index_);
+    searcher_->set_cache_rebalance_enabled(cache_rebalance_enabled_);
     opened_ = true;
     return result;
 }
@@ -129,6 +133,15 @@ void Engine::flush() {
     if (!opened_ || !index_) return;
     Builder b(*index_);
     b.flush();
+}
+
+std::vector<Candidate> Engine::search(const float* query, uint32_t k,
+                                       const SearchConfig& config) {
+    if (!opened_ || !searcher_) {
+        throw Error(ErrorCode::InvalidParam,
+                    "Engine::search: index not opened");
+    }
+    return searcher_->search(query, k, config);
 }
 
 
