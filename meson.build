@@ -111,6 +111,7 @@ engine_sources = [
     'src/engine/probe.cpp',
     'src/engine/builder.cpp',
     'src/engine/searcher.cpp',
+    'src/engine/estimator.cpp',
     'src/engine/fbin_source.cpp',
     'src/engine/partition.cpp',
     'src/logging.cpp',

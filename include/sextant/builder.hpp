@@ -32,9 +32,11 @@ class VamanaCore;
 /// centroids); the heavy state (quantizer, core, buffers, stores) lives on
 /// the Index and is mutated in place.
 class Builder {
-    friend class Engine;  // Phase B: Engine::build_mini_ (estimate path) reaches
-                          // into the private build helpers until Phase D moves
-                          // the Estimator onto Builder directly.
+    friend class Engine;     // Phase B bridge: Engine keeps thin delegators
+                             // until Phase E deletes it.
+    friend class Estimator;  // Phase D: Estimator reaches into the private
+                             // build pipeline for in-RAM mini-builds without
+                             // the sidecar flush step.
 public:
     /// Build into `index` (which must outlive the Builder). The Index's
     /// metadata (count, dim, path) is populated from `source` / `index_path`.
