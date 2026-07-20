@@ -282,9 +282,27 @@ public:
     uint32_t max_protected() const { return shards_[0]->max_protected(); }
 
     /// Feed a hit/miss sample into the cache-level hill-climber. Called by each
-    /// shard's lookup()/insert() via its back-pointer. Uses relaxed atomics on
-    /// the sample counters and a CAS guard so only one thread runs climb().
+    /// shard's lookup()/insert() via its back-pointer.
+    ///
+    /// Performance: this is on the hottest path of the search (every L2 cache
+    /// lookup). Doing a shared-atomic `fetch_add` per call caused severe cache-
+    /// line bouncing across cores — at 8 threads, the atomic instruction alone
+    /// consumed ~30% of CPU cycles. We instead accumulate hits/misses in a
+    /// thread-local counter and flush to the shared atomics every `kFlushMask+1`
+    /// calls (currently 64), reducing cross-core traffic by ~64×. The
+    /// hill-climber's sample window is in the millions, so this coarsening is
+    /// well within its tolerance.
     void record_access(bool hit);
+
+    /// Flush this thread's pending samples for this cache to the shared
+    /// atomics. Only needed at explicit teardown points (tests that destroy
+    /// a BlockCache on a thread that may have pending samples); in normal
+    /// operation the per-call flush every 64 samples is sufficient.
+    void flush_thread_local();
+
+    /// Mask used to determine when to flush: flush when
+    /// `(local_hits + local_misses) & kFlushMask == 0`. Power of two minus 1.
+    static constexpr uint64_t kFlushMask = 63;
 
 private:
     friend class CacheShard;
@@ -325,6 +343,25 @@ private:
     std::atomic<bool> hc_climbing_{false};
     double hc_prev_hit_rate_ = 0.0;
     double hc_step_size_ = 0.0;
+
+    // --- thread-local sample accumulation (see record_access comment) --------
+    // Per-thread, per-BlockCache accumulation buffer. `record_access` bumps
+    // these (no atomics — thread_local is implicitly thread-private) and
+    // flushes to the shared `hc_hits_in_sample_` / `hc_misses_in_sample_`
+    // every 64 calls. Keyed by `this` because a thread may search against
+    // multiple BlockCache instances (graph_cache_ + code_cache_) over its
+    // lifetime and the hill-climber signal must not conflate them.
+    //
+    // alignas(64): padding prevents false-sharing between distinct
+    // HotCounters entries when the thread_local allocator packs them
+    // into adjacent slots. (Per-thread, so technically already isolated,
+    // but the padding is cheap insurance against aliasing surprises.)
+    struct alignas(64) HotCounters {
+        uint64_t local_hits = 0;
+        uint64_t local_misses = 0;
+    };
+    static thread_local std::unordered_map<const BlockCache*, HotCounters>
+        tl_hot_counters_;
 };
 
 }  // namespace sextant

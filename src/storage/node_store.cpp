@@ -15,6 +15,10 @@
 
 namespace sextant {
 
+// Per-thread, per-store L1 hit/miss accumulators (see comment in node_store.hpp).
+thread_local std::unordered_map<const PagedNodeStore*, PagedNodeStore::L1Counters>
+    PagedNodeStore::tl_l1_counters_;
+
 namespace {
 
 struct alignas(kDiskAlign) AlignedStaging {
@@ -166,11 +170,26 @@ PinResult PagedNodeStore::batched_read(DirectFile& file, uint32_t block_size,
     const uint64_t epoch = cache.shard_epoch(block_idx);
     if (const uint8_t* hit = l1.lookup(key_base, epoch)) {
         ++l1.hits;
-        tl_hits_.fetch_add(1, std::memory_order_relaxed);
+        // Per-thread accumulation; flush every 64 calls. See comment on
+        // tl_l1_counters_ in node_store.hpp — per-call fetch_add on the
+        // shared atomic was the dominant scaling villain (~30% of 8t cycles).
+        L1Counters& c = tl_l1_counters_[this];
+        c.local_hits++;
+        if (!((c.local_hits + c.local_misses) & kL1FlushMask)) {
+            tl_hits_.fetch_add(c.local_hits, std::memory_order_relaxed);
+            tl_misses_.fetch_add(c.local_misses, std::memory_order_relaxed);
+            c.local_hits = c.local_misses = 0;
+        }
         return {hit, false};  // L1 hit — no I/O, no L2 lock
     }
     ++l1.misses;
-    tl_misses_.fetch_add(1, std::memory_order_relaxed);
+    L1Counters& c = tl_l1_counters_[this];
+    c.local_misses++;
+    if (!((c.local_hits + c.local_misses) & kL1FlushMask)) {
+        tl_hits_.fetch_add(c.local_hits, std::memory_order_relaxed);
+        tl_misses_.fetch_add(c.local_misses, std::memory_order_relaxed);
+        c.local_hits = c.local_misses = 0;
+    }
 
     // Step 1–2: check the requested block's shard under its write lock.
     {

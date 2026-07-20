@@ -8,6 +8,12 @@
 
 namespace sextant {
 
+// Definition of the per-thread, per-BlockCache sample accumulator. Declared
+// in block_cache.hpp. Lives for the lifetime of the thread; entries are
+// never explicitly erased (see ~BlockCache note in record_access).
+thread_local std::unordered_map<const BlockCache*, BlockCache::HotCounters>
+    BlockCache::tl_hot_counters_;
+
 // --- CacheShard -------------------------------------------------------------
 
 CacheShard::CacheShard(uint32_t capacity_blocks, uint32_t block_size,
@@ -327,7 +333,17 @@ BlockCache::BlockCache(uint32_t num_shards,
     }
 }
 
-BlockCache::~BlockCache() = default;
+BlockCache::~BlockCache() {
+    // Flush any pending samples on the destroying thread. Other threads'
+    // thread_local entries for this cache will leak (a few bytes each) until
+    // they exit — acceptable because BlockCache instances are engine-lifetime
+    // objects in production (graph_cache_ + code_cache_). The key (raw
+    // pointer) becomes stale but is never dereferenced after this point; a
+    // future BlockCache reusing the same address would collide, but the
+    // accumulated counter is at most 63 samples (negligible vs the
+    // million-sample hill-climber window).
+    flush_thread_local();
+}
 
 CacheStats BlockCache::stats() const {
     CacheStats s;
@@ -375,12 +391,35 @@ void BlockCache::resize(uint32_t new_blocks_per_shard) {
 // so there is no cross-shard lock-acquisition deadlock risk.
 
 void BlockCache::record_access(bool hit) {
-    if (hit) {
-        hc_hits_in_sample_.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        hc_misses_in_sample_.fetch_add(1, std::memory_order_relaxed);
-    }
+    // Per-thread accumulation: thread_local map means no cross-core traffic
+    // on the hot path. The map lookup is one hash; in steady state each
+    // thread pins a single entry per BlockCache instance.
+    HotCounters& c = tl_hot_counters_[this];
+    if (hit) c.local_hits++;
+    else     c.local_misses++;
+
+    // Flush every (kFlushMask + 1) calls. Power-of-two check is a bitmask
+    // AND, cheaper than a modulo. After flush, the shared atomics carry the
+    // signal for maybe_climb() to sample.
+    if ((c.local_hits + c.local_misses) & kFlushMask) return;
+
+    hc_hits_in_sample_.fetch_add(c.local_hits, std::memory_order_relaxed);
+    hc_misses_in_sample_.fetch_add(c.local_misses, std::memory_order_relaxed);
+    c.local_hits = 0;
+    c.local_misses = 0;
     maybe_climb();
+}
+
+void BlockCache::flush_thread_local() {
+    auto it = tl_hot_counters_.find(this);
+    if (it == tl_hot_counters_.end()) return;
+    HotCounters& c = it->second;
+    if (c.local_hits || c.local_misses) {
+        hc_hits_in_sample_.fetch_add(c.local_hits, std::memory_order_relaxed);
+        hc_misses_in_sample_.fetch_add(c.local_misses, std::memory_order_relaxed);
+        c.local_hits = 0;
+        c.local_misses = 0;
+    }
 }
 
 void BlockCache::maybe_climb() {

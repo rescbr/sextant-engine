@@ -127,14 +127,36 @@ public:
         return code_reads_.load(std::memory_order_relaxed);
     }
 
-    /// Aggregate L1 (thread-local) hit/miss counters across all threads that
-    /// have used this store. Relaxed atomics — statistical only.
+    /// Drain this thread's pending L1 hit/miss samples into the shared
+    /// atomics, then return the current totals. Only needed by callers that
+    /// read stats immediately after a small number of operations (e.g. tests);
+    /// in normal operation the per-call flush every 64 samples is sufficient.
+    /// Note: only drains the CALLING thread's pending samples — other threads
+    /// may still have unflushed counts. Single-threaded tests are exact;
+    /// multi-threaded stats are already approximate (see comment on
+    /// tl_l1_counters_).
     uint64_t tl_hits() const {
+        flush_l1_counters();
         return tl_hits_.load(std::memory_order_relaxed);
     }
     uint64_t tl_misses() const {
+        flush_l1_counters();
         return tl_misses_.load(std::memory_order_relaxed);
     }
+
+private:
+    void flush_l1_counters() const {
+        auto it = tl_l1_counters_.find(this);
+        if (it == tl_l1_counters_.end()) return;
+        L1Counters& c = it->second;
+        if (c.local_hits || c.local_misses) {
+            tl_hits_.fetch_add(c.local_hits, std::memory_order_relaxed);
+            tl_misses_.fetch_add(c.local_misses, std::memory_order_relaxed);
+            c.local_hits = c.local_misses = 0;
+        }
+    }
+
+public:
 
     /// W-TinyLFU cache profiling counters (window/probation/protected hits,
     /// misses, admission decisions). Combined across the graph and code caches.
@@ -201,6 +223,20 @@ private:
     // entries left on threads that didn't run the destructor.
     static std::atomic<uint64_t> next_instance_id_;
     uint64_t instance_id_;
+    // Per-thread L1 hit/miss accumulators. The hot path of the search does an
+    // L1 lookup on every cache access (~4.5M per 1000-query bench); updating
+    // shared atomics per call caused severe cache-line bouncing across cores
+    // (~30% of cycles at 8 threads, second only to BlockCache::record_access).
+    // We instead accumulate per-thread and flush to the shared atomics every
+    // `kL1FlushMask + 1` calls. Stats are read only at end-of-bench, so the
+    // ≤63-sample loss on thread exit is invisible.
+    struct alignas(64) L1Counters {
+        uint64_t local_hits = 0;
+        uint64_t local_misses = 0;
+    };
+    static thread_local std::unordered_map<const PagedNodeStore*, L1Counters>
+        tl_l1_counters_;
+    static constexpr uint64_t kL1FlushMask = 63;
     mutable std::atomic<uint64_t> tl_hits_{0};
     mutable std::atomic<uint64_t> tl_misses_{0};
 
