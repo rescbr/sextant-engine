@@ -12,7 +12,14 @@
 #include <gtest/gtest.h>
 #include "engine/fbin_source.hpp"
 #include "sextant/config.hpp"
-#include "sextant/engine.hpp"
+#include "sextant/builder.hpp"
+#include "sextant/estimator.hpp"
+#include "sextant/index.hpp"
+#include "sextant/searcher.hpp"
+#include "algo/vamana_core.hpp"
+#include "quant/pq_quantizer.hpp"
+#include "storage/memgraph.hpp"
+#include "storage/node_store.hpp"
 #include "sextant/error.hpp"
 #include "sextant/vector_source.hpp"
 #include "storage/memgraph.hpp"
@@ -196,9 +203,9 @@ TEST(MemGraph, EngineOpenInstallsMemGraphAndMaintainsRecall) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Read base vectors for ground-truth computation.
@@ -213,14 +220,14 @@ TEST(MemGraph, EngineOpenInstallsMemGraphAndMaintainsRecall) {
         std::fclose(fp);
     }
 
-    Engine engine;
-    engine.open(index_path);
+    auto idx = Index::read(index_path);
+    Searcher searcher(*idx);
 
     // MemGraph must be installed and have cached a non-trivial neighborhood.
-    EXPECT_TRUE(engine.is_paged());
-    EXPECT_GT(engine.memgraph_cached_count(), 0u);
+    EXPECT_TRUE(idx->is_paged());
+    EXPECT_GT(searcher.memgraph_cached_count(), 0u);
     // Entry points (16) × some neighborhood — should be a meaningful fraction.
-    EXPECT_LE(engine.memgraph_cached_count(), engine.count());
+    EXPECT_LE(searcher.memgraph_cached_count(), idx->count);
 
     // Issue several queries = base[i] + tiny noise. Exact NN is row i.
     const uint32_t n_queries = 20;
@@ -237,7 +244,7 @@ TEST(MemGraph, EngineOpenInstallsMemGraphAndMaintainsRecall) {
         SearchConfig scfg;
         scfg.k = 10;
         scfg.L_search = 150;
-        auto cands = engine.search(query.data(), scfg.k, scfg);
+        auto cands = searcher.search(query.data(), scfg.k, scfg);
         if (cands.empty()) continue;
 
         // Rerank by exact L2-sq distance.
@@ -290,9 +297,9 @@ TEST(MemGraph, EngineOpenInstallsMemGraphAndMaintainsRecall) {
     // Recall quality is covered by test_paged_search on SIFTsmall.
     // TODO: replace with a larger committed dataset so MemGraph exercises
     //       its paged-delegation (cold-read) path, then re-add a recall gate.
-    EXPECT_TRUE(engine.is_paged());
-    EXPECT_GT(engine.memgraph_cached_count(), 0u);
-    EXPECT_LE(engine.memgraph_cached_count(), engine.count());
+    EXPECT_TRUE(idx->is_paged());
+    EXPECT_GT(searcher.memgraph_cached_count(), 0u);
+    EXPECT_LE(searcher.memgraph_cached_count(), idx->count);
     ASSERT_GT(recall_total, 0u);
 
     remove_sidecars(index_path);

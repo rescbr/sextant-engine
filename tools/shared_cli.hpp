@@ -6,7 +6,7 @@
 /// are added per-command after calling add_common_flags.
 
 #include "sextant/config.hpp"
-#include "sextant/engine.hpp"
+#include "sextant/estimator.hpp"
 #include "sextant/logging.hpp"
 #include "sextant/vector_source.hpp"
 

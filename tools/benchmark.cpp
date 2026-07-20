@@ -14,7 +14,8 @@
 
 #include "fbin_io.hpp"
 #include "sextant/config.hpp"
-#include "sextant/engine.hpp"
+#include "sextant/searcher.hpp"
+#include "sextant/index.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
 
@@ -179,14 +180,14 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        sextant::Engine engine;
-        engine.set_cache_size(cache_size_req);
+        std::unique_ptr<sextant::Index> idx =
+            sextant::Index::read(index, cache_size_req);
+        sextant::Searcher searcher(*idx);
         if (p.exist("no-cache-rebalance")) {
-            engine.set_cache_rebalance_enabled(false);
+            searcher.set_cache_rebalance_enabled(false);
         }
-        engine.open(index);
-        const uint32_t dim = engine.dim();
-        const uint64_t n_base = engine.count();
+        const uint32_t dim = idx->dim;
+        const uint64_t n_base = idx->count;
 
         FbinHeader qh;
         if (!read_fbin_header(query_path, qh) || qh.dim != dim) {
@@ -323,7 +324,7 @@ int main(int argc, char* argv[]) {
                     scfg.io_limit = io_limit;
 
                     const auto q_start = Clock::now();
-                    auto results = engine.search(q, scfg.k, scfg);
+                    auto results = searcher.search(q, scfg.k, scfg);
 
                     // Resolve final top-k row_ids (with optional exact rerank).
                     // We keep each result's true L2sq distance for proximity metrics.
@@ -547,11 +548,11 @@ int main(int argc, char* argv[]) {
                   << std::setprecision(3) << total_sec << "s\n";
          std::cout << "[benchmark] QPS: " << std::fixed
                    << std::setprecision(1) << qps << "\n";
-         if (engine.is_paged()) {
+         if (idx->is_paged()) {
              std::cout << "[benchmark] cache: graph_reads="
-                       << engine.cache_graph_reads()
-                       << " code_reads=" << engine.cache_code_reads() << "\n";
-             const auto as = engine.cache_admission_stats();
+                       << searcher.cache_graph_reads()
+                       << " code_reads=" << searcher.cache_code_reads() << "\n";
+             const auto as = searcher.cache_admission_stats();
              const uint64_t total_hits = as.hits_window + as.hits_probation + as.hits_protected;
              const uint64_t total_accesses = total_hits + as.misses;
              const double hit_rate = total_accesses > 0
@@ -569,8 +570,8 @@ int main(int argc, char* argv[]) {
                        << " miss=" << as.misses << ")"
                        << " admit=" << std::setprecision(1) << admit_rate << "%"
                         << " (" << as.evictions_admitted << "/" << total_evicts << ")\n";
-             const uint64_t tl_h = engine.tl_hits();
-             const uint64_t tl_m = engine.tl_misses();
+             const uint64_t tl_h = searcher.tl_hits();
+             const uint64_t tl_m = searcher.tl_misses();
              const uint64_t tl_total = tl_h + tl_m;
              const double tl_rate = tl_total > 0
                  ? 100.0 * static_cast<double>(tl_h) / static_cast<double>(tl_total)

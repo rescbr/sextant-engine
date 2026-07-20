@@ -13,7 +13,14 @@
 #include <gtest/gtest.h>
 #include "engine/fbin_source.hpp"
 #include "sextant/config.hpp"
-#include "sextant/engine.hpp"
+#include "sextant/builder.hpp"
+#include "sextant/estimator.hpp"
+#include "sextant/index.hpp"
+#include "sextant/searcher.hpp"
+#include "algo/vamana_core.hpp"
+#include "quant/pq_quantizer.hpp"
+#include "storage/memgraph.hpp"
+#include "storage/node_store.hpp"
 #include "sextant/error.hpp"
 #include "sextant/vector_source.hpp"
 
@@ -87,22 +94,22 @@ TEST(Cli, BuildSearchFindsAnchorNN) {
 
     // Build.
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Query = exact copy of the anchor vector.
     std::vector<float> query(data.begin() + anchor * dim,
                              data.begin() + (anchor + 1) * dim);
 
-    Engine engine;
-    engine.open(index_path);
+    auto idx = Index::read(index_path);
+    Searcher searcher(*idx);
 
     SearchConfig scfg;
     scfg.k = 10;
     scfg.L_search = 120;
-    auto results = engine.search(query.data(), scfg.k, scfg);
+    auto results = searcher.search(query.data(), scfg.k, scfg);
     ASSERT_FALSE(results.empty());
     EXPECT_EQ(results.front().row_id, static_cast<RowId>(anchor));
 
@@ -131,9 +138,9 @@ TEST(Cli, BuildSearchRerankExactNN) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Query = target vector + tiny perturbation.
@@ -142,15 +149,15 @@ TEST(Cli, BuildSearchRerankExactNN) {
         query[d] = data[static_cast<size_t>(target) * dim + d] + 1e-4f;
     }
 
-    Engine engine;
-    engine.open(index_path);
+    auto idx = Index::read(index_path);
+    Searcher searcher(*idx);
 
     const uint32_t k = 3;
     const uint32_t rerank_factor = 10;
     SearchConfig scfg;
     scfg.k = k * rerank_factor;
     scfg.L_search = 150;
-    auto cands = engine.search(query.data(), scfg.k, scfg);
+    auto cands = searcher.search(query.data(), scfg.k, scfg);
     ASSERT_FALSE(cands.empty());
 
     // Rerank exactly.
@@ -190,9 +197,9 @@ TEST(Cli, InsertPersistAndSearch) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Insert a near-duplicate of base vector #0 (in-distribution so the PQ
@@ -207,24 +214,25 @@ TEST(Cli, InsertPersistAndSearch) {
 
     // Mimic the CLI insert path: open → insert → flush.
     {
-        Engine engine;
-        engine.open(index_path);
-        EXPECT_EQ(static_cast<uint64_t>(n), engine.count());
-        engine.insert(ins.data(), dim, ins_row);
-        EXPECT_EQ(static_cast<uint64_t>(n) + 1, engine.count());
-        engine.flush();
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        EXPECT_EQ(static_cast<uint64_t>(n), idx->count);
+        Builder builder(*idx);
+        builder.insert(ins.data(), dim, ins_row);
+        EXPECT_EQ(static_cast<uint64_t>(n) + 1, idx->count);
+        builder.flush();
     }
 
     // Reopen and search for the inserted vector.
     {
-        Engine engine;
-        engine.open(index_path);
-        EXPECT_EQ(static_cast<uint64_t>(n) + 1, engine.count());
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        EXPECT_EQ(static_cast<uint64_t>(n) + 1, idx->count);
 
         SearchConfig scfg;
         scfg.k = 10;
         scfg.L_search = 120;
-        auto results = engine.search(ins.data(), scfg.k, scfg);
+        auto results = searcher.search(ins.data(), scfg.k, scfg);
         ASSERT_FALSE(results.empty());
         bool found = false;
         for (const auto& c : results) {

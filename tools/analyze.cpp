@@ -14,7 +14,7 @@
 #include "engine/fbin_source.hpp"
 #include "shared_cli.hpp"
 #include "sextant/config.hpp"
-#include "sextant/engine.hpp"
+#include "sextant/estimator.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
 
@@ -49,8 +49,8 @@ int cmd_analyze(int argc, char* argv[]) {
     cfg.proximity_target = p.get<float>("proximity-target");
     cfg.recall_target    = p.get<float>("recall-target");
 
-    sextant::Engine engine;
-    const auto est = engine.estimate_config(source, cfg);
+    sextant::Estimator estimator;
+    const auto est = estimator.estimate_config(source, cfg);
     print_analysis_(source, input, cfg, est.params, est.diag);
     return 0;
 }

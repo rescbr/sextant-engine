@@ -12,6 +12,7 @@
 
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
+#include "sextant/config.hpp"
 #include "sextant/error.hpp"
 #include "sextant/sync.hpp"
 
@@ -28,6 +29,26 @@
 // also in the header.
 
 namespace sextant {
+
+// ---------------------------------------------------------------------------
+// VamanaParams::from_resolved — factory used by all build/search cores.
+// Defined here because it needs the full ResolvedParams definition
+// (from config.hpp, included via vamana_core.hpp).
+// ---------------------------------------------------------------------------
+VamanaParams VamanaParams::from_resolved(const ResolvedParams& p, Dim dim,
+                                           uint16_t R_override) {
+    VamanaParams v;
+    v.dim = dim;
+    v.R = R_override ? R_override : p.R;
+    v.L = p.L;
+    v.L_build = p.L_build;
+    v.alpha = p.alpha;
+    v.n_entry_points = p.n_entry_points;
+    v.n_search_entry_points = p.n_search_entry_points;
+    v.early_exit_patience = p.early_exit_patience;
+    v.max_occlusion = p.max_occlusion;
+    return v;
+}
 
 namespace {
 

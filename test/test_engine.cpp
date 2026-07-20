@@ -1,7 +1,14 @@
 #include <gtest/gtest.h>
 #include "engine/fbin_source.hpp"
 #include "sextant/config.hpp"
-#include "sextant/engine.hpp"
+#include "sextant/builder.hpp"
+#include "sextant/estimator.hpp"
+#include "sextant/index.hpp"
+#include "sextant/searcher.hpp"
+#include "algo/vamana_core.hpp"
+#include "quant/pq_quantizer.hpp"
+#include "storage/memgraph.hpp"
+#include "storage/node_store.hpp"
 #include "sextant/error.hpp"
 #include "sextant/vector_source.hpp"
 
@@ -65,14 +72,14 @@ TEST(Engine, BuildWritesAllSidecars) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         ASSERT_EQ(n, source.count());
         ASSERT_EQ(dim, source.dim());
 
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        BuildResult result = engine.build(source, index_path, cfg);
+        BuildResult result = Builder(*idx).build(source, index_path, cfg);
         EXPECT_EQ(static_cast<uint64_t>(n), result.n_vectors);
         EXPECT_EQ(dim, result.dim);
     }
@@ -105,11 +112,11 @@ TEST(Engine, ManifestAtomicity) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        engine.build(source, index_path, cfg);
+        Builder(*idx).build(source, index_path, cfg);
     }
 
     const std::string manifest = index_path + ".manifest";
@@ -137,19 +144,19 @@ TEST(Engine, OpenAndSearch) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        engine.build(source, index_path, cfg);
+        Builder(*idx).build(source, index_path, cfg);
     }
 
     {
-        Engine engine;
-        engine.open(index_path);
-        EXPECT_TRUE(engine.is_open());
-        EXPECT_EQ(static_cast<uint64_t>(n), engine.count());
-        EXPECT_EQ(dim, engine.dim());
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        EXPECT_TRUE(idx != nullptr);
+        EXPECT_EQ(static_cast<uint64_t>(n), idx->count);
+        EXPECT_EQ(dim, idx->dim);
 
         // Search with one of the indexed vectors (recall should find it).
         std::vector<float> query(dim);
@@ -160,7 +167,7 @@ TEST(Engine, OpenAndSearch) {
         SearchConfig scfg;
         scfg.k = 10;
         scfg.L_search = 100;
-        auto results = engine.search(query.data(), scfg.k, scfg);
+        auto results = searcher.search(query.data(), scfg.k, scfg);
         EXPECT_LE(results.size(), static_cast<size_t>(scfg.k));
         for (const auto& c : results) {
             EXPECT_GE(c.row_id, 0);
@@ -187,23 +194,23 @@ TEST(Engine, OpenIsPagedLowIdleRam) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        engine.build(source, index_path, cfg);
+        Builder(*idx).build(source, index_path, cfg);
         // After build+flush: flat buffers freed, paged mode active.
-        EXPECT_TRUE(engine.is_paged());
-        EXPECT_FALSE(engine.has_flat_buffers());
+        EXPECT_TRUE(idx->is_paged());
+        EXPECT_FALSE(idx->has_flat_buffers());
     }
 
     {
-        Engine engine;
-        engine.open(index_path);
-        EXPECT_TRUE(engine.is_open());
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        EXPECT_TRUE(idx != nullptr);
         // open() loads only .meta — flat buffers must remain null.
-        EXPECT_TRUE(engine.is_paged());
-        EXPECT_FALSE(engine.has_flat_buffers());
+        EXPECT_TRUE(idx->is_paged());
+        EXPECT_FALSE(idx->has_flat_buffers());
 
         // Search must still work through the PagedNodeStore.
         std::vector<float> query(dim);
@@ -214,7 +221,7 @@ TEST(Engine, OpenIsPagedLowIdleRam) {
         SearchConfig scfg;
         scfg.k = 10;
         scfg.L_search = 100;
-        auto results = engine.search(query.data(), scfg.k, scfg);
+        auto results = searcher.search(query.data(), scfg.k, scfg);
         EXPECT_LE(results.size(), static_cast<size_t>(scfg.k));
         for (const auto& c : results) {
             EXPECT_GE(c.row_id, 0);
@@ -242,9 +249,9 @@ TEST(Engine, PagedSearchMatchesFlat) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Build a set of queries.
@@ -258,14 +265,14 @@ TEST(Engine, PagedSearchMatchesFlat) {
     // Paged search path (open → PagedNodeStore).
     std::vector<std::vector<Candidate>> paged_results;
     {
-        Engine engine;
-        engine.open(index_path);
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
         SearchConfig scfg;
         scfg.k = 10;
         scfg.L_search = 120;
         for (size_t q = 0; q < 5; q++) {
             paged_results.push_back(
-                engine.search(&queries[q * dim], scfg.k, scfg));
+                searcher.search(&queries[q * dim], scfg.k, scfg));
         }
     }
 
@@ -286,10 +293,11 @@ TEST(Engine, PagedSearchMatchesFlat) {
 // search() before open() throws.
 // ---------------------------------------------------------------------------
 TEST(Engine, SearchBeforeOpenThrows) {
-    Engine engine;
+    auto idx = std::make_unique<sextant::Index>();
+    Searcher searcher(*idx);
     std::vector<float> q(16, 0.0f);
     SearchConfig scfg;
-    EXPECT_THROW(engine.search(q.data(), 10, scfg), Error);
+    EXPECT_THROW(searcher.search(q.data(), 10, scfg), Error);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,11 +317,11 @@ TEST(Engine, InsertAfterBuildIsFindable) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        engine.build(source, index_path, cfg);
+        Builder(*idx).build(source, index_path, cfg);
     }
 
     // Read base vector #0 to build an in-distribution inserted near-duplicate.
@@ -333,18 +341,19 @@ TEST(Engine, InsertAfterBuildIsFindable) {
 
     const RowId new_row_id = 123456;
     {
-        Engine engine;
-        engine.open(index_path);
-        EXPECT_EQ(static_cast<uint64_t>(n), engine.count());
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        EXPECT_EQ(static_cast<uint64_t>(n), idx->count);
 
-        engine.insert(new_vec.data(), dim, new_row_id);
-        EXPECT_EQ(static_cast<uint64_t>(n) + 1, engine.count());
+        Builder builder(*idx);
+        builder.insert(new_vec.data(), dim, new_row_id);
+        EXPECT_EQ(static_cast<uint64_t>(n) + 1, idx->count);
 
         // Searching for the inserted vector must find it in the top results.
         SearchConfig scfg;
         scfg.k = 20;
         scfg.L_search = 150;
-        auto results = engine.search(new_vec.data(), scfg.k, scfg);
+        auto results = searcher.search(new_vec.data(), scfg.k, scfg);
         ASSERT_FALSE(results.empty());
         bool found = false;
         for (const auto& c : results) {
@@ -352,19 +361,19 @@ TEST(Engine, InsertAfterBuildIsFindable) {
         }
         EXPECT_TRUE(found) << "inserted row_id not in search results";
 
-        engine.flush();
+        builder.flush();
     }
 
     // Reopen: the inserted vector must still be present and findable.
     {
-        Engine engine;
-        engine.open(index_path);
-        EXPECT_EQ(static_cast<uint64_t>(n) + 1, engine.count());
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        EXPECT_EQ(static_cast<uint64_t>(n) + 1, idx->count);
 
         SearchConfig scfg;
         scfg.k = 20;
         scfg.L_search = 150;
-        auto results = engine.search(new_vec.data(), scfg.k, scfg);
+        auto results = searcher.search(new_vec.data(), scfg.k, scfg);
         ASSERT_FALSE(results.empty());
         bool found = false;
         for (const auto& c : results) {
@@ -381,9 +390,9 @@ TEST(Engine, InsertAfterBuildIsFindable) {
 // insert() before open() throws.
 // ---------------------------------------------------------------------------
 TEST(Engine, InsertBeforeOpenThrows) {
-    Engine engine;
+    auto idx = std::make_unique<sextant::Index>();  // empty
     std::vector<float> v(16, 0.0f);
-    EXPECT_THROW(engine.insert(v.data(), 16, 1), Error);
+    EXPECT_THROW(Builder(*idx).insert(v.data(), 16, 1), Error);
 }
 
 // ---------------------------------------------------------------------------
@@ -400,16 +409,16 @@ TEST(Engine, InsertDimMismatchThrows) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     {
-        Engine engine;
-        engine.open(index_path);
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
         std::vector<float> bad(dim + 1, 0.0f);
-        EXPECT_THROW(engine.insert(bad.data(), dim + 1, 7), Error);
+        EXPECT_THROW(Builder(*idx).insert(bad.data(), dim + 1, 7), Error);
     }
 
     remove_sidecars(index_path);
@@ -431,9 +440,9 @@ TEST(Engine, SearchRerankFindsExactNN) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Read all base vectors so we can compute exact distances for rerank and
@@ -452,8 +461,8 @@ TEST(Engine, SearchRerankFindsExactNN) {
         std::fclose(fp);
     }
 
-    Engine engine;
-    engine.open(index_path);
+    auto idx = Index::read(index_path);
+    Searcher searcher(*idx);
 
     // Query = base vector #42 + tiny noise → its exact NN is row 42.
     std::vector<float> query(dim);
@@ -467,7 +476,7 @@ TEST(Engine, SearchRerankFindsExactNN) {
     SearchConfig scfg;
     scfg.k = k * rerank_factor;
     scfg.L_search = 150;
-    auto cands = engine.search(query.data(), scfg.k, scfg);
+    auto cands = searcher.search(query.data(), scfg.k, scfg);
     ASSERT_FALSE(cands.empty());
 
     // Rerank by exact L2-sq distance against the base vectors.
@@ -513,9 +522,9 @@ TEST(Engine, PageShuffleRecallPreserved) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Read all base vectors to compute exact distances for rerank.
@@ -533,9 +542,9 @@ TEST(Engine, PageShuffleRecallPreserved) {
         std::fclose(fp);
     }
 
-    Engine engine;
-    engine.open(index_path);
-    ASSERT_TRUE(engine.is_open());
+    auto idx = Index::read(index_path);
+    Searcher searcher(*idx);
+    ASSERT_TRUE(idx != nullptr);
 
     // Query a handful of indexed vectors; each query's exact NN is itself.
     SearchConfig scfg;
@@ -549,7 +558,7 @@ TEST(Engine, PageShuffleRecallPreserved) {
         for (uint32_t d = 0; d < dim; d++) {
             query[d] = base[static_cast<size_t>(target) * dim + d] + 1e-4f;
         }
-        auto cands = engine.search(query.data(), scfg.k, scfg);
+        auto cands = searcher.search(query.data(), scfg.k, scfg);
         ASSERT_FALSE(cands.empty());
 
         // Rerank by exact L2-sq distance; the top-1 must be `target`.
@@ -600,11 +609,11 @@ TEST(Engine, EntryPointPersistenceRoundTrip) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        engine.build(source, index_path, cfg);
+        Builder(*idx).build(source, index_path, cfg);
     }
 
     // Parse the .meta payload directly to recover persisted entry points.
@@ -656,11 +665,11 @@ TEST(Engine, EntryPointPersistenceRoundTrip) {
     // open() must load the index and the persisted entry points, and search
     // must be functional (proving load_sidecars → set_entry_points works).
     {
-        Engine engine;
-        engine.open(index_path);
-        ASSERT_TRUE(engine.is_open());
-        ASSERT_EQ(static_cast<uint64_t>(n), engine.count());
-        ASSERT_EQ(dim, engine.dim());
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        ASSERT_TRUE(idx != nullptr);
+        ASSERT_EQ(static_cast<uint64_t>(n), idx->count);
+        ASSERT_EQ(dim, idx->dim);
 
         std::vector<float> query(dim);
         std::mt19937 rng(99);
@@ -670,7 +679,7 @@ TEST(Engine, EntryPointPersistenceRoundTrip) {
         SearchConfig scfg;
         scfg.k = 10;
         scfg.L_search = 100;
-        auto results = engine.search(query.data(), scfg.k, scfg);
+        auto results = searcher.search(query.data(), scfg.k, scfg);
         EXPECT_LE(results.size(), static_cast<size_t>(scfg.k));
         for (const auto& c : results) {
             EXPECT_GE(c.row_id, 0);
@@ -696,20 +705,19 @@ TEST(Engine, OpenRejectsOrphanedSidecars) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        engine.build(source, index_path, cfg);
+        Builder(*idx).build(source, index_path, cfg);
     }
 
     // Delete ONLY the manifest, leaving orphaned sidecars.
     std::remove((index_path + ".manifest").c_str());
 
     {
-        Engine engine;
         try {
-            engine.open(index_path);
+            auto idx = Index::read(index_path);
             FAIL() << "expected Error";
         } catch (const Error& e) {
             EXPECT_EQ(ErrorCode::CorruptIndex, e.code());
@@ -729,9 +737,8 @@ TEST(Engine, OpenRejectsMissingIndex) {
             .string();
     remove_sidecars(index_path);
 
-    Engine engine;
     try {
-        engine.open(index_path);
+        auto idx = Index::read(index_path);
         FAIL() << "expected Error";
     } catch (const Error& e) {
         EXPECT_EQ(ErrorCode::CorruptIndex, e.code());
@@ -754,14 +761,14 @@ TEST(Engine, BuildHDCMode) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         ASSERT_EQ(n, source.count());
         ASSERT_EQ(dim, source.dim());
 
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        BuildResult result = engine.build(source, index_path, cfg);
+        BuildResult result = Builder(*idx).build(source, index_path, cfg);
         EXPECT_EQ(static_cast<uint64_t>(n), result.n_vectors);
         EXPECT_EQ(dim, result.dim);
     }
@@ -778,11 +785,11 @@ TEST(Engine, BuildHDCMode) {
 
     // Open and search — basic smoke test that the HDC-built graph works.
     {
-        Engine engine;
-        engine.open(index_path);
-        EXPECT_TRUE(engine.is_open());
-        EXPECT_EQ(static_cast<uint64_t>(n), engine.count());
-        EXPECT_EQ(dim, engine.dim());
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        EXPECT_TRUE(idx != nullptr);
+        EXPECT_EQ(static_cast<uint64_t>(n), idx->count);
+        EXPECT_EQ(dim, idx->dim);
 
         std::vector<float> query(dim);
         std::mt19937 rng(99);
@@ -792,7 +799,7 @@ TEST(Engine, BuildHDCMode) {
         SearchConfig scfg;
         scfg.k = 10;
         scfg.L_search = 100;
-        auto results = engine.search(query.data(), scfg.k, scfg);
+        auto results = searcher.search(query.data(), scfg.k, scfg);
         EXPECT_LE(results.size(), static_cast<size_t>(scfg.k));
         for (const auto& c : results) {
             EXPECT_GE(c.row_id, 0);

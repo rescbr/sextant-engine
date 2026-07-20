@@ -12,7 +12,14 @@
 
 #include <gtest/gtest.h>
 #include "engine/fbin_source.hpp"
-#include "sextant/engine.hpp"
+#include "sextant/builder.hpp"
+#include "sextant/estimator.hpp"
+#include "sextant/index.hpp"
+#include "sextant/searcher.hpp"
+#include "algo/vamana_core.hpp"
+#include "quant/pq_quantizer.hpp"
+#include "storage/memgraph.hpp"
+#include "storage/node_store.hpp"
 #include "sextant/types.hpp"
 #include "storage/block_cache.hpp"
 #include "storage/node_store.hpp"
@@ -165,9 +172,9 @@ TEST(TLBlockCache, IntegrationL1ServesRepeatedPins) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     uint32_t node_size = 0;
@@ -230,8 +237,8 @@ TEST(TLBlockCache, PerInstanceIsolation) {
     remove_sidecars(idx_b);
 
     {
-        Engine ea; FbinSource sa(fbin_a); ea.build(sa, idx_a, BuildConfig{.pq_m = 8, .pq_bits = 8});
-        Engine eb; FbinSource sb(fbin_b); eb.build(sb, idx_b, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        auto ea = std::make_unique<sextant::Index>(); FbinSource sa(fbin_a); Builder(*ea).build(sa, idx_a, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        auto eb = std::make_unique<sextant::Index>(); FbinSource sb(fbin_b); Builder(*eb).build(sb, idx_b, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     uint32_t node_size_a = 0, node_size_b = 0;

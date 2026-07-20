@@ -105,8 +105,6 @@ engine_sources = [
     'src/quant/pq_quantizer.cpp',
     'src/algo/vamana_core.cpp',
     'src/engine/resolve_params.cpp',
-    'src/engine/search.cpp',
-    'src/engine/engine.cpp',
     'src/engine/index.cpp',
     'src/engine/probe.cpp',
     'src/engine/builder.cpp',

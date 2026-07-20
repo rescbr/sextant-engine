@@ -12,7 +12,14 @@
 #include "test_data.hpp"
 #include "engine/fbin_source.hpp"
 #include "sextant/config.hpp"
-#include "sextant/engine.hpp"
+#include "sextant/builder.hpp"
+#include "sextant/estimator.hpp"
+#include "sextant/index.hpp"
+#include "sextant/searcher.hpp"
+#include "algo/vamana_core.hpp"
+#include "quant/pq_quantizer.hpp"
+#include "storage/memgraph.hpp"
+#include "storage/node_store.hpp"
 #include "sextant/error.hpp"
 #include "sextant/vector_source.hpp"
 #include "storage/node_store.hpp"
@@ -66,9 +73,9 @@ static float siftsmall_recall(const std::string& index_path,
                               const SearchConfig& scfg_template) {
     remove_sidecars(index_path);
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(test::siftsmall_base());
-        engine.build(source, index_path, cfg);
+        Builder(*idx).build(source, index_path, cfg);
     }
 
     const std::string fbin = test::siftsmall_base();
@@ -113,15 +120,15 @@ static float siftsmall_recall(const std::string& index_path,
         std::fclose(fp);
     }
 
-    Engine engine;
-    engine.open(index_path);
+    auto idx = Index::read(index_path);
+    Searcher searcher(*idx);
 
     const uint32_t k = 10;
     uint32_t recall_hits = 0, recall_total = 0;
     for (uint32_t q = 0; q < nq; q++) {
         const float* query = &queries[static_cast<size_t>(q) * dim];
         SearchConfig scfg = scfg_template;
-        auto cands = engine.search(query, scfg.k, scfg);
+        auto cands = searcher.search(query, scfg.k, scfg);
         if (cands.empty()) continue;
 
         std::vector<std::pair<float, RowId>> scored;
@@ -167,18 +174,18 @@ TEST(PagedSearch, OpenIsPagedMode) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
-        EXPECT_TRUE(engine.is_paged());
-        EXPECT_FALSE(engine.has_flat_buffers());
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        EXPECT_TRUE(idx->is_paged());
+        EXPECT_FALSE(idx->has_flat_buffers());
     }
 
     {
-        Engine engine;
-        engine.open(index_path);
-        EXPECT_TRUE(engine.is_paged());
-        EXPECT_FALSE(engine.has_flat_buffers());
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        EXPECT_TRUE(idx->is_paged());
+        EXPECT_FALSE(idx->has_flat_buffers());
     }
 
     remove_sidecars(index_path);
@@ -200,9 +207,9 @@ TEST(PagedSearch, FindsExactNN) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Read base vectors.
@@ -217,8 +224,8 @@ TEST(PagedSearch, FindsExactNN) {
         std::fclose(fp);
     }
 
-    Engine engine;
-    engine.open(index_path);
+    auto idx = Index::read(index_path);
+    Searcher searcher(*idx);
 
     // Query = base[42] + tiny noise → exact NN is row 42.
     std::vector<float> query(dim);
@@ -228,7 +235,7 @@ TEST(PagedSearch, FindsExactNN) {
     SearchConfig scfg;
     scfg.k = 50;  // over-fetch for rerank
     scfg.L_search = 150;
-    auto cands = engine.search(query.data(), scfg.k, scfg);
+    auto cands = searcher.search(query.data(), scfg.k, scfg);
     ASSERT_FALSE(cands.empty());
 
     // Rerank by exact L2-sq distance.
@@ -269,9 +276,9 @@ TEST(PagedSearch, NodeStoreReadsAndCaches) {
 
     // Build to produce .graph + .codes sidecars.
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Determine node_size + code_size from the meta-side params by reconstructing
@@ -280,8 +287,8 @@ TEST(PagedSearch, NodeStoreReadsAndCaches) {
     uint32_t node_size = 0;
     uint8_t code_size = 0;
     {
-        Engine engine;
-        engine.open(index_path);
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
         // After open we can't read private members directly; infer code_size
         // from the quantizer via a round-trip search (ensures the sidecars are
         // valid). We instead read code_size from the .codes file size / count.
@@ -357,9 +364,9 @@ TEST(PagedSearch, CacheHitsAndMisses) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Derive node_size + code_size from file sizes.
@@ -480,9 +487,9 @@ TEST(PagedSearch, BatchedPreReadPopulatesCache) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        engine.build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
     }
 
     // Derive node_size from the .graph file so we can compute nodes_per_block.

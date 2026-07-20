@@ -15,10 +15,18 @@
 #include "engine/fbin_source.hpp"
 #include "fbin_io.hpp"
 #include "shared_cli.hpp"
+#include "sextant/builder.hpp"
 #include "sextant/config.hpp"
-#include "sextant/engine.hpp"
 #include "sextant/error.hpp"
+#include "sextant/estimator.hpp"
+#include "sextant/index.hpp"
 #include "sextant/logging.hpp"
+#include "sextant/searcher.hpp"
+
+#include "algo/vamana_core.hpp"
+#include "quant/pq_quantizer.hpp"
+#include "storage/memgraph.hpp"
+#include "storage/node_store.hpp"
 
 #include <cmdline/cmdline.h>
 
@@ -56,8 +64,8 @@ int cmd_build(int argc, char* argv[]) {
     apply_log_level(p);
 
     const std::string input = p.get<std::string>("input");
-    const std::string index = p.get<std::string>("index");
-    if (index.empty()) {
+    const std::string index_path = p.get<std::string>("index");
+    if (index_path.empty()) {
         std::cerr << "sextant build: --index is required\n";
         return 1;
     }
@@ -75,9 +83,9 @@ int cmd_build(int argc, char* argv[]) {
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
 
-    sextant::Engine engine;
-    sextant::BuildResult result = engine.build(source, index, cfg);
-    std::cout << "built index '" << index << "': n=" << result.n_vectors
+    sextant::Index idx;
+    sextant::BuildResult result = sextant::Builder(idx).build(source, index_path, cfg);
+    std::cout << "built index '" << index_path << "': n=" << result.n_vectors
               << " dim=" << result.dim
               << " R=" << result.R
               << " L_build=" << result.L_build
@@ -96,8 +104,8 @@ int cmd_autobuild(int argc, char* argv[]) {
     apply_log_level(p);
 
     const std::string input = p.get<std::string>("input");
-    const std::string index = p.get<std::string>("index");
-    if (index.empty()) {
+    const std::string index_path = p.get<std::string>("index");
+    if (index_path.empty()) {
         std::cerr << "sextant autobuild: --index is required\n";
         return 1;
     }
@@ -117,17 +125,19 @@ int cmd_autobuild(int argc, char* argv[]) {
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
 
-    sextant::Engine engine;
+    sextant::Estimator estimator;
     // estimate_config handles all auto knobs; locked ones override.
-    const sextant::EstimateResult est = engine.estimate_config(source, cfg);
+    const sextant::EstimateResult est = estimator.estimate_config(source, cfg);
 
     // Print the analysis (shared pretty-print with analyze).
     print_analysis_(source, input, cfg, est.params, est.diag);
 
     // Build with the resolved params (in-process, no string round-trip).
-    const sextant::BuildResult result = engine.build(source, index, est.params);
+    sextant::Index idx;
+    const sextant::BuildResult result =
+        sextant::Builder(idx).build(source, index_path, est.params);
     std::cout << "\n═══ Build Result ═══\n";
-    std::cout << "built index '" << index << "': n=" << result.n_vectors
+    std::cout << "built index '" << index_path << "': n=" << result.n_vectors
               << " dim=" << result.dim
               << " R=" << result.R
               << " L_build=" << result.L_build
@@ -172,7 +182,7 @@ int cmd_search(int argc, char* argv[]) {
         else if (lvl == "error") sextant::set_log_level(sextant::LogLevel::Error);
     }
 
-    const std::string index = p.get<std::string>("index");
+    const std::string index_path = p.get<std::string>("index");
     const std::string query_path = p.get<std::string>("query");
     const uint32_t k = p.get<uint32_t>("topk");
     const uint32_t L = p.get<uint32_t>("search-beam-width");
@@ -187,18 +197,18 @@ int cmd_search(int argc, char* argv[]) {
         num_threads = std::max(1u, std::thread::hardware_concurrency());
     }
 
-    sextant::Engine engine;
-    engine.set_cache_size(p.get<uint64_t>("cache-size"));
+    std::unique_ptr<sextant::Index> idx =
+        sextant::Index::read(index_path, p.get<uint64_t>("cache-size"));
+    sextant::Searcher searcher(*idx);
     if (p.exist("no-cache-rebalance")) {
-        engine.set_cache_rebalance_enabled(false);
+        searcher.set_cache_rebalance_enabled(false);
     }
-    engine.open(index);
 
     // Read the query file header.
     FbinHeader qh;
-    if (!read_fbin_header(query_path, qh) || qh.dim != engine.dim()) {
+    if (!read_fbin_header(query_path, qh) || qh.dim != idx->dim) {
         std::cerr << "sextant search: invalid query file '" << query_path
-                  << "' (dim=" << qh.dim << ", expected " << engine.dim()
+                  << "' (dim=" << qh.dim << ", expected " << idx->dim
                   << ")\n";
         return 1;
     }
@@ -211,12 +221,12 @@ int cmd_search(int argc, char* argv[]) {
     const bool do_rerank = (rerank > 1) && !base_data.empty();
     FbinHeader bh{};
     if (do_rerank) {
-        if (!read_fbin_header(base_data, bh) || bh.dim != engine.dim()) {
+        if (!read_fbin_header(base_data, bh) || bh.dim != idx->dim) {
             std::cerr << "sextant search: invalid base-data file '" << base_data
                       << "' for rerank; skipping rerank\n";
         }
     }
-    const bool rerank_ok = do_rerank && bh.dim == engine.dim();
+    const bool rerank_ok = do_rerank && bh.dim == idx->dim;
 
     std::ofstream out_file;
     std::ostream* out = &std::cout;
@@ -230,9 +240,9 @@ int cmd_search(int argc, char* argv[]) {
         out = &out_file;
     }
 
-    const uint32_t dim = engine.dim();
+    const uint32_t dim = idx->dim;
     const uint32_t fetch_k =
-        rerank_ok ? std::min<uint32_t>(k * rerank, engine.count()) : k;
+        rerank_ok ? std::min<uint32_t>(k * rerank, idx->count) : k;
 
     if (num_threads <= 1) {
         // Serial path (unchanged): stream queries one at a time.
@@ -252,7 +262,7 @@ int cmd_search(int argc, char* argv[]) {
             scfg.k = fetch_k;
             scfg.L_search = L;
             scfg.rerank_factor = rerank;
-            auto results = engine.search(qvec.data(), scfg.k, scfg);
+            auto results = searcher.search(qvec.data(), scfg.k, scfg);
 
             if (rerank_ok && !results.empty()) {
                 // Fetch actual vectors and re-sort by exact L2-sq distance.
@@ -325,7 +335,7 @@ int cmd_search(int argc, char* argv[]) {
                     scfg.k = fetch_k;
                     scfg.L_search = L;
                     scfg.rerank_factor = rerank;
-                    auto results = engine.search(q, scfg.k, scfg);
+                    auto results = searcher.search(q, scfg.k, scfg);
 
                     std::string buf;
                     if (rerank_ok && !results.empty()) {
@@ -392,18 +402,17 @@ int cmd_insert(int argc, char* argv[]) {
     p.add<int64_t>("row-id", 0, "Row ID for the inserted vector", true);
     p.parse_check(argc, argv);
 
-    const std::string index = p.get<std::string>("index");
+    const std::string index_path = p.get<std::string>("index");
     const std::string vector_path = p.get<std::string>("vector");
     const int64_t row_id = p.get<int64_t>("row-id");
 
-    sextant::Engine engine;
-    engine.open(index);
+    auto idx = sextant::Index::read(index_path);
 
     FbinHeader vh;
-    if (!read_fbin_header(vector_path, vh) || vh.dim != engine.dim() ||
+    if (!read_fbin_header(vector_path, vh) || vh.dim != idx->dim ||
         vh.n != 1) {
         std::cerr << "sextant insert: need a single-vector .fbin with dim="
-                  << engine.dim() << " (got n=" << vh.n << " dim=" << vh.dim
+                  << idx->dim << " (got n=" << vh.n << " dim=" << vh.dim
                   << ")\n";
         return 1;
     }
@@ -418,10 +427,11 @@ int cmd_insert(int argc, char* argv[]) {
         return 1;
     }
 
-    engine.insert(vec.data(), vh.dim, static_cast<sextant::RowId>(row_id));
-    engine.flush();
+    sextant::Builder builder(*idx);
+    builder.insert(vec.data(), vh.dim, static_cast<sextant::RowId>(row_id));
+    builder.flush();
     std::cout << "inserted row_id=" << row_id
-              << " (count now " << engine.count() << ")\n";
+              << " (count now " << idx->count << ")\n";
     return 0;
 }
 

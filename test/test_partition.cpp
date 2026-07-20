@@ -1,7 +1,14 @@
 #include <gtest/gtest.h>
 #include "engine/fbin_source.hpp"
 #include "sextant/config.hpp"
-#include "sextant/engine.hpp"
+#include "sextant/builder.hpp"
+#include "sextant/estimator.hpp"
+#include "sextant/index.hpp"
+#include "sextant/searcher.hpp"
+#include "algo/vamana_core.hpp"
+#include "quant/pq_quantizer.hpp"
+#include "storage/memgraph.hpp"
+#include "storage/node_store.hpp"
 #include "sextant/error.hpp"
 #include "sextant/vector_source.hpp"
 
@@ -106,13 +113,13 @@ static float measure_recall(const std::string& fbin_path, uint32_t n,
                             uint32_t n_queries, uint32_t L_search) {
     remove_sidecars(index_path);
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin_path);
-        engine.build(source, index_path, cfg);
+        Builder(*idx).build(source, index_path, cfg);
     }
-    Engine engine;
-    engine.open(index_path);
-    EXPECT_EQ(static_cast<uint64_t>(n), engine.count());
+    auto idx = Index::read(index_path);
+    Searcher searcher(*idx);
+    EXPECT_EQ(static_cast<uint64_t>(n), idx->count);
 
     uint32_t hits = 0;
     uint32_t total = 0;
@@ -124,7 +131,7 @@ static float measure_recall(const std::string& fbin_path, uint32_t n,
     for (uint32_t q = 0; q < n_queries; q++) {
         const float* query = &base[static_cast<size_t>(q) * dim];
         auto truth = brute_force_knn(base, n, dim, query, k);
-        auto results = engine.search(query, k, scfg);
+        auto results = searcher.search(query, k, scfg);
 
         std::vector<RowId> truth_ids;
         truth_ids.reserve(truth.size());
@@ -156,7 +163,7 @@ TEST(Partition, PartitionedBuildProducesValidIndex) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.R = 32;
@@ -164,7 +171,7 @@ TEST(Partition, PartitionedBuildProducesValidIndex) {
         // per_vec ≈ code_size(16) + node_size(144) = 160.
         // budget = 80000 → max_per_partition = 500 → K = ceil(2000/500) = 4.
         cfg.build_ram_budget = 80000;
-        BuildResult result = engine.build(source, index_path, cfg);
+        BuildResult result = Builder(*idx).build(source, index_path, cfg);
         EXPECT_EQ(static_cast<uint64_t>(n), result.n_vectors);
         EXPECT_EQ(dim, result.dim);
     }
@@ -179,15 +186,15 @@ TEST(Partition, PartitionedBuildProducesValidIndex) {
     }
 
     {
-        Engine engine;
-        engine.open(index_path);
-        EXPECT_TRUE(engine.is_open());
-        EXPECT_EQ(static_cast<uint64_t>(n), engine.count());
+        auto idx = Index::read(index_path);
+        Searcher searcher(*idx);
+        EXPECT_TRUE(idx != nullptr);
+        EXPECT_EQ(static_cast<uint64_t>(n), idx->count);
         std::vector<float> q(dim, 0.0f);
         SearchConfig scfg;
         scfg.k = 10;
         scfg.L_search = 100;
-        auto results = engine.search(q.data(), 10, scfg);
+        auto results = searcher.search(q.data(), 10, scfg);
         EXPECT_LE(results.size(), static_cast<size_t>(10));
         for (const auto& c : results) {
             EXPECT_GE(c.row_id, 0);
@@ -215,13 +222,13 @@ TEST(Partition, MergedGraphIsConnected) {
     remove_sidecars(index_path);
 
     {
-        Engine engine;
+        auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         BuildConfig cfg;
         cfg.R = 32;
         cfg.pq_m = 16; cfg.pq_bits = 8;
         cfg.build_ram_budget = 80000;  // forces K ≈ 3
-        engine.build(source, index_path, cfg);
+        Builder(*idx).build(source, index_path, cfg);
     }
 
     // Read the .graph sidecar header (64 bytes) + node bodies. We set
