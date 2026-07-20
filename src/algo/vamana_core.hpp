@@ -79,7 +79,6 @@ struct VamanaParams {
     uint16_t L = 100;             ///< Search beam width
     uint16_t L_build = 100;       ///< Build beam width
     float alpha = 1.2f;           ///< Prune distance threshold
-    uint16_t inline_pq_count = 0; ///< Neighbor PQ codes inlined per node
     uint16_t n_entry_points = 16;
     uint16_t n_search_entry_points = 4;  ///< Multi-start: seed top-M entry points per query
     uint32_t early_exit_patience = 0;    ///< Search early-exit: terminate after N stalled pops post-convergence (0 = disabled)
@@ -87,11 +86,9 @@ struct VamanaParams {
 
     /// Factory: build VamanaParams from resolved engine params.
     /// `R_override` (0 = use p.R) lets callers pick a per-shard R (e.g. 2R/3).
-    /// `inline_pq` is 0 for build cores (flat layout) and the resolved
-    /// inline_pq_count for search cores. n_entry_points is set from ResolvedParams.
+    /// n_entry_points is set from ResolvedParams.
     static VamanaParams from_resolved(const ResolvedParams& p, Dim dim,
-                                       uint16_t R_override = 0,
-                                       uint16_t inline_pq = 0);
+                                       uint16_t R_override = 0);
 };
 
 /// Per-thread-local scratch for Vamana operations (visit marks, prune buffers).
@@ -124,9 +121,8 @@ public:
     VamanaCore(VamanaParams params, PqQuantizer& quantizer);
     ~VamanaCore();
 
-    /// Compute the static node size for a given R and inline_pq_count.
-    static uint32_t static_node_size(uint16_t R, uint16_t inline_pq_count,
-                                     uint32_t code_size);
+    /// Compute the static node size for a given R.
+    static uint32_t static_node_size(uint16_t R, uint32_t code_size);
 
     /// Prepare for building `count` nodes.
     void prepare_for_build(uint32_t count);
@@ -197,9 +193,6 @@ public:
                            const std::vector<Candidate>& selected,
                            VamanaTLS& tls);
 
-    /// Finalize inline PQ codes (reformat from build layout).
-    void finalize_inline_codes();
-
     /// Compute entry points via k-means on PQ codes.
     void compute_entry_points();
 
@@ -215,8 +208,6 @@ public:
     static void set_internal_id(uint8_t* node, uint32_t val);
     static uint16_t get_neighbor_count(const uint8_t* node);
     static void set_neighbor_count(uint8_t* node, uint16_t val);
-    static uint16_t get_inline_pq_count(const uint8_t* node);
-    static void set_inline_pq_count(uint8_t* node, uint16_t val);
     static uint32_t get_neighbor(const uint8_t* node, uint32_t i);
     static void set_neighbor(uint8_t* node, uint32_t i, uint32_t val);
 

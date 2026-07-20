@@ -8,26 +8,12 @@
 
 namespace sextant {
 
-/// Build mode. The raw-vector construct mode has been removed — the FP16
-/// prune hybrid made it redundant (only +0.0003 recall at 1.4× build cost). The
-/// enum is retained with HDC as the sole value for API compatibility. HDC
-/// (Hybrid Distance Calculation) uses PQ codes for cheap navigation and FP16
-/// vectors for precise pruning.
-enum class BuildMode : uint8_t { HDC = 0 };
-
 /// Build configuration. Fields set to 0/default are auto-resolved.
 struct BuildConfig {
     uint16_t R = 0;             ///< 0 = auto from N
     uint16_t L = 0;             ///< 0 = auto from R
     float alpha = 0.0f;         ///< Vamana prune threshold: alpha * d(p,pp) <= d(q,pp).
-                                ///< 0 = auto (1.2). Purely the prune threshold;
-                                ///< build mode is set via `build_mode`.
-    BuildMode build_mode = BuildMode::HDC;  ///< HDC (PQ-distance construct)
-    /// Inline PQ codes per node. 0 = compact (no inline). DEPRECATED: the
-    /// two-cache search architecture handles code locality without inflating
-    /// node size, so inline PQ provides no benefit. Retained for backward
-    /// compatibility with old indexes; new builds should use 0.
-    uint16_t inline_pq_count = 0;
+                                ///< 0 = auto (1.2).
     uint16_t pq_m = 0;          ///< 0 = auto (reservoir probe)
     uint8_t pq_bits = 8;        ///< 4, 8, or 0 (auto via reservoir probe)
     /// PQ max distortion for auto (m, bits) selection. Used only when pq_m or
@@ -112,23 +98,19 @@ struct BuildConfig {
     float closure_f_target = 0.0f;
     float closure_d_eff = 0.0f;
 
-    /// PQ anisotropic codebook training (0 = disabled, >0 = enabled).
-    /// When enabled, each subspace's dims are scaled by √(eigval/mean_eigval)
-    /// of the subspace covariance before k-means (scale-transform trick), so
-    /// high-variance dims get more weight. Centroids are unscaled back to the
-    /// original data space after k-means. The value is a boolean flag
-    /// (covariance determines the weights); kept as float for CLI compat.
-    /// Only affects codebook training; encoding, search, and the serialized
-    /// codebook format are unchanged. One-time build-time cost.
-    float pq_anisotropy_lambda = 0.0f;
+    /// PQ anisotropic codebook training (scale-transform k-means). When true,
+    /// each subspace's dims are scaled by √(eigval/mean_eigval) of the subspace
+    /// covariance before k-means; centroids are unscaled back afterward. Only
+    /// affects codebook training — encoding/search/serialized format unchanged.
+    /// One-time build-time cost.
+    bool pq_anisotropy = false;
 
-    /// OPQ (PCA rotation) — 0 = disabled, >0 = enabled. When enabled, a d×d
-    /// PCA rotation is learned from the training-sample covariance and applied
-    /// to vectors before PQ encoding and to queries before LUT construction,
-    /// so PQ splits align with principal components. The rotation matrix is
-    /// serialized with the quantizer. Boolean flag (value ignored). Adds a
-    /// one-time ~20s eigendecomposition at d=768 to the build.
-    float pq_opq = 0.0f;
+    /// OPQ (PCA rotation). When true, a d×d PCA rotation is learned from the
+    /// training-sample covariance and applied to vectors before PQ encoding
+    /// and to queries before LUT construction, so PQ splits align with the
+    /// principal components. The rotation matrix is serialized with the
+    /// quantizer. Adds a one-time ~20s eigendecomposition at d=768.
+    bool pq_opq = false;
 };
 
 /// Result of a build operation.

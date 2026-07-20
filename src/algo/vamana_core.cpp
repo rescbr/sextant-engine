@@ -37,13 +37,11 @@ namespace {
 // offset 0:   row_id          (8 bytes)
 // offset 8:   internal_id     (4 bytes)
 // offset 12:  neighbor_count  (2 bytes)
-// offset 14:  inline_pq_count (2 bytes)
+// offset 14:  reserved        (2 bytes, keeps neighbor array 4-aligned)
 // offset 16:  neighbor_array  (R × 4 bytes)
-// [optional: inline PQ codes for first inline_pq_count neighbors]
 inline constexpr uint32_t kRowIdOffset = 0;
 inline constexpr uint32_t kInternalIdOffset = 8;
 inline constexpr uint32_t kNeighborCountOffset = 12;
-inline constexpr uint32_t kInlinePqCountOffset = 14;
 inline constexpr uint32_t kNeighborArrayOffset = 16;
 
 namespace {
@@ -142,7 +140,7 @@ VamanaCore::VamanaCore(VamanaParams params, PqQuantizer& quantizer)
         params_.alpha = 1.0f;
     }
     code_size_ = quantizer_.code_size();
-    node_size_ = static_node_size(params_.R, params_.inline_pq_count, code_size_);
+    node_size_ = static_node_size(params_.R, code_size_);
     num_locks_ = std::max(256u, std::thread::hardware_concurrency() * 4);
     node_locks_ = std::unique_ptr<Mutex[]>(new Mutex[num_locks_]);
 }
@@ -151,12 +149,11 @@ VamanaCore::~VamanaCore() {
     clear_build_buffers();
 }
 
-uint32_t VamanaCore::static_node_size(uint16_t R, uint16_t inline_pq_count,
-                                       uint32_t code_size) {
-    // (16 + R*4 + 7) & ~7, plus inline codes.
-    uint32_t base = (kNeighborArrayOffset + static_cast<uint32_t>(R) * 4 + 7) & ~7u;
-    uint32_t inline_bytes = static_cast<uint32_t>(inline_pq_count) * code_size;
-    return base + inline_bytes;
+uint32_t VamanaCore::static_node_size(uint16_t R, uint32_t code_size) {
+    // (16 + R*4 + 7) & ~7. Header is 16 bytes (incl. 2 bytes reserved padding
+    // to keep the neighbor array 4-aligned). No variable-length trailing region.
+    (void)code_size;
+    return (kNeighborArrayOffset + static_cast<uint32_t>(R) * 4 + 7) & ~7u;
 }
 
 void VamanaCore::prepare_for_build(uint32_t count) {
@@ -221,16 +218,6 @@ uint16_t VamanaCore::get_neighbor_count(const uint8_t* node) {
 
 void VamanaCore::set_neighbor_count(uint8_t* node, uint16_t val) {
     std::memcpy(node + kNeighborCountOffset, &val, sizeof(val));
-}
-
-uint16_t VamanaCore::get_inline_pq_count(const uint8_t* node) {
-    uint16_t val;
-    std::memcpy(&val, node + kInlinePqCountOffset, sizeof(val));
-    return val;
-}
-
-void VamanaCore::set_inline_pq_count(uint8_t* node, uint16_t val) {
-    std::memcpy(node + kInlinePqCountOffset, &val, sizeof(val));
 }
 
 uint32_t VamanaCore::get_neighbor(const uint8_t* node, uint32_t i) {
@@ -948,8 +935,7 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
                     "VamanaCore::insert_build_core: build buffers not set");
     }
 
-    // Zero the fixed header + neighbor array. The inline PQ region, if any,
-    // is filled later by finalize_inline_codes().
+    // Zero the fixed header + neighbor array.
     uint8_t* node = node_ptr(internal_id);
     std::memset(node, 0,
                 kNeighborArrayOffset +
@@ -957,7 +943,6 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     set_row_id(node, row_id);
     set_internal_id(node, internal_id);
     set_neighbor_count(node, 0);
-    set_inline_pq_count(node, params_.inline_pq_count);
 
     if (internal_id >= tls.visited_flags.size()) {
         tls.visited_flags.resize(
@@ -1038,40 +1023,6 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     count_ = std::max(count_, internal_id + 1);
 }
 
-// ===========================================================================
-// finalize_inline_codes — copy neighbor PQ codes into inline region.
-// Serial sweep; parallelism is orchestrated at the engine level if desired.
-//
-// After all nodes are built, copy each neighbor's PQ code into the inline
-// region of the node so search can read neighbor codes without a separate
-// codes fetch for the first inline_pq_count neighbors.
-// ===========================================================================
-
-void VamanaCore::finalize_inline_codes() {
-    if (params_.inline_pq_count == 0 || count_ == 0) {
-        return;
-    }
-    const uint32_t neighbor_region_end =
-        kNeighborArrayOffset +
-        static_cast<uint32_t>(params_.R) * sizeof(uint32_t);
-    // The inline region starts at the 8-byte-aligned boundary after the
-    // neighbor array (matches static_node_size's base padding).
-    const uint32_t inline_region_off = (neighbor_region_end + 7u) & ~7u;
-
-    for (uint32_t id = 0; id < count_; id++) {
-        uint8_t* node = node_ptr(id);
-        const uint16_t n = get_neighbor_count(node);
-        const uint16_t nin =
-            std::min<uint16_t>(n, params_.inline_pq_count);
-        for (uint16_t i = 0; i < nin; i++) {
-            const uint32_t nb = get_neighbor(node, i);
-            std::memcpy(node + inline_region_off +
-                            static_cast<size_t>(i) * code_size_,
-                        build_codes_ + static_cast<size_t>(nb) * code_size_,
-                        code_size_);
-        }
-    }
-}
 
 // ===========================================================================
 // compute_entry_points — select entry points via evenly-spaced node IDs.

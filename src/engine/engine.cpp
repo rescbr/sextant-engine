@@ -7,7 +7,7 @@
 //   3. Pass 1: reservoir sample (256K) + PQ train
 //   4. Pass 2: encode all vectors → codes_buffer_
 //   5. Parallel HDC construct via CTPL (disjoint node ranges)
-//   6. Finalize: compute_entry_points + finalize_inline_codes
+//   6. Finalize: compute_entry_points
 //   7. Flush sidecars (.graph/.codes/.meta/.manifest)
 //
 // The search/load path is in search.cpp.
@@ -71,15 +71,13 @@ using engine_detail::write_padded;
 // ResolvedParams definition from engine.hpp.
 // ---------------------------------------------------------------------------
 VamanaParams VamanaParams::from_resolved(const ResolvedParams& p, Dim dim,
-                                           uint16_t R_override,
-                                           uint16_t inline_pq) {
+                                           uint16_t R_override) {
     VamanaParams v;
     v.dim = dim;
     v.R = R_override ? R_override : p.R;
     v.L = p.L;
     v.L_build = p.L_build;
     v.alpha = p.alpha;
-    v.inline_pq_count = inline_pq;
     v.n_entry_points = p.n_entry_points;
     v.n_search_entry_points = p.n_search_entry_points;
     v.early_exit_patience = p.early_exit_patience;
@@ -111,7 +109,7 @@ std::pair<uint64_t, uint64_t> make_uuid() {
 /// neighbors together improves paged-search cache hit rates.
 ///
 /// `build_node_size` is the stride between consecutive nodes in `nodes_buffer`
-/// (the inline_pq=0 build layout). `n` is the node count.
+/// (the flat build layout). `n` is the node count.
 std::vector<uint32_t> compute_bfs_order(
     const uint8_t* nodes_buffer, uint32_t n, uint32_t build_node_size,
     const std::vector<uint32_t>& entry_points) {
@@ -204,7 +202,7 @@ BuildResult Engine::build(VectorSource& source, const std::string& index_path,
     const auto t1 = std::chrono::steady_clock::now();
     result.build_time_sec =
         std::chrono::duration<double>(t1 - t0).count() + result.build_time_sec;
-    spdlog::info("[sextant] build complete (K={}) in {:.2f}s", params.K,
+    spdlog::info("[sextant] build complete (K={}) in {:.2f}s", params.partition_count,
                  result.build_time_sec);
     return result;
 }
@@ -1034,18 +1032,18 @@ void Engine::pass1_sample_and_train(VectorSource& source,
     // Construct + train the quantizer at the resolved params.
     quantizer_ = std::make_unique<PqQuantizer>(
         params.metric, dim_, pq_m, pq_bits);
-    if (params.pq_anisotropy_lambda > 0.0f) {
-        quantizer_->set_anisotropy(params.pq_anisotropy_lambda);
+    if (params.pq_anisotropy) {
+        quantizer_->set_anisotropy(1.0f);
     }
-    if (params.pq_opq > 0.0f) {
+    if (params.pq_opq) {
         quantizer_->enable_opq();
     }
     code_size_ = quantizer_->code_size();
     std::string aniso_note;
-    if (params.pq_anisotropy_lambda > 0.0f) {
+    if (params.pq_anisotropy) {
         aniso_note = std::string(", anisotropy=on (covariance-based)");
     }
-    if (params.pq_opq > 0.0f) {
+    if (params.pq_opq) {
         aniso_note += ", opq=on (PCA rotation)";
     }
     spdlog::info("[sextant] pass 1: training PQ (m={}, bits={}{}) on {} samples",
@@ -1329,17 +1327,17 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // matter more than marginal quality at large scale.
 
     spdlog::info("[sextant] build: N={} K={} closure_factor={:.4f}",
-                 count_, params.K, params.closure_factor);
+                 count_, params.partition_count, params.closure_factor);
 
     // --- 1. Quantizer (global): train via pass1 (resolves pq_bits if auto) ---
     // pass1 fills the reservoir, runs the global probe if pq_bits==0, then
     // constructs + trains the quantizer. After it, code_size_ is valid.
     pass1_sample_and_train(source, params);
 
-    // node_size for the FINAL build buffer (inline_pq=0). Shards build at
-    // R_shard, but the merged result lands in nodes_buffer_ at full R.
-    node_size_ = VamanaCore::static_node_size(params.R, 0,
-                                              code_size_);
+    // node_size for the build buffer (flat neighbor lists).
+    // Shards build at R_shard, but the merged result lands in nodes_buffer_
+    // at full R.
+    node_size_ = VamanaCore::static_node_size(params.R, code_size_);
 
     // Allocate global flat buffers.
     {
@@ -1421,10 +1419,10 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // (chunked work-stealing + T5 dynamic L_build progress logger) so the graph
     // is bit-identical to the former standalone monolithic build.
     // =====================================================================
-    if (params.K == 1) {
-        // K==1 full-graph build core. inline_pq=0 (build layout is flat).
+    if (params.partition_count == 1) {
+        // K==1 full-graph build core (flat build layout).
         VamanaParams vp_full =
-            VamanaParams::from_resolved(params, dim_, 0, 0);
+            VamanaParams::from_resolved(params, dim_);
 
         core_ = std::make_unique<VamanaCore>(vp_full, *quantizer_);
         core_->set_build_codes(codes_buffer_, n);
@@ -1450,7 +1448,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
 
     // --- 2. Partition via k-means on PQ codes ---
     auto assignment = partition_codes(*quantizer_, codes_buffer_, n,
-                                      code_size_, params.K,
+                                      code_size_, params.partition_count,
                                       params.closure_factor);
     const uint32_t K = static_cast<uint32_t>(assignment.shards.size());
 
@@ -1462,18 +1460,17 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     spdlog::info("[sextant] partitioned: R_shard={} (2R/3, R={})", R_shard,
                  params.R);
 
-    const uint32_t shard_node_size = VamanaCore::static_node_size(
-        R_shard, 0, code_size_);
+    const uint32_t shard_node_size =
+        VamanaCore::static_node_size(R_shard, code_size_);
 
     // Store each shard's node buffer + local→global map for the merge.
     std::vector<std::vector<uint8_t>> shard_node_bufs(K);
     std::vector<std::vector<uint32_t>> shard_local_to_global(K);
 
     // Build a single VamanaParams template; R/L per shard.
-    // Build a single VamanaParams template; R/L per shard. R_shard is the
-    // per-shard degree (2R/3); inline_pq=0 (build layout is flat).
+    // R_shard is the per-shard degree (2R/3); flat build layout.
     VamanaParams vp_shard =
-        VamanaParams::from_resolved(params, dim_, R_shard, 0);
+        VamanaParams::from_resolved(params, dim_, R_shard);
 
     for (uint32_t k = 0; k < K; k++) {
         auto& members = assignment.shards[k];
@@ -1597,7 +1594,6 @@ BuildResult Engine::build_partitioned(VectorSource& source,
         VamanaCore::set_row_id(out_node, static_cast<RowId>(gid));
         VamanaCore::set_internal_id(out_node, gid);
         VamanaCore::set_neighbor_count(out_node, 0);
-        VamanaCore::set_inline_pq_count(out_node, 0);
 
         ++visit_token;
          std::vector<std::pair<float, uint32_t>> cands;
@@ -1778,11 +1774,10 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     spdlog::info("[sextant] merge complete; flushing sidecars");
 
     // Set up the master VamanaCore (full R) over the merged nodes_buffer_ for
-    // entry-point computation and final-layout inlining during flush. (K==1
-    // already has core_ set up over the global buffers in the fast path above.)
-    // K>1 merged-graph build core. inline_pq=0 (build layout is flat).
+    // entry-point computation during flush. (K==1 already has core_ set up
+    // over the global buffers in the fast path above.)
     VamanaParams vp_full =
-        VamanaParams::from_resolved(params, dim_, 0, 0);
+        VamanaParams::from_resolved(params, dim_);
     core_ = std::make_unique<VamanaCore>(vp_full, *quantizer_);
     core_->set_build_codes(codes_buffer_, n);
     core_->set_build_nodes(nodes_buffer_);
@@ -1793,22 +1788,16 @@ BuildResult Engine::build_partitioned(VectorSource& source,
     // Shared by both K==1 (graph built directly) and K>1 (merged graph). For
     // K==1, core_ is already wired to nodes_buffer_/codes_buffer_.
     snap_entry_points_(params);
-    if (params.inline_pq_count > 0) {
-        spdlog::warn("[sextant] inline_pq_count={} is deprecated and provides no "
-                     "benefit (two-cache search handles code locality). Set to 0.",
-                     params.inline_pq_count);
-    }
-    core_->finalize_inline_codes();
     auto bfs = compute_bfs_reorder_(params);
     write_sidecars_(index_path_, bfs, params);
 
     // Post-flush: switch from flat build buffers to a PagedNodeStore so
-    // post-build search is SSD-resident. The sidecars now hold the FINAL-layout
-    // graph (node_size includes inline_pq_count). This runs for ALL K — the
-    // partitioned path previously omitted it (left flat buffers resident and
-    // no paged store), which was an asymmetry vs the monolithic path.
-    const uint32_t final_node_size = VamanaCore::static_node_size(
-        params.R, params.inline_pq_count, code_size_);
+    // post-build search is SSD-resident. The sidecars now hold the final
+    // graph. This runs for ALL K — the partitioned path previously omitted
+    // it (left flat buffers resident and no paged store), which was an
+    // asymmetry vs the monolithic path.
+    const uint32_t final_node_size =
+        VamanaCore::static_node_size(params.R, code_size_);
     node_size_ = final_node_size;
     flat_store_.reset();  // disconnect store before freeing buffers
     core_->set_store(nullptr);
@@ -1843,7 +1832,7 @@ BuildResult Engine::build_partitioned(VectorSource& source,
 
 Engine::BfsReorder Engine::compute_bfs_reorder_(const ResolvedParams& params) const {
     const uint32_t n = static_cast<uint32_t>(count_);
-    const uint32_t build_node_size = node_size_;  // inline_pq=0 layout
+    const uint32_t build_node_size = node_size_;  // flat build layout
     const auto& raw_entry_points = core_->entry_points();
     BfsReorder bfs;
     bfs.order = compute_bfs_order(nodes_buffer_, n, build_node_size, raw_entry_points);
@@ -1909,10 +1898,11 @@ void Engine::write_sidecars_(const std::string& index_path,
     const auto uuid = make_uuid();
     const uint32_t n = static_cast<uint32_t>(count_);
 
-    // Final node layout: node_size with the resolved inline_pq_count.
-    const uint32_t final_node_size = VamanaCore::static_node_size(
-        params.R, params.inline_pq_count, code_size_);
-    const uint32_t build_node_size = node_size_;  // inline_pq=0 layout
+    // Final node layout: same as build layout (flat neighbor lists, single
+    // node_size for the whole index).
+    const uint32_t final_node_size =
+        VamanaCore::static_node_size(params.R, code_size_);
+    const uint32_t build_node_size = node_size_;
 
     // ----- .codes (reordered to BFS order, STREAMED) -----
     {
@@ -1990,8 +1980,6 @@ void Engine::write_sidecars_(const std::string& index_path,
 
         const uint32_t neighbor_region_end =
             kNeighborArrayOffset + params.R * sizeof(uint32_t);
-        const uint32_t inline_region_off =
-            (neighbor_region_end + 7u) & ~7u;
 
         uint64_t write_off = sizeof(h);
         uint32_t in_block = 0;
@@ -2019,23 +2007,6 @@ void Engine::write_sidecars_(const std::string& index_path,
                 }
             }
 
-            // Inline the first inline_pq_count neighbors' PQ codes. The code
-            // bytes belong to the (old) vector; neighbor labels are remapped
-            // above, but code contents are order-independent.
-            if (params.inline_pq_count > 0) {
-                const uint16_t nin = std::min<uint16_t>(
-                    ndeg, params.inline_pq_count);
-                for (uint16_t i = 0; i < nin; i++) {
-                    const uint32_t nb = VamanaCore::get_neighbor(src, i);
-                    if (nb < n) {
-                        std::memcpy(
-                            dst + inline_region_off +
-                                static_cast<size_t>(i) * code_size_,
-                            codes_buffer_ + static_cast<size_t>(nb) * code_size_,
-                            code_size_);
-                    }
-                }
-            }
 
             in_block++;
             if (in_block >= per_block) {
@@ -2207,7 +2178,7 @@ void Engine::write_meta_file(const ResolvedParams& params,
     }
 
     // Append the resolved params as a POD block so open() can rebuild the
-    // VamanaCore with the same R/L/alpha/inline_pq/max_occlusion.
+    // VamanaCore with the same R/L/alpha/max_occlusion.
     ResolvedParams p = params;  // copy
     payload.insert(payload.end(),
                    reinterpret_cast<uint8_t*>(&p),
@@ -2428,7 +2399,7 @@ void Engine::flush() {
     const uint32_t n = static_cast<uint32_t>(count_);
 
     // After open(), nodes_buffer_ is already in final layout (node_size_
-    // includes inline_pq_count), so we write it verbatim — no reformat pass.
+    // single node_size layout), so we write it verbatim — no reformat pass.
     spdlog::info("[sextant] flush: persisting {} vectors to '{}'", n,
                  index_path_);
 
@@ -2506,7 +2477,7 @@ std::unique_ptr<Engine> Engine::build_mini_(const float* sample,
 
     // Mirror build_partitioned K==1 fast path (engine.cpp ~897-1005):
     mini->pass1_sample_and_train(src, mp);
-    mini->node_size_ = VamanaCore::static_node_size(mp.R, 0, mini->code_size_);
+    mini->node_size_ = VamanaCore::static_node_size(mp.R, mini->code_size_);
 
     // Allocate codes_buffer_ + nodes_buffer_ (aligned, zeroed).
     {
@@ -2551,7 +2522,7 @@ std::unique_ptr<Engine> Engine::build_mini_(const float* sample,
     const uint32_t n = static_cast<uint32_t>(sample_n);
 
     // Set up core_ + flat_store_ (mirror build_partitioned K==1 lines 984-1000).
-    VamanaParams vp = VamanaParams::from_resolved(mp, dim, 0, 0);
+    VamanaParams vp = VamanaParams::from_resolved(mp, dim);
     mini->core_ = std::make_unique<VamanaCore>(vp, *mini->quantizer_);
     mini->core_->set_build_codes(mini->codes_buffer_, n);
     mini->core_->set_build_nodes(mini->nodes_buffer_);
@@ -2736,7 +2707,7 @@ Engine::SearchQuality Engine::measure_search_(
     return sq;
 }
 
-ResolvedParams Engine::estimate_config(VectorSource& source,
+EstimateResult Engine::estimate_config(VectorSource& source,
                                         const BuildConfig& overrides) {
     const auto t_ec_start = std::chrono::steady_clock::now();
     const uint64_t total_n = source.count();
@@ -3257,12 +3228,6 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
                            : std::max<uint32_t>(p.L_build,
                                                 static_cast<uint32_t>(p.R) + 1u);
     p.closure_factor = closure_c;
-    p.inline_pq_count = 0;  // deprecated
-    p.measured_median_lid = median_lid;
-    p.measured_avg_degree = gstats.avg_degree;
-    p.measured_clustering = gstats.clustering_coeff;
-    p.measured_dead_end_frac = gstats.dead_end_frac;
-    p.build_mode = overrides.build_mode;
     p.metric = overrides.metric;
     p.num_threads = base.num_threads;
     p.build_ram_budget = base.build_ram_budget;
@@ -3284,18 +3249,26 @@ ResolvedParams Engine::estimate_config(VectorSource& source,
                 if (k < 1) k = 1;
             }
         }
-        p.K = k;
+        p.partition_count = k;
     }
 
     spdlog::info("[sextant] estimate_config: final → R={} alpha={:.1f} "
                  "pq_m={} pq_bits={} L_build={} K={}",
                  p.R, p.alpha, p.pq_m, static_cast<int>(p.pq_bits), p.L_build,
-                  p.K);
+                  p.partition_count);
 
     spdlog::info("[sextant] estimate_config: total time {:.1f}s",
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t_ec_start).count());
-    return p;
+    return EstimateResult{
+        std::move(p),
+        EstimationDiagnostics{
+            /*median_lid=*/median_lid,
+            /*avg_degree=*/gstats.avg_degree,
+            /*clustering_coeff=*/gstats.clustering_coeff,
+            /*dead_end_frac=*/gstats.dead_end_frac,
+        },
+    };
 }
 
 }  // namespace sextant

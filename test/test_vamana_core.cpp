@@ -25,15 +25,14 @@ struct TestGraph {
     std::vector<uint8_t> codes;   // count × code_size
     std::vector<uint8_t> nodes;   // count × node_size
 
-    TestGraph(uint32_t count, uint16_t R = 8, uint16_t L = 16,
-              uint16_t inline_pq = 0)
-        : params{/*.dim=*/16, R, L, /*L_build=*/L, /*alpha=*/1.2f, inline_pq,
+    TestGraph(uint32_t count, uint16_t R = 8, uint16_t L = 16)
+        : params{/*.dim=*/16, R, L, /*L_build=*/L, /*alpha=*/1.2f,
                  /*n_entry_points=*/4, /*max_occlusion=*/750},
           quant(MetricKind::L2Sq, /*dim=*/16, /*m=*/4, /*bits=*/4) {
         core = std::make_unique<VamanaCore>(params, quant);
         const uint32_t cs = quant.code_size();
-        const uint32_t ns = VamanaCore::static_node_size(R, inline_pq,
-                                                          static_cast<uint8_t>(cs));
+        const uint32_t ns = VamanaCore::static_node_size(
+            R, static_cast<uint8_t>(cs));
         codes.assign(static_cast<size_t>(count) * cs, 0);
         nodes.assign(static_cast<size_t>(count) * ns, 0);
         core->set_build_codes(codes.data(), count);
@@ -47,11 +46,8 @@ struct TestGraph {
 // ---------------------------------------------------------------------------
 
 TEST(VamanaCore, NodeSize) {
-    // R=64, inline_pq=0, code_size=32: (16 + 64*4 + 7) & ~7 = 272
-    EXPECT_EQ(272u, VamanaCore::static_node_size(64, 0, 32));
-
-    // R=64, inline_pq=64, code_size=32: 272 + 64*32 = 2320
-    EXPECT_EQ(2320u, VamanaCore::static_node_size(64, 64, 32));
+    // R=64, code_size=32: (16 + 64*4 + 7) & ~7 = 272
+    EXPECT_EQ(272u, VamanaCore::static_node_size(64, 32));
 }
 
 // ---------------------------------------------------------------------------
@@ -71,9 +67,6 @@ TEST(VamanaCore, NodeAccessors) {
 
     g.core->set_neighbor_count(node, 3);
     EXPECT_EQ(3u, g.core->get_neighbor_count(node));
-
-    g.core->set_inline_pq_count(node, 7);
-    EXPECT_EQ(7u, g.core->get_inline_pq_count(node));
 
     g.core->set_neighbor(node, 0, 10u);
     g.core->set_neighbor(node, 1, 20u);
@@ -113,7 +106,7 @@ TEST(VamanaCore, BuildStructuralInvariants) {
     for (uint32_t id = 0; id < N; id++) {
         const uint8_t* node = g.nodes.data() +
                               static_cast<size_t>(id) * g.core->static_node_size(
-                                  g.params.R, g.params.inline_pq_count,
+                                  g.params.R,
                                   static_cast<uint8_t>(g.quant.code_size()));
         const uint16_t deg = g.core->get_neighbor_count(node);
         ASSERT_LE(deg, R) << "node " << id << " exceeds degree R";
@@ -139,7 +132,7 @@ TEST(VamanaCore, BuildGraphConnected) {
 
     // Build undirected adjacency from the directed neighbor lists.
     const uint32_t ns = g.core->static_node_size(
-        g.params.R, g.params.inline_pq_count,
+        g.params.R,
         static_cast<uint8_t>(g.quant.code_size()));
     std::vector<std::vector<uint32_t>> adj(N);
     for (uint32_t id = 0; id < N; id++) {
@@ -190,7 +183,7 @@ TEST(VamanaCore, InsertBuildFromCode) {
     EXPECT_EQ(N, g.core->size());
 
     const uint32_t ns = g.core->static_node_size(
-        g.params.R, g.params.inline_pq_count,
+        g.params.R,
         static_cast<uint8_t>(g.quant.code_size()));
     for (uint32_t id = 0; id < N; id++) {
         const uint8_t* node = g.nodes.data() + static_cast<size_t>(id) * ns;
@@ -316,36 +309,6 @@ TEST(VamanaCore, BeamSearchForcedEntry) {
         }
     }
     EXPECT_TRUE(found);
-}
-
-// ---------------------------------------------------------------------------
-// finalize_inline_codes — no crash, preserves neighbor counts.
-// ---------------------------------------------------------------------------
-
-TEST(VamanaCore, FinalizeInlineCodes) {
-    const uint32_t N = 15;
-    const uint16_t R = 4;
-    const uint16_t inline_pq = 4;
-    // Use inline_pq > 0 so finalize actually does work.
-    TestGraph g(N, R, /*L=*/8, inline_pq);
-
-    VamanaTLS tls;
-    tls.resize(N);
-    tls.resize_lut(g.quant.lut_size());
-    for (uint32_t i = 0; i < N; i++) {
-        g.core->insert_build_from_code(i, static_cast<RowId>(i), tls);
-    }
-    // Should not throw; neighbor counts unchanged.
-    g.core->finalize_inline_codes();
-
-    const uint32_t ns = g.core->static_node_size(
-        g.params.R, g.params.inline_pq_count,
-        static_cast<uint8_t>(g.quant.code_size()));
-    for (uint32_t id = 0; id < N; id++) {
-        const uint8_t* node = g.nodes.data() + static_cast<size_t>(id) * ns;
-        const uint16_t deg = g.core->get_neighbor_count(node);
-        EXPECT_LE(deg, R);
-    }
 }
 
 // ---------------------------------------------------------------------------

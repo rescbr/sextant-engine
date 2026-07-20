@@ -138,15 +138,14 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
         else throw std::runtime_error("--pq-bits must be 4, 8, or auto");
     }
     cfg.pq_max_distortion = p.get<float>("pq-max-distortion");
-    cfg.pq_anisotropy_lambda = p.get<float>("pq-anisotropy");
-    cfg.pq_opq = p.get<float>("pq-opq");
+    cfg.pq_anisotropy = (p.get<float>("pq-anisotropy") > 0.0f);
+    cfg.pq_opq = (p.get<float>("pq-opq") > 0.0f);
     cfg.num_threads       = p.get<uint32_t>("threads");
     {
         const std::string m = p.get<std::string>("metric");
         cfg.metric = (m == "ip") ? sextant::MetricKind::InnerProduct
                                   : sextant::MetricKind::L2Sq;
     }
-    cfg.build_mode = sextant::BuildMode::HDC;  // HDC only; raw-vector construct removed
     // target-topk is only defined for Analyze/Autobuild modes; guard with
     // a try-catch because cmdline::parser::exist() throws if the flag wasn't
     // registered (it doesn't return false for undefined flags).
@@ -182,7 +181,8 @@ inline void apply_log_level(const cmdline::parser& p) {
 inline void print_analysis_(sextant::VectorSource& source,
                             const std::string& input,
                             const sextant::BuildConfig& cfg,
-                            const sextant::ResolvedParams& params) {
+                            const sextant::ResolvedParams& params,
+                            const sextant::EstimationDiagnostics& diag) {
     const uint64_t n = source.count();
     const sextant::Dim dim = source.dim();
     const std::string metric_str =
@@ -202,13 +202,13 @@ inline void print_analysis_(sextant::VectorSource& source,
     // Measured signals.
     std::cout << "─── Measured Signals ───\n";
     std::cout << "  median LID:           " << std::fixed
-              << std::setprecision(2) << params.measured_median_lid << "\n";
+              << std::setprecision(2) << diag.median_lid << "\n";
     std::cout << "  avg degree (R̄):       " << std::setprecision(2)
-              << params.measured_avg_degree << "\n";
+              << diag.avg_degree << "\n";
     std::cout << "  clustering coeff:     " << std::setprecision(4)
-              << params.measured_clustering << "\n";
+              << diag.clustering_coeff << "\n";
     std::cout << "  dead-end fraction:    " << std::setprecision(4)
-              << params.measured_dead_end_frac << "\n\n";
+              << diag.dead_end_frac << "\n\n";
 
     // Resolved params.
     std::cout << "─── Resolved Parameters ───\n";
@@ -225,7 +225,7 @@ inline void print_analysis_(sextant::VectorSource& source,
     std::cout << "  max_occlusion:  " << params.max_occlusion << "\n";
     std::cout << "  closure_factor: " << std::setprecision(4)
               << params.closure_factor << "\n";
-    std::cout << "  K (partitions): " << params.K << "\n\n";
+    std::cout << "  K (partitions): " << params.partition_count << "\n\n";
 
     // Recommended build command.
     std::cout << "─── Build Command ───\n";

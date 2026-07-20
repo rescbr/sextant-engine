@@ -10,6 +10,7 @@
 #include "sextant/engine.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
+#include "sextant/system.hpp"
 
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
@@ -25,11 +26,6 @@
 #include <filesystem>
 #include <thread>
 #include <vector>
-
-#ifdef __APPLE__
-#include <sys/types.h>
-#include <sys/sysctl.h>
-#endif
 
 namespace sextant {
 
@@ -253,14 +249,10 @@ void Engine::load_sidecars() {
     }
 
     // Reconstruct the final node size from the resolved params.
-    node_size_ = VamanaCore::static_node_size(
-        params.R, params.inline_pq_count,
-        code_size_);
+    node_size_ = VamanaCore::static_node_size(params.R, code_size_);
 
-    // --- Reconstruct the VamanaCore with the loaded params ---
-    // Search core uses the resolved inline_pq_count (nodes carry inline codes).
-    VamanaParams vparams =
-        VamanaParams::from_resolved(params, dim_, 0, params.inline_pq_count);
+    // Reconstruct the search VamanaCore with the loaded params.
+    VamanaParams vparams = VamanaParams::from_resolved(params, dim_);
     core_ = std::make_unique<VamanaCore>(vparams, *quantizer_);
     core_->prepare_for_build(static_cast<uint32_t>(count_));
 
@@ -279,22 +271,7 @@ void Engine::load_sidecars() {
         const uint64_t codes_size =
             static_cast<uint64_t>(count_) * code_size_;
         const uint64_t total_index_size = graph_size + codes_size;
-        uint64_t phys_ram = 0;
-#ifdef __APPLE__
-        // sysctl hw.memsize
-        int mib[2] = {CTL_HW, HW_MEMSIZE};
-        uint64_t memsize = 0;
-        size_t len = sizeof(memsize);
-        if (sysctl(mib, 2, &memsize, &len, nullptr, 0) == 0) {
-            phys_ram = memsize;
-        }
-#else
-        long pages = sysconf(_SC_PHYS_PAGES);
-        long page_size = sysconf(_SC_PAGE_SIZE);
-        if (pages > 0 && page_size > 0) {
-            phys_ram = static_cast<uint64_t>(pages) * page_size;
-        }
-#endif
+        const uint64_t phys_ram = sextant::physical_ram_bytes();
         uint64_t cache_bytes;
         if (cache_size_override_ > 0) {
             cache_bytes = cache_size_override_;

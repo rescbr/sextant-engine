@@ -4,17 +4,13 @@
 
 #include "build.hpp"
 #include "sextant/error.hpp"
+#include "sextant/system.hpp"
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cmath>
 #include <thread>
-
-#if defined(__APPLE__)
-#include <sys/sysctl.h>
-#endif
-#include <unistd.h>
 
 namespace sextant {
 
@@ -27,27 +23,6 @@ uint16_t auto_R(uint64_t n) {
     if (n < 10'000'000ull) return 64;
     if (n < 100'000'000ull) return 96;
     return 128;
-}
-
-/// Physical RAM in bytes. Platform-specific with a portable fallback.
-uint64_t physical_ram_bytes() {
-#if defined(__APPLE__)
-    uint64_t membytes = 0;
-    size_t len = sizeof(membytes);
-    if (::sysctlbyname("hw.memsize", &membytes, &len, nullptr, 0) == 0 &&
-        membytes > 0) {
-        return membytes;
-    }
-#elif defined(__linux__)
-    // /proc/meminfo is more reliable than sysconf on Linux, but sysconf is a
-    // fine portable fallback. Try sysconf first (no file parse needed).
-#endif
-    long pages = ::sysconf(_SC_PHYS_PAGES);
-    long page_size = ::sysconf(_SC_PAGE_SIZE);
-    if (pages > 0 && page_size > 0) {
-        return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
-    }
-    return 0;
 }
 
 }  // namespace
@@ -91,8 +66,6 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     } else {
         p.alpha = 1.2f;
     }
-    // --- build_mode (HDC only; raw-vector construct removed) ---
-    p.build_mode = overrides.build_mode;
     spdlog::info("[sextant] alpha = {:.2f} [{}]", p.alpha,
                  overrides.alpha != 0.0f ? "override" : "auto");
 
@@ -130,22 +103,18 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                      overrides.pq_max_distortion > 0.0f ? "override" : "default");
     }
 
-    // --- pq_anisotropy_lambda (covariance-based anisotropic codebook training) ---
-    // 0 = disabled (plain L2sq k-means). >0 = enabled: each subspace's dims
-    // are scaled by √(eigval/mean_eigval) before k-means (scale-transform).
-    // Pure pass-through: no auto value; defaults to disabled.
-    p.pq_anisotropy_lambda = overrides.pq_anisotropy_lambda;
-    if (p.pq_anisotropy_lambda > 0.0f) {
+    // --- pq_anisotropy (covariance-based anisotropic codebook training) ---
+    // Pure pass-through; defaults to off.
+    p.pq_anisotropy = overrides.pq_anisotropy;
+    if (p.pq_anisotropy) {
         spdlog::info("[sextant] pq_anisotropy = on [override] "
                      "(covariance-based anisotropic codebook training ENABLED)");
     }
 
     // --- pq_opq (OPQ PCA rotation) ---
-    // 0 = disabled (plain PQ). >0 = enabled: learn a d×d PCA rotation from
-    // the training-sample covariance and apply it at train/encode/search time.
-    // Pure pass-through: no auto value; defaults to disabled.
+    // Pure pass-through; defaults to off.
     p.pq_opq = overrides.pq_opq;
-    if (p.pq_opq > 0.0f) {
+    if (p.pq_opq) {
         spdlog::info("[sextant] pq_opq = on [override] "
                      "(OPQ PCA rotation ENABLED)");
     }
@@ -162,23 +131,6 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                                              static_cast<uint32_t>(p.R) + 1u);
         spdlog::info("[sextant] max_occlusion = {} [auto]", p.max_occlusion);
     }
-
-    // --- inline_pq_count ---
-    // Inline PQ is deprecated (two-cache search makes it redundant). The auto
-    // sentinel (0xFFFF) is removed; default is 0 (compact). Users who explicitly
-    // set >0 get a deprecation warning at flush time.
-    p.inline_pq_count = overrides.inline_pq_count;
-    // Defensive: an old caller/test may still pass the 0xFFFF auto sentinel.
-    // Treat it as 0 (auto → compact).
-    if (p.inline_pq_count == 0xFFFF) {
-        p.inline_pq_count = 0;
-    }
-    // Cap to R — can't inline more neighbor codes than neighbors.
-    if (p.inline_pq_count > p.R) {
-        p.inline_pq_count = p.R;
-    }
-    spdlog::info("[sextant] inline_pq_count = {} [{}]", p.inline_pq_count,
-                 overrides.inline_pq_count != 0 ? "override" : "default");
 
     // --- metric ---
     p.metric = overrides.metric;
@@ -197,7 +149,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     if (overrides.build_ram_budget != 0) {
         p.build_ram_budget = overrides.build_ram_budget;
     } else {
-        uint64_t ram = physical_ram_bytes();
+        uint64_t ram = sextant::physical_ram_bytes();
         p.build_ram_budget = ram > 0 ? ram / 2 : 0;
     }
     spdlog::info("[sextant] build_ram_budget = {} bytes ({:.1f}MB) [{}] — "
@@ -246,7 +198,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
 
 
     // --- K (partition count) ---
-    // per_vec = code_size + node_size(R, inline_pq=0, code_size).
+    // per_vec = code_size + node_size(R, code_size).
     // code_size = pq_m (for pq_bits=8, 1 byte per segment).
     {
         const uint32_t code_sz = static_cast<uint32_t>(p.pq_m);
@@ -263,7 +215,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                 if (k < 1) k = 1;
             }
         }
-        p.K = k;
+        p.partition_count = k;
         const uint64_t monolithic_ram = n_vectors * per_vec;
         if (k == 1) {
             spdlog::info("[sextant] K (partitions) = 1 [monolithic, "
@@ -273,8 +225,8 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
         } else {
             spdlog::info("[sextant] K (partitions) = {} [flat RAM {:.1f}MB > "
                          "budget {:.1f}MB → {} shards of ≤{} vectors each]",
-                         p.K, monolithic_ram / 1e6,
-                         p.build_ram_budget / 1e6, p.K, max_per_partition);
+                         p.partition_count, monolithic_ram / 1e6,
+                         p.build_ram_budget / 1e6, p.partition_count, max_per_partition);
         }
     }
 

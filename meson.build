@@ -110,6 +110,7 @@ engine_sources = [
     'src/engine/fbin_source.cpp',
     'src/engine/partition.cpp',
     'src/logging.cpp',
+    'src/system.cpp',
 ]
 
 sextant_lib = static_library('sextant',

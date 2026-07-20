@@ -761,7 +761,6 @@ TEST(Engine, BuildHDCMode) {
 
         BuildConfig cfg;
         cfg.pq_m = 8; cfg.pq_bits = 8;
-        cfg.build_mode = BuildMode::HDC;  // HDC build mode (PQ-distance construct)
         BuildResult result = engine.build(source, index_path, cfg);
         EXPECT_EQ(static_cast<uint64_t>(n), result.n_vectors);
         EXPECT_EQ(dim, result.dim);

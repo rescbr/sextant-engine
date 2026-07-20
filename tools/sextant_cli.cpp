@@ -119,13 +119,13 @@ int cmd_autobuild(int argc, char* argv[]) {
 
     sextant::Engine engine;
     // estimate_config handles all auto knobs; locked ones override.
-    const sextant::ResolvedParams params = engine.estimate_config(source, cfg);
+    const sextant::EstimateResult est = engine.estimate_config(source, cfg);
 
     // Print the analysis (shared pretty-print with analyze).
-    print_analysis_(source, input, cfg, params);
+    print_analysis_(source, input, cfg, est.params, est.diag);
 
     // Build with the resolved params (in-process, no string round-trip).
-    const sextant::BuildResult result = engine.build(source, index, params);
+    const sextant::BuildResult result = engine.build(source, index, est.params);
     std::cout << "\n═══ Build Result ═══\n";
     std::cout << "built index '" << index << "': n=" << result.n_vectors
               << " dim=" << result.dim

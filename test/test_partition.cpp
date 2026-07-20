@@ -220,15 +220,14 @@ TEST(Partition, MergedGraphIsConnected) {
         BuildConfig cfg;
         cfg.R = 32;
         cfg.pq_m = 16; cfg.pq_bits = 8;
-        cfg.inline_pq_count = 0;  // deterministic node_size = build layout
         cfg.build_ram_budget = 80000;  // forces K ≈ 3
         engine.build(source, index_path, cfg);
     }
 
     // Read the .graph sidecar header (64 bytes) + node bodies. We set
-    // inline_pq_count=0 so node_size = ((16 + R*4 + 7) & ~7) = 144 for R=32.
+    // node_size = ((16 + R*4 + 7) & ~7) = 144 for R=32.
     // Neighbor layout within a node:
-    //   [row_id 8][internal_id 4][neighbor_count 2][inline_pq_count 2]
+    //   [row_id 8][internal_id 4][neighbor_count 2][reserved 2]
     //   [neighbors R×4]
     constexpr uint32_t R = 32;
     const uint32_t node_stride = (16u + R * 4u + 7u) & ~7u;  // 144

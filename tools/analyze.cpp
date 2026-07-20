@@ -50,8 +50,8 @@ int cmd_analyze(int argc, char* argv[]) {
     cfg.recall_target    = p.get<float>("recall-target");
 
     sextant::Engine engine;
-    const auto params = engine.estimate_config(source, cfg);
-    print_analysis_(source, input, cfg, params);
+    const auto est = engine.estimate_config(source, cfg);
+    print_analysis_(source, input, cfg, est.params, est.diag);
     return 0;
 }
 

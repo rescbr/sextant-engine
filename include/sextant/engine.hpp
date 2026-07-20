@@ -31,8 +31,6 @@ struct ResolvedParams {
     uint16_t L = 100;
     uint16_t L_build = 100;
     float alpha = 1.2f;
-    BuildMode build_mode = BuildMode::HDC;
-    uint16_t inline_pq_count = 0;
     uint16_t pq_m = 32;
     uint8_t pq_bits = 8;          ///< 0 = auto (resolved by reservoir probe in pass1)
     float pq_max_distortion = 0.0f;   ///< 0 = default (1.20); max acceptable PQ distortion
@@ -40,21 +38,33 @@ struct ResolvedParams {
     MetricKind metric = MetricKind::L2Sq;
     uint64_t build_ram_budget = 0;
     uint32_t num_threads = 0;
-    uint32_t K = 1;             ///< Partition count (K>1 → partitioned build)
+    uint32_t partition_count = 1; ///< Partition count (>1 → partitioned build)
     float closure_factor = 1.033f;  ///< Shard overlap radius ratio
     uint16_t n_entry_points = 16;   ///< K-means centroid count for entry-point selection
     uint16_t n_search_entry_points = 4;  ///< Multi-start: top-M entry points per query
     float target_recall = 0.0f;     ///< Recall target the index was built for (0 = unspecified). Drives search early-exit.
     uint32_t early_exit_patience = 0;  ///< Search early-exit: terminate after N stalled pops post-convergence (0 = disabled; set by resolve_params when recall_target is set)
-    float pq_anisotropy_lambda = 0.0f;  ///< PQ covariance-based anisotropic codebook training (0 = disabled, >0 = enabled). Threaded into PqQuantizer::train.
-    float pq_opq = 0.0f;  ///< OPQ PCA rotation (0 = disabled, >0 = enabled). Threaded into PqQuantizer::train.
+    bool pq_anisotropy = false;  ///< PQ covariance-based anisotropic codebook training. Threaded into PqQuantizer::train.
+    bool pq_opq = false;          ///< OPQ PCA rotation. Threaded into PqQuantizer::train.
+};
 
-    // Diagnostic signals populated by estimate_config (zero when not estimated).
-    // Stored so build logging and --explain can report what drove the choices.
-    double measured_median_lid = 0.0;   ///< MLE LID from probe truth (0 = unmeasured)
-    double measured_avg_degree = 0.0;   ///< R̄ from mini-build (0 = unmeasured)
-    double measured_clustering = 0.0;   ///< clustering coefficient (0 = unmeasured)
-    double measured_dead_end_frac = 0.0;
+/// Estimation diagnostics produced by `Engine::estimate_config` (and the
+/// Estimator in the post-refactor world). Display-only — they do NOT influence
+/// the build (the inputs that drove the resolved params are already in
+/// `ResolvedParams`) and are NOT serialized to `.meta`. Kept in a separate
+/// struct so the build-input `ResolvedParams` stays pure.
+struct EstimationDiagnostics {
+    double median_lid = 0.0;       ///< MLE LID from probe truth (0 = unmeasured)
+    double avg_degree = 0.0;       ///< R̄ from mini-build (0 = unmeasured)
+    double clustering_coeff = 0.0; ///< clustering coefficient (0 = unmeasured)
+    double dead_end_frac = 0.0;    ///< fraction of nodes with degree ≤ 1
+};
+
+/// Result of `Engine::estimate_config`: resolved build inputs + the measured
+/// signals that informed them (for display / `--explain`).
+struct EstimateResult {
+    ResolvedParams params;
+    EstimationDiagnostics diag;
 };
 
 /// Structural properties of a built graph, measured for parameter estimation.
@@ -148,7 +158,7 @@ public:
     ///   - max_occlusion: if 0, auto (= max(L_build, R+1))
     ///
     /// Implementation lives in src/engine/estimate_config.cpp (Part 2).
-    ResolvedParams estimate_config(VectorSource& source, const BuildConfig& overrides);
+    EstimateResult estimate_config(VectorSource& source, const BuildConfig& overrides);
 
     /// Load an index from sidecar files for searching.
     void open(const std::string& index_path);
