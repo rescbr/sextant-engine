@@ -91,7 +91,30 @@ struct VamanaParams {
                                        uint16_t R_override = 0);
 };
 
-/// Per-thread-local scratch for Vamana operations (visit marks, prune buffers).
+/// Search-internal heap item types. Exposed so per-worker scratch
+/// (VamanaTLS) can own the heap buffers — no more thread_local globals.
+struct FrontierItem {
+    float dist;
+    uint32_t internal_id;
+};
+struct FrontierCmp {
+    bool operator()(const FrontierItem& a, const FrontierItem& b) const {
+        return a.dist > b.dist;
+    }
+};
+struct WorkingItem {
+    float dist;
+    uint32_t internal_id;
+};
+struct WorkingCmp {
+    bool operator()(const WorkingItem& a, const WorkingItem& b) const {
+        return a.dist < b.dist;
+    }
+};
+
+/// Per-worker scratch for Vamana operations (visit marks, prune buffers,
+/// search heaps). Owned by the caller (Builder pool worker or Searcher
+/// pool worker) and passed by reference — NEVER a thread_local global.
 struct VamanaTLS {
     std::vector<uint32_t> visited_flags;
     std::vector<Candidate> prune_buffer;    // robust_prune internal sort copy
@@ -105,13 +128,28 @@ struct VamanaTLS {
     /// Built once per insert_build_from_code; 8KB (m=32,K=256), L1-resident.
     std::vector<float> anchor_lut;
     std::vector<uint8_t> removed_flags;  // robust_prune removed bitset (bytes, not bools)
+    // Search-time heaps (capacity retained across queries). Owned here so
+    // beam_search_into is allocation-free on the hot path without relying
+    // on thread_local globals.
+    std::vector<FrontierItem> frontier_heap;  // min-heap by dist
+    std::vector<WorkingItem> working_heap;    // max-heap by dist
     std::mt19937 rng;
     uint32_t visit_token = 0;
+    uint32_t search_count_for_resize = 0;  // last count_ search scratch was sized for
 
     void resize(uint32_t max_nodes);
-    /// Size the reusable LUT scratch once per thread (m*K floats from the
-    /// quantizer). Called by the Engine after the quantizer is trained.
+    /// Size the reusable LUT scratch once per worker (m*K floats from the
+    /// quantizer). Called by the Engine/Builder after the quantizer is trained.
     void resize_lut(uint32_t lut_size);
+    /// Prepare the search heaps for a beam of width L (capacity retained
+    /// across calls; clears contents). Equivalent to the former
+    /// SearchScratch::prepare.
+    void prepare_search(uint32_t L) {
+        if (frontier_heap.capacity() < L + 1) frontier_heap.reserve(L + 1);
+        if (working_heap.capacity() < L + 1) working_heap.reserve(L + 1);
+        frontier_heap.clear();
+        working_heap.clear();
+    }
 };
 
 /// The Vamana graph core. Owns the flat-in-RAM node buffer and codes buffer
@@ -196,9 +234,13 @@ public:
     /// Compute entry points via k-means on PQ codes.
     void compute_entry_points();
 
-    /// Search: top-k candidates.
+    /// Search: top-k candidates. The caller supplies the per-worker `tls`
+    /// (owned by the pool worker, NOT a thread_local global — eliminates
+    /// cross-instance aliasing and lets a single Searcher fan queries out
+    /// across multiple VamanaTLS instances).
     std::vector<Candidate> search(const float* query_lut, uint32_t k,
                                    uint32_t L_search, uint32_t io_limit,
+                                   VamanaTLS& tls,
                                    const float16_t* query_fp16 = nullptr) const;
 
     // --- Node accessors (flat buffer layout) ---

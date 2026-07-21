@@ -199,7 +199,7 @@ int cmd_search(int argc, char* argv[]) {
 
     std::unique_ptr<sextant::Index> idx =
         sextant::Index::read(index_path, p.get<uint64_t>("cache-size"));
-    sextant::Searcher searcher(*idx);
+    sextant::Searcher searcher(*idx, num_threads);
     if (p.exist("no-cache-rebalance")) {
         searcher.set_cache_rebalance_enabled(false);
     }
@@ -318,73 +318,73 @@ int cmd_search(int argc, char* argv[]) {
 
         const uint32_t n_threads =
             std::max(1u, std::min(num_threads, qh.n));
+        // Chunked batch through the Searcher's pool (size = num_threads).
+        // Per-query formatting (rerank, base lookup) is cheap relative to
+        // search and runs inline on the caller thread as batches return.
+        constexpr uint32_t kChunkMin = 1;
+        const uint32_t chunk_size = std::max(kChunkMin, n_threads);
         std::vector<std::string> formatted_results(qh.n);
-        std::atomic<uint32_t> next{0};
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads);
+        std::vector<float> base_vec(dim);
 
-        for (uint32_t t = 0; t < n_threads; t++) {
-            workers.emplace_back([&]() {
-                // Thread-local scratch.
-                std::vector<float> base_vec(dim);
-                uint32_t qi;
-                while ((qi = next.fetch_add(1, std::memory_order_relaxed)) < qh.n) {
-                    const float* q = &queries[static_cast<size_t>(qi) * dim];
-
-                    sextant::SearchConfig scfg;
-                    scfg.k = fetch_k;
-                    scfg.L_search = L;
-                    scfg.rerank_factor = rerank;
-                    auto results = searcher.search(q, scfg.k, scfg);
-
-                    std::string buf;
-                    if (rerank_ok && !results.empty()) {
-                        std::vector<std::pair<float, sextant::RowId>> scored;
-                        scored.reserve(results.size());
-                        for (const auto& c : results) {
-                            if (c.row_id < 0 ||
-                                static_cast<uint64_t>(c.row_id) >= bh.n) {
-                                continue;
-                            }
-                            if (!read_fbin_vector(base_data, dim,
-                                                  static_cast<uint64_t>(c.row_id),
-                                                  base_vec)) {
-                                scored.emplace_back(c.dist, c.row_id);
-                                continue;
-                            }
-                            scored.emplace_back(
-                                l2sq_distance(q, base_vec.data(), dim),
-                                c.row_id);
+        for (uint32_t base = 0; base < qh.n; base += chunk_size) {
+            const uint32_t n_this =
+                std::min<uint32_t>(chunk_size, qh.n - base);
+            sextant::SearchConfig scfg;
+            scfg.k = fetch_k;
+            scfg.L_search = L;
+            scfg.rerank_factor = rerank;
+            const float* q0 = &queries[static_cast<size_t>(base) * dim];
+            auto batch = searcher.search_batch(q0, n_this, scfg.k, scfg);
+            for (uint32_t j = 0; j < n_this; j++) {
+                const uint32_t qi = base + j;
+                const float* q = &queries[static_cast<size_t>(qi) * dim];
+                auto& results = batch[j];
+                std::string buf;
+                if (rerank_ok && !results.empty()) {
+                    std::vector<std::pair<float, sextant::RowId>> scored;
+                    scored.reserve(results.size());
+                    for (const auto& c : results) {
+                        if (c.row_id < 0 ||
+                            static_cast<uint64_t>(c.row_id) >= bh.n) {
+                            continue;
                         }
-                        std::sort(scored.begin(), scored.end(),
-                                  [](const auto& a, const auto& b) {
-                                      return a.first < b.first;
-                                  });
-                        const uint32_t topk = std::min<uint32_t>(k, scored.size());
-                        for (uint32_t i = 0; i < topk; i++) {
-                            buf += std::to_string(qi);
-                            buf += "\t";
-                            buf += std::to_string(scored[i].second);
-                            buf += "\t";
-                            buf += std::to_string(scored[i].first);
-                            buf += "\n";
+                        if (!read_fbin_vector(base_data, dim,
+                                              static_cast<uint64_t>(c.row_id),
+                                              base_vec)) {
+                            scored.emplace_back(c.dist, c.row_id);
+                            continue;
                         }
-                    } else {
-                        const uint32_t topk = std::min<uint32_t>(k, results.size());
-                        for (uint32_t i = 0; i < topk; i++) {
-                            buf += std::to_string(qi);
-                            buf += "\t";
-                            buf += std::to_string(results[i].row_id);
-                            buf += "\t";
-                            buf += std::to_string(results[i].dist);
-                            buf += "\n";
-                        }
+                        scored.emplace_back(
+                            l2sq_distance(q, base_vec.data(), dim),
+                            c.row_id);
                     }
-                    formatted_results[qi] = std::move(buf);
+                    std::sort(scored.begin(), scored.end(),
+                              [](const auto& a, const auto& b) {
+                                  return a.first < b.first;
+                              });
+                    const uint32_t topk = std::min<uint32_t>(k, scored.size());
+                    for (uint32_t i = 0; i < topk; i++) {
+                        buf += std::to_string(qi);
+                        buf += "\t";
+                        buf += std::to_string(scored[i].second);
+                        buf += "\t";
+                        buf += std::to_string(scored[i].first);
+                        buf += "\n";
+                    }
+                } else {
+                    const uint32_t topk = std::min<uint32_t>(k, results.size());
+                    for (uint32_t i = 0; i < topk; i++) {
+                        buf += std::to_string(qi);
+                        buf += "\t";
+                        buf += std::to_string(results[i].row_id);
+                        buf += "\t";
+                        buf += std::to_string(results[i].dist);
+                        buf += "\n";
+                    }
                 }
-            });
+                formatted_results[qi] = std::move(buf);
+            }
         }
-        for (auto& w : workers) w.join();
 
         // Emit in query order.
         for (uint32_t qi = 0; qi < qh.n; qi++) {

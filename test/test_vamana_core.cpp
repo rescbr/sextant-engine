@@ -270,7 +270,7 @@ TEST(VamanaCore, SearchReturnsAtMostK) {
     std::vector<float> lut(lut_sz, 0.0f);
     const uint32_t k = 5;
     auto results = g.core->search(lut.data(), k, /*L_search=*/16,
-                                  /*io_limit=*/0);
+                                  /*io_limit=*/0, tls);
     EXPECT_LE(results.size(), static_cast<size_t>(k));
     // Every returned row_id must map to a node we inserted.
     for (const auto& c : results) {

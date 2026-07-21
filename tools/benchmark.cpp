@@ -182,7 +182,7 @@ int main(int argc, char* argv[]) {
     try {
         std::unique_ptr<sextant::Index> idx =
             sextant::Index::read(index, cache_size_req);
-        sextant::Searcher searcher(*idx);
+        sextant::Searcher searcher(*idx, n_threads_hint);
         if (p.exist("no-cache-rebalance")) {
             searcher.set_cache_rebalance_enabled(false);
         }
@@ -226,10 +226,8 @@ int main(int argc, char* argv[]) {
                                      ? std::min<uint32_t>(k * rerank, n_base)
                                      : k;
 
-        const uint32_t n_threads = std::max(1u, std::min(
-            threads_req > 0 ? threads_req
-                            : static_cast<uint32_t>(std::thread::hardware_concurrency()),
-            n_queries));
+        const uint32_t n_threads = std::max(1u, std::min(n_threads_hint,
+                                                          n_queries));
 
         std::cout << "[benchmark] queries: " << n_queries << ", k: " << k
                   << ", L: " << L << ", rerank: " << rerank
@@ -283,198 +281,160 @@ int main(int argc, char* argv[]) {
         constexpr double kRatioCap = 10.0;
         constexpr double kEps = 1e-6f;
 
-        std::atomic<uint32_t> next{0};
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads);
-
-        // Per-thread accumulators (merged after join).
-        std::vector<std::vector<double>> local_latencies(n_threads);
-        std::vector<double> local_recall_sum(n_threads, 0.0);
-        std::vector<uint64_t> local_recall_hits(n_threads, 0);
-        std::vector<uint64_t> local_recall_total(n_threads, 0);
-        std::vector<std::vector<double>> local_prox_ratios(n_threads);
-        std::vector<uint64_t> local_prox_in(n_threads, 0);
-        std::vector<uint64_t> local_prox_total(n_threads, 0);
-
-        const auto t_start = Clock::now();
-        for (uint32_t t = 0; t < n_threads; t++) {
-            workers.emplace_back([&, t]() {
-                // Thread-local scratch.
-                std::vector<float> qvec;  // unused (queries in RAM), kept for clarity
-                std::vector<float> base_vec(dim);
-                auto& latencies_local = local_latencies[t];
-                double& recall_sum_local = local_recall_sum[t];
-                uint64_t& recall_hits_local = local_recall_hits[t];
-                uint64_t& recall_total_local = local_recall_total[t];
-                auto& prox_ratios_local = local_prox_ratios[t];
-                uint64_t& prox_in_local = local_prox_in[t];
-                uint64_t& prox_total_local = local_prox_total[t];
-                latencies_local.reserve(n_queries / n_threads + 16);
-                prox_ratios_local.reserve(
-                    (n_queries / n_threads + 16) * std::max(1u, k));
-
-                uint32_t qi;
-                while ((qi = next.fetch_add(1, std::memory_order_relaxed)) < n_queries) {
-                    const float* q = &queries[static_cast<size_t>(qi) * dim];
-
-                    sextant::SearchConfig scfg;
-                    scfg.k = fetch_k;
-                    scfg.L_search = L;
-                    scfg.rerank_factor = rerank;
-                    scfg.io_limit = io_limit;
-
-                    const auto q_start = Clock::now();
-                    auto results = searcher.search(q, scfg.k, scfg);
-
-                    // Resolve final top-k row_ids (with optional exact rerank).
-                    // We keep each result's true L2sq distance for proximity metrics.
-                    std::vector<std::pair<float, sextant::RowId>> topk_scored;
-                    topk_scored.reserve(k);
-                    if (do_rerank && !results.empty()) {
-                        std::vector<std::pair<float, sextant::RowId>> scored;
-                        scored.reserve(results.size());
-                        for (const auto& c : results) {
-                            if (c.row_id < 0 ||
-                                static_cast<uint64_t>(c.row_id) >= bh.n) {
-                                continue;
-                            }
-                            float d;
-                            if (base_in_ram) {
-                                const float* bv =
-                                    &base_all[static_cast<size_t>(c.row_id) * dim];
-                                d = l2sq_distance(q, bv, dim);
-                            } else {
-                                read_fbin_vector(base_data, dim,
-                                                 static_cast<uint64_t>(c.row_id),
-                                                 base_vec);
-                                d = l2sq_distance(q, base_vec.data(), dim);
-                            }
-                            scored.emplace_back(d, c.row_id);
-                        }
-                        std::sort(scored.begin(), scored.end(),
-                                  [](const auto& a, const auto& b) {
-                                      return a.first < b.first;
-                                  });
-                        const uint32_t topk_n = std::min<uint32_t>(k, scored.size());
-                        for (uint32_t i = 0; i < topk_n; i++) {
-                            topk_scored.push_back(scored[i]);
-                        }
-                    } else {
-                        // No rerank: compute true distances for proximity reporting.
-                        const uint32_t topk_n = std::min<uint32_t>(k, results.size());
-                        for (uint32_t i = 0; i < topk_n; i++) {
-                            const auto rid = results[i].row_id;
-                            float d = std::numeric_limits<float>::infinity();
-                            if (rid >= 0 &&
-                                static_cast<uint64_t>(rid) < bh.n) {
-                                if (base_in_ram) {
-                                    const float* bv =
-                                        &base_all[static_cast<size_t>(rid) * dim];
-                                    d = l2sq_distance(q, bv, dim);
-                                } else {
-                                    read_fbin_vector(base_data, dim,
-                                                     static_cast<uint64_t>(rid),
-                                                     base_vec);
-                                    d = l2sq_distance(q, base_vec.data(), dim);
-                                }
-                            }
-                            topk_scored.emplace_back(d, rid);
-                        }
-                    }
-                    const auto q_end = Clock::now();
-                    latencies_local.push_back(US(q_end - q_start).count());
-
-                    // Recall@k against ground truth.
-                    if (qi < gt.n) {
-                        const uint32_t* gt_row =
-                            &gt.ids[static_cast<size_t>(qi) * gt.k];
-                        const uint32_t gt_k = std::min(gt.k, k);
-                        uint32_t hits = 0;
-                        for (uint32_t i = 0; i < gt_k; i++) {
-                            const uint32_t g = gt_row[i];
-                            for (const auto& [d, r] : topk_scored) {
-                                (void)d;
-                                if (r >= 0 && static_cast<uint32_t>(r) == g) {
-                                    ++hits;
-                                    break;
-                                }
-                            }
-                        }
-                        recall_sum_local += static_cast<double>(hits) / static_cast<double>(gt_k);
-                        recall_hits_local += hits;
-                        recall_total_local += gt_k;
-
-                        // Proximity: how close each returned result is to the
-                        // k-th true NN. ratio = d_target / d_result (>=1 = at or
-                        // inside target). For degenerate near-zero distances we
-                        // treat co-located vectors as perfectly matching.
-                        //
-                        // IMPORTANT: d_target is recomputed from the base vectors
-                        // using L2sq (matching d_result), NOT from gt.dists.
-                        // GT files may store cosine distance, L2, or L2sq
-                        // depending on the tool that generated them — using a
-                        // mismatched metric makes the ratio meaningless.
-                        if (have_gt_dists && base_in_ram) {
-                            // Recompute the k-th true NN distance in L2sq.
-                            const uint32_t gt_kth_id =
-                                gt.ids[static_cast<size_t>(qi) * gt.k +
-                                       (gt_k - 1)];
-                            float d_target;
-                            if (gt_kth_id < bh.n) {
-                                const float* bv_kth =
-                                    &base_all[static_cast<size_t>(gt_kth_id) * dim];
-                                d_target = l2sq_distance(q, bv_kth, dim);
-                            } else {
-                                d_target = gt.dists[static_cast<size_t>(qi) * gt.k +
-                                                     (gt_k - 1)];
-                            }
-                            for (const auto& [d, r] : topk_scored) {
-                                if (r < 0) continue;
-                                double ratio;
-                                if (d_target <= kEps && d <= kEps) {
-                                    ratio = 1.0;  // both co-located: perfect
-                                } else if (d <= kEps) {
-                                    ratio = kRatioCap;  // found a closer point
-                                } else if (d_target <= kEps) {
-                                    ratio = 0.0;  // target is co-located, we're not
-                                } else {
-                                    ratio = static_cast<double>(d_target) /
-                                            static_cast<double>(d);
-                                }
-                                prox_ratios_local.push_back(ratio);
-                                if (ratio >= 1.0) ++prox_in_local;
-                                ++prox_total_local;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
-        const auto t_end = Clock::now();
-        const double total_sec =
-            std::chrono::duration<double>(t_end - t_start).count();
-
-        // Merge thread-local accumulators into aggregates.
+        // Aggregates (collected on the main thread as batches return).
         double recall_sum = 0.0;
         uint64_t recall_hits = 0;
         uint64_t recall_total = 0;
         std::vector<double> prox_ratios;
         uint64_t prox_in = 0;
         uint64_t prox_total = 0;
-        for (uint32_t t = 0; t < n_threads; t++) {
-            latencies_us.insert(latencies_us.end(),
-                                local_latencies[t].begin(),
-                                local_latencies[t].end());
-            recall_sum += local_recall_sum[t];
-            recall_hits += local_recall_hits[t];
-            recall_total += local_recall_total[t];
-            prox_ratios.insert(prox_ratios.end(),
-                               local_prox_ratios[t].begin(),
-                               local_prox_ratios[t].end());
-            prox_in += local_prox_in[t];
-            prox_total += local_prox_total[t];
+        prox_ratios.reserve(n_queries * std::max(1u, k));
+
+        // Per-query rerank + metrics processing — runs on the caller thread
+        // as each batch returns. The pool handles the parallel search; all
+        // post-processing is single-threaded (cheap compared to search).
+        auto process_result = [&](uint32_t qi,
+                                  std::vector<sextant::Candidate>&& results,
+                                  double latency_us) {
+            const float* q = &queries[static_cast<size_t>(qi) * dim];
+            latencies_us.push_back(latency_us);
+
+            std::vector<std::pair<float, sextant::RowId>> topk_scored;
+            topk_scored.reserve(k);
+            std::vector<float> base_vec(dim);
+            if (do_rerank && !results.empty()) {
+                std::vector<std::pair<float, sextant::RowId>> scored;
+                scored.reserve(results.size());
+                for (const auto& c : results) {
+                    if (c.row_id < 0 ||
+                        static_cast<uint64_t>(c.row_id) >= bh.n) {
+                        continue;
+                    }
+                    float d;
+                    if (base_in_ram) {
+                        const float* bv =
+                            &base_all[static_cast<size_t>(c.row_id) * dim];
+                        d = l2sq_distance(q, bv, dim);
+                    } else {
+                        read_fbin_vector(base_data, dim,
+                                         static_cast<uint64_t>(c.row_id),
+                                         base_vec);
+                        d = l2sq_distance(q, base_vec.data(), dim);
+                    }
+                    scored.emplace_back(d, c.row_id);
+                }
+                std::sort(scored.begin(), scored.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.first < b.first;
+                          });
+                const uint32_t topk_n = std::min<uint32_t>(k, scored.size());
+                for (uint32_t i = 0; i < topk_n; i++) {
+                    topk_scored.push_back(scored[i]);
+                }
+            } else {
+                const uint32_t topk_n = std::min<uint32_t>(k, results.size());
+                for (uint32_t i = 0; i < topk_n; i++) {
+                    const auto rid = results[i].row_id;
+                    float d = std::numeric_limits<float>::infinity();
+                    if (rid >= 0 &&
+                        static_cast<uint64_t>(rid) < bh.n) {
+                        if (base_in_ram) {
+                            const float* bv =
+                                &base_all[static_cast<size_t>(rid) * dim];
+                            d = l2sq_distance(q, bv, dim);
+                        } else {
+                            read_fbin_vector(base_data, dim,
+                                             static_cast<uint64_t>(rid),
+                                             base_vec);
+                            d = l2sq_distance(q, base_vec.data(), dim);
+                        }
+                    }
+                    topk_scored.emplace_back(d, rid);
+                }
+            }
+
+            if (qi < gt.n) {
+                const uint32_t* gt_row =
+                    &gt.ids[static_cast<size_t>(qi) * gt.k];
+                const uint32_t gt_k = std::min(gt.k, k);
+                uint32_t hits = 0;
+                for (uint32_t i = 0; i < gt_k; i++) {
+                    const uint32_t g = gt_row[i];
+                    for (const auto& [d, r] : topk_scored) {
+                        (void)d;
+                        if (r >= 0 && static_cast<uint32_t>(r) == g) {
+                            ++hits;
+                            break;
+                        }
+                    }
+                }
+                recall_sum += static_cast<double>(hits) / static_cast<double>(gt_k);
+                recall_hits += hits;
+                recall_total += gt_k;
+
+                if (have_gt_dists && base_in_ram) {
+                    const uint32_t gt_kth_id =
+                        gt.ids[static_cast<size_t>(qi) * gt.k + (gt_k - 1)];
+                    float d_target;
+                    if (gt_kth_id < bh.n) {
+                        const float* bv_kth =
+                            &base_all[static_cast<size_t>(gt_kth_id) * dim];
+                        d_target = l2sq_distance(q, bv_kth, dim);
+                    } else {
+                        d_target = gt.dists[static_cast<size_t>(qi) * gt.k +
+                                             (gt_k - 1)];
+                    }
+                    for (const auto& [d, r] : topk_scored) {
+                        if (r < 0) continue;
+                        double ratio;
+                        if (d_target <= kEps && d <= kEps) {
+                            ratio = 1.0;
+                        } else if (d <= kEps) {
+                            ratio = kRatioCap;
+                        } else if (d_target <= kEps) {
+                            ratio = 0.0;
+                        } else {
+                            ratio = static_cast<double>(d_target) /
+                                    static_cast<double>(d);
+                        }
+                        prox_ratios.push_back(ratio);
+                        if (ratio >= 1.0) ++prox_in;
+                        ++prox_total;
+                    }
+                }
+            }
+        };
+
+        // Chunked batch driver: submit chunks of queries to the pool, then
+        // process results as each chunk returns. Chunk size = pool size so
+        // the pool stays saturated without over-allocating futures.
+        constexpr uint32_t kChunkMin = 1;
+        const uint32_t chunk_size = std::max(kChunkMin, n_threads);
+        const auto t_start = Clock::now();
+        for (uint32_t base = 0; base < n_queries; base += chunk_size) {
+            const uint32_t n_this = std::min<uint32_t>(chunk_size,
+                                                       n_queries - base);
+            sextant::SearchConfig scfg;
+            scfg.k = fetch_k;
+            scfg.L_search = L;
+            scfg.rerank_factor = rerank;
+            scfg.io_limit = io_limit;
+
+            const float* q0 = &queries[static_cast<size_t>(base) * dim];
+            const auto batch_start = Clock::now();
+            auto batch_results = searcher.search_batch(q0, n_this, scfg.k, scfg);
+            const auto batch_end = Clock::now();
+            const double batch_us = US(batch_end - batch_start).count();
+            // Per-query latency: average across the batch (the batch ran
+            // concurrently, so wall-time / n_this is the throughput view).
+            const double per_q_us = batch_us / static_cast<double>(n_this);
+            for (uint32_t i = 0; i < n_this; i++) {
+                process_result(base + i, std::move(batch_results[i]), per_q_us);
+            }
         }
+        const auto t_end = Clock::now();
+        const double total_sec =
+            std::chrono::duration<double>(t_end - t_start).count();
 
         const double mean_recall =
             (n_queries > 0) ? recall_sum / static_cast<double>(n_queries)

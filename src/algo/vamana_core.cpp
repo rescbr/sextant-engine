@@ -67,28 +67,6 @@ inline constexpr uint32_t kNeighborArrayOffset = 16;
 
 namespace {
 
-// Min-heap frontier (pop closest first).
-struct FrontierItem {
-    float dist;
-    uint32_t internal_id;
-};
-struct FrontierCmp {
-    bool operator()(const FrontierItem& a, const FrontierItem& b) const {
-        return a.dist > b.dist;
-    }
-};
-
-// Max-heap working set W (pop farthest first).
-struct WorkingItem {
-    float dist;
-    uint32_t internal_id;
-};
-struct WorkingCmp {
-    bool operator()(const WorkingItem& a, const WorkingItem& b) const {
-        return a.dist < b.dist;
-    }
-};
-
 // T5: Dynamic beam width for graph construction. Ramps L_build from L_min to
 // L_max as construction progresses from 25% to 50% complete, holding L_min
 // before and L_max after. Fewer candidates early (sparse graph) reduce gather
@@ -107,23 +85,9 @@ inline uint32_t dynamic_L_build(uint32_t inserted, uint32_t total,
 }
 
 // ---------------------------------------------------------------------------
-// Thread-local search scratch: pre-reserved heaps to avoid per-query
-// reallocation. The backing vectors are reserved once (to L+1) and clear()'d
-// (capacity retained) between queries.
+// (Search heap scratch was a thread_local SearchScratch; it now lives in
+// VamanaTLS as frontier_heap / working_heap, sized per-worker.)
 // ---------------------------------------------------------------------------
-struct SearchScratch {
-    std::vector<FrontierItem> frontier_heap;  // min-heap by dist
-    std::vector<WorkingItem> working_heap;    // max-heap by dist
-
-    void prepare(uint32_t L) {
-        if (frontier_heap.capacity() < L + 1) frontier_heap.reserve(L + 1);
-        if (working_heap.capacity() < L + 1) working_heap.reserve(L + 1);
-        frontier_heap.clear();
-        working_heap.clear();
-    }
-};
-
-thread_local SearchScratch g_search_scratch;
 
 }  // namespace
 
@@ -338,9 +302,9 @@ void VamanaCore::beam_search_into(
         return d;
     };
 
-    g_search_scratch.prepare(L);
-    auto& frontier = g_search_scratch.frontier_heap;  // min-heap by dist
-    auto& W = g_search_scratch.working_heap;          // max-heap by dist
+    tls.prepare_search(L);
+    auto& frontier = tls.frontier_heap;  // min-heap by dist
+    auto& W = tls.working_heap;          // max-heap by dist
 
     uint32_t io_count = 0;
 
@@ -1076,6 +1040,7 @@ void VamanaCore::compute_entry_points() {
 std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
                                            uint32_t L_search,
                                            uint32_t io_limit,
+                                           VamanaTLS& tls,
                                            const float16_t* query_fp16) const {
     if (count_ == 0 || k == 0) {
         return {};
@@ -1087,14 +1052,13 @@ std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
         L_search = k;
     }
 
-    // Reuse a thread-local VamanaTLS across search calls. Allocating a
-    // fresh TLS (4MB for visited_flags at 1M nodes) on every query was the
-    // #1 bottleneck under multi-threaded search — vector::__append dominated.
-    thread_local VamanaTLS tls;
-    thread_local uint32_t tls_count = 0;
-    if (tls_count != count_) {
+    // Lazily size the per-worker search scratch when the index size changes.
+    // (Was a thread_local VamanaTLS + tls_count — now owned by the caller's
+    // pool worker, so a single Searcher can fan out across workers without
+    // 4MB thread_local aliasing.)
+    if (tls.search_count_for_resize != count_) {
         tls.resize(count_);
-        tls_count = count_;
+        tls.search_count_for_resize = count_;
     }
 
     auto cands = beam_search(query_lut, L_search, io_limit, tls,

@@ -232,6 +232,11 @@ Estimator::SearchQuality Estimator::measure_search_(
     if (!mini.core || !mini.quantizer || qidx.empty()) return sq;
 
     PqQuantizer& q = *mini.quantizer;
+
+    // Per-call scratch (single-threaded measurement). Sized once; reused
+    // across all sampled queries in this measure_search_ call.
+    VamanaTLS tls;
+    if (mini.count > 0) tls.resize(static_cast<uint32_t>(mini.count));
     std::vector<float> lut(q.lut_size());
     // Over-fetch for rerank: k * rerank (matches the production benchmark tool
     // at benchmark.cpp:225). Previously `k + rerank`, which under-fetched and
@@ -248,7 +253,8 @@ Estimator::SearchQuality Estimator::measure_search_(
 
         // Production-style search: index_->core->search returns candidates ranked by
         // PQ LUT distance. We over-fetch k+rerank candidates.
-        auto results = mini.core->search(lut.data(), fetch_k, L, /*io_limit=*/0);
+        auto results = mini.core->search(lut.data(), fetch_k, L, /*io_limit=*/0,
+                                          tls);
         if (results.empty()) continue;
 
         // Rerank by true L2sq distance computed from the FP32 sample buffer.
