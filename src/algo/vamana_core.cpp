@@ -580,35 +580,147 @@ void VamanaCore::beam_search_into(
                 }
             }
         } else {
-            for (uint16_t i = 0; i < n; i++) {
-                const uint32_t nb_internal =
-                    nb_ptr ? nb_ptr[i]
-                        : (store_
-                            ? get_neighbor(store_->pin_node(
-                                                best.internal_id).data,
-                                            i)
-                            : get_neighbor(
-                                build_ctx_->node_ptr(best.internal_id, node_size_), i));
-                // (no per-pin cleanup — NodeStore::unpin_* removed: all
-                // implementations were no-ops; the cache outlives the call.)
-                if (is_visited(nb_internal)) {
-                    continue;
-                }
-                mark_visited(nb_internal);
+            // Search path (store_ active) or build path without LUT batching.
+            //
+            // Layer 4 perf: batch the distance evaluation. Collect all
+            // unvisited neighbor IDs first (no locks, no virtual calls),
+            // then:
+            //   - FP16-path nodes (MemGraph ball nodes with precise_vec):
+            //     compute l2sq_f16 per-node (no code pinning needed).
+            //   - PQ-path nodes: batch-pin all codes via ONE pin_codes call
+            //     (lock per shard, not per node), then lut_distance_batch4
+            //     over the returned pointers (SVE2 4-way gather).
+            //
+            // The build-path fallback (no store_, no LUT) still goes through
+            // dist_to per-node — it's the rare untrained-quantizer test path.
+            const bool has_store = (store_ != nullptr);
+            const bool has_lut = (anchor_lut != nullptr ||
+                                  query_lut != nullptr);
+            const bool can_batch_search = has_store && has_lut;
 
-                if (io_limit > 0 && io_count >= io_limit) {
-                    continue;  // out of I/O budget: mark visited, skip distance.
+            if (can_batch_search) {
+                const float* batch_lut = anchor_lut ? anchor_lut : query_lut;
+                uint32_t pq_ids[1024];
+                const uint8_t* pq_codes[1024];
+                uint32_t pq_n = 0;
+                // FP16-path nodes (MemGraph ball nodes). Computed per-node
+                // since each has a distinct FP16 vector.
+                uint32_t fp16_ids[1024];
+                const float16_t* fp16_vecs[1024];
+                uint32_t fp16_n = 0;
+
+                for (uint16_t i = 0; i < n; i++) {
+                    const uint32_t nb_internal = nb_ptr ? nb_ptr[i] : 0;
+                    if (is_visited(nb_internal)) continue;
+                    mark_visited(nb_internal);
+                    if (io_limit > 0 && io_count >= io_limit) continue;
+                    io_count++;
+
+                    if (query_fp16) {
+                        const float16_t* fp16 = store_->precise_vec(nb_internal);
+                        if (fp16) {
+                            fp16_ids[fp16_n] = nb_internal;
+                            fp16_vecs[fp16_n] = fp16;
+                            ++fp16_n;
+                            continue;
+                        }
+                    }
+                    pq_ids[pq_n++] = nb_internal;
                 }
-                io_count++;
-                const float d = dist_to(nb_internal);
-                if (W.size() < L_current || d < W.front().dist) {
-                    frontier.push_back({d, nb_internal});
-                    std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
-                    W.push_back({d, nb_internal});
-                    std::push_heap(W.begin(), W.end(), WorkingCmp{});
-                    if (W.size() > L_current) {
-                        std::pop_heap(W.begin(), W.end(), WorkingCmp{});
-                        W.pop_back();
+
+                // Batch-pin PQ codes (one lock per shard).
+                store_->pin_codes(pq_ids, pq_n, pq_codes);
+
+                // FP16 distances (per-node, but no locking — MemGraph RAM).
+                for (uint32_t i = 0; i < fp16_n; i++) {
+                    const float d = l2sq_f16(query_fp16, fp16_vecs[i],
+                                              params_.dim);
+                    const uint32_t id = fp16_ids[i];
+                    if (W.size() < L_current || d < W.front().dist) {
+                        frontier.push_back({d, id});
+                        std::push_heap(frontier.begin(), frontier.end(),
+                                       FrontierCmp{});
+                        W.push_back({d, id});
+                        std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                        if (W.size() > L_current) {
+                            std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                            W.pop_back();
+                        }
+                    }
+                }
+
+                // PQ distances: batch4 via SVE2 (4 codes per gather pass).
+                uint32_t idx = 0;
+                for (; idx + 3 < pq_n; idx += 4) {
+                    float dists[4];
+                    quantizer_.lut_distance_batch4(
+                        pq_codes[idx], pq_codes[idx + 1],
+                        pq_codes[idx + 2], pq_codes[idx + 3],
+                        batch_lut, dists);
+                    for (uint32_t b = 0; b < 4; b++) {
+                        const uint32_t id = pq_ids[idx + b];
+                        const float d = dists[b];
+                        if (W.size() < L_current || d < W.front().dist) {
+                            frontier.push_back({d, id});
+                            std::push_heap(frontier.begin(), frontier.end(),
+                                           FrontierCmp{});
+                            W.push_back({d, id});
+                            std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                            if (W.size() > L_current) {
+                                std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                                W.pop_back();
+                            }
+                        }
+                    }
+                }
+                // Remainder.
+                for (; idx < pq_n; idx++) {
+                    const float d = quantizer_.lut_distance(pq_codes[idx],
+                                                             batch_lut);
+                    const uint32_t id = pq_ids[idx];
+                    if (W.size() < L_current || d < W.front().dist) {
+                        frontier.push_back({d, id});
+                        std::push_heap(frontier.begin(), frontier.end(),
+                                       FrontierCmp{});
+                        W.push_back({d, id});
+                        std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                        if (W.size() > L_current) {
+                            std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                            W.pop_back();
+                        }
+                    }
+                }
+            } else {
+                // Fallback: per-node dist_to (build path without LUT, or
+                // no-store tests). Kept for the untrained-quantizer test path.
+                for (uint16_t i = 0; i < n; i++) {
+                    const uint32_t nb_internal =
+                        nb_ptr ? nb_ptr[i]
+                            : (store_
+                                ? get_neighbor(store_->pin_node(
+                                                    best.internal_id).data,
+                                                i)
+                                : get_neighbor(
+                                    build_ctx_->node_ptr(best.internal_id, node_size_), i));
+                    if (is_visited(nb_internal)) {
+                        continue;
+                    }
+                    mark_visited(nb_internal);
+
+                    if (io_limit > 0 && io_count >= io_limit) {
+                        continue;
+                    }
+                    io_count++;
+                    const float d = dist_to(nb_internal);
+                    if (W.size() < L_current || d < W.front().dist) {
+                        frontier.push_back({d, nb_internal});
+                        std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+                        W.push_back({d, nb_internal});
+                        std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                        if (W.size() > L_current) {
+                            std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                            W.pop_back();
+                        }
                     }
                 }
             }

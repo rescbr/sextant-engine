@@ -63,6 +63,16 @@ PinResult FlatNodeStore::pin_code(uint32_t id) {
     return {codes_ + static_cast<size_t>(id) * code_size_, false};
 }
 
+// Default batch-pin: loop over pin_code. Subclasses (PagedNodeStore) override
+// with a shard-batched implementation that acquires each shard's read lock at
+// most once per batch.
+void NodeStore::pin_codes(const uint32_t* ids, size_t n,
+                           const uint8_t** out_ptrs) {
+    for (size_t i = 0; i < n; ++i) {
+        out_ptrs[i] = pin_code(ids[i]).data;
+    }
+}
+
 // ===========================================================================
 // PagedNodeStore
 // ===========================================================================
@@ -300,6 +310,113 @@ PinResult PagedNodeStore::pin_code(uint32_t id) {
     const uint32_t off_in_block = (id % codes_per_block_) * code_size_;
     PinResult pr = get_code_block(block_idx);
     return {pr.data + off_in_block, pr.from_ssd};
+}
+
+void PagedNodeStore::pin_codes(const uint32_t* ids, size_t n,
+                                 const uint8_t** out_ptrs) {
+    // Pass 1: L1 hits are lock-free. Collect L1 misses + their shard index.
+    //
+    // We cap the batch at 1024 (the max neighbor count for R≤256); a heap
+    // allocation here would dominate the win. Caller (beam_search_into)
+    // already uses a 1024-entry stack buffer for the same reason.
+    //
+    // Same TLFastPath pattern as batched_read: cache the per-store L1 +
+    // counters pointers in thread_local so we skip two hash lookups per call.
+    TLFastPath& fp = tl_fast_;
+    if (fp.owner != this) [[unlikely]] {
+        fp.owner = this;
+        fp.l1 = &g_tl_caches[instance_id_];
+        fp.counters = &tl_l1_counters_[this];
+    }
+    TLBlockCache& l1 = *fp.l1;
+    L1Counters& c = *fp.counters;
+
+    struct Miss { uint32_t id; uint32_t batch_pos; };
+    Miss misses[1024];
+    uint32_t miss_shards[1024];
+    size_t n_misses = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t id = ids[i];
+        const uint64_t block_idx = id / codes_per_block_;
+        const uint32_t off_in_block = (id % codes_per_block_) * code_size_;
+        const uint64_t key_base = block_idx | kCodeL1KeyBit;
+        const uint64_t epoch = code_cache_.shard_epoch(block_idx);
+        if (const uint8_t* hit = l1.lookup(key_base, epoch)) {
+            ++l1.hits;
+            c.local_hits++;
+            out_ptrs[i] = hit + off_in_block;
+        } else {
+            ++l1.misses;
+            c.local_misses++;
+            misses[n_misses] = {static_cast<uint32_t>(id),
+                                static_cast<uint32_t>(i)};
+            miss_shards[n_misses] =
+                static_cast<uint32_t>(block_idx % code_cache_.num_shards());
+            ++n_misses;
+        }
+    }
+    // Flush L1 counters opportunistically (same threshold as batched_read).
+    if (!((c.local_hits + c.local_misses) & kL1FlushMask)) {
+        tl_hits_.fetch_add(c.local_hits, std::memory_order_relaxed);
+        tl_misses_.fetch_add(c.local_misses, std::memory_order_relaxed);
+        c.local_hits = c.local_misses = 0;
+    }
+
+    if (n_misses == 0) return;  // all L1 hits — no locks acquired
+
+    // Pass 2: group misses by shard, take each shard's read lock once and
+    // resolve all misses that map to it. Locks are acquired in ascending
+    // shard order (no deadlock risk).
+    //
+    // With n_misses ≤ 1024 and ≤ 64 shards, a counting-sort is cheap.
+    constexpr uint32_t kMaxShards = 256;
+    uint32_t shard_counts[kMaxShards] = {0};
+    const uint32_t num_shards = code_cache_.num_shards();
+    for (size_t i = 0; i < n_misses; ++i) {
+        ++shard_counts[miss_shards[i]];
+    }
+    uint32_t shard_offsets[kMaxShards] = {0};
+    uint32_t acc = 0;
+    for (uint32_t s = 0; s < num_shards; ++s) {
+        shard_offsets[s] = acc;
+        acc += shard_counts[s];
+    }
+    Miss grouped[1024];
+    uint32_t cursor[kMaxShards] = {0};
+    for (size_t i = 0; i < n_misses; ++i) {
+        const uint32_t s = miss_shards[i];
+        grouped[shard_offsets[s] + cursor[s]++] = misses[i];
+    }
+
+    // For each shard with misses, take the read lock once and resolve.
+    // On L2 hit: install into L1 + fill out_ptrs. On L2 miss: fall through
+    // to the full batched_read path (pread + insert).
+    for (uint32_t s = 0; s < num_shards; ++s) {
+        if (shard_counts[s] == 0) continue;
+        const uint64_t sample_block = grouped[shard_offsets[s]].id /
+                                       codes_per_block_;
+        CacheShard& shard = code_cache_.shard(sample_block);
+        ScopedReadLock lock(shard.mutex());
+        for (uint32_t j = 0; j < shard_counts[s]; ++j) {
+            const Miss& m = grouped[shard_offsets[s] + j];
+            const uint64_t block_idx = m.id / codes_per_block_;
+            const uint32_t off_in_block =
+                (m.id % codes_per_block_) * code_size_;
+            uint8_t* hit = shard.lookup_unlocked(block_idx);
+            if (hit != nullptr) {
+                const uint64_t post_epoch =
+                    code_cache_.shard_epoch(block_idx);
+                l1.insert(block_idx | kCodeL1KeyBit, hit, post_epoch);
+                out_ptrs[m.batch_pos] = hit + off_in_block;
+            } else {
+                // L2 miss — fall back to per-id batched_read (pread + insert).
+                // This is the rare path (<1% of L2 accesses).
+                PinResult pr = get_code_block(block_idx);
+                out_ptrs[m.batch_pos] = pr.data + off_in_block;
+            }
+        }
+    }
 }
 
 void PagedNodeStore::maybe_rebalance_caches() {

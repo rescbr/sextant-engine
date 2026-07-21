@@ -54,6 +54,18 @@ public:
     /// Read a PQ code. Returns pointer + whether it caused I/O.
     virtual PinResult pin_code(uint32_t internal_id) = 0;
 
+    /// Batch-pin PQ codes for multiple nodes. Fills `out_ptrs[i]` with the
+    /// code pointer for `ids[i]`. Default implementation calls pin_code in
+    /// a loop; PagedNodeStore overrides to batch by shard (one lock
+    /// acquisition per shard instead of per-id).
+    ///
+    /// Used by beam_search_into's batched distance evaluation (Layer 4 perf):
+    /// collecting all unvisited neighbor codes under minimal locking,
+    /// enabling lut_distance_batch4 (SVE2 4-way SIMD gather) over the
+    /// returned pointers. Callers must size `out_ptrs` to at least `n`.
+    virtual void pin_codes(const uint32_t* ids, size_t n,
+                           const uint8_t** out_ptrs);
+
     /// True if this store can serve SSD reads (PagedNodeStore or MemGraph
     /// with a paged backing store). Used to gate DynamicWidth.
     virtual bool is_paged() const = 0;
@@ -253,6 +265,14 @@ private:
 
     /// Returns this thread's TLBlockCache for this store (lazily allocated).
     TLBlockCache& tl_cache() const;
+
+    /// Batch-pin PQ codes. Overrides the default (per-id pin_code loop) with
+    /// a shard-batched implementation: L1 hits are lock-free, L1 misses are
+    /// grouped by their owning shard so each shard's read lock is acquired
+    /// at most once per batch. Used by beam_search_into's batched distance
+    /// evaluation (Layer 4 perf).
+    void pin_codes(const uint32_t* ids, size_t n,
+                   const uint8_t** out_ptrs) override;
 
     PinResult get_node_block(uint64_t block_idx);
     PinResult get_code_block(uint64_t block_idx);
