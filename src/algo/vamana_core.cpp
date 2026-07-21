@@ -4,7 +4,7 @@
 //  - DuckDB dependencies stripped (stdlib + sextant::Error only)
 //  - Per-node spinlocks replaced with the sextant::Mutex sharded lock pool
 //  - LabelFilter machinery stripped (Phase 1 is label-less)
-//  - Storage backend is flat-in-RAM during build (build_codes_ always active)
+//  - Storage backend is flat-in-RAM during build (build_ctx_->codes always active)
 //
 // Algorithmic reference: Suhas Jayaram Subramanya et al., "DiskANN: Fast
 // Accurate Billion-point Nearest Neighbor Search on a Single Node", NeurIPS
@@ -126,13 +126,12 @@ VamanaCore::VamanaCore(VamanaParams params, PqQuantizer& quantizer)
     }
     code_size_ = quantizer_.code_size();
     node_size_ = static_node_size(params_.R, code_size_);
-    num_locks_ = std::max(256u, std::thread::hardware_concurrency() * 4);
-    node_locks_ = std::unique_ptr<Mutex[]>(new Mutex[num_locks_]);
+    // Layer 4: node_locks_ moved into BuildContext; allocated lazily via
+    // init_build_context() only when actually building. Search-only cores
+    // no longer pay for 256+ Mutex objects.
 }
 
-VamanaCore::~VamanaCore() {
-    clear_build_buffers();
-}
+VamanaCore::~VamanaCore() = default;
 
 uint32_t VamanaCore::static_node_size(uint16_t R, uint32_t code_size) {
     // (16 + R*4 + 7) & ~7. Header is 16 bytes (incl. 2 bytes reserved padding
@@ -145,32 +144,11 @@ void VamanaCore::prepare_for_build(uint32_t count) {
     count_ = count;
     entry_points_.clear();
     entry_points_.reserve(std::max<uint16_t>(1, params_.n_entry_points));
-}
-
-void VamanaCore::set_build_codes(const uint8_t* codes, uint32_t /*count*/) {
-    build_codes_ = codes;
-}
-
-void VamanaCore::set_build_nodes(uint8_t* nodes) {
-    build_nodes_ = nodes;
-}
-
-void VamanaCore::clear_build_buffers() {
-    build_codes_ = nullptr;
-    build_nodes_ = nullptr;
-    build_vecs_ = nullptr;
-}
-
-uint8_t* VamanaCore::node_ptr(uint32_t internal_id) {
-    return build_nodes_ + static_cast<size_t>(internal_id) * node_size_;
-}
-
-const uint8_t* VamanaCore::node_ptr(uint32_t internal_id) const {
-    return build_nodes_ + static_cast<size_t>(internal_id) * node_size_;
-}
-
-Mutex* VamanaCore::node_lock(uint32_t internal_id) {
-    return &node_locks_[internal_id % num_locks_];
+    // Layer 4: allocate the BuildContext (node locks etc.) lazily here, so
+    // any core that enters build mode has it ready before set_build_codes/
+    // nodes/vecs are called. Search-only cores never call this and stay
+    // free of the lock pool + buffer pointers.
+    init_build_context();
 }
 
 // --- Node accessors ---
@@ -290,7 +268,7 @@ void VamanaCore::beam_search_into(
         }
         const uint8_t* code_ptr = store_
             ? (store_->pin_code(id).data)
-            : (build_codes_ + static_cast<size_t>(id) * code_size_);
+            : (build_ctx_->codes + static_cast<size_t>(id) * code_size_);
         float d;
         if (anchor_lut) {
             d = quantizer_.lut_distance(code_ptr, anchor_lut);
@@ -476,7 +454,7 @@ void VamanaCore::beam_search_into(
                             n * sizeof(uint32_t));
             }
         } else {
-            const uint8_t* node = node_ptr(best.internal_id);
+            const uint8_t* node = build_ctx_->node_ptr(best.internal_id, node_size_);
             n = get_neighbor_count(node);
             if (n <= 1024) {
                 std::memcpy(neighbors_buf,
@@ -559,7 +537,7 @@ void VamanaCore::beam_search_into(
                 mark_visited(nb_internal);
                 if (io_limit > 0 && io_count >= io_limit) continue;
                 unvisited_ids[nu] = nb_internal;
-                unvisited_codes[nu] = build_codes_ +
+                unvisited_codes[nu] = build_ctx_->codes +
                     static_cast<size_t>(nb_internal) * code_size_;
                 nu++;
                 io_count++;
@@ -611,7 +589,7 @@ void VamanaCore::beam_search_into(
                                                 best.internal_id).data,
                                             i)
                             : get_neighbor(
-                                node_ptr(best.internal_id), i));
+                                build_ctx_->node_ptr(best.internal_id, node_size_), i));
                 // (no per-pin cleanup — NodeStore::unpin_* removed: all
                 // implementations were no-ops; the cache outlives the call.)
                 if (is_visited(nb_internal)) {
@@ -653,7 +631,7 @@ void VamanaCore::beam_search_into(
 // robust_prune — occlusion-filtered neighbor selection.
 //
 // Stripped: the query_lut parameter (unused; occlusion uses candidate-candidate
-// distances). The flat build buffer is always active, so we index build_codes_
+// distances). The flat build buffer is always active, so we index build_ctx_->codes
 // directly (no per-prune gather).
 //
 // Occlusion rule (DiskANN): a candidate pp is pruned if there exists an
@@ -680,11 +658,11 @@ void VamanaCore::robust_prune_into(
         return;
     }
 
-    // FP16 prune hybrid: when query_vec is provided (and build_vecs_ is set),
+    // FP16 prune hybrid: when query_vec is provided (and build_ctx_->vecs is set),
     // use FP16 L2-squared distances for the occlusion check instead of PQ
     // code_distance. This overrides the PQ distances from beam_search with
     // exact (FP16-precision) float distances, matching AISAQ's approach.
-    const bool use_fp16 = (query_vec != nullptr && build_vecs_ != nullptr);
+    const bool use_fp16 = (query_vec != nullptr && build_ctx_->vecs != nullptr);
 
     // Copy candidates into a mutable, sortable buffer (tls.prune_buffer is
     // reused — capacity retained across inserts). We copy because callers
@@ -699,7 +677,7 @@ void VamanaCore::robust_prune_into(
         // ordering ≠ FP16 ordering, so we must re-sort afterward.
         for (size_t i = 0; i < buf.size(); i++) {
             const float16_t* pp_vec =
-                build_vecs_ + static_cast<size_t>(buf[i].row_id) * params_.dim;
+                build_ctx_->vecs + static_cast<size_t>(buf[i].row_id) * params_.dim;
             buf[i].dist = l2sq_f16(query_vec, pp_vec, params_.dim);
         }
         std::sort(buf.begin(), buf.end(),
@@ -715,16 +693,16 @@ void VamanaCore::robust_prune_into(
 
     const size_t n = buf.size();
     auto code_at = [&](size_t idx) {
-        return build_codes_ +
+        return build_ctx_->codes +
                static_cast<size_t>(buf[idx].row_id) * code_size_;
     };
     auto vec_at = [&](size_t idx) {
-        return build_vecs_ +
+        return build_ctx_->vecs +
                static_cast<size_t>(buf[idx].row_id) * params_.dim;
     };
 
     // Occlusion check. Candidate codes are accessed by row_id — scattered in
-    // the 32MB build_codes_ buffer — so the dominant cost is cache misses on
+    // the 32MB build_ctx_->codes buffer — so the dominant cost is cache misses on
     // candidate-code loads. Software prefetch was tested (dist 6/12/24, single
     // and dual) but measured no reliable improvement under 10-thread
     // contention: the cold-miss microbenchmark showed 2.9× single-threaded, but
@@ -759,8 +737,8 @@ void VamanaCore::robust_prune_into(
             }
         } else {
             // PQ code_distance occlusion check (fallback for tests / untrained
-            // quantizers where build_vecs_ is null). The primary build path
-            // always sets build_vecs_ and uses the FP16 path above.
+            // quantizers where build_ctx_->vecs is null). The primary build path
+            // always sets build_ctx_->vecs and uses the FP16 path above.
             const uint8_t* p_code = code_at(p_idx);
 
             // Batch4 occlusion check: collect up to 4 non-removed candidates,
@@ -820,7 +798,7 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
     // beam_search reader never observes a non-zero count with uninitialized
     // slots (which would traverse to node 0).
     {
-        uint8_t* node = node_ptr(new_internal_id);
+        uint8_t* node = build_ctx_->node_ptr(new_internal_id, node_size_);
         const uint16_t cnt =
             static_cast<uint16_t>(std::min<size_t>(selected.size(), params_.R));
         for (uint16_t i = 0; i < cnt; i++) {
@@ -831,7 +809,7 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
     }
 
     const uint8_t* new_code =
-        build_codes_ + static_cast<size_t>(new_internal_id) * code_size_;
+        build_ctx_->codes + static_cast<size_t>(new_internal_id) * code_size_;
 
     // Snapshot the selected targets into tls.recip_targets BEFORE the
     // reciprocal loop. `selected` aliases tls.prune_output (the caller's
@@ -849,9 +827,9 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
     for (const auto& s : targets) {
         const uint32_t s_internal = static_cast<uint32_t>(s.row_id);
 
-        ScopedWriteLock guard(*node_lock(s_internal));
+        ScopedWriteLock guard(*build_ctx_->lock_for(s_internal));
 
-        uint8_t* s_node = node_ptr(s_internal);
+        uint8_t* s_node = build_ctx_->node_ptr(s_internal, node_size_);
         uint16_t cnt = get_neighbor_count(s_node);
         if (cnt < params_.R) {
             // Common case: room left. Append the back-edge.
@@ -867,13 +845,13 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
         cand.clear();
         cand.reserve(static_cast<size_t>(cnt) + 1);
         const uint8_t* s_code =
-            build_codes_ + static_cast<size_t>(s_internal) * code_size_;
+            build_ctx_->codes + static_cast<size_t>(s_internal) * code_size_;
         cand.push_back({static_cast<RowId>(new_internal_id),
                         quantizer_.code_distance(s_code, new_code)});
         for (uint16_t i = 0; i < cnt; i++) {
             const uint32_t nb = get_neighbor(s_node, i);
             const uint8_t* nb_code =
-                build_codes_ + static_cast<size_t>(nb) * code_size_;
+                build_ctx_->codes + static_cast<size_t>(nb) * code_size_;
             cand.push_back({static_cast<RowId>(nb),
                             quantizer_.code_distance(s_code, nb_code)});
         }
@@ -886,7 +864,7 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
         // distance to s, NOT to the new node being inserted).
         robust_prune_into(cand, tls.prune_output, params_.R, params_.alpha,
                           tls, params_.max_occlusion, /*presorted=*/false,
-                          /*query_vec=*/build_vecs_ ? build_vec_ptr(s_internal) : nullptr);
+                          /*query_vec=*/build_ctx_->vecs ? build_vec_ptr(s_internal) : nullptr);
         auto& kept = tls.prune_output;
         // Write neighbors before publishing count.
         for (size_t i = 0; i < kept.size(); i++) {
@@ -900,7 +878,7 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
 // ===========================================================================
 // insert_build_from_code — the sole build entry point. LUT is always built
 // via build_code_lut from the node's own PQ code (HDC). The prune query vec
-// comes from build_vec_ptr(internal_id) when build_vecs_ is set (FP16 prune).
+// comes from build_vec_ptr(internal_id) when build_ctx_->vecs is set (FP16 prune).
 // ===========================================================================
 
 void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
@@ -910,15 +888,17 @@ void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
 
 void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
                                      VamanaTLS& tls) {
-    // HDC mode requires the build_codes_ buffer (own PQ code).
-    // build_nodes_ is always required.
-    if (!build_nodes_ || !build_codes_) {
+    // HDC mode requires the build_ctx_->codes buffer (own PQ code).
+    // build_ctx_->nodes is always required.
+    if (!build_ctx_ || !build_ctx_->nodes || !build_ctx_->codes) {
         throw Error(ErrorCode::InvalidParam,
-                    "VamanaCore::insert_build_core: build buffers not set");
+                    "VamanaCore::insert_build_core: build buffers not set "
+                    "(did you call init_build_context() + set_build_codes/"
+                    "set_build_nodes?)");
     }
 
     // Zero the fixed header + neighbor array.
-    uint8_t* node = node_ptr(internal_id);
+    uint8_t* node = build_ctx_->node_ptr(internal_id, node_size_);
     std::memset(node, 0,
                 kNeighborArrayOffset +
                     static_cast<size_t>(params_.R) * sizeof(uint32_t));
@@ -956,7 +936,7 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
         // lut_distance — 32 sequential reads from a contiguous buffer —
         // instead of scattered code_distance reads into the 8MB table.
         const uint8_t* anchor_code =
-            build_codes_ + static_cast<size_t>(internal_id) * code_size_;
+            build_ctx_->codes + static_cast<size_t>(internal_id) * code_size_;
         float* alut = tls.anchor_lut.data();
         const bool lut_ok = quantizer_.build_code_lut(anchor_code, alut);
         anchor_lut = lut_ok ? alut : nullptr;
@@ -973,8 +953,8 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     const uint32_t L_build_full =
         params_.L_build > 0 ? params_.L_build : params_.L;
     const uint32_t L_build =
-        build_progress_
-            ? dynamic_L_build(build_progress_->load(std::memory_order_relaxed),
+        build_ctx_->progress
+            ? dynamic_L_build(build_ctx_->progress->load(std::memory_order_relaxed),
                               count_, L_build_full)
             : L_build_full;
     // beam_search_into writes candidates (ascending distance) into
@@ -988,15 +968,15 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
 
     // FP16 prune hybrid: pass the insert point's float vector to
     // robust_prune_into so the occlusion check uses FP16 L2sq instead of PQ
-    // code_distance. When build_vecs_ is set, use build_vec_ptr(internal_id).
-    // When build_vecs_ is null (tests, untrained quantizers), query_vec stays
+    // code_distance. When build_ctx_->vecs is set, use build_vec_ptr(internal_id).
+    // When build_ctx_->vecs is null (tests, untrained quantizers), query_vec stays
     // null → PQ fallback.
     //
     // presorted is only honored on the PQ path (beam_search output is ascending
     // by PQ dist). On the FP16 path, robust_prune_into re-sorts after
     // recomputing distances, so presorted is ignored.
     const float16_t* prune_query_vec =
-        build_vecs_ != nullptr ? build_vec_ptr(internal_id) : nullptr;
+        build_ctx_->vecs != nullptr ? build_vec_ptr(internal_id) : nullptr;
     robust_prune_into(tls.search_result, tls.prune_output, params_.R,
                       params_.alpha, tls, params_.max_occlusion,
                       /*presorted=*/(prune_query_vec == nullptr),
@@ -1078,7 +1058,7 @@ std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
                 const RowId rid = get_row_id(pr.data);
                 c.row_id = rid;
             } else {
-                c.row_id = get_row_id(node_ptr(iid));
+                c.row_id = get_row_id(build_ctx_->node_ptr(iid, node_size_));
             }
         }
     }

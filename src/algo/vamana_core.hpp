@@ -18,6 +18,7 @@
 #include <atomic>
 #include <memory>
 #include <random>
+#include <thread>
 
 namespace sextant {
 
@@ -152,6 +153,48 @@ struct VamanaTLS {
     }
 };
 
+/// Per-build scratch and mutable state. Owned by VamanaCore when building;
+/// null when the core is configured for search-only use (Layer 4 §2.3).
+///
+/// Bundles the flat-in-RAM build buffers (codes, nodes, raw FP16 vectors),
+/// the sharded node-lock pool that protects neighbor-list mutations during
+/// parallel construction, and the optional atomic progress signal used by
+/// the T5 dynamic-L_build ramp.
+struct BuildContext {
+    const uint8_t* codes = nullptr;            // count × code_size
+    uint8_t* nodes = nullptr;                  // count × node_size
+    const float16_t* vecs = nullptr;           // count × dim raw FP16 vectors
+    std::unique_ptr<Mutex[]> node_locks;       // sharded lock pool
+    uint32_t num_locks = 0;
+    std::atomic<uint32_t>* progress = nullptr;  // dynamic L_build signal
+
+    static constexpr uint32_t kDefaultLocksFactor = 4;
+
+    /// Allocate the sharded lock pool sized to the build parallelism.
+    void init_locks(uint32_t factor = kDefaultLocksFactor) {
+        num_locks = std::max(256u, std::thread::hardware_concurrency() * factor);
+        node_locks = std::unique_ptr<Mutex[]>(new Mutex[num_locks]);
+    }
+
+    /// Acquire the lock for a node (sharded lock pool).
+    Mutex* lock_for(uint32_t internal_id) {
+        return &node_locks[internal_id % num_locks];
+    }
+
+    /// Pointer into the flat node buffer.
+    uint8_t* node_ptr(uint32_t internal_id, uint32_t node_size) {
+        return nodes + static_cast<size_t>(internal_id) * node_size;
+    }
+    const uint8_t* node_ptr(uint32_t internal_id, uint32_t node_size) const {
+        return nodes + static_cast<size_t>(internal_id) * node_size;
+    }
+
+    /// Pointer into the raw FP16 vectors (FP16 prune hybrid).
+    const float16_t* vec_ptr(uint32_t internal_id, Dim dim) const {
+        return vecs + static_cast<size_t>(internal_id) * dim;
+    }
+};
+
 /// The Vamana graph core. Owns the flat-in-RAM node buffer and codes buffer
 /// during build, and references BlockCache during search.
 class VamanaCore {
@@ -253,16 +296,50 @@ public:
     static uint32_t get_neighbor(const uint8_t* node, uint32_t i);
     static void set_neighbor(uint8_t* node, uint32_t i, uint32_t val);
 
-    // --- Setters for build buffers ---
-    void set_build_codes(const uint8_t* codes, uint32_t count);
-    void set_build_nodes(uint8_t* nodes);
-    void set_build_vecs(const float16_t* vecs) { build_vecs_ = vecs; }
-    void clear_build_buffers();
+    // --- Setters for build buffers (no-op when no BuildContext is installed) ---
+
+    /// Allocate the BuildContext (holds flat build buffers + node locks).
+    /// Required before any insert_build_*/connect_and_prune call. Idempotent
+    /// — calling again reallocates the lock pool (existing buffers must be
+    /// re-installed via set_build_codes/nodes/vecs).
+    void init_build_context() {
+        if (!build_ctx_) {
+            build_ctx_ = std::make_unique<BuildContext>();
+        }
+        build_ctx_->init_locks();
+    }
+
+    /// True when this core has a BuildContext installed (build mode). False
+    /// for search-only cores.
+    bool has_build_context() const { return static_cast<bool>(build_ctx_); }
+
+    void set_build_codes(const uint8_t* codes, uint32_t /*count*/) {
+        if (!build_ctx_) init_build_context();
+        build_ctx_->codes = codes;
+    }
+
+    void set_build_nodes(uint8_t* nodes) {
+        if (!build_ctx_) init_build_context();
+        build_ctx_->nodes = nodes;
+    }
+
+    void set_build_vecs(const float16_t* vecs) {
+        if (!build_ctx_) init_build_context();
+        build_ctx_->vecs = vecs;
+    }
+
+    void clear_build_buffers() {
+        if (build_ctx_) {
+            build_ctx_->codes = nullptr;
+            build_ctx_->nodes = nullptr;
+            build_ctx_->vecs = nullptr;
+        }
+    }
 
     /// Pointer to the raw FP16 vector for `internal_id` (FP16 prune).
     /// Only valid when set_build_vecs() has been called with a count×dim buffer.
     const float16_t* build_vec_ptr(uint32_t internal_id) const {
-        return build_vecs_ + static_cast<size_t>(internal_id) * params_.dim;
+        return build_ctx_->vec_ptr(internal_id, params_.dim);
     }
 
     /// Install a NodeStore for read access (search path). When set, beam_search
@@ -290,7 +367,7 @@ public:
     /// outlive the build; it is read with a relaxed load inside the insert
     /// path. Pass nullptr (the default) to use a fixed L_build.
     void set_build_progress(std::atomic<uint32_t>* progress) {
-        build_progress_ = progress;
+        if (build_ctx_) build_ctx_->progress = progress;
     }
 
 private:
@@ -301,33 +378,17 @@ private:
     uint32_t node_size_ = 0;
     uint32_t code_size_ = 0;
 
-    // Flat-in-RAM build buffers (Issue 13).
-    const uint8_t* build_codes_ = nullptr;  // count × code_size
-    uint8_t* build_nodes_ = nullptr;        // count × node_size
-    const float16_t* build_vecs_ = nullptr;     // count × dim raw vectors (FP16)
-
     // NodeStore for read access (search + build both go through this). When
-    // null, beam_search falls back to the flat buffers directly.
+    // null, beam_search falls back to the flat buffers directly (build path).
     NodeStore* store_ = nullptr;
 
-    // Sharded lock pool (Issue 11) — protects node neighbor-list mutations.
-    std::unique_ptr<Mutex[]> node_locks_;
-    uint32_t num_locks_ = 0;
+    // Build-only state (Layer 4 §2.3). Null when the core is configured for
+    // search-only use; installed via init_build_context() before any build
+    // method is called.
+    std::unique_ptr<BuildContext> build_ctx_;
 
     // Entry points (computed after construct).
     std::vector<uint32_t> entry_points_;
-
-    // T5: progress signal for dynamic L_build (optional). Set by
-    // parallel_construct to &next_id; read with a relaxed load. Null in
-    // paths without a global progress counter (partitioned/online/tests).
-    std::atomic<uint32_t>* build_progress_ = nullptr;
-
-    /// Get a pointer into the flat node buffer.
-    uint8_t* node_ptr(uint32_t internal_id);
-    const uint8_t* node_ptr(uint32_t internal_id) const;
-
-    /// Acquire the lock for a node (sharded lock pool).
-    Mutex* node_lock(uint32_t internal_id);
 };
 
 }  // namespace sextant
