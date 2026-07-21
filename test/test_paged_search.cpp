@@ -433,7 +433,6 @@ TEST(PagedSearch, PageSearchMaintainsRecall) {
     SearchConfig scfg;
     scfg.k = 100;  // fetch enough for rerank (SIFTsmall GT has k=100)
     scfg.L_search = 200;
-    scfg.rerank_factor = 10;
 
     const float recall = siftsmall_recall(index_path,
         BuildConfig{.pq_m = 32, .pq_bits = 8}, scfg);
@@ -459,7 +458,6 @@ TEST(PagedSearch, DynamicWidthMaintainsRecall) {
     SearchConfig scfg;
     scfg.k = 100;
     scfg.L_search = 200;
-    scfg.rerank_factor = 10;
 
     const float recall = siftsmall_recall(index_path,
         BuildConfig{.pq_m = 32, .pq_bits = 8}, scfg);

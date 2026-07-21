@@ -126,7 +126,6 @@ static float measure_recall(const std::string& fbin_path, uint32_t n,
     SearchConfig scfg;
     scfg.k = k;
     scfg.L_search = L_search;
-    scfg.rerank_factor = 1;
 
     for (uint32_t q = 0; q < n_queries; q++) {
         const float* query = &base[static_cast<size_t>(q) * dim];

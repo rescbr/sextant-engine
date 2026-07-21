@@ -446,10 +446,9 @@ int main(int argc, char* argv[]) {
         // a per-query post-processing callback that runs on the worker.
         // For now the SIMD rerank recovers most of the gap.
         sextant::SearchConfig scfg;
-        scfg.k = fetch_k;
-        scfg.L_search = L;
-        scfg.rerank_factor = rerank;
-        scfg.io_limit = io_limit;
+         scfg.k = fetch_k;
+         scfg.L_search = L;
+         scfg.io_limit = io_limit;
 
         const auto t_start = Clock::now();
         std::vector<std::future<std::vector<sextant::Candidate>>> futs;

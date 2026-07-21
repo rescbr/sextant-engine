@@ -261,7 +261,6 @@ int cmd_search(int argc, char* argv[]) {
             sextant::SearchConfig scfg;
             scfg.k = fetch_k;
             scfg.L_search = L;
-            scfg.rerank_factor = rerank;
             auto results = searcher.search(qvec.data(), scfg.k, scfg);
 
             if (rerank_ok && !results.empty()) {
@@ -332,7 +331,6 @@ int cmd_search(int argc, char* argv[]) {
             sextant::SearchConfig scfg;
             scfg.k = fetch_k;
             scfg.L_search = L;
-            scfg.rerank_factor = rerank;
             const float* q0 = &queries[static_cast<size_t>(base) * dim];
             auto batch = searcher.search_batch(q0, n_this, scfg.k, scfg);
             for (uint32_t j = 0; j < n_this; j++) {
