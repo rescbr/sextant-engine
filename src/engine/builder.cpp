@@ -666,29 +666,26 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     {
         const size_t codes_bytes = static_cast<size_t>(index_.count) * index_.code_size;
         const size_t nodes_bytes = static_cast<size_t>(index_.count) * index_.node_size;
-        index_.codes_buffer = static_cast<uint8_t*>(
-            aligned_alloc(kDiskAlign, codes_bytes));
-        index_.nodes_buffer = static_cast<uint8_t*>(
-            aligned_alloc(kDiskAlign, nodes_bytes));
-        if (!index_.codes_buffer || !index_.nodes_buffer) {
-            throw Error(ErrorCode::OutOfMemory,
-                        "build_partitioned: buffer alloc failed");
-        }
-        std::memset(index_.codes_buffer, 0, codes_bytes);
-        std::memset(index_.nodes_buffer, 0, nodes_bytes);
+        AlignedBuf codes(kDiskAlign, codes_bytes);
+        AlignedBuf nodes(kDiskAlign, nodes_bytes);
+        std::memset(codes.get(), 0, codes_bytes);
+        std::memset(nodes.get(), 0, nodes_bytes);
 #ifdef __linux__
         // Same THP hint as the single-partition build path (see Builder::build).
-        if (codes_bytes > 0 && madvise(index_.codes_buffer, codes_bytes,
+        if (codes_bytes > 0 && madvise(codes.get(), codes_bytes,
                                        MADV_HUGEPAGE) != 0) {
             spdlog::debug("[sextant] huge pages unavailable for codes buffer "
                           "(partitioned), using standard pages");
         }
-        if (nodes_bytes > 0 && madvise(index_.nodes_buffer, nodes_bytes,
+        if (nodes_bytes > 0 && madvise(nodes.get(), nodes_bytes,
                                        MADV_HUGEPAGE) != 0) {
             spdlog::debug("[sextant] huge pages unavailable for nodes buffer "
                           "(partitioned), using standard pages");
         }
 #endif
+        // Hand ownership to Index (long-lived). Index::~Index frees.
+        index_.codes_buffer = codes.as<uint8_t>(); codes.release();
+        index_.nodes_buffer = nodes.as<uint8_t>(); nodes.release();
     }
 
     // Encode (pass2). The quantizer needs its cross-distance table for HDC;
@@ -705,12 +702,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     {
         const size_t vecs_bytes =
             static_cast<size_t>(index_.count) * index_.dim * sizeof(float16_t);
-        index_.raw_vecs_buffer = static_cast<float16_t*>(
-            aligned_alloc(kDiskAlign, vecs_bytes));
-        if (!index_.raw_vecs_buffer) {
-            throw Error(ErrorCode::OutOfMemory,
-                        "build_partitioned: index_.raw_vecs_buffer alloc failed");
-        }
+        AlignedBuf vecs(kDiskAlign, vecs_bytes);
         spdlog::info("[sextant] loading raw vectors as FP16 ({:.1f}MB) for "
                       "HDC (FP16 prune)",
                      vecs_bytes / 1e6);
@@ -721,7 +713,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
             for (uint32_t r = 0; r < chunk.count; r++) {
                 const RowId rid = chunk.row_ids[r];
                 if (rid >= 0 && static_cast<uint64_t>(rid) < index_.count) {
-                    float16_t* dst = index_.raw_vecs_buffer +
+                    float16_t* dst = vecs.as<float16_t>() +
                                   static_cast<size_t>(rid) * index_.dim;
                     const float* src = chunk.vectors +
                                        static_cast<size_t>(r) * index_.dim;
@@ -733,6 +725,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
             }
         }
         spdlog::info("[sextant] loaded {} raw vectors as FP16", loaded);
+        index_.raw_vecs_buffer = vecs.as<float16_t>(); vecs.release();
     }
 
     // =====================================================================
@@ -1252,31 +1245,26 @@ void Builder::write_sidecars_(const std::string& index_path,
         codes_per_block -= codes_per_block % align_step;  // round down
         codes_per_block = std::max<uint32_t>(codes_per_block, align_step);
         const size_t buf_cap = static_cast<size_t>(codes_per_block) * index_.code_size;
-        uint8_t* ring = static_cast<uint8_t*>(aligned_alloc(kDiskAlign, buf_cap));
-        if (!ring) {
-            throw Error(ErrorCode::OutOfMemory,
-                        "write_sidecars_: .codes ring alloc failed");
-        }
+        AlignedBuf ring(kDiskAlign, buf_cap);
 
         uint64_t write_off = sizeof(h);
         uint32_t in_block = 0;
         for (uint32_t new_pos = 0; new_pos < n; new_pos++) {
             const uint32_t old_id = bfs.order[new_pos];
-            std::memcpy(ring + static_cast<size_t>(in_block) * index_.code_size,
+            std::memcpy(ring.as<uint8_t>() + static_cast<size_t>(in_block) * index_.code_size,
                         index_.codes_buffer + static_cast<size_t>(old_id) * index_.code_size,
                         index_.code_size);
             if (++in_block >= codes_per_block) {
-                write_padded(f, ring,
+                write_padded(f, ring.get(),
                              static_cast<size_t>(in_block) * index_.code_size, write_off);
                 write_off += static_cast<size_t>(in_block) * index_.code_size;
                 in_block = 0;
             }
         }
         if (in_block > 0) {
-            write_padded(f, ring,
+            write_padded(f, ring.get(),
                          static_cast<size_t>(in_block) * index_.code_size, write_off);
         }
-        aligned_free(ring);
         f.sync();
         spdlog::info("[sextant] wrote {} ({} bytes, BFS-reordered, streamed)",
                      path, codes_bytes);
@@ -1299,7 +1287,7 @@ void Builder::write_sidecars_(const std::string& index_path,
         const uint32_t per_block =
             std::max<uint32_t>(1, static_cast<uint32_t>(block_cap / final_node_size));
         const size_t buf_cap = static_cast<size_t>(per_block) * final_node_size;
-        uint8_t* ring = static_cast<uint8_t*>(aligned_alloc(kDiskAlign, buf_cap));
+        AlignedBuf ring(kDiskAlign, buf_cap);
 
         const uint32_t neighbor_region_end =
             kNeighborArrayOffset + params.R * sizeof(uint32_t);
@@ -1312,7 +1300,7 @@ void Builder::write_sidecars_(const std::string& index_path,
             const uint32_t old_id = bfs.order[new_pos];
             const uint8_t* src = index_.nodes_buffer +
                                  static_cast<size_t>(old_id) * build_node_size;
-            uint8_t* dst = ring + static_cast<size_t>(in_block) * final_node_size;
+            uint8_t* dst = ring.as<uint8_t>() + static_cast<size_t>(in_block) * final_node_size;
 
             // Copy the fixed header + neighbor array (identical in both layouts
             // since the build and final layouts share the same R).
@@ -1333,7 +1321,7 @@ void Builder::write_sidecars_(const std::string& index_path,
 
             in_block++;
             if (in_block >= per_block) {
-                write_padded(f, ring,
+                write_padded(f, ring.get(),
                              static_cast<size_t>(in_block) * final_node_size,
                              write_off);
                 write_off += static_cast<size_t>(in_block) * final_node_size;
@@ -1341,11 +1329,10 @@ void Builder::write_sidecars_(const std::string& index_path,
             }
         }
         if (in_block > 0) {
-            write_padded(f, ring,
+            write_padded(f, ring.get(),
                          static_cast<size_t>(in_block) * final_node_size,
                          write_off);
         }
-        aligned_free(ring);
         f.sync();
         spdlog::info("[sextant] wrote {} ({} nodes, {} bytes/node)", path, n,
                      final_node_size);
@@ -1424,30 +1411,25 @@ void Builder::write_sidecars_(const std::string& index_path,
         const uint32_t vecs_per_block =
             std::max<uint32_t>(1u, static_cast<uint32_t>(block_cap / vec_bytes));
         const size_t buf_cap = static_cast<size_t>(vecs_per_block) * vec_bytes;
-        uint8_t* ring = static_cast<uint8_t*>(aligned_alloc(kDiskAlign, buf_cap));
-        if (!ring) {
-            throw Error(ErrorCode::OutOfMemory,
-                        "write_sidecars_: .ball ring alloc failed");
-        }
+        AlignedBuf ring(kDiskAlign, buf_cap);
         uint64_t write_off = sizeof(h);
         uint32_t in_block = 0;
         for (uint32_t bid : ball_ids) {
             const float16_t* vec =
                 index_.raw_vecs_buffer + static_cast<size_t>(bid) * index_.dim;
-            std::memcpy(ring + static_cast<size_t>(in_block) * vec_bytes,
+            std::memcpy(ring.as<uint8_t>() + static_cast<size_t>(in_block) * vec_bytes,
                         vec, vec_bytes);
             if (++in_block >= vecs_per_block) {
-                write_padded(f, ring,
+                write_padded(f, ring.get(),
                              static_cast<size_t>(in_block) * vec_bytes, write_off);
                 write_off += static_cast<size_t>(in_block) * vec_bytes;
                 in_block = 0;
             }
         }
         if (in_block > 0) {
-            write_padded(f, ring,
+            write_padded(f, ring.get(),
                          static_cast<size_t>(in_block) * vec_bytes, write_off);
         }
-        aligned_free(ring);
         f.sync();
         spdlog::info("[sextant] wrote {} ({} FP16 vectors, {} bytes each)",
                      path, ball_ids.size(), index_.dim * sizeof(float16_t));
@@ -1590,10 +1572,11 @@ void Builder::insert(const float* vec, Dim dim, RowId row_id) {
             DirectFile f(path, false);
             const size_t codes_bytes =
                 static_cast<size_t>(index_.count) * index_.code_size;
-            index_.codes_buffer = static_cast<uint8_t*>(
-                aligned_alloc(kDiskAlign, codes_bytes));
-            std::memset(index_.codes_buffer, 0, codes_bytes);
-            read_exact(f, index_.codes_buffer, codes_bytes, sizeof(SidecarHeader));
+            AlignedBuf buf(kDiskAlign, codes_bytes);
+            std::memset(buf.get(), 0, codes_bytes);
+            read_exact(f, buf.get(), codes_bytes, sizeof(SidecarHeader));
+            index_.codes_buffer = buf.as<uint8_t>();
+            buf.release();
         }
         // Nodes.
         {
@@ -1601,10 +1584,11 @@ void Builder::insert(const float* vec, Dim dim, RowId row_id) {
             DirectFile f(path, false);
             const size_t nodes_bytes =
                 static_cast<size_t>(index_.count) * index_.node_size;
-            index_.nodes_buffer = static_cast<uint8_t*>(
-                aligned_alloc(kDiskAlign, nodes_bytes));
-            std::memset(index_.nodes_buffer, 0, nodes_bytes);
-            read_exact(f, index_.nodes_buffer, nodes_bytes, sizeof(SidecarHeader));
+            AlignedBuf buf(kDiskAlign, nodes_bytes);
+            std::memset(buf.get(), 0, nodes_bytes);
+            read_exact(f, buf.get(), nodes_bytes, sizeof(SidecarHeader));
+            index_.nodes_buffer = buf.as<uint8_t>();
+            buf.release();
         }
         index_.paged_store.reset();
         index_.core->set_store(nullptr);  // cleared; recreated below
@@ -1618,17 +1602,13 @@ void Builder::insert(const float* vec, Dim dim, RowId row_id) {
         const size_t old_bytes = static_cast<size_t>(index_.count) * index_.code_size;
         const size_t new_bytes = static_cast<size_t>(new_count) * index_.code_size;
         const size_t alloc_bytes = (new_bytes + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
-        uint8_t* nb =
-            static_cast<uint8_t*>(aligned_alloc(kDiskAlign, alloc_bytes));
-        if (!nb) {
-            throw Error(ErrorCode::OutOfMemory,
-                        "Builder::insert: codes realloc failed");
-        }
-        std::memcpy(nb, index_.codes_buffer, old_bytes);
+        AlignedBuf nb(kDiskAlign, alloc_bytes);
+        std::memcpy(nb.get(), index_.codes_buffer, old_bytes);
         // Encode the new vector into the appended slot.
-        index_.quantizer->encode(vec, nb + old_bytes);
+        index_.quantizer->encode(vec, nb.as<uint8_t>() + old_bytes);
         aligned_free(index_.codes_buffer);
-        index_.codes_buffer = nb;
+        index_.codes_buffer = nb.as<uint8_t>();
+        nb.release();
     }
 
     // --- 2. Grow the nodes buffer by one node (O(N) copy). ---
@@ -1636,16 +1616,12 @@ void Builder::insert(const float* vec, Dim dim, RowId row_id) {
         const size_t old_bytes = static_cast<size_t>(index_.count) * index_.node_size;
         const size_t new_bytes = static_cast<size_t>(new_count) * index_.node_size;
         const size_t alloc_bytes = (new_bytes + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
-        uint8_t* nb =
-            static_cast<uint8_t*>(aligned_alloc(kDiskAlign, alloc_bytes));
-        if (!nb) {
-            throw Error(ErrorCode::OutOfMemory,
-                        "Builder::insert: nodes realloc failed");
-        }
-        std::memcpy(nb, index_.nodes_buffer, old_bytes);
-        std::memset(nb + old_bytes, 0, index_.node_size);
+        AlignedBuf nb(kDiskAlign, alloc_bytes);
+        std::memcpy(nb.get(), index_.nodes_buffer, old_bytes);
+        std::memset(nb.as<uint8_t>() + old_bytes, 0, index_.node_size);
         aligned_free(index_.nodes_buffer);
-        index_.nodes_buffer = nb;
+        index_.nodes_buffer = nb.as<uint8_t>();
+        nb.release();
     }
 
     // --- 3. Publish the grown buffers + new count to the core. ---
@@ -1666,21 +1642,17 @@ void Builder::insert(const float* vec, Dim dim, RowId row_id) {
         const size_t old_bytes = static_cast<size_t>(index_.count - 1) * index_.dim * sizeof(float16_t);
         const size_t new_bytes = static_cast<size_t>(index_.count) * index_.dim * sizeof(float16_t);
         const size_t alloc_bytes = (new_bytes + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
-        float16_t* nb =
-            static_cast<float16_t*>(aligned_alloc(kDiskAlign, alloc_bytes));
-        if (!nb) {
-            throw Error(ErrorCode::OutOfMemory,
-                        "Builder::insert: raw_vecs realloc failed");
-        }
+        AlignedBuf nb(kDiskAlign, alloc_bytes);
         if (index_.raw_vecs_buffer) {
-            std::memcpy(nb, index_.raw_vecs_buffer, old_bytes);
+            std::memcpy(nb.get(), index_.raw_vecs_buffer, old_bytes);
             aligned_free(index_.raw_vecs_buffer);
         }
-        float16_t* dst = nb + static_cast<size_t>(new_internal) * index_.dim;
+        float16_t* dst = nb.as<float16_t>() + static_cast<size_t>(new_internal) * index_.dim;
         for (uint32_t d = 0; d < index_.dim; d++) {
             dst[d] = static_cast<float16_t>(vec[d]);
         }
-        index_.raw_vecs_buffer = nb;
+        index_.raw_vecs_buffer = nb.as<float16_t>();
+        nb.release();
     }
     index_.core->set_build_vecs(index_.raw_vecs_buffer);
 

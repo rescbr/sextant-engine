@@ -93,16 +93,12 @@ std::unique_ptr<Index> Estimator::build_mini_(const float* sample,
             static_cast<size_t>(sample_n) * mini->code_size;
         const size_t nodes_bytes =
             static_cast<size_t>(sample_n) * mini->node_size;
-        mini->codes_buffer = static_cast<uint8_t*>(
-            aligned_alloc(kDiskAlign, codes_bytes));
-        mini->nodes_buffer = static_cast<uint8_t*>(
-            aligned_alloc(kDiskAlign, nodes_bytes));
-        if (!mini->codes_buffer || !mini->nodes_buffer) {
-            throw Error(ErrorCode::OutOfMemory,
-                        "build_mini_: buffer alloc failed");
-        }
-        std::memset(mini->codes_buffer, 0, codes_bytes);
-        std::memset(mini->nodes_buffer, 0, nodes_bytes);
+        AlignedBuf codes(kDiskAlign, codes_bytes);
+        AlignedBuf nodes(kDiskAlign, nodes_bytes);
+        std::memset(codes.get(), 0, codes_bytes);
+        std::memset(nodes.get(), 0, nodes_bytes);
+        mini->codes_buffer = codes.as<uint8_t>(); codes.release();
+        mini->nodes_buffer = nodes.as<uint8_t>(); nodes.release();
     }
 
     b.pass2_encode(src, mp);
@@ -111,20 +107,16 @@ std::unique_ptr<Index> Estimator::build_mini_(const float* sample,
     {
         const size_t vecs_bytes =
             static_cast<size_t>(sample_n) * dim * sizeof(float16_t);
-        mini->raw_vecs_buffer = static_cast<float16_t*>(
-            aligned_alloc(kDiskAlign, vecs_bytes));
-        if (!mini->raw_vecs_buffer) {
-            throw Error(ErrorCode::OutOfMemory,
-                        "build_mini_: raw_vecs_buffer alloc failed");
-        }
+        AlignedBuf vecs(kDiskAlign, vecs_bytes);
         for (uint64_t i = 0; i < sample_n; i++) {
             float16_t* dst =
-                mini->raw_vecs_buffer + static_cast<size_t>(i) * dim;
+                vecs.as<float16_t>() + static_cast<size_t>(i) * dim;
             const float* svec = sample + static_cast<size_t>(i) * dim;
             for (uint32_t d = 0; d < dim; d++) {
                 dst[d] = static_cast<float16_t>(svec[d]);
             }
         }
+        mini->raw_vecs_buffer = vecs.as<float16_t>(); vecs.release();
     }
 
     const uint32_t n = static_cast<uint32_t>(sample_n);

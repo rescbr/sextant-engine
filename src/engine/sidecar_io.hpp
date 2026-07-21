@@ -26,11 +26,10 @@ inline void write_padded(DirectFile& f, const void* buf, size_t count,
         f.pwrite_aligned(buf, count, offset);
         return;
     }
-    void* stage = aligned_alloc(kDiskAlign, aligned);
-    std::memset(stage, 0, aligned);
-    std::memcpy(stage, buf, count);
-    f.pwrite_aligned(stage, aligned, offset);
-    aligned_free(stage);
+    AlignedBuf stage(kDiskAlign, aligned);
+    std::memset(stage.get(), 0, aligned);
+    std::memcpy(stage.get(), buf, count);
+    f.pwrite_aligned(stage.get(), aligned, offset);
 }
 
 /// Read exactly `count` bytes at `offset` into `buf` from a DirectFile, via an
@@ -42,11 +41,10 @@ inline void read_exact(DirectFile& f, void* buf, size_t count, uint64_t offset) 
     // an aligned staging buffer for the O_DIRECT count requirement.
     const size_t aligned =
         (count + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
-    void* stage = aligned_alloc(kDiskAlign, aligned);
-    std::memset(stage, 0, aligned);
-    f.pread_aligned(stage, aligned, offset);
-    std::memcpy(buf, stage, count);
-    aligned_free(stage);
+    AlignedBuf stage(kDiskAlign, aligned);
+    std::memset(stage.get(), 0, aligned);
+    f.pread_aligned(stage.get(), aligned, offset);
+    std::memcpy(buf, stage.get(), count);
 }
 
 /// Fill a SidecarHeader with the common fields.

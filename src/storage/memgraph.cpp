@@ -47,11 +47,10 @@ void read_at(DirectFile& f, uint8_t* dst, size_t count, uint64_t offset) {
     if (count == 0) return;
     const size_t aligned =
         (count + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
-    void* stage = aligned_alloc(kDiskAlign, aligned);
-    std::memset(stage, 0, aligned);
-    f.pread_aligned(stage, aligned, offset);
-    std::memcpy(dst, stage, count);
-    aligned_free(stage);
+    AlignedBuf stage(kDiskAlign, aligned);
+    std::memset(stage.get(), 0, aligned);
+    f.pread_aligned(stage.get(), aligned, offset);
+    std::memcpy(dst, stage.get(), count);
 }
 
 // Read `count` bytes of payload starting just after the SidecarHeader.

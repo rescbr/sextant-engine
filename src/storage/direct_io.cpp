@@ -100,20 +100,18 @@ size_t DirectFile::pread_aligned(void* buf, size_t count, uint64_t offset) {
     const size_t total = count + off_misalign;
     const size_t aligned_count =
         (total + kDiskAlign - 1) & ~static_cast<size_t>(kDiskAlign - 1);
-    void* stage = aligned_alloc(kDiskAlign, aligned_count);
-    std::memset(stage, 0, aligned_count);
-    ssize_t n = ::pread(fd_, stage, aligned_count,
+    AlignedBuf stage(kDiskAlign, aligned_count);
+    std::memset(stage.get(), 0, aligned_count);
+    ssize_t n = ::pread(fd_, stage.get(), aligned_count,
                         static_cast<off_t>(aligned_off));
     if (n < 0) {
-        aligned_free(stage);
         throw Error(ErrorCode::IoError,
                     "DirectFile::pread failed on '" + path_ + "': " +
                         std::strerror(errno));
     }
     const size_t usable = (static_cast<size_t>(n) > off_misalign)
         ? std::min(static_cast<size_t>(static_cast<size_t>(n) - off_misalign), count) : 0;
-    std::memcpy(buf, static_cast<uint8_t*>(stage) + off_misalign, usable);
-    aligned_free(stage);
+    std::memcpy(buf, stage.as<uint8_t>() + off_misalign, usable);
     return usable;
 }
 

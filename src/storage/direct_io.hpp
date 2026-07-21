@@ -54,4 +54,55 @@ private:
 void* aligned_alloc(size_t alignment, size_t size);
 void aligned_free(void* ptr);
 
+/// RAII owning wrapper around an aligned allocation. Frees on destruction;
+/// move-only; supports release() to hand ownership to a raw pointer (e.g.
+/// when transferring to a long-lived owner like `Index::codes_buffer`).
+///
+/// Use this instead of raw `aligned_alloc` + `aligned_free` locals: it closes
+/// the leak-on-exception window between alloc and free, and documents ownership
+/// at the type level.
+class AlignedBuf {
+public:
+    AlignedBuf() noexcept = default;
+    AlignedBuf(size_t alignment, size_t size)
+        : ptr_(aligned_alloc(alignment, size)), size_(size) {}
+
+    ~AlignedBuf() { reset(); }
+
+    AlignedBuf(const AlignedBuf&) = delete;
+    AlignedBuf& operator=(const AlignedBuf&) = delete;
+    AlignedBuf(AlignedBuf&& o) noexcept
+        : ptr_(o.ptr_), size_(o.size_) { o.ptr_ = nullptr; o.size_ = 0; }
+    AlignedBuf& operator=(AlignedBuf&& o) noexcept {
+        if (this != &o) {
+            reset();
+            ptr_ = o.ptr_; size_ = o.size_;
+            o.ptr_ = nullptr; o.size_ = 0;
+        }
+        return *this;
+    }
+
+    void* get() noexcept { return ptr_; }
+    const void* get() const noexcept { return ptr_; }
+    template <typename T> T* as() noexcept { return static_cast<T*>(ptr_); }
+    template <typename T> const T* as() const noexcept { return static_cast<const T*>(ptr_); }
+    size_t size() const noexcept { return size_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    /// Release ownership. The caller is now responsible for `aligned_free`.
+    void* release() noexcept {
+        void* p = ptr_;
+        ptr_ = nullptr; size_ = 0;
+        return p;
+    }
+
+    void reset() noexcept {
+        if (ptr_) { aligned_free(ptr_); ptr_ = nullptr; size_ = 0; }
+    }
+
+private:
+    void* ptr_ = nullptr;
+    size_t size_ = 0;
+};
+
 }  // namespace sextant
