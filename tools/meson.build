@@ -15,7 +15,7 @@ fvecs_to_fbin = executable('fvecs_to_fbin',
 sextant_bench = executable('sextant_bench',
     'benchmark.cpp',
     dependencies: sextant_dep,
-    include_directories: [engine_inc, third_party_inc],
+    include_directories: [engine_inc, third_party_inc, numkong_inc],
     install: false,
 )
 

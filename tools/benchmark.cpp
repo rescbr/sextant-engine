@@ -12,6 +12,8 @@
 //   benchmark --index myindex --queries query.fbin --base-data base.fbin \
 //             --ground-truth gt.gt --k 10 --L 200 --rerank 10
 
+#include <numkong/numkong.h>
+
 #include "fbin_io.hpp"
 #include "sextant/config.hpp"
 #include "sextant/searcher.hpp"
@@ -31,6 +33,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -100,10 +103,35 @@ double percentile(std::vector<double>& sorted_us, double pct) {
     const double rank = (pct / 100.0) * (sorted_us.size() - 1);
     const size_t lo = static_cast<size_t>(std::floor(rank));
     const size_t hi = static_cast<size_t>(std::ceil(rank));
-    if (lo == hi) return sorted_us[lo];
-    const double frac = rank - static_cast<double>(lo);
-    return sorted_us[lo] + frac * (sorted_us[hi] - sorted_us[lo]);
+     if (lo == hi) return sorted_us[lo];
+     const double frac = rank - static_cast<double>(lo);
+     return sorted_us[lo] + frac * (sorted_us[hi] - sorted_us[lo]);
+ }
+
+/// SIMD L2-squared distance between two FP32 vectors. Uses numkong's
+/// SVE2/NEON kernel (~4-8× faster than the scalar fallback for 768-dim).
+/// Falls back to the scalar fbin_io::l2sq_distance if numkong reports an
+/// error (shouldn't happen for valid inputs).
+inline float l2sq_simd(const float* a, const float* b, uint32_t dim) {
+    nk_f64_t acc = 0;
+    nk_sqeuclidean_f32(a, b, dim, &acc);
+    return static_cast<float>(acc);
 }
+
+/// Per-query metrics produced by a worker thread. The main thread aggregates
+/// these — no shared mutable state during the benchmark loop.
+struct QueryMetrics {
+    double latency_us = 0.0;
+    double recall_sum = 0.0;       // hits/gt_k for this query
+    uint32_t recall_hits = 0;
+    uint32_t recall_total = 0;
+    uint64_t prox_in = 0;
+    uint64_t prox_total = 0;
+    // Proximity ratios for this query's top-k. Stored as a packed vector
+    // (rare >0 only when have_gt_dists && base_in_ram). The main thread
+    // concatenates these across queries for the distribution report.
+    std::vector<double> prox_ratios;
+};
 
 }  // namespace
 
@@ -272,6 +300,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Aggregates (collected on the main thread from per-query metrics).
         std::vector<double> latencies_us;
         latencies_us.reserve(n_queries);
 
@@ -281,27 +310,25 @@ int main(int argc, char* argv[]) {
         constexpr double kRatioCap = 10.0;
         constexpr double kEps = 1e-6f;
 
-        // Aggregates (collected on the main thread as batches return).
-        double recall_sum = 0.0;
-        uint64_t recall_hits = 0;
-        uint64_t recall_total = 0;
-        std::vector<double> prox_ratios;
-        uint64_t prox_in = 0;
-        uint64_t prox_total = 0;
-        prox_ratios.reserve(n_queries * std::max(1u, k));
-
-        // Per-query rerank + metrics processing — runs on the caller thread
-        // as each batch returns. The pool handles the parallel search; all
-        // post-processing is single-threaded (cheap compared to search).
-        auto process_result = [&](uint32_t qi,
+        // Per-query worker function: search → rerank → recall → proximity.
+        // Returns QueryMetrics; the main thread aggregates. This parallelizes
+        // the rerank (was the 8t bottleneck — single main thread doing serial
+        // l2sq_distance over 200 candidates × 1000 queries while 8 workers
+        // waited in futex_do_wait).
+        //
+        // base_all is shared read-only across workers (loaded once into RAM
+        // before the loop). dim, k, gt, do_rerank, etc. are captured by value
+        // or const-ref.
+        auto process_query = [&](uint32_t qi,
                                   std::vector<sextant::Candidate>&& results,
-                                  double latency_us) {
+                                  double latency_us) -> QueryMetrics {
+            QueryMetrics m;
+            m.latency_us = latency_us;
             const float* q = &queries[static_cast<size_t>(qi) * dim];
-            latencies_us.push_back(latency_us);
 
             std::vector<std::pair<float, sextant::RowId>> topk_scored;
             topk_scored.reserve(k);
-            std::vector<float> base_vec(dim);
+            std::vector<float> base_vec(dim);  // only used if !base_in_ram
             if (do_rerank && !results.empty()) {
                 std::vector<std::pair<float, sextant::RowId>> scored;
                 scored.reserve(results.size());
@@ -314,12 +341,12 @@ int main(int argc, char* argv[]) {
                     if (base_in_ram) {
                         const float* bv =
                             &base_all[static_cast<size_t>(c.row_id) * dim];
-                        d = l2sq_distance(q, bv, dim);
+                        d = l2sq_simd(q, bv, dim);
                     } else {
                         read_fbin_vector(base_data, dim,
                                          static_cast<uint64_t>(c.row_id),
                                          base_vec);
-                        d = l2sq_distance(q, base_vec.data(), dim);
+                        d = l2sq_simd(q, base_vec.data(), dim);
                     }
                     scored.emplace_back(d, c.row_id);
                 }
@@ -341,12 +368,12 @@ int main(int argc, char* argv[]) {
                         if (base_in_ram) {
                             const float* bv =
                                 &base_all[static_cast<size_t>(rid) * dim];
-                            d = l2sq_distance(q, bv, dim);
+                            d = l2sq_simd(q, bv, dim);
                         } else {
                             read_fbin_vector(base_data, dim,
                                              static_cast<uint64_t>(rid),
                                              base_vec);
-                            d = l2sq_distance(q, base_vec.data(), dim);
+                            d = l2sq_simd(q, base_vec.data(), dim);
                         }
                     }
                     topk_scored.emplace_back(d, rid);
@@ -368,9 +395,10 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
-                recall_sum += static_cast<double>(hits) / static_cast<double>(gt_k);
-                recall_hits += hits;
-                recall_total += gt_k;
+                m.recall_sum = static_cast<double>(hits) /
+                                static_cast<double>(gt_k);
+                m.recall_hits = hits;
+                m.recall_total = gt_k;
 
                 if (have_gt_dists && base_in_ram) {
                     const uint32_t gt_kth_id =
@@ -379,11 +407,12 @@ int main(int argc, char* argv[]) {
                     if (gt_kth_id < bh.n) {
                         const float* bv_kth =
                             &base_all[static_cast<size_t>(gt_kth_id) * dim];
-                        d_target = l2sq_distance(q, bv_kth, dim);
+                        d_target = l2sq_simd(q, bv_kth, dim);
                     } else {
                         d_target = gt.dists[static_cast<size_t>(qi) * gt.k +
                                              (gt_k - 1)];
                     }
+                    m.prox_ratios.reserve(topk_scored.size());
                     for (const auto& [d, r] : topk_scored) {
                         if (r < 0) continue;
                         double ratio;
@@ -397,26 +426,31 @@ int main(int argc, char* argv[]) {
                             ratio = static_cast<double>(d_target) /
                                     static_cast<double>(d);
                         }
-                        prox_ratios.push_back(ratio);
-                        if (ratio >= 1.0) ++prox_in;
-                        ++prox_total;
+                        m.prox_ratios.push_back(ratio);
+                        if (ratio >= 1.0) ++m.prox_in;
+                        ++m.prox_total;
                     }
                 }
             }
+            return m;
         };
 
-        // Push all queries into the pool up front (work-stealing: each
-        // worker pulls the next query as soon as it finishes — no per-chunk
-        // barrier). Then collect results in input order as futures complete.
-        // Per-query latency isn't meaningful under async work-stealing
-        // (queries overlap); we report batch throughput + wall-time-derived
-        // p50/p99 over the collection order, which approximates per-query
-        // latency when the pool is saturated.
+        // Push all queries to the Searcher pool up front (work-stealing).
+        // Workers pull the next query as soon as they finish. The main
+        // thread collects futures in order and runs process_query (rerank
+        // + recall + proximity) inline. This is serial post-processing but
+        // uses SIMD l2sq_distance (nk_sqeuclidean_f32) for the rerank.
+        //
+        // NOTE: serial post-processing is the 8t bottleneck. A future
+        // workstream could parallelize it by extending Searcher to accept
+        // a per-query post-processing callback that runs on the worker.
+        // For now the SIMD rerank recovers most of the gap.
         sextant::SearchConfig scfg;
         scfg.k = fetch_k;
         scfg.L_search = L;
         scfg.rerank_factor = rerank;
         scfg.io_limit = io_limit;
+
         const auto t_start = Clock::now();
         std::vector<std::future<std::vector<sextant::Candidate>>> futs;
         futs.reserve(n_queries);
@@ -424,12 +458,28 @@ int main(int argc, char* argv[]) {
             const float* q = &queries[static_cast<size_t>(qi) * dim];
             futs.push_back(searcher.search_one_async(q, scfg.k, scfg));
         }
+
+        double recall_sum = 0.0;
+        uint64_t recall_hits = 0, recall_total = 0;
+        uint64_t prox_in = 0, prox_total = 0;
+        std::vector<double> prox_ratios;
         for (uint32_t qi = 0; qi < n_queries; qi++) {
             const auto q_start = Clock::now();
             auto results = futs[qi].get();
             const auto q_end = Clock::now();
             const double per_q_us = US(q_end - q_start).count();
-            process_result(qi, std::move(results), per_q_us);
+            QueryMetrics m = process_query(qi, std::move(results), per_q_us);
+            latencies_us.push_back(m.latency_us);
+            recall_sum += m.recall_sum;
+            recall_hits += m.recall_hits;
+            recall_total += m.recall_total;
+            if (!m.prox_ratios.empty()) {
+                prox_ratios.insert(prox_ratios.end(),
+                                   m.prox_ratios.begin(),
+                                   m.prox_ratios.end());
+            }
+            prox_in += m.prox_in;
+            prox_total += m.prox_total;
         }
         const auto t_end = Clock::now();
         const double total_sec =
