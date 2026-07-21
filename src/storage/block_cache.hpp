@@ -307,10 +307,10 @@ public:
     /// well within its tolerance.
     void record_access(bool hit);
 
-    /// Flush this thread's pending samples for this cache to the shared
-    /// atomics. Only needed at explicit teardown points (tests that destroy
-    /// a BlockCache on a thread that may have pending samples); in normal
-    /// operation the per-call flush every 64 samples is sufficient.
+    /// Flush this cache's pending samples to the shared atomics. With
+    /// per-worker cache ownership (Layer 3) the flush is trivial — the
+    /// counters live on the cache itself — but kept for explicit teardown
+    /// points (tests).
     void flush_thread_local();
 
     /// Mask used to determine when to flush: flush when
@@ -357,24 +357,19 @@ private:
     double hc_prev_hit_rate_ = 0.0;
     double hc_step_size_ = 0.0;
 
-    // --- thread-local sample accumulation (see record_access comment) --------
-    // Per-thread, per-BlockCache accumulation buffer. `record_access` bumps
-    // these (no atomics — thread_local is implicitly thread-private) and
-    // flushes to the shared `hc_hits_in_sample_` / `hc_misses_in_sample_`
-    // every 64 calls. Keyed by `this` because a thread may search against
-    // multiple BlockCache instances (graph_cache_ + code_cache_) over its
-    // lifetime and the hill-climber signal must not conflate them.
+    // --- per-worker sample accumulation (Layer 3: was thread_local map) -----
+    // Per-worker accumulation buffer. `record_access` bumps these (no atomics
+    // — single-threaded per worker) and flushes to the shared
+    // `hc_hits_in_sample_` / `hc_misses_in_sample_` every 64 calls.
     //
-    // alignas(64): padding prevents false-sharing between distinct
-    // HotCounters entries when the thread_local allocator packs them
-    // into adjacent slots. (Per-thread, so technically already isolated,
-    // but the padding is cheap insurance against aliasing surprises.)
+    // alignas(64): padding prevents false-sharing between distinct worker
+    // caches when several BlockCaches happen to sit in adjacent heap slots.
+    // (Each is single-threaded, but cheap insurance against aliasing.)
     struct alignas(64) HotCounters {
         uint64_t local_hits = 0;
         uint64_t local_misses = 0;
     };
-    static thread_local std::unordered_map<const BlockCache*, HotCounters>
-        tl_hot_counters_;
+    HotCounters hot_counters_;
 };
 
 }  // namespace sextant

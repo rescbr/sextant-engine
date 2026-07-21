@@ -8,11 +8,8 @@
 
 namespace sextant {
 
-// Definition of the per-thread, per-BlockCache sample accumulator. Declared
-// in block_cache.hpp. Lives for the lifetime of the thread; entries are
-// never explicitly erased (see ~BlockCache note in record_access).
-thread_local std::unordered_map<const BlockCache*, BlockCache::HotCounters>
-    BlockCache::tl_hot_counters_;
+// (Layer 3) BlockCache sample counters now live as instance state
+// (`hot_counters_`), one per worker cache. No thread_local machinery.
 
 // --- CacheShard -------------------------------------------------------------
 
@@ -414,34 +411,31 @@ void BlockCache::resize(uint32_t new_blocks_per_shard) {
 // so there is no cross-shard lock-acquisition deadlock risk.
 
 void BlockCache::record_access(bool hit) {
-    // Per-thread accumulation: thread_local map means no cross-core traffic
-    // on the hot path. The map lookup is one hash; in steady state each
-    // thread pins a single entry per BlockCache instance.
-    HotCounters& c = tl_hot_counters_[this];
-    if (hit) c.local_hits++;
-    else     c.local_misses++;
+    // Per-worker accumulation (Layer 3: was thread_local map). Single-threaded
+    // per cache — no atomics on the hot path. Flush every (kFlushMask + 1)
+    // calls; after flush, the shared atomics carry the signal for maybe_climb().
+    if (hit) hot_counters_.local_hits++;
+    else     hot_counters_.local_misses++;
 
-    // Flush every (kFlushMask + 1) calls. Power-of-two check is a bitmask
-    // AND, cheaper than a modulo. After flush, the shared atomics carry the
-    // signal for maybe_climb() to sample.
-    if ((c.local_hits + c.local_misses) & kFlushMask) return;
+    if ((hot_counters_.local_hits + hot_counters_.local_misses) & kFlushMask) return;
 
-    hc_hits_in_sample_.fetch_add(c.local_hits, std::memory_order_relaxed);
-    hc_misses_in_sample_.fetch_add(c.local_misses, std::memory_order_relaxed);
-    c.local_hits = 0;
-    c.local_misses = 0;
+    hc_hits_in_sample_.fetch_add(hot_counters_.local_hits,
+                                  std::memory_order_relaxed);
+    hc_misses_in_sample_.fetch_add(hot_counters_.local_misses,
+                                    std::memory_order_relaxed);
+    hot_counters_.local_hits = 0;
+    hot_counters_.local_misses = 0;
     maybe_climb();
 }
 
 void BlockCache::flush_thread_local() {
-    auto it = tl_hot_counters_.find(this);
-    if (it == tl_hot_counters_.end()) return;
-    HotCounters& c = it->second;
-    if (c.local_hits || c.local_misses) {
-        hc_hits_in_sample_.fetch_add(c.local_hits, std::memory_order_relaxed);
-        hc_misses_in_sample_.fetch_add(c.local_misses, std::memory_order_relaxed);
-        c.local_hits = 0;
-        c.local_misses = 0;
+    if (hot_counters_.local_hits || hot_counters_.local_misses) {
+        hc_hits_in_sample_.fetch_add(hot_counters_.local_hits,
+                                      std::memory_order_relaxed);
+        hc_misses_in_sample_.fetch_add(hot_counters_.local_misses,
+                                        std::memory_order_relaxed);
+        hot_counters_.local_hits = 0;
+        hot_counters_.local_misses = 0;
     }
 }
 

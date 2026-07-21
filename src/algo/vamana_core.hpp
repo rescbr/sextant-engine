@@ -276,6 +276,16 @@ public:
     const std::vector<uint32_t>& entry_points() const { return entry_points_; }
     void set_entry_points(std::vector<uint32_t> eps) { entry_points_ = std::move(eps); }
 
+    /// Configure this core for search-only use (Layer 3: per-worker cores).
+    /// Sets the node count + entry points that search() needs. The store must
+    /// be installed separately via set_store(). Quantizer + params are set at
+    /// construction. No build buffers are populated (search reads through the
+    /// store, not the flat buffers).
+    void set_search_state(uint32_t count, std::vector<uint32_t> entry_points) {
+        count_ = count;
+        entry_points_ = std::move(entry_points);
+    }
+
     /// T5: install a progress signal for dynamic L_build. The pointer must
     /// outlive the build; it is read with a relaxed load inside the insert
     /// path. Pass nullptr (the default) to use a fixed L_build.

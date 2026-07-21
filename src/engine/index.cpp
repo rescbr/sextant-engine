@@ -226,12 +226,13 @@ std::unique_ptr<Index> Index::read(const std::string& index_path,
                      cache_bytes / 1e6, graph_size / 1e6,
                      codes_size / 1e6, phys_ram / 1e6);
 
-        idx->paged_store = std::make_unique<PagedNodeStore>(
-            index_path + ".graph", index_path + ".codes",
-            idx->node_size, idx->code_size,
-            std::max(1u, std::thread::hardware_concurrency()),
-            cache_bytes);
-    }
+         idx->paged_store = std::make_unique<PagedNodeStore>(
+             index_path + ".graph", index_path + ".codes",
+             idx->node_size, idx->code_size,
+             std::max(1u, std::thread::hardware_concurrency()),
+             cache_bytes);
+         idx->cache_size_bytes = cache_bytes;
+     }
 
     // Build a MemGraph over the sidecar files: cache the entry-point BFS
     // neighborhood (default 3 hops) in RAM, delegate cold nodes to the
@@ -259,12 +260,14 @@ std::unique_ptr<Index> Index::read(const std::string& index_path,
     idx->core->set_store(idx->memgraph.get());
 
     // Restore entry points from .meta if present; otherwise compute a
-    // deterministic fallback set. `entry_points` is moved into the core here.
-    if (!entry_points.empty()) {
-        idx->core->set_entry_points(std::move(entry_points));
-    } else {
+    // deterministic fallback set. Keep a copy on idx->entry_points so Searcher
+    // can construct per-worker VamanaCores with the same entry points.
+    if (entry_points.empty()) {
         idx->core->compute_entry_points();
+        entry_points = idx->core->entry_points();
     }
+    idx->entry_points = entry_points;
+    idx->core->set_entry_points(std::move(entry_points));
 
     spdlog::info("[sextant] opened index '{}' (n={} dim={})", index_path,
                  idx->count, idx->dim);

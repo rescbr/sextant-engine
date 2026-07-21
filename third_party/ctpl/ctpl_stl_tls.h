@@ -81,10 +81,9 @@ namespace ctpl {
 
     template<class TLS>
     class thread_pool_tls {
+    public:
         using base_func_type = std::function<void(size_t, TLS&)>;
         using init_func_type = std::function<void(size_t, std::shared_ptr<TLS>&)>;
-    public:
-
         thread_pool_tls() { this->init(); }
         thread_pool_tls(size_t nThreads, init_func_type tlsInitFunction = nullptr) {
             this->init(); 
@@ -222,7 +221,18 @@ namespace ctpl {
         }
 
 
+        /// Read-only access to per-thread TLS slots. Caller must ensure the
+        /// pool stays alive while iterating. Each slot is a shared_ptr that
+        /// is non-null once the worker thread has run its init function; the
+        /// init runs lazily on the worker's first task, so callers should
+        /// only iterate after at least one task has run on each worker.
+        const std::vector<std::shared_ptr<TLS>>& tls_slots() const {
+            return m_tls;
+        }
+
+
     private:
+
 
         // deleted
         thread_pool_tls(const thread_pool_tls &);// = delete;

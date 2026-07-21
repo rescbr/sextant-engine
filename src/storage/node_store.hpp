@@ -22,12 +22,10 @@
 #include "storage/tl_cache.hpp"
 #include "sextant/types.hpp"
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <unordered_map>
 
 namespace sextant {
 
@@ -102,43 +100,19 @@ public:
     /// contain nearby graph nodes. 4 × 256KB = 1MB per miss.
     static constexpr uint32_t kBlocksPerRead = 4;
 
-    uint64_t graph_reads() const {
-        return graph_reads_.load(std::memory_order_relaxed);
-    }
-    uint64_t code_reads() const {
-        return code_reads_.load(std::memory_order_relaxed);
-    }
+    uint64_t graph_reads() const { return graph_reads_; }
+    uint64_t code_reads() const { return code_reads_; }
 
-    /// Drain this thread's pending L1 hit/miss samples into the shared
-    /// atomics, then return the current totals. Only needed by callers that
-    /// read stats immediately after a small number of operations (e.g. tests);
-    /// in normal operation the per-call flush every 64 samples is sufficient.
-    /// Note: only drains the CALLING thread's pending samples — other threads
-    /// may still have unflushed counts. Single-threaded tests are exact;
-    /// multi-threaded stats are already approximate (see comment on
-    /// tl_l1_counters_).
+    /// L1 (per-worker block cache) hit/miss counters. Single-threaded per
+    /// PagedNodeStore instance (Layer 3: per-worker ownership). Returns the
+    /// flushed total PLUS pending per-call accumulations (≤ kL1FlushMask
+    /// samples) so tests get exact counts even after a handful of pins.
     uint64_t tl_hits() const {
-        flush_l1_counters();
-        return tl_hits_.load(std::memory_order_relaxed);
+        return tl_hits_ + l1_counters_.local_hits;
     }
     uint64_t tl_misses() const {
-        flush_l1_counters();
-        return tl_misses_.load(std::memory_order_relaxed);
+        return tl_misses_ + l1_counters_.local_misses;
     }
-
-private:
-    void flush_l1_counters() const {
-        auto it = tl_l1_counters_.find(this);
-        if (it == tl_l1_counters_.end()) return;
-        L1Counters& c = it->second;
-        if (c.local_hits || c.local_misses) {
-            tl_hits_.fetch_add(c.local_hits, std::memory_order_relaxed);
-            tl_misses_.fetch_add(c.local_misses, std::memory_order_relaxed);
-            c.local_hits = c.local_misses = 0;
-        }
-    }
-
-public:
 
     /// W-TinyLFU cache profiling counters (window/probation/protected hits,
     /// misses, admission decisions). Combined across the graph and code caches.
@@ -151,12 +125,11 @@ public:
     }
 
     /// Periodically rebalance the graph/code cache split based on hit/miss
-    /// ratios. Safe to call from any thread.
+    /// ratios. Single-threaded per worker (Layer 3).
     void maybe_rebalance_caches();
 
     /// Current fraction [0,1] of the total cache budget assigned to graph
-    /// blocks. Diagnostic read for the rebalance controller's cadence logic.
-    /// Reads shard(0) capacities (uniform across shards); atomic loads, no lock.
+    /// blocks. Reads shard(0) capacities (uniform across shards).
     double graph_cache_fraction() const;
 
 private:
@@ -176,15 +149,15 @@ private:
 
     // L1 key namespace separator: graph uses plain block_idx as the L1 key;
     // code uses block_idx | kCodeL1KeyBit. This ONLY disambiguates the L1
-    // (thread-local) entries — the L2 caches are fully separate and use plain
+    // (per-worker) entries — the L2 caches are fully separate and use plain
     // block_idx as keys.
     static constexpr uint64_t kCodeL1KeyBit = 1ULL << 63;
 
-    // Relaxed atomics: these are statistical counters read only after a
-    // benchmark run completes. No ordering needed, just lock-free increments
-    // on the cache-miss hot path.
-    mutable std::atomic<uint64_t> graph_reads_{0};
-    mutable std::atomic<uint64_t> code_reads_{0};
+    // Statistical counters (single-threaded per worker; uint64_t is fine).
+    uint64_t graph_reads_ = 0;
+    uint64_t code_reads_ = 0;
+    uint64_t tl_hits_ = 0;
+    uint64_t tl_misses_ = 0;
 
     // Adaptive controller that rebalances graph_cache_ / code_cache_ sizes.
     // Constructed after the caches (lazily initialized in the constructor body
@@ -192,63 +165,26 @@ private:
     // after the files are open).
     std::unique_ptr<CacheController> cache_controller_;
 
-    // --- Thread-local L1 (per-search-thread block cache) -------------------
-    // Each thread that calls batched_read() gets its own TLBlockCache for THIS
-    // store instance. Per-instance isolation is essential: two different
-    // PagedNodeStore objects backing different index files must never share L1
-    // entries (a block key like 0 means different data in each file).
-    //
-    // Implementation: a thread_local unordered_map keyed by a per-instance
-    // unique ID (instance_id_), NOT by `this`. Using a monotonic ID avoids the
-    // address-reuse hazard: if a destroyed store's memory is recycled for a
-    // new store, the new store has a different ID and won't match stale
-    // entries left on threads that didn't run the destructor.
-    static std::atomic<uint64_t> next_instance_id_;
-    uint64_t instance_id_;
-    // Per-thread L1 hit/miss accumulators. The hot path of the search does an
-    // L1 lookup on every cache access (~4.5M per 1000-query bench); updating
-    // shared atomics per call caused severe cache-line bouncing across cores
-    // (~30% of cycles at 8 threads, second only to BlockCache::record_access).
-    // We instead accumulate per-thread and flush to the shared atomics every
-    // `kL1FlushMask + 1` calls. Stats are read only at end-of-bench, so the
-    // ≤63-sample loss on thread exit is invisible.
+    // --- per-worker L1 (Layer 3: was thread_local machinery) ----------------
+    // Each PagedNodeStore is owned by ONE pool worker, so the L1 (TLBlockCache),
+    // the L1 hit/miss counters, and the pread staging buffer are plain
+    // per-instance state. No cross-thread coordination, no instance-id keying.
+    TLBlockCache l1_;
     struct alignas(64) L1Counters {
         uint64_t local_hits = 0;
         uint64_t local_misses = 0;
     };
-    static thread_local std::unordered_map<const PagedNodeStore*, L1Counters>
-        tl_l1_counters_;
+    L1Counters l1_counters_;
     static constexpr uint64_t kL1FlushMask = 63;
-    mutable std::atomic<uint64_t> tl_hits_{0};
-    mutable std::atomic<uint64_t> tl_misses_{0};
 
-    // --- per-thread fast-path cache (avoids 2 hash lookups per L1 access) ----
-    // The hot path of batched_read() used to call tl_cache() (one hash lookup
-    // in g_tl_caches) AND access tl_l1_counters_[this] (another hash lookup)
-    // on every L1 access. Together these added ~9% of 8t cycles and caused
-    // the 1t regression seen after step 1 (-2% to -4% depending on config).
-    // We cache both pointers in a single thread_local struct, invalidated
-    // only when the calling thread switches stores. The slow path runs once
-    // per thread per store.
-    //
-    // Lifetime coupling: the cached pointers are valid only while the owning
-    // PagedNodeStore lives. In practice stores outlive all search threads
-    // (engine-lifetime objects); if a store is destroyed while a thread still
-    // holds a stale pointer, the next identity check (`fp.owner != this`)
-    // catches the switch and re-hashes. A subtle aliasing risk remains if a
-    // new store reuses the address of a destroyed one AND the same thread
-    // accessed the old one — then owner==this matches but the pointers are
-    // stale. Mitigated by instance_id_ being monotonic, but the fast path
-    // doesn't check instance_id_. Acceptable for engine-lifetime coupling.
-    struct TLFastPath {
-        const PagedNodeStore* owner = nullptr;
-        TLBlockCache* l1 = nullptr;
-        L1Counters* counters = nullptr;
+    // Per-worker aligned staging buffer for batched pread (was thread_local
+    // g_staging). 1MB aligned to kDiskAlign for O_DIRECT.
+    struct alignas(kDiskAlign) AlignedStaging {
+        static constexpr size_t kCapacity =
+            kBlockSize * PagedNodeStore::kBlocksPerRead;
+        uint8_t data[kCapacity];
     };
-    static thread_local TLFastPath tl_fast_;
-
-    /// Returns this thread's TLBlockCache for this store (lazily allocated).
-    TLBlockCache& tl_cache() const;
+    AlignedStaging staging_;
 
     PinResult get_node_block(uint64_t block_idx);
     PinResult get_code_block(uint64_t block_idx);
@@ -262,8 +198,7 @@ private:
     /// code_cache_).
     PinResult batched_read(DirectFile& file, uint32_t block_size,
                            uint64_t block_idx, uint64_t key_base,
-                           std::atomic<uint64_t>& counter,
-                           BlockCache& cache);
+                           uint64_t& counter, BlockCache& cache);
 };
 
 }  // namespace sextant

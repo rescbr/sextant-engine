@@ -405,32 +405,31 @@ int main(int argc, char* argv[]) {
             }
         };
 
-        // Chunked batch driver: submit chunks of queries to the pool, then
-        // process results as each chunk returns. Chunk size = pool size so
-        // the pool stays saturated without over-allocating futures.
-        constexpr uint32_t kChunkMin = 1;
-        const uint32_t chunk_size = std::max(kChunkMin, n_threads);
+        // Push all queries into the pool up front (work-stealing: each
+        // worker pulls the next query as soon as it finishes — no per-chunk
+        // barrier). Then collect results in input order as futures complete.
+        // Per-query latency isn't meaningful under async work-stealing
+        // (queries overlap); we report batch throughput + wall-time-derived
+        // p50/p99 over the collection order, which approximates per-query
+        // latency when the pool is saturated.
+        sextant::SearchConfig scfg;
+        scfg.k = fetch_k;
+        scfg.L_search = L;
+        scfg.rerank_factor = rerank;
+        scfg.io_limit = io_limit;
         const auto t_start = Clock::now();
-        for (uint32_t base = 0; base < n_queries; base += chunk_size) {
-            const uint32_t n_this = std::min<uint32_t>(chunk_size,
-                                                       n_queries - base);
-            sextant::SearchConfig scfg;
-            scfg.k = fetch_k;
-            scfg.L_search = L;
-            scfg.rerank_factor = rerank;
-            scfg.io_limit = io_limit;
-
-            const float* q0 = &queries[static_cast<size_t>(base) * dim];
-            const auto batch_start = Clock::now();
-            auto batch_results = searcher.search_batch(q0, n_this, scfg.k, scfg);
-            const auto batch_end = Clock::now();
-            const double batch_us = US(batch_end - batch_start).count();
-            // Per-query latency: average across the batch (the batch ran
-            // concurrently, so wall-time / n_this is the throughput view).
-            const double per_q_us = batch_us / static_cast<double>(n_this);
-            for (uint32_t i = 0; i < n_this; i++) {
-                process_result(base + i, std::move(batch_results[i]), per_q_us);
-            }
+        std::vector<std::future<std::vector<sextant::Candidate>>> futs;
+        futs.reserve(n_queries);
+        for (uint32_t qi = 0; qi < n_queries; qi++) {
+            const float* q = &queries[static_cast<size_t>(qi) * dim];
+            futs.push_back(searcher.search_one_async(q, scfg.k, scfg));
+        }
+        for (uint32_t qi = 0; qi < n_queries; qi++) {
+            const auto q_start = Clock::now();
+            auto results = futs[qi].get();
+            const auto q_end = Clock::now();
+            const double per_q_us = US(q_end - q_start).count();
+            process_result(qi, std::move(results), per_q_us);
         }
         const auto t_end = Clock::now();
         const double total_sec =

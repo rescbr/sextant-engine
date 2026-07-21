@@ -58,6 +58,9 @@ struct Index {
     ResolvedParams params{};
     std::vector<uint32_t> entry_points;
     std::string path;  ///< Index directory/path prefix (no extension).
+    /// Cache budget resolved by Index::read (cache_size_override or auto from
+    /// index size + physical RAM). Searcher splits this across its N workers.
+    uint64_t cache_size_bytes = 0;
 
     // --- Index data + search core ---
     std::unique_ptr<PqQuantizer> quantizer;
