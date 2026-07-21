@@ -1017,11 +1017,10 @@ void VamanaCore::compute_entry_points() {
 // resolve each to its table row_id here.
 // ===========================================================================
 
-std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
+std::vector<Candidate> VamanaCore::search(const BeamQuery& q, uint32_t k,
                                            uint32_t L_search,
                                            uint32_t io_limit,
-                                           VamanaTLS& tls,
-                                           const float16_t* query_fp16) const {
+                                           VamanaTLS& tls) const {
     if (count_ == 0 || k == 0) {
         return {};
     }
@@ -1041,10 +1040,7 @@ std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
         tls.search_count_for_resize = count_;
     }
 
-    BeamQuery sq;
-    sq.query_lut = query_lut;
-    sq.query_fp16 = query_fp16;
-    auto cands = beam_search(sq, L_search, io_limit, tls);
+    auto cands = beam_search(q, L_search, io_limit, tls);
     if (cands.size() > k) {
         cands.resize(k);
     }

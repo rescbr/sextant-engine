@@ -298,10 +298,14 @@ public:
     /// (owned by the pool worker, NOT a thread_local global — eliminates
     /// cross-instance aliasing and lets a single Searcher fan queries out
     /// across multiple VamanaTLS instances).
-    std::vector<Candidate> search(const float* query_lut, uint32_t k,
+    /// Search: top-k candidates. The caller supplies the per-worker `tls`
+    /// (owned by the pool worker, NOT a thread_local global — eliminates
+    /// cross-instance aliasing and lets a single Searcher fan queries out
+    /// across multiple VamanaTLS instances). `q` bundles the LUT + optional
+    /// FP16 query (see BeamQuery).
+    std::vector<Candidate> search(const BeamQuery& q, uint32_t k,
                                    uint32_t L_search, uint32_t io_limit,
-                                   VamanaTLS& tls,
-                                   const float16_t* query_fp16 = nullptr) const;
+                                   VamanaTLS& tls) const;
 
     // --- Node accessors (flat buffer layout) ---
     static RowId get_row_id(const uint8_t* node);

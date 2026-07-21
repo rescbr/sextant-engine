@@ -313,27 +313,17 @@ public:
     /// well within its tolerance.
     void record_access(bool hit);
 
-    /// Flush this cache's pending samples to the shared atomics. With
-    /// per-worker cache ownership (Layer 3) the flush is trivial — the
-    /// counters live on the cache itself — but kept for explicit teardown
-    /// points (tests).
+    /// Flush this thread's pending samples for this cache to the shared
+    /// atomics. Only needed at explicit teardown points (tests that destroy
+    /// a BlockCache on a thread that may have pending samples); in normal
+    /// operation the per-call flush every 64 samples is sufficient.
     void flush_thread_local();
 
     /// Mask used to determine when to flush: flush when
     /// `(local_hits + local_misses) & kFlushMask == 0`. Power of two minus 1.
     static constexpr uint64_t kFlushMask = 63;
 
-    // --- accessors used by CacheShard (Layer 4 §1.2: friend removed) -------
-    // The cache and its shards are tightly coupled by design (the shards
-    // feed hit/miss samples to the cache-level hill-climber; the cache
-    // bumps per-shard epochs on resize). These were previously private with
-    // a mutual friend declaration — but that gave no encapsulation benefit
-    // since the two classes are always used together. Exposed publicly so
-    // the friend tangle is gone and the contract is explicit.
-
-    /// Per-shard epoch counter access. Incremented when a block is evicted
-    /// from that specific shard. Declared BEFORE shards_ so epochs outlive
-    /// the shards during destruction.
+    // --- accessor used by CacheShard (Layer 4 §1.2: friend removed) --------
     std::atomic<uint64_t>& shard_epoch_slot(uint32_t shard_idx) {
         return shard_epochs_[shard_idx];
     }
@@ -376,19 +366,24 @@ private:
     double hc_prev_hit_rate_ = 0.0;
     double hc_step_size_ = 0.0;
 
-    // --- per-worker sample accumulation (Layer 3: was thread_local map) -----
-    // Per-worker accumulation buffer. `record_access` bumps these (no atomics
-    // — single-threaded per worker) and flushes to the shared
-    // `hc_hits_in_sample_` / `hc_misses_in_sample_` every 64 calls.
+    // --- thread-local sample accumulation (see record_access comment) --------
+    // Per-thread, per-BlockCache accumulation buffer. `record_access` bumps
+    // these (no atomics — thread_local is implicitly thread-private) and
+    // flushes to the shared `hc_hits_in_sample_` / `hc_misses_in_sample_`
+    // every 64 calls. Keyed by `this` because a thread may search against
+    // multiple BlockCache instances (graph_cache_ + code_cache_) over its
+    // lifetime and the hill-climber signal must not conflate them.
     //
-    // alignas(64): padding prevents false-sharing between distinct worker
-    // caches when several BlockCaches happen to sit in adjacent heap slots.
-    // (Each is single-threaded, but cheap insurance against aliasing.)
+    // alignas(64): padding prevents false-sharing between distinct
+    // HotCounters entries when the thread_local allocator packs them
+    // into adjacent slots. (Per-thread, so technically already isolated,
+    // but the padding is cheap insurance against aliasing surprises.)
     struct alignas(64) HotCounters {
         uint64_t local_hits = 0;
         uint64_t local_misses = 0;
     };
-    HotCounters hot_counters_;
+    static thread_local std::unordered_map<const BlockCache*, HotCounters>
+        tl_hot_counters_;
 };
 
 }  // namespace sextant

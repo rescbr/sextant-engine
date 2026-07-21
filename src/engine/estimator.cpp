@@ -253,8 +253,9 @@ Estimator::SearchQuality Estimator::measure_search_(
 
         // Production-style search: index_->core->search returns candidates ranked by
         // PQ LUT distance. We over-fetch k+rerank candidates.
-        auto results = mini.core->search(lut.data(), fetch_k, L, /*io_limit=*/0,
-                                          tls);
+        BeamQuery eq;
+        eq.query_lut = lut.data();
+        auto results = mini.core->search(eq, fetch_k, L, /*io_limit=*/0, tls);
         if (results.empty()) continue;
 
         // Rerank by true L2sq distance computed from the FP32 sample buffer.
