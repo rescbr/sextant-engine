@@ -228,7 +228,7 @@ void MemGraph::materialize(const uint8_t* nodes, const uint8_t* codes) {
     collected_.shrink_to_fit();
 }
 
-const float16_t* MemGraph::fp16_ptr(uint32_t id) const {
+const float16_t* MemGraph::precise_vec(uint32_t id) const {
     if (fp16_data_.empty() || dim_ == 0) return nullptr;
     const uint32_t local = (id < id_to_local_.size())
         ? id_to_local_[id]

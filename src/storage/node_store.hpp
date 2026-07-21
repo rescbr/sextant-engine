@@ -56,12 +56,22 @@ public:
     /// with a paged backing store). Used to gate DynamicWidth.
     virtual bool is_paged() const = 0;
 
-    /// FP16 vector for this node, if available (MemGraph ball nodes). Returns
-    /// nullptr if no FP16 data is stored for this node (the default —
-    /// PagedNodeStore and FlatNodeStore don't have FP16). When non-null,
-    /// beam_search uses l2sq_f16 instead of PQ lut_distance for this node
-    /// (hybrid precision: FP16 in the approach phase, PQ in the converge phase).
-    virtual const float16_t* fp16_ptr(uint32_t id) const { (void)id; return nullptr; }
+    /// Optional: return a higher-precision vector for `id` if the store has
+    /// one (e.g. MemGraph caches FP16 "ball" vectors for the entry-point
+    /// neighborhood). Default: no precise vector (PQ-only path).
+    ///
+    /// Contract: this is a *policy hook* — the store advertises "I can give
+    /// you a more precise vector for this node" and the algorithm decides
+    /// whether to use it. The actual storage format (FP16, FP32, ...) is
+    /// private to the store; the algorithm only needs the typed pointer and
+    /// the dim (from VamanaParams).
+    ///
+    /// VamanaCore's dist_to lambda uses this to switch between PQ LUT
+    /// distance (default) and direct L2sq on the precise vector when the
+    /// query also has a precise (FP16) form — the "hybrid FP16+PQ" path.
+    virtual const float16_t* precise_vec(uint32_t id) const {
+        (void)id; return nullptr;
+    }
 };
 
 /// Flat buffer backing. Used during build and for small indices at search.

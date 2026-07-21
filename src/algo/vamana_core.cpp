@@ -260,7 +260,7 @@ void VamanaCore::beam_search_into(
     // path. Priority among PQ modes: anchor_lut > hdc_anchor > query_lut.
     auto dist_to = [&](uint32_t id) {
         if (query_fp16 && store_) {
-            const float16_t* fp16 = store_->fp16_ptr(id);
+            const float16_t* fp16 = store_->precise_vec(id);
             if (fp16) {
                 return l2sq_f16(query_fp16, fp16, params_.dim);
             }
