@@ -171,9 +171,22 @@ public:
     uint64_t evictions_admitted() const { return evictions_admitted_.load(std::memory_order_relaxed); }
     uint64_t evictions_rejected() const { return evictions_rejected_.load(std::memory_order_relaxed); }
 
-private:
-    friend class BlockCache;
+    // --- cache-coupling accessors (Layer 4 §1.2: was friend-only) ----------
+    // The cache's hill-climber writes these without holding the shard lock;
+    // maybe_adapt reconciles the entry lists on the next operation.
+    void set_window_limits(uint32_t max_window, uint32_t max_protected) {
+        max_window_.store(max_window, std::memory_order_relaxed);
+        max_protected_.store(max_protected, std::memory_order_relaxed);
+    }
 
+    /// Resize this shard to `new_capacity` blocks. The caller MUST hold mu_.
+    /// Evicts excess entries (window LRU first, then probation, then protected)
+    /// until map_.size() <= capacity_, recomputes the window/protected limits,
+    /// and calls maybe_adapt() to reconcile. If new_capacity == 0, evicts ALL
+    /// entries.
+    void resize(uint32_t new_capacity);
+
+private:
     void on_window_hit(LRUEntry* e);
     void on_probation_hit(LRUEntry* e);
     void on_protected_hit(LRUEntry* e);
@@ -184,13 +197,6 @@ private:
     /// atomic limits (which the cache's hill-climber may have changed since
     /// the last operation). Called under mu_ from lookup()/insert().
     void maybe_adapt();
-
-    /// Resize this shard to `new_capacity` blocks. The caller MUST hold mu_.
-    /// Evicts excess entries (window LRU first, then probation, then protected)
-    /// until map_.size() <= capacity_, recomputes the window/protected limits,
-    /// and calls maybe_adapt() to reconcile. If new_capacity == 0, evicts ALL
-    /// entries.
-    void resize(uint32_t new_capacity);
 
     // Fast xorshift RNG for anti-starvation admission on frequency ties.
     uint32_t hc_rng_state_ = 0x12345678u;
@@ -317,9 +323,22 @@ public:
     /// `(local_hits + local_misses) & kFlushMask == 0`. Power of two minus 1.
     static constexpr uint64_t kFlushMask = 63;
 
-private:
-    friend class CacheShard;
+    // --- accessors used by CacheShard (Layer 4 §1.2: friend removed) -------
+    // The cache and its shards are tightly coupled by design (the shards
+    // feed hit/miss samples to the cache-level hill-climber; the cache
+    // bumps per-shard epochs on resize). These were previously private with
+    // a mutual friend declaration — but that gave no encapsulation benefit
+    // since the two classes are always used together. Exposed publicly so
+    // the friend tangle is gone and the contract is explicit.
 
+    /// Per-shard epoch counter access. Incremented when a block is evicted
+    /// from that specific shard. Declared BEFORE shards_ so epochs outlive
+    /// the shards during destruction.
+    std::atomic<uint64_t>& shard_epoch_slot(uint32_t shard_idx) {
+        return shard_epochs_[shard_idx];
+    }
+
+private:
     /// Compute a new window ratio from the accumulated sample and write it to
     /// every shard's atomic limits (no shard locks acquired).
     void climb();

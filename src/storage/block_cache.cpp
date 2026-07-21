@@ -51,7 +51,7 @@ void CacheShard::free_entry(LRUEntry* e) {
     // stale. Per-shard (not global): an eviction in shard K only invalidates
     // L1 entries from shard K.
     if (cache_) {
-        cache_->shard_epochs_[shard_index_].fetch_add(1,
+        cache_->shard_epoch_slot(shard_index_).fetch_add(1,
             std::memory_order_relaxed);
     }
     auto it = map_.find(e->block_idx);
@@ -495,8 +495,7 @@ void BlockCache::climb() {
     uint32_t max_protected = (hc_per_shard_capacity_ - max_window) * 80 / 100;
 
     for (auto& shard : shards_) {
-        shard->max_window_.store(max_window, std::memory_order_relaxed);
-        shard->max_protected_.store(max_protected, std::memory_order_relaxed);
+        shard->set_window_limits(max_window, max_protected);
     }
 }
 
