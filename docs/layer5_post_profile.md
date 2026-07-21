@@ -80,10 +80,28 @@ page cache already absorb the working set.
 
 | Lever | Mechanism | Expected impact | Effort |
 |---|---|---|---|
-| Raise PQ-only recall ceiling | Better quantization (the docs trail: anisotropic was a negative result; OPQ shipped) | Eliminates 12% rerank tax, +1.0 pp recall ceiling → closer to 0.95 peer target | Large |
+| Raise PQ-only recall ceiling | Better quantization | Eliminates 12% rerank tax, +1.0 pp recall ceiling → closer to 0.95 peer target | Large |
 | `beam_search_into` SIMD wins | Tighter neighbor-list distance batching, prefetch ahead of LUT gather | 5-15% on the 32% hot spot | Medium |
 | Cache-miss path | `batched_read` 1.3% — not worth attacking | <1% | Skip |
 | `preprocess_query` | Already cheap (2.5%); the LUT materialization is the cost | 1-2% | Small |
+
+### Note on "raise the PQ-only ceiling"
+
+This index was built with **plain PQ (OPQ off)**. The `pq_opq` flag exists and
+works, but per `docs/quantization_findings.md` OPQ was already validated at
+1.34M scale: **+0 pp recall** (0.7300 → 0.7300). The +1.03pp gain on arxiv100k
+does not transfer — concentration-of-measure at scale makes the ceiling a
+structural problem, not a codebook problem. **Do not re-run with `--pq-opq 1`
+expecting a recall change.**
+
+The structural levers (none implemented):
+- **ScaNN-style anisotropic objective** — prototyped, negative result (see
+  `docs/quantization_findings.md` §1).
+- **SymphonyQG-style two-level quantization** (coarse PQ → fine refinement
+  without reading FP32 vectors) — untried. Would eliminate the FP32 rerank
+  bandwidth cost entirely.
+- **Higher m or 10-bit PQ** — increases code size (more I/O) but is the
+  brute-force way to push the ceiling.
 
 ## Files
 - `perf_rr1.data` — perf record at rerank=1, `--delay 2000` to exclude setup
