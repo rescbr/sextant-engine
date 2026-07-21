@@ -99,25 +99,56 @@ TEST(TLBlockCache, LookupMiss) {
 // Unit: FIFO replacement. After kCapacity+1 inserts, the oldest entry is
 // evicted (miss) and the newest is still present (hit).
 // ---------------------------------------------------------------------------
-TEST(TLBlockCache, FIFOReplacement) {
+// Layer 4 (2026-07-21): TLBlockCache switched from FIFO linear-scan to
+// direct-mapped hash-indexed. Replacement is now "overwrite the slot the
+// key hashes to" — not FIFO. This test verifies the direct-mapped contract:
+// inserting a key evicts whatever previously occupied that key's slot.
+// ---------------------------------------------------------------------------
+TEST(TLBlockCache, DirectMappedReplacement) {
     TLBlockCache cache;
-    std::array<uint8_t, kBlockSize> backing{};
+    std::array<uint8_t, kBlockSize> backing_a{};
+    std::array<uint8_t, kBlockSize> backing_b{};
     const uint64_t epoch = 0;
 
-    // Fill all slots with distinct keys 0..kCapacity-1.
-    for (uint32_t i = 0; i < TLBlockCache::kCapacity; i++) {
-        cache.insert(i, backing.data(), epoch);
-    }
-    // All should still be present.
-    for (uint32_t i = 0; i < TLBlockCache::kCapacity; i++) {
-        EXPECT_NE(cache.lookup(i, epoch), nullptr) << "key " << i << " should be cached";
-    }
+    // Insert key 100.
+    cache.insert(100, backing_a.data(), epoch);
+    ASSERT_NE(cache.lookup(100, epoch), nullptr);
 
-    // Insert one more — this evicts key 0 (FIFO: slot 0 was first).
-    cache.insert(TLBlockCache::kCapacity, backing.data(), epoch);
-    EXPECT_EQ(cache.lookup(0, epoch), nullptr)
-        << "key 0 should have been evicted by FIFO replacement";
-    EXPECT_NE(cache.lookup(TLBlockCache::kCapacity, epoch), nullptr);
+    // Find another key that hashes to the same slot. With the multiplicative
+    // hash, key 100 + kCapacity may not collide, so we search for a key that
+    // does. We use the public hash() to find a colliding partner.
+    const uint32_t slot_100 = TLBlockCache::hash(100) & TLBlockCache::kMask;
+    uint64_t collision_key = 0;
+    for (uint64_t k = 101; k < 100000; ++k) {
+        if ((TLBlockCache::hash(k) & TLBlockCache::kMask) == slot_100) {
+            collision_key = k;
+            break;
+        }
+    }
+    ASSERT_NE(collision_key, 0u) << "no colliding key found within search range";
+
+    // Inserting the colliding key MUST evict key 100 (same slot).
+    cache.insert(collision_key, backing_b.data(), epoch);
+    EXPECT_EQ(cache.lookup(100, epoch), nullptr)
+        << "key 100 should have been evicted (same slot as " << collision_key << ")";
+    EXPECT_NE(cache.lookup(collision_key, epoch), nullptr);
+
+    // A non-colliding key should NOT evict key 100's slot — but since 100 was
+    // already evicted, we re-insert and verify a non-colliding insert preserves it.
+    cache.insert(100, backing_a.data(), epoch);
+    // Find a key that does NOT collide with slot_100.
+    uint64_t other_key = 0;
+    for (uint64_t k = 101; k < 100000; ++k) {
+        if ((TLBlockCache::hash(k) & TLBlockCache::kMask) != slot_100) {
+            other_key = k;
+            break;
+        }
+    }
+    ASSERT_NE(other_key, 0u);
+    cache.insert(other_key, backing_b.data(), epoch);
+    EXPECT_NE(cache.lookup(100, epoch), nullptr)
+        << "key 100 should still be cached (different slot from " << other_key << ")";
+    EXPECT_NE(cache.lookup(other_key, epoch), nullptr);
 }
 
 // ---------------------------------------------------------------------------
