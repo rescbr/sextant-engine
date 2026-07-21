@@ -296,8 +296,10 @@ TEST(VamanaCore, BeamSearchForcedEntry) {
     const uint32_t lut_sz = g.quant.lut_size();
     std::vector<float> lut(lut_sz, 0.0f);
     std::vector<uint32_t> eps = {5};
-    auto results = g.core->beam_search(lut.data(), /*L=*/10, /*io_limit=*/0,
-                                       tls, &eps);
+    sextant::BeamQuery bq;
+    bq.query_lut = lut.data();
+    bq.forced_entry_points = &eps;
+    auto results = g.core->beam_search(bq, /*L=*/10, /*io_limit=*/0, tls);
     // At minimum, the forced entry point is in the working set.
     ASSERT_GE(results.size(), 1u);
     // With the stub quantizer all distances are 0; the entry point should be
@@ -332,7 +334,9 @@ TEST(VamanaCore, BeamSearchDynamicWidth) {
     const uint32_t lut_sz = g.quant.lut_size();
     std::vector<float> lut(lut_sz, 0.0f);
     // L larger than R so DynamicWidth's L_current starts at max(R, L/4)=R.
-    auto results = g.core->beam_search(lut.data(), /*L=*/32, /*io_limit=*/0, tls);
+    sextant::BeamQuery bq;
+    bq.query_lut = lut.data();
+    auto results = g.core->beam_search(bq, /*L=*/32, /*io_limit=*/0, tls);
     ASSERT_GE(results.size(), 1u);
     // All returned candidates must be valid internal ids.
     for (const auto& c : results) {

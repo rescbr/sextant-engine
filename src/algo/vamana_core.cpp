@@ -208,23 +208,22 @@ void VamanaCore::set_neighbor(uint8_t* node, uint32_t i, uint32_t val) {
 // ===========================================================================
 
 std::vector<Candidate> VamanaCore::beam_search(
-    const float* query_lut, uint32_t L, uint32_t io_limit, VamanaTLS& tls,
-    const std::vector<uint32_t>* forced_entry_points,
-    const uint8_t* hdc_anchor,
-    const float* anchor_lut,
-    const float16_t* query_fp16) const {
+    const BeamQuery& q, uint32_t L, uint32_t io_limit, VamanaTLS& tls) const {
     std::vector<Candidate> out;
-    beam_search_into(out, query_lut, L, io_limit, tls, forced_entry_points,
-                     hdc_anchor, anchor_lut, query_fp16);
+    beam_search_into(out, q, L, io_limit, tls);
     return out;
 }
 
 void VamanaCore::beam_search_into(
-    std::vector<Candidate>& out, const float* query_lut, uint32_t L,
-    uint32_t io_limit, VamanaTLS& tls,
-    const std::vector<uint32_t>* forced_entry_points,
-    const uint8_t* hdc_anchor, const float* anchor_lut,
-    const float16_t* query_fp16) const {
+    std::vector<Candidate>& out, const BeamQuery& q,
+    uint32_t L, uint32_t io_limit, VamanaTLS& tls) const {
+    const float* query_lut = q.query_lut;
+    const float16_t* query_fp16 = q.query_fp16;
+    const uint8_t* hdc_anchor = q.hdc_anchor;
+    const float* anchor_lut = q.anchor_lut;
+    const std::vector<uint32_t>* forced_entry_points = q.forced_entry_points;
+    (void)query_lut; (void)query_fp16; (void)hdc_anchor;
+    (void)anchor_lut; (void)forced_entry_points;  // captured by dist_to below
     out.clear();
     if (count_ == 0 || L == 0) {
         return;
@@ -960,11 +959,12 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     // beam_search_into writes candidates (ascending distance) into
     // tls.search_result. robust_prune can skip the sort (presorted=true, Opt 2)
     // since beam_search drains a max-heap then reverses → ascending.
-    beam_search_into(tls.search_result, query_lut, L_build,
-                     0 /* io_limit=0 → unlimited */, tls,
-                     /*forced_entry_points=*/nullptr,
-                      /*hdc_anchor=*/hdc_anchor,
-                     /*anchor_lut=*/anchor_lut);
+    BeamQuery probe;
+    probe.query_lut = query_lut;
+    probe.hdc_anchor = hdc_anchor;
+    probe.anchor_lut = anchor_lut;
+    beam_search_into(tls.search_result, probe, L_build,
+                     0 /* io_limit=0 → unlimited */, tls);
 
     // FP16 prune hybrid: pass the insert point's float vector to
     // robust_prune_into so the occlusion check uses FP16 L2sq instead of PQ
@@ -1041,11 +1041,10 @@ std::vector<Candidate> VamanaCore::search(const float* query_lut, uint32_t k,
         tls.search_count_for_resize = count_;
     }
 
-    auto cands = beam_search(query_lut, L_search, io_limit, tls,
-                              /*forced_entry_points=*/nullptr,
-                              /*hdc_anchor=*/nullptr,
-                              /*anchor_lut=*/nullptr,
-                              query_fp16);
+    BeamQuery sq;
+    sq.query_lut = query_lut;
+    sq.query_fp16 = query_fp16;
+    auto cands = beam_search(sq, L_search, io_limit, tls);
     if (cands.size() > k) {
         cands.resize(k);
     }

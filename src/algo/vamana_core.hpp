@@ -195,6 +195,40 @@ struct BuildContext {
     }
 };
 
+/// Per-query parameters for beam_search / beam_search_into (Layer 4 §8.1).
+///
+/// Bundles the four optional pointers that previously made beam_search_into
+/// an 8-param signature. Each field is independently optional (null) and
+/// gates a different distance-computation mode:
+///
+///   **Search path** (called by search()):
+///   - `query_lut`     — PQ lookup table (m*K floats). Always set.
+///   - `query_fp16`    — when non-null AND the store exposes FP16 vectors
+///                       for the candidate node (MemGraph ball nodes),
+///                       distances use l2sq_f16 instead of PQ lut_distance
+///                       (hybrid FP16+PQ precision).
+///
+///   **Build path** (called by insert_build_core):
+///   - `query_lut`     — generic PQ LUT (default build mode).
+///   - `hdc_anchor`    — when non-null, distances are computed via direct
+///                       code-to-code lookup (code_distance) instead of the
+///                       materialized LUT. Skips the 32KB LUT gather.
+///   - `anchor_lut`    — when non-null, takes priority over both query_lut
+///                       and hdc_anchor: distances are gathered from this
+///                       8KB per-anchor LUT (L1-resident) via lut_distance.
+///
+///   **Common**:
+///   - `forced_entry_points` — when non-null, overrides the core's own
+///                             entry_points_ (used by partitioned builds
+///                             and tests).
+struct BeamQuery {
+    const float* query_lut = nullptr;
+    const float16_t* query_fp16 = nullptr;
+    const uint8_t* hdc_anchor = nullptr;
+    const float* anchor_lut = nullptr;
+    const std::vector<uint32_t>* forced_entry_points = nullptr;
+};
+
 /// The Vamana graph core. Owns the flat-in-RAM node buffer and codes buffer
 /// during build, and references BlockCache during search.
 class VamanaCore {
@@ -220,34 +254,17 @@ public:
     void insert_build_core(uint32_t internal_id, RowId row_id, VamanaTLS& tls);
 
     /// BeamSearch from entry points. Returns candidates.
-    /// When `hdc_anchor` is non-null, distances are computed via direct
-    /// code-to-code lookup (code_distance) instead of the materialized LUT.
-    /// This skips the 32KB LUT gather, trading scattered table reads for
-    /// zero memcpy. Only valid in HDC build mode (anchor is a PQ code).
     ///
-    /// When `anchor_lut` is non-null, it takes priority over both `query_lut`
-    /// and `hdc_anchor`: distances are gathered from the 8KB per-anchor LUT
-    /// (L1-resident) via lut_distance, which is contiguous and cache-friendly.
-    std::vector<Candidate> beam_search(const float* query_lut, uint32_t L,
-                                       uint32_t io_limit, VamanaTLS& tls,
-                                       const std::vector<uint32_t>* forced_entry_points = nullptr,
-                                       const uint8_t* hdc_anchor = nullptr,
-                                       const float* anchor_lut = nullptr,
-                                       const float16_t* query_fp16 = nullptr) const;
+    /// `q` bundles the query inputs (LUT + optional FP16/HDC anchor/forced
+    /// entry points). See BeamQuery for the distance-mode taxonomy.
+    std::vector<Candidate> beam_search(const BeamQuery& q, uint32_t L,
+                                        uint32_t io_limit, VamanaTLS& tls) const;
 
     /// BeamSearch writing into `out` (cleared; capacity retained). Build path
     /// uses this to avoid per-insert heap allocation.
-    ///
-    /// When `query_fp16` is non-null AND the store exposes FP16 vectors for a
-    /// node (NodeStore::fp16_ptr), distances use l2sq_f16 instead of PQ
-    /// lut_distance for that node (hybrid FP16+PQ precision).
-    void beam_search_into(std::vector<Candidate>& out,
-                          const float* query_lut, uint32_t L,
-                          uint32_t io_limit, VamanaTLS& tls,
-                          const std::vector<uint32_t>* forced_entry_points = nullptr,
-                           const uint8_t* hdc_anchor = nullptr,
-                          const float* anchor_lut = nullptr,
-                          const float16_t* query_fp16 = nullptr) const;
+    void beam_search_into(std::vector<Candidate>& out, const BeamQuery& q,
+                          uint32_t L, uint32_t io_limit,
+                          VamanaTLS& tls) const;
 
     /// RobustPrune: select R neighbors from candidates with occlusion.
     /// Writes the kept candidates into `out` (cleared; capacity retained).
