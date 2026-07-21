@@ -132,10 +132,10 @@ std::unique_ptr<Index> Estimator::build_mini_(const float* sample,
         mini->node_size, mini->code_size);
     mini->core->set_store(mini->flat_store.get());
     mini->core->set_build_vecs(mini->raw_vecs_buffer);
+    VamanaCore::BuildVecLoan build_vec_loan(*mini->core);
 
     b.parallel_construct(mp);
 
-    mini->core->set_build_vecs(nullptr);
     mini->core->compute_entry_points();
 
     return mini;

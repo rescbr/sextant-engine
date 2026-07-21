@@ -357,6 +357,31 @@ public:
         }
     }
 
+    /// RAII scope guard: clears the build-vec pointer on destruction so the
+    /// core doesn't hold a dangling pointer after the borrower's buffer goes
+    /// away. Use around the lifetime of a raw_vecs_buffer handed to set_build_vecs:
+    ///
+    ///     {
+    ///         core.set_build_vecs(buf);
+    ///         VamanaCore::BuildVecLoan loan(*core);
+    ///         parallel_construct(...);   // may throw — loan still clears
+    ///     }                              // buf pointer cleared here
+    ///
+    /// This is a clarity/maintenance guard only: the current call sites are
+    /// already correct by construction (parallel_construct completes before
+    /// the owner's buffer is freed), but the loan documents the invariant in
+    /// the type system and closes the window if future code throws between
+    /// set_build_vecs and the manual set_build_vecs(nullptr).
+    class BuildVecLoan {
+    public:
+        explicit BuildVecLoan(VamanaCore& core) : core_(core) {}
+        ~BuildVecLoan() { core_.set_build_vecs(nullptr); }
+        BuildVecLoan(const BuildVecLoan&) = delete;
+        BuildVecLoan& operator=(const BuildVecLoan&) = delete;
+    private:
+        VamanaCore& core_;
+    };
+
     /// Pointer to the raw FP16 vector for `internal_id` (FP16 prune).
     /// Only valid when set_build_vecs() has been called with a count×dim buffer.
     const float16_t* build_vec_ptr(uint32_t internal_id) const {

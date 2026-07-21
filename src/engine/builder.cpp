@@ -752,11 +752,10 @@ BuildResult Builder::build_partitioned(VectorSource& source,
         index_.core->set_store(index_.flat_store.get());
 
         index_.core->set_build_vecs(index_.raw_vecs_buffer);
+        VamanaCore::BuildVecLoan build_vec_loan(*index_.core);
 
         parallel_construct(params);
-
-        // Raw vectors are no longer needed after construct (for K=1).
-        index_.core->set_build_vecs(nullptr);
+        // Raw vectors cleared by build_vec_loan destructor (K=1 no longer needs them).
     } else {
     // =====================================================================
     // K>1 partitioned path: partition → per-shard build (R_shard=2R/3) → merge.
