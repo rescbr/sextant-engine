@@ -1728,4 +1728,169 @@ void Builder::flush() {
     spdlog::info("[sextant] flush: sidecars rewritten (count={})", index_.count);
 }
 
+// =============================================================================
+// prepare_codes — pass1 (reservoir + PQ train) + pass2 (encode) only.
+// Leaves codes_buffer + raw_vecs_buffer populated for tools that want to
+// experiment with partitioning without a full merged-graph build.
+// =============================================================================
+void Builder::prepare_codes(VectorSource& source, const ResolvedParams& params) {
+    index_.count = source.count();
+    index_.dim = source.dim();
+    if (index_.count == 0) {
+        throw Error(ErrorCode::InvalidParam, "prepare_codes: source is empty");
+    }
+    if (index_.dim == 0) {
+        throw Error(ErrorCode::InvalidParam, "prepare_codes: source has dim=0");
+    }
+    // pass1 trains the quantizer and sets index_.code_size.
+    pass1_sample_and_train(source, params);
+    index_.node_size = VamanaCore::static_node_size(params.R, index_.code_size);
+
+    // Allocate flat codes + raw_vecs buffers (mirrors build_partitioned, but
+    // skips nodes_buffer — caller is not constructing a graph here).
+    const size_t codes_bytes = static_cast<size_t>(index_.count) * index_.code_size;
+    AlignedBuf codes(kDiskAlign, codes_bytes);
+    std::memset(codes.get(), 0, codes_bytes);
+    index_.codes_buffer = codes.as<uint8_t>();
+    codes.release();
+
+    const size_t vecs_bytes =
+        static_cast<size_t>(index_.count) * index_.dim * sizeof(float16_t);
+    AlignedBuf vecs(kDiskAlign, vecs_bytes);
+    index_.raw_vecs_buffer = vecs.as<float16_t>();
+    vecs.release();
+    spdlog::info("[sextant] prepare_codes: allocated {:.1f}MB codes + {:.1f}MB FP16",
+                 codes_bytes / 1e6, vecs_bytes / 1e6);
+
+    // Load raw vectors as FP16 for the FP16 prune (same as build_partitioned).
+    source.reset();
+    Chunk chunk{};
+    uint64_t loaded = 0;
+    while (source.next(chunk)) {
+        for (uint32_t r = 0; r < chunk.count; r++) {
+            const RowId rid = chunk.row_ids[r];
+            if (rid >= 0 && static_cast<uint64_t>(rid) < index_.count) {
+                float16_t* dst = index_.raw_vecs_buffer +
+                                 static_cast<size_t>(rid) * index_.dim;
+                const float* src = chunk.vectors +
+                                   static_cast<size_t>(r) * index_.dim;
+                for (uint32_t d = 0; d < index_.dim; d++) {
+                    dst[d] = static_cast<float16_t>(src[d]);
+                }
+                loaded++;
+            }
+        }
+    }
+    spdlog::info("[sextant] prepare_codes: loaded {} FP16 vectors", loaded);
+
+    pass2_encode(source, params);
+}
+
+// =============================================================================
+// build_shards_unmerged — IVF-probe measurement helper.
+// Builds K independent Vamana graphs (one per k-means shard) and returns them
+// in-memory WITHOUT merging. Used to measure the cross-shard-edge recall loss
+// vs the merged-graph baseline. See docs/optimization_levers_and_attribution.md
+// lever #1.
+// =============================================================================
+std::vector<Builder::ShardOutput> Builder::build_shards_unmerged(
+    const ResolvedParams& params, uint32_t K, float closure_factor_override) {
+    if (index_.codes_buffer == nullptr || index_.count == 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_shards_unmerged: Index has no encoded codes "
+                    "(run pass1_sample_and_train + pass2_encode first)");
+    }
+    if (K < 2) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_shards_unmerged: K must be >= 2");
+    }
+    const uint32_t n = static_cast<uint32_t>(index_.count);
+    const float cf = closure_factor_override > 0.0f
+                         ? closure_factor_override
+                         : params.closure_factor;
+
+    // --- 1. Partition via k-means on PQ codes (closure_factor overlap) ---
+    ResolvedParams shard_params = params;
+    shard_params.partition_count = K;
+    shard_params.closure_factor = cf;
+    auto assignment = partition_codes(*index_.quantizer, index_.codes_buffer,
+                                       n, index_.code_size, K, cf);
+    if (assignment.shards.size() != K) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_shards_unmerged: partition returned wrong K");
+    }
+
+    // Per-shard Vamana uses R_shard = 2R/3 (same as build_partitioned).
+    const uint16_t R_shard = static_cast<uint16_t>(
+        std::max<uint32_t>(8u, (2u * params.R) / 3u));
+    const uint32_t shard_node_size =
+        VamanaCore::static_node_size(R_shard, index_.code_size);
+    spdlog::info("[sextant] build_shards_unmerged: K={}, R_shard={}, "
+                 "closure_factor={:.4f}", K, R_shard, cf);
+
+    VamanaParams vp_shard = VamanaParams::from_resolved(params, index_.dim, R_shard);
+    const uint32_t shard_lut_sz =
+        index_.quantizer ? index_.quantizer->lut_size() : 0;
+    const uint32_t nthreads = params.num_threads > 0
+                                  ? params.num_threads
+                                  : std::thread::hardware_concurrency();
+
+    std::vector<ShardOutput> out(K);
+    for (uint32_t k = 0; k < K; k++) {
+        auto& members = assignment.shards[k];
+        const uint32_t shard_n = static_cast<uint32_t>(members.size());
+        if (shard_n == 0) {
+            spdlog::warn("[sextant] shard {} empty", k);
+            continue;
+        }
+        spdlog::info("[sextant] building shard {}/{} ({} vectors)", k, K, shard_n);
+
+        ShardOutput s;
+        s.shard_n = shard_n;
+        s.codes.resize(static_cast<size_t>(shard_n) * index_.code_size, 0);
+        s.vecs.resize(static_cast<size_t>(shard_n) * index_.dim, 0);
+        s.nodes.resize(static_cast<size_t>(shard_n) * shard_node_size, 0);
+        s.local_to_global.resize(shard_n);
+        for (uint32_t i = 0; i < shard_n; i++) {
+            const uint32_t gid = members[i];
+            s.local_to_global[i] = gid;
+            std::memcpy(s.codes.data() + static_cast<size_t>(i) * index_.code_size,
+                        index_.codes_buffer + static_cast<size_t>(gid) * index_.code_size,
+                        index_.code_size);
+            if (index_.raw_vecs_buffer) {
+                std::memcpy(s.vecs.data() + static_cast<size_t>(i) * index_.dim,
+                            index_.raw_vecs_buffer + static_cast<size_t>(gid) * index_.dim,
+                            index_.dim * sizeof(float16_t));
+            }
+        }
+        // Centroid PQ code (for routing).
+        s.centroid_code.assign(assignment.centroids[k].begin(),
+                               assignment.centroids[k].end());
+
+        // Build the shard's VamanaCore.
+        s.core = std::make_unique<VamanaCore>(vp_shard, *index_.quantizer);
+        s.core->set_build_codes(s.codes.data(), shard_n);
+        s.core->set_build_nodes(s.nodes.data());
+        s.core->set_build_vecs(s.vecs.data());
+        s.core->prepare_for_build(shard_n);
+        VamanaCore::BuildVecLoan loan(*s.core);
+
+        const std::string label = "shard " + std::to_string(k) + "/" + std::to_string(K);
+        construct_into(*s.core, shard_n,
+                       [&members](uint32_t local_id) {
+                           return static_cast<RowId>(members[local_id]);
+                       },
+                       shard_lut_sz, nthreads, label.c_str());
+        s.core->compute_entry_points();
+
+        // Wire a FlatNodeStore over the local buffers for search.
+        s.store = std::make_unique<FlatNodeStore>(
+            s.nodes.data(), s.codes.data(), shard_node_size, index_.code_size);
+        s.core->set_store(s.store.get());
+
+        out[k] = std::move(s);
+    }
+    return out;
+}
+
 }  // namespace sextant

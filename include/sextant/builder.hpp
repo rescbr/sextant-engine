@@ -27,6 +27,7 @@ namespace sextant {
 
 class PqQuantizer;
 class VamanaCore;
+class FlatNodeStore;
 
 /// Builds and mutates an Index. Owns build-only scratch (entry-point
 /// centroids); the heavy state (quantizer, core, buffers, stores) lives on
@@ -84,6 +85,39 @@ public:
     /// Probe PQ (m, bits) selection on a sample. Pure — no Index mutation.
     static PqSelection probe_pq_config(const float* sample, uint64_t n, Dim dim,
                                         const ResolvedParams& params);
+
+    /// IVF-probe measurement helper (temporary — for the cross-shard-edge
+    /// recall experiment, see docs/optimization_levers_and_attribution.md #1).
+    /// Builds K independent shards in-memory WITHOUT merging, and returns
+    /// them. Each ShardOutput contains:
+    ///   - codes/nodes/vecs in LOCAL index order (0..shard_n-1)
+    ///   - local_to_global map (local idx → global row_id)
+    ///   - the centroid PQ code (for routing)
+    ///   - a fresh VamanaCore wired to the local buffers
+    ///   - a FlatNodeStore over those buffers
+    /// The Index must already have pass1 (quantizer trained) + pass2 (codes
+    /// encoded) done — call this instead of build_partitioned's merge step.
+    struct ShardOutput {
+        std::vector<uint8_t> codes;       // shard_n × code_size
+        std::vector<uint8_t> nodes;       // shard_n × shard_node_size
+        std::vector<float16_t> vecs;      // shard_n × dim (FP16, for rerank/routing)
+        std::vector<uint32_t> local_to_global;
+        std::vector<uint8_t> centroid_code;  // code_size bytes — PQ code of shard centroid
+        std::unique_ptr<VamanaCore> core;
+        std::unique_ptr<FlatNodeStore> store;
+        uint32_t shard_n = 0;
+    };
+    std::vector<ShardOutput> build_shards_unmerged(const ResolvedParams& params,
+                                                    uint32_t K,
+                                                    float closure_factor_override = 0.0f);
+
+    /// Prepare codes only: run pass1 (reservoir + PQ train) and pass2
+    /// (encode), leaving codes_buffer + raw_vecs_buffer populated on the
+    /// Index without running the construct or flush pipeline. Used by
+    /// build_shards_unmerged and by measurement tools that want to
+    /// experiment with partitioning on encoded codes without paying for a
+    /// full merged-graph build.
+    void prepare_codes(VectorSource& source, const ResolvedParams& params);
 
 private:
     Index& index_;

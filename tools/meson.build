@@ -25,3 +25,10 @@ pq_explore = executable('pq_explore',
     include_directories: [engine_inc, third_party_inc],
     install: false,
 )
+
+measure_ivf_probe = executable('measure_ivf_probe',
+    'measure_ivf_probe.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, src_inc, third_party_inc, numkong_inc],
+    install: false,
+)
