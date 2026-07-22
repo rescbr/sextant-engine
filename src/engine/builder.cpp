@@ -656,42 +656,31 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     // --- 1. Quantizer (global): train via pass1 (resolves pq_bits if auto) ---
     // pass1 fills the reservoir, runs the global probe if pq_bits==0, then
     // constructs + trains the quantizer. After it, index_.code_size is valid.
-    pass1_sample_and_train(source, params);
+    // prepare_codes also runs pass2_encode and loads raw_vecs_buffer (FP16).
+    prepare_codes(source, params);
 
     // node_size for the build buffer (flat neighbor lists).
     // Shards build at R_shard, but the merged result lands in index_.nodes_buffer
     // at full R.
     index_.node_size = VamanaCore::static_node_size(params.R, index_.code_size);
 
-    // Allocate global flat buffers.
+    // Allocate the flat nodes buffer (codes + raw_vecs already populated by
+    // prepare_codes). nodes_buffer is construct-only — the merged graph
+    // lands here at full R, then gets flushed.
     {
-        const size_t codes_bytes = static_cast<size_t>(index_.count) * index_.code_size;
         const size_t nodes_bytes = static_cast<size_t>(index_.count) * index_.node_size;
-        AlignedBuf codes(kDiskAlign, codes_bytes);
         AlignedBuf nodes(kDiskAlign, nodes_bytes);
-        std::memset(codes.get(), 0, codes_bytes);
         std::memset(nodes.get(), 0, nodes_bytes);
 #ifdef __linux__
         // Same THP hint as the single-partition build path (see Builder::build).
-        if (codes_bytes > 0 && madvise(codes.get(), codes_bytes,
-                                       MADV_HUGEPAGE) != 0) {
-            spdlog::debug("[sextant] huge pages unavailable for codes buffer "
-                          "(partitioned), using standard pages");
-        }
         if (nodes_bytes > 0 && madvise(nodes.get(), nodes_bytes,
                                        MADV_HUGEPAGE) != 0) {
             spdlog::debug("[sextant] huge pages unavailable for nodes buffer "
                           "(partitioned), using standard pages");
         }
 #endif
-        // Hand ownership to Index (long-lived). Index::~Index frees.
-        index_.codes_buffer = codes.as<uint8_t>(); codes.release();
         index_.nodes_buffer = nodes.as<uint8_t>(); nodes.release();
     }
-
-    // Encode (pass2). The quantizer needs its cross-distance table for HDC;
-    // PqQuantizer builds it during train() in pass1.
-    pass2_encode(source, params);
 
     const uint32_t n = static_cast<uint32_t>(index_.count);
 
