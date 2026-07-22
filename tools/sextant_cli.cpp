@@ -124,13 +124,33 @@ int cmd_autobuild(int argc, char* argv[]) {
     cfg.recall_target    = p.get<float>("recall-target");
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
+    const bool ivf_mode = p.exist("ivf");
+    cfg.ivf_mode = ivf_mode;
 
     sextant::Estimator estimator;
     // estimate_config handles all auto knobs; locked ones override.
-    const sextant::EstimateResult est = estimator.estimate_config(source, cfg);
+    sextant::EstimateResult est = estimator.estimate_config(source, cfg);
 
     // Print the analysis (shared pretty-print with analyze).
     print_analysis_(source, input, cfg, est.params, est.diag);
+
+    if (ivf_mode) {
+        const uint32_t n_probe_default = p.get<uint32_t>("ivf-n-probe");
+        sextant::Index idx;
+        const sextant::BuildResult result =
+            sextant::Builder(idx).build_ivf(source, index_path, est.params,
+                                             n_probe_default);
+        std::cout << "\n═══ Build Result (IVF) ═══\n";
+        std::cout << "built IVF index '" << index_path << ".shards': n="
+                  << result.n_vectors << " dim=" << result.dim
+                  << " K=" << est.params.partition_count
+                  << " R=" << result.R
+                  << " L_build=" << result.L_build
+                  << " pq_m=" << static_cast<int>(result.pq_m)
+                  << " pq_bits=" << static_cast<int>(result.pq_bits)
+                  << " in " << result.build_time_sec << "s\n";
+        return 0;
+    }
 
     // Build with the resolved params (in-process, no string round-trip).
     sextant::Index idx;

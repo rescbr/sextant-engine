@@ -257,14 +257,28 @@ public:
     ///
     /// `q` bundles the query inputs (LUT + optional FP16/HDC anchor/forced
     /// entry points). See BeamQuery for the distance-mode taxonomy.
+    /// `early_exit_patience`: search-time early-exit patience (0 = disabled,
+    /// UINT32_MAX = defer to params_.early_exit_patience). Build callers MUST
+    /// pass 0 (build never early-exits — see beam_search_into docs).
     std::vector<Candidate> beam_search(const BeamQuery& q, uint32_t L,
-                                        uint32_t io_limit, VamanaTLS& tls) const;
+                                        uint32_t io_limit, VamanaTLS& tls,
+                                        uint32_t early_exit_patience = kDeferToParams) const;
 
     /// BeamSearch writing into `out` (cleared; capacity retained). Build path
     /// uses this to avoid per-insert heap allocation.
+    ///
+    /// `early_exit_patience`: search-time early-exit patience. The build path
+    /// (insert_build_core) passes kNeverExit (UINT32_MAX) — build-time
+    /// beam_search determines edge quality and must NEVER be truncated, since
+    /// a shallower candidate pool permanently degrades the graph. Search-time
+    /// callers pass the SearchConfig's patience (0 = disabled). The default
+    /// kDeferToParams resolves to params_.early_exit_patience for back-compat.
+    static constexpr uint32_t kDeferToParams = 0xFFFFFFFFu;  // resolve to params_
+    static constexpr uint32_t kNeverExit = 0xFFFFFFFEu;      // build path: no early-exit
     void beam_search_into(std::vector<Candidate>& out, const BeamQuery& q,
                           uint32_t L, uint32_t io_limit,
-                          VamanaTLS& tls) const;
+                          VamanaTLS& tls,
+                          uint32_t early_exit_patience = kDeferToParams) const;
 
     /// RobustPrune: select R neighbors from candidates with occlusion.
     /// Writes the kept candidates into `out` (cleared; capacity retained).
@@ -305,7 +319,8 @@ public:
     /// FP16 query (see BeamQuery).
     std::vector<Candidate> search(const BeamQuery& q, uint32_t k,
                                    uint32_t L_search, uint32_t io_limit,
-                                   VamanaTLS& tls) const;
+                                   VamanaTLS& tls,
+                                   uint32_t early_exit_patience = kDeferToParams) const;
 
     // --- Node accessors (flat buffer layout) ---
     static RowId get_row_id(const uint8_t* node);

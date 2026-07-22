@@ -43,12 +43,17 @@ struct PartitionAssignment {
 /// @param K           Number of partitions (clusters).
 /// @param closure_factor  Ratio threshold for multi-shard assignment.
 /// @param iterations  K-means iterations (default 10).
+/// @param num_threads Parallelism for the assignment + medoid passes
+///                    (0 = hardware_concurrency). The assignment passes are
+///                    embarrassingly parallel; the medoid pass parallelizes
+///                    over the K clusters.
 /// @param seed        RNG seed for initial centroid selection.
 PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                                      const uint8_t* codes, uint32_t n,
                                      uint32_t code_size, uint32_t K,
                                      float closure_factor,
                                      uint32_t iterations = 10,
+                                     uint32_t num_threads = 0,
                                      uint64_t seed = 0xC0DE1234ULL);
 
 }  // namespace sextant

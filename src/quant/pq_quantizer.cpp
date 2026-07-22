@@ -650,6 +650,30 @@ void PqQuantizer::encode(const float* vec, uint8_t* code_out) const {
     }
 }
 
+void PqQuantizer::decode_code(const uint8_t* code, float* out) const {
+    // Gather segment centroids into `out` (rotated space if OPQ).
+    for (uint32_t s = 0; s < m_; s++) {
+        const uint32_t cid = read_code(code, bits_, s);
+        const float* cen = codebook_.data() +
+                           static_cast<size_t>(s) * K_ * sub_dim_ +
+                           static_cast<size_t>(cid) * sub_dim_;
+        std::memcpy(out + s * sub_dim_, cen, sub_dim_ * sizeof(float));
+    }
+    // Apply inverse rotation R^T (R is orthogonal): out[c] = Σ_r R[r*dim+c]·out[r].
+    // Done in place via a temporary to avoid clobbering source mid-transform.
+    if (has_rotation_) {
+        std::vector<float> rotated(out, out + dim_);
+        const float* R = rotation_.data();
+        for (uint32_t c = 0; c < dim_; c++) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < dim_; r++) {
+                acc += R[r * dim_ + c] * rotated[r];
+            }
+            out[c] = acc;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Query preprocessing (PQ LUT)
 // ---------------------------------------------------------------------------

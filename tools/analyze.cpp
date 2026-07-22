@@ -48,6 +48,8 @@ int cmd_analyze(int argc, char* argv[]) {
     sextant::BuildConfig cfg = build_config_from_parser(p);
     cfg.proximity_target = p.get<float>("proximity-target");
     cfg.recall_target    = p.get<float>("recall-target");
+    cfg.build_ram_budget = p.get<uint64_t>("build-ram");
+    cfg.ivf_mode         = p.exist("ivf");
 
     sextant::Estimator estimator;
     const auto est = estimator.estimate_config(source, cfg);

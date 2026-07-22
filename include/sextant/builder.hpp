@@ -86,38 +86,28 @@ public:
     static PqSelection probe_pq_config(const float* sample, uint64_t n, Dim dim,
                                         const ResolvedParams& params);
 
-    /// IVF-probe measurement helper (temporary — for the cross-shard-edge
-    /// recall experiment, see docs/optimization_levers_and_attribution.md #1).
-    /// Builds K independent shards in-memory WITHOUT merging, and returns
-    /// them. Each ShardOutput contains:
-    ///   - codes/nodes/vecs in LOCAL index order (0..shard_n-1)
-    ///   - local_to_global map (local idx → global row_id)
-    ///   - the centroid PQ code (for routing)
-    ///   - a fresh VamanaCore wired to the local buffers
-    ///   - a FlatNodeStore over those buffers
-    /// The Index must already have pass1 (quantizer trained) + pass2 (codes
-    /// encoded) done — call this instead of build_partitioned's merge step.
-    struct ShardOutput {
-        std::vector<uint8_t> codes;       // shard_n × code_size
-        std::vector<uint8_t> nodes;       // shard_n × shard_node_size
-        std::vector<float16_t> vecs;      // shard_n × dim (FP16, for rerank/routing)
-        std::vector<uint32_t> local_to_global;
-        std::vector<uint8_t> centroid_code;  // code_size bytes — PQ code of shard centroid
-        std::unique_ptr<VamanaCore> core;
-        std::unique_ptr<FlatNodeStore> store;
-        uint32_t shard_n = 0;
-    };
-    std::vector<ShardOutput> build_shards_unmerged(const ResolvedParams& params,
-                                                    uint32_t K,
-                                                    float closure_factor_override = 0.0f);
-
     /// Prepare codes only: run pass1 (reservoir + PQ train) and pass2
     /// (encode), leaving codes_buffer + raw_vecs_buffer populated on the
     /// Index without running the construct or flush pipeline. Used by
-    /// build_shards_unmerged and by measurement tools that want to
-    /// experiment with partitioning on encoded codes without paying for a
-    /// full merged-graph build.
+    /// build_partitioned and build_ivf to share the global train+encode
+    /// step across all shards.
     void prepare_codes(VectorSource& source, const ResolvedParams& params);
+
+    /// IVF-probe build: train the quantizer ONCE globally, encode all N
+    /// vectors, partition into K shards, and flush each shard as a complete
+    /// production Index under `<index_path>.shards/shard_NNNN/`. Also writes
+    /// `centroids.bin` (K × dim × float16_t, decoded from the partition's PQ
+    /// centroid codes) and a line-oriented `manifest` (ready/K/dim/
+    /// n_probe_default/closure_factor). Each shard is openable unchanged via
+    /// `Index::read(shard_prefix)`; the whole IVF index via
+    /// `IVFIndex::read(<index_path>.shards)`.
+    ///
+    /// The quantizer is shared across all shards (never retrained per shard).
+    /// Each shard is built by a fresh Builder + Index pair at R_shard = 2R/3.
+    /// `n_probe_default` (0 → max(1, K/4)) is recorded in the manifest.
+    BuildResult build_ivf(VectorSource& source, const std::string& index_path,
+                          const ResolvedParams& params,
+                          uint32_t n_probe_default = 0);
 
 private:
     Index& index_;
@@ -137,6 +127,30 @@ private:
                         const std::function<RowId(uint32_t)>& row_id_at,
                         uint32_t lut_sz, uint32_t nthreads, const char* label);
 
+    /// Build one IVF shard and flush it as a complete production Index to
+    /// `shard_prefix.*` (standard sidecars: .graph/.codes/.meta/.ball/
+    /// .manifest). The shard Index is fully populated by the caller:
+    ///   - a CLONE of the global quantizer (so write_meta_file can serialize
+    ///     it independently, and the reopened shard reconstructs its own
+    ///     VamanaCore at R_shard);
+    ///   - materialized shard-local codes/nodes/vecs buffers (local
+    ///     0..shard_n-1 ordering; each node's row_id = its global ID);
+    ///   - `count`/`dim`/`code_size`/`node_size` set (node_size = R_shard);
+    ///   - a fresh VamanaCore at R_shard wired to those buffers.
+    ///
+    /// `shard_params` carries R = R_shard (2R/3) so write_sidecars_ emits the
+    /// final layout at R_shard and Index::read reopens the shard with the
+    /// right node_size. This helper runs construct_into (on a fresh Builder
+    /// bound to `shard_index`) → snap_entry_points_ → compute_bfs_reorder_ →
+    /// write_sidecars_, reusing the entire flush pipeline unchanged. The
+    /// quantizer is NEVER retrained here — `members` is only used to remap
+    /// shard-local IDs → global row IDs during construct.
+    void build_shard_into_(Index& shard_index,
+                           const ResolvedParams& shard_params,
+                           const std::vector<uint32_t>& members,
+                           uint32_t shard_k, uint32_t K,
+                           const std::string& shard_prefix);
+
     /// Unified build (K==1 fast path + K>1 partitioned): partition →
     /// per-shard build → merge → flush.
     BuildResult build_partitioned(VectorSource& source,
@@ -153,6 +167,19 @@ private:
     /// Snap stored FP32 centroids to nearest data vectors (medoids) in
     /// index_.raw_vecs_buffer and set them as the core's entry points.
     void snap_entry_points_(const ResolvedParams& params);
+
+    /// IVF Workstream A1/A3: sub-clustered entry points for a shard.
+    /// Runs a small k-means (k' = n_sub) on the shard's PQ codes, snaps each
+    /// sub-centroid to its top-`medoids_per_cluster` members (nearest by FP16
+    /// L2sq), and sets the k'×M deduped medoid LOCAL IDs as the core's entry
+    /// points. Also populates index_.sub_centroids (k' × dim FP16) and
+    /// index_.sub_centroid_medoids (k' × M LOCAL IDs) so write_sidecars_ can
+    /// emit the `.epc` sidecar for A2/A3. Falls back to snap_entry_points_
+    /// (stride sampling) when the shard is too small. Returns k_sub used (0
+    /// on fallback).
+    uint32_t compute_sub_cluster_entry_points_(const ResolvedParams& params,
+                                                uint32_t n_sub,
+                                                uint32_t medoids_per_cluster);
 
     // --- Sidecar writers (shared by build + flush) ---
     void write_sidecars_(const std::string& index_path, const BfsReorder& bfs,

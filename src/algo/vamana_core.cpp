@@ -208,15 +208,17 @@ void VamanaCore::set_neighbor(uint8_t* node, uint32_t i, uint32_t val) {
 // ===========================================================================
 
 std::vector<Candidate> VamanaCore::beam_search(
-    const BeamQuery& q, uint32_t L, uint32_t io_limit, VamanaTLS& tls) const {
+    const BeamQuery& q, uint32_t L, uint32_t io_limit, VamanaTLS& tls,
+    uint32_t early_exit_patience) const {
     std::vector<Candidate> out;
-    beam_search_into(out, q, L, io_limit, tls);
+    beam_search_into(out, q, L, io_limit, tls, early_exit_patience);
     return out;
 }
 
 void VamanaCore::beam_search_into(
     std::vector<Candidate>& out, const BeamQuery& q,
-    uint32_t L, uint32_t io_limit, VamanaTLS& tls) const {
+    uint32_t L, uint32_t io_limit, VamanaTLS& tls,
+    uint32_t early_exit_patience) const {
     const float* query_lut = q.query_lut;
     const float16_t* query_fp16 = q.query_fp16;
     const uint8_t* hdc_anchor = q.hdc_anchor;
@@ -314,8 +316,15 @@ void VamanaCore::beam_search_into(
     uint32_t no_improvement_count = 0;
     float prev_best_dist = std::numeric_limits<float>::max();
 
-    // Early-exit: post-convergence stall tracking.
-    const bool use_early_exit = params_.early_exit_patience > 0;
+    // Early-exit: post-convergence stall tracking. Resolve the caller-supplied
+    // patience: kDeferToParams → use the index's baked-in params_.early_exit_
+    // patience (back-compat for the merged Searcher); kNeverExit (build path)
+    // → disabled; otherwise use the explicit search-time value (IVF override).
+    const uint32_t resolved_patience =
+        (early_exit_patience == kDeferToParams) ? params_.early_exit_patience
+        : (early_exit_patience == kNeverExit)   ? 0
+                                                 : early_exit_patience;
+    const bool use_early_exit = resolved_patience > 0;
     uint32_t post_converge_stall = 0;
     float prev_w_front_dist = std::numeric_limits<float>::max();
 
@@ -420,7 +429,7 @@ void VamanaCore::beam_search_into(
                 post_converge_stall++;
             }
             prev_w_front_dist = w_front;
-            if (post_converge_stall >= params_.early_exit_patience) {
+            if (post_converge_stall >= resolved_patience) {
                 break;  // W is saturated; further pops won't improve results
             }
         }
@@ -1076,7 +1085,8 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     probe.hdc_anchor = hdc_anchor;
     probe.anchor_lut = anchor_lut;
     beam_search_into(tls.search_result, probe, L_build,
-                     0 /* io_limit=0 → unlimited */, tls);
+                     0 /* io_limit=0 → unlimited */, tls,
+                     kNeverExit /* build NEVER early-exits; see beam_search_into docs */);
 
     // FP16 prune hybrid: pass the insert point's float vector to
     // robust_prune_into so the occlusion check uses FP16 L2sq instead of PQ
@@ -1132,7 +1142,8 @@ void VamanaCore::compute_entry_points() {
 std::vector<Candidate> VamanaCore::search(const BeamQuery& q, uint32_t k,
                                            uint32_t L_search,
                                            uint32_t io_limit,
-                                           VamanaTLS& tls) const {
+                                           VamanaTLS& tls,
+                                           uint32_t early_exit_patience) const {
     if (count_ == 0 || k == 0) {
         return {};
     }
@@ -1152,7 +1163,7 @@ std::vector<Candidate> VamanaCore::search(const BeamQuery& q, uint32_t k,
         tls.search_count_for_resize = count_;
     }
 
-    auto cands = beam_search(q, L_search, io_limit, tls);
+    auto cands = beam_search(q, L_search, io_limit, tls, early_exit_patience);
     if (cands.size() > k) {
         cands.resize(k);
     }

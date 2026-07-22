@@ -78,6 +78,22 @@ struct Index {
     uint8_t* nodes_buffer = nullptr;
     float16_t* raw_vecs_buffer = nullptr;
 
+    /// IVF shard sub-cluster entry-point centroids (A1/A2/A3, Workstream A).
+    /// Populated ONLY by Builder::build_shard_into_ for IVF shards (empty for
+    /// the merged path). Layout:
+    ///   - `sub_centroids`: k' × dim FP16 (k-means centroids on PQ codes).
+    ///   - `sub_centroid_medoids`: k' × sub_medoids_per_cluster shard-LOCAL IDs
+    ///     (row-major: cluster c, slot s → index c*sub_medoids_per_cluster + s).
+    ///     Each slot is one of the cluster's M members nearest the sub-centroid
+    ///     (FP16 L2sq). M = sub_medoids_per_cluster (default 4 → 8×4=32 entry
+    ///     points when k'=8).
+    /// write_sidecars_ remaps the medoids to disk positions and emits a `.epc`
+    /// sidecar; IVFIndex::read loads them for query-adaptive entry-point
+    /// selection (A2). Null/empty for non-IVF indexes.
+    std::vector<float16_t> sub_centroids;
+    std::vector<uint32_t> sub_centroid_medoids;
+    uint32_t sub_medoids_per_cluster = 0;  // M; 0 when sub_centroids is empty
+
     Index() = default;
     ~Index();
 

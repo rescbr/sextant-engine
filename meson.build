@@ -106,6 +106,8 @@ engine_sources = [
     'src/algo/vamana_core.cpp',
     'src/engine/resolve_params.cpp',
     'src/engine/index.cpp',
+    'src/engine/ivf_index.cpp',
+    'src/engine/ivf_searcher.cpp',
     'src/engine/probe.cpp',
     'src/engine/builder.cpp',
     'src/engine/searcher.cpp',

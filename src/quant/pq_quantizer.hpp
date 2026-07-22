@@ -121,6 +121,13 @@ public:
                              const float* lut,
                              float* out) const;
 
+    /// Decode a PQ code back to an approximate vector (sum of assigned
+    /// centroids). Writes `dim` floats to `out`. When OPQ is enabled, the
+    /// inverse (transpose) rotation is applied so the result is in the
+    /// original input space. Used to reverse-map partition centroids (PQ
+    /// codes) back to vector space for IVF routing.
+    void decode_code(const uint8_t* code, float* out) const;
+
     /// Serialize the quantizer state (codebook + params).
     void serialize(std::vector<uint8_t>& out) const;
 

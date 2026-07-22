@@ -64,6 +64,30 @@ public:
     std::vector<Candidate> search(const float* query, uint32_t k,
                                    const SearchConfig& config);
 
+    /// Precomputed per-query PQ state, shared across searches that use the
+    /// same trained quantizer (e.g. IVF shard searches). Building it once and
+    /// passing it to `search_with_lut` avoids redundant `preprocess_query`
+    /// (the PQ LUT) and query→FP16 conversion per shard — ~8% of IVF query
+    /// time at n_probe=9 on arxiv100k. Owned by the caller; must outlive the
+    /// search call.
+    struct QueryLUT {
+        std::vector<float> lut;          // lut_size() floats
+        std::vector<float16_t> query_fp16;  // dim float16_t
+    };
+
+    /// Build the QueryLUT for a query (PQ LUT + FP16 cast). The LUT is
+    /// quantizer-specific; reusing it across Searchers that share the same
+    /// trained quantizer (e.g. all shards of an IVF index) is safe.
+    QueryLUT build_query_lut(const float* query) const;
+
+    /// Search with a precomputed QueryLUT (skips preprocess_query + FP16
+    /// cast). Same semantics as `search`. The LUT must have been built by
+    /// `build_query_lut` on a Searcher over the same quantizer.
+    std::vector<Candidate> search_with_lut(const float* query,
+                                            const QueryLUT& lut,
+                                            uint32_t k,
+                                            const SearchConfig& config);
+
     /// Push a single search to the pool and return its future immediately
     /// (no wait). Callers pushing a batch of queries can collect futures up
     /// front, then `.get()` them in order — this lets workers pull the next
@@ -126,6 +150,15 @@ private:
     std::vector<Candidate> search_body_(const float* query, uint32_t k,
                                          const SearchConfig& config,
                                          VamanaTLS& tls);
+
+    /// Core search body with a precomputed LUT (skips preprocess_query +
+    /// FP16 cast). The LUT pointers must remain valid for the call duration.
+    std::vector<Candidate> search_body_with_lut_(const float* query,
+                                                  const float* lut,
+                                                  const float16_t* query_fp16,
+                                                  uint32_t k,
+                                                  const SearchConfig& config,
+                                                  VamanaTLS& tls);
 
     void maybe_rebalance_();
 };

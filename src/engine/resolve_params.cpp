@@ -198,35 +198,75 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
 
 
     // --- K (partition count) ---
+    // Two drivers, take the max (then clamp to [1, K_max]):
+    //   ram_driven_K   — from build_ram_budget / per_vec (existing logic).
+    //                    Keeps each shard's flat buffers under the RAM budget.
+    //   recall_driven_K — sqrt(N)/8 floor, applied ONLY when ivf_mode is set.
+    //                     Empirical from the arxiv100k IVF sweep: below this K,
+    //                     routing quality drops and n_probe can't recover recall.
+    // An explicit partition_count override wins outright.
     // per_vec = code_size + node_size(R, code_size).
     // code_size = pq_m (for pq_bits=8, 1 byte per segment).
     {
+        constexpr uint32_t kKMax = 512;
         const uint32_t code_sz = static_cast<uint32_t>(p.pq_m);
         const uint32_t node_sz =
             ((16u + static_cast<uint32_t>(p.R) * 4u + 7u) & ~7u);
         const uint64_t per_vec = code_sz + node_sz;
-        uint32_t k = 1;
-        uint64_t max_per_partition = 0;
-        if (per_vec > 0 && p.build_ram_budget > 0) {
-            max_per_partition = p.build_ram_budget / per_vec;
-            if (max_per_partition > 0) {
-                k = static_cast<uint32_t>(
-                    (n_vectors + max_per_partition - 1) / max_per_partition);
-                if (k < 1) k = 1;
-            }
-        }
-        p.partition_count = k;
-        const uint64_t monolithic_ram = n_vectors * per_vec;
-        if (k == 1) {
-            spdlog::info("[sextant] K (partitions) = 1 [monolithic, "
-                         "flat RAM = {:.1f}MB ≤ budget {:.1f}MB]",
-                         monolithic_ram / 1e6,
-                         p.build_ram_budget / 1e6);
+
+        if (overrides.partition_count > 0) {
+            // Explicit override — clamp to [1, K_max] and use verbatim.
+            p.partition_count = std::min(overrides.partition_count, kKMax);
+            spdlog::info("[sextant] K (partitions) = {} [override]", p.partition_count);
         } else {
-            spdlog::info("[sextant] K (partitions) = {} [flat RAM {:.1f}MB > "
-                         "budget {:.1f}MB → {} shards of ≤{} vectors each]",
-                         p.partition_count, monolithic_ram / 1e6,
-                         p.build_ram_budget / 1e6, p.partition_count, max_per_partition);
+            // RAM-driven floor.
+            uint32_t ram_driven_k = 1;
+            uint64_t max_per_partition = 0;
+            if (per_vec > 0 && p.build_ram_budget > 0) {
+                max_per_partition = p.build_ram_budget / per_vec;
+                if (max_per_partition > 0) {
+                    ram_driven_k = static_cast<uint32_t>(
+                        (n_vectors + max_per_partition - 1) / max_per_partition);
+                    if (ram_driven_k < 1) ram_driven_k = 1;
+                }
+            }
+
+            // Recall-driven floor (IVF only). sqrt(N)/8, clamped [2, 256].
+            // At arxiv-nomic 1.34M this is ~144; at arxiv100k ~39. Below this,
+            // IVF routing can't place queries precisely enough.
+            uint32_t recall_driven_k = 1;
+            std::string recall_note;
+            if (overrides.ivf_mode) {
+                recall_driven_k = static_cast<uint32_t>(
+                    std::max<double>(2.0,
+                                     std::sqrt(static_cast<double>(n_vectors)) / 8.0));
+                recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
+                recall_note = std::string(", recall_floor=") +
+                              std::to_string(recall_driven_k);
+            }
+
+            uint32_t k = std::max(ram_driven_k, recall_driven_k);
+            k = std::min(k, kKMax);
+            p.partition_count = k;
+
+            const uint64_t monolithic_ram = n_vectors * per_vec;
+            if (k == 1) {
+                spdlog::info("[sextant] K (partitions) = 1 [monolithic, "
+                             "flat RAM = {:.1f}MB ≤ budget {:.1f}MB]",
+                             monolithic_ram / 1e6,
+                             p.build_ram_budget / 1e6);
+            } else if (ram_driven_k >= recall_driven_k) {
+                spdlog::info("[sextant] K (partitions) = {} [flat RAM {:.1f}MB > "
+                             "budget {:.1f}MB → {} shards of ≤{} vectors each{}]",
+                             p.partition_count, monolithic_ram / 1e6,
+                             p.build_ram_budget / 1e6, p.partition_count,
+                             max_per_partition, recall_note);
+            } else {
+                spdlog::info("[sextant] K (partitions) = {} [recall-driven IVF "
+                             "floor sqrt(N)/8={}; RAM budget {:.1f}MB would allow "
+                             "K={}]", p.partition_count, recall_driven_k,
+                             p.build_ram_budget / 1e6, ram_driven_k);
+            }
         }
     }
 

@@ -16,8 +16,10 @@
 
 #include "fbin_io.hpp"
 #include "sextant/config.hpp"
+#include "sextant/ivf_searcher.hpp"
 #include "sextant/searcher.hpp"
 #include "sextant/index.hpp"
+#include "sextant/ivf_index.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
 
@@ -32,10 +34,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -133,7 +137,168 @@ struct QueryMetrics {
     std::vector<double> prox_ratios;
 };
 
+/// Shared context for the per-query rerank + recall + proximity logic.
+/// Bundles the read-only inputs that the original `process_query` lambda
+/// captured by reference, so both the single-index and IVF paths can call
+/// the same free `process_results` without duplicating the rerank/recall/
+/// proximity code.
+struct RerankCtx {
+    uint32_t dim;
+    uint32_t k;
+    uint64_t n_base;            // base-data row count (bh.n)
+    bool do_rerank;
+    bool base_in_ram;
+    const std::vector<float>* base_all;   // base_in_ram payload
+    const std::string* base_data;         // path for read_fbin_vector fallback
+    const GroundTruth* gt;
+    bool have_gt_dists;
+};
+
+/// Rerank + recall + proximity post-processing shared by the single-index
+/// and IVF benchmark paths. Takes the raw search `results` (candidates from
+/// either Searcher or IVFSearcher) and the measured `latency_us`, returns
+/// the per-query metrics. The `queries` pointer is used for the rerank
+/// distance computation.
+QueryMetrics process_results(const RerankCtx& ctx,
+                             const std::vector<float>& queries,
+                             uint32_t qi,
+                             std::vector<sextant::Candidate>&& results,
+                             double latency_us) {
+    QueryMetrics m;
+    m.latency_us = latency_us;
+    const float* q = &queries[static_cast<size_t>(qi) * ctx.dim];
+
+    std::vector<std::pair<float, sextant::RowId>> topk_scored;
+    topk_scored.reserve(ctx.k);
+    std::vector<float> base_vec(ctx.dim);  // only used if !base_in_ram
+    if (ctx.do_rerank && !results.empty()) {
+        std::vector<std::pair<float, sextant::RowId>> scored;
+        scored.reserve(results.size());
+        for (const auto& c : results) {
+            if (c.row_id < 0 ||
+                static_cast<uint64_t>(c.row_id) >= ctx.n_base) {
+                continue;
+            }
+            float d;
+            if (ctx.base_in_ram) {
+                const float* bv =
+                    &(*ctx.base_all)[static_cast<size_t>(c.row_id) * ctx.dim];
+                d = l2sq_simd(q, bv, ctx.dim);
+            } else {
+                read_fbin_vector(*ctx.base_data, ctx.dim,
+                                 static_cast<uint64_t>(c.row_id),
+                                 base_vec);
+                d = l2sq_simd(q, base_vec.data(), ctx.dim);
+            }
+            scored.emplace_back(d, c.row_id);
+        }
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first < b.first;
+                  });
+        const uint32_t topk_n = std::min<uint32_t>(ctx.k, scored.size());
+        for (uint32_t i = 0; i < topk_n; i++) {
+            topk_scored.push_back(scored[i]);
+        }
+    } else {
+        const uint32_t topk_n = std::min<uint32_t>(ctx.k, results.size());
+        for (uint32_t i = 0; i < topk_n; i++) {
+            const auto rid = results[i].row_id;
+            float d = std::numeric_limits<float>::infinity();
+            if (rid >= 0 &&
+                static_cast<uint64_t>(rid) < ctx.n_base) {
+                if (ctx.base_in_ram) {
+                    const float* bv =
+                        &(*ctx.base_all)[static_cast<size_t>(rid) * ctx.dim];
+                    d = l2sq_simd(q, bv, ctx.dim);
+                } else {
+                    read_fbin_vector(*ctx.base_data, ctx.dim,
+                                     static_cast<uint64_t>(rid),
+                                     base_vec);
+                    d = l2sq_simd(q, base_vec.data(), ctx.dim);
+                }
+            }
+            topk_scored.emplace_back(d, rid);
+        }
+    }
+
+    const GroundTruth& gt = *ctx.gt;
+    if (qi < gt.n) {
+        const uint32_t* gt_row =
+            &gt.ids[static_cast<size_t>(qi) * gt.k];
+        const uint32_t gt_k = std::min(gt.k, ctx.k);
+        uint32_t hits = 0;
+        for (uint32_t i = 0; i < gt_k; i++) {
+            const uint32_t g = gt_row[i];
+            for (const auto& [d, r] : topk_scored) {
+                (void)d;
+                if (r >= 0 && static_cast<uint32_t>(r) == g) {
+                    ++hits;
+                    break;
+                }
+            }
+        }
+        m.recall_sum = static_cast<double>(hits) /
+                        static_cast<double>(gt_k);
+        m.recall_hits = hits;
+        m.recall_total = gt_k;
+
+        if (ctx.have_gt_dists && ctx.base_in_ram) {
+            const uint32_t gt_kth_id =
+                gt.ids[static_cast<size_t>(qi) * gt.k + (gt_k - 1)];
+            float d_target;
+            if (gt_kth_id < ctx.n_base) {
+                const float* bv_kth =
+                    &(*ctx.base_all)[static_cast<size_t>(gt_kth_id) * ctx.dim];
+                d_target = l2sq_simd(q, bv_kth, ctx.dim);
+            } else {
+                d_target = gt.dists[static_cast<size_t>(qi) * gt.k +
+                                     (gt_k - 1)];
+            }
+            // ratio = d_target / d_result. Capped to keep the mean sane when
+            // the result is far closer than the target.
+            constexpr double kRatioCap = 10.0;
+            constexpr double kEps = 1e-6f;
+            m.prox_ratios.reserve(topk_scored.size());
+            for (const auto& [d, r] : topk_scored) {
+                if (r < 0) continue;
+                double ratio;
+                if (d_target <= kEps && d <= kEps) {
+                    ratio = 1.0;
+                } else if (d <= kEps) {
+                    ratio = kRatioCap;
+                } else if (d_target <= kEps) {
+                    ratio = 0.0;
+                } else {
+                    ratio = static_cast<double>(d_target) /
+                            static_cast<double>(d);
+                }
+                m.prox_ratios.push_back(ratio);
+                if (ratio >= 1.0) ++m.prox_in;
+                ++m.prox_total;
+            }
+        }
+    }
+    return m;
+}
+
 }  // namespace
+
+/// IVF benchmark path. Opened when `<index>.shards/` exists. Runs queries
+/// synchronously through IVFSearcher (no search_one_async yet — parallelism
+/// across shards is Milestone 3). Shares rerank/recall/proximity logic with
+/// the single-index path via `process_results`. Returns 0 on success, 1 on
+/// error (mirroring main's exit codes).
+ int run_ivf_benchmark(const std::string& index,
+                      const std::string& query_path,
+                      const std::string& base_data,
+                      const std::string& gt_path,
+                      uint32_t k, uint32_t L, uint32_t rerank,
+                      uint32_t io_limit, uint32_t limit,
+                      uint32_t n_threads_hint,
+                      uint64_t cache_size_req,
+                      uint32_t n_probe_req,
+                      uint32_t early_exit_req);
 
 int main(int argc, char* argv[]) {
     sextant::init_logging();
@@ -159,6 +324,16 @@ int main(int argc, char* argv[]) {
     p.add<std::string>("log-level", 0,
                        "Log level: debug, info, warn, error",
                        false, "info");
+    p.add<uint32_t>("n-probe", 0,
+                    "IVF: number of shards to probe per query "
+                    "(0 = use the index's built-in n_probe_default)",
+                    false, 0);
+    p.add<uint32_t>("early-exit-patience", 0,
+                    "Search-time early-exit patience (post-convergence stall "
+                    "count before terminating). 0 = disabled (full L_search). "
+                    "Default: defer to the index's baked-in value. Higher = "
+                    "deeper shard search (more recall, less QPS).",
+                    false, 0xFFFFFFFFu);
     p.parse_check(argc, argv);
 
     // Set log level (must come after init_logging() above and before any
@@ -205,6 +380,20 @@ int main(int argc, char* argv[]) {
                          cache_size_req / 1e6, n_threads_hint,
                          recommended / 1e6, kMinCachePerThread / 1e6);
         }
+    }
+
+    const uint32_t n_probe_req = p.get<uint32_t>("n-probe");
+    const uint32_t early_exit_req = p.get<uint32_t>("early-exit-patience");
+
+    // IVF dispatch: if `<index>.shards/` is a directory, this is an IVF-probe
+    // index — open via IVFIndex::read and run queries through IVFSearcher
+    // (synchronous; per-shard parallelism is Milestone 3). The single-index
+    // path below is unchanged when `.shards/` is absent.
+    if (std::filesystem::is_directory(index + ".shards")) {
+         return run_ivf_benchmark(index, query_path, base_data, gt_path,
+                                 k, L, rerank, io_limit, limit,
+                                 n_threads_hint, cache_size_req,
+                                 n_probe_req, early_exit_req);
     }
 
     try {
@@ -305,139 +494,18 @@ int main(int argc, char* argv[]) {
         latencies_us.reserve(n_queries);
 
         const bool have_gt_dists = !gt.dists.empty();
-        // ratio = d_target / d_result. Capped to keep the mean sane when the
-        // result is far closer than the target (common with co-located points).
-        constexpr double kRatioCap = 10.0;
-        constexpr double kEps = 1e-6f;
 
-        // Per-query worker function: search → rerank → recall → proximity.
-        // Returns QueryMetrics; the main thread aggregates. This parallelizes
-        // the rerank (was the 8t bottleneck — single main thread doing serial
-        // l2sq_distance over 200 candidates × 1000 queries while 8 workers
-        // waited in futex_do_wait).
-        //
-        // base_all is shared read-only across workers (loaded once into RAM
-        // before the loop). dim, k, gt, do_rerank, etc. are captured by value
-        // or const-ref.
-        auto process_query = [&](uint32_t qi,
-                                  std::vector<sextant::Candidate>&& results,
-                                  double latency_us) -> QueryMetrics {
-            QueryMetrics m;
-            m.latency_us = latency_us;
-            const float* q = &queries[static_cast<size_t>(qi) * dim];
-
-            std::vector<std::pair<float, sextant::RowId>> topk_scored;
-            topk_scored.reserve(k);
-            std::vector<float> base_vec(dim);  // only used if !base_in_ram
-            if (do_rerank && !results.empty()) {
-                std::vector<std::pair<float, sextant::RowId>> scored;
-                scored.reserve(results.size());
-                for (const auto& c : results) {
-                    if (c.row_id < 0 ||
-                        static_cast<uint64_t>(c.row_id) >= bh.n) {
-                        continue;
-                    }
-                    float d;
-                    if (base_in_ram) {
-                        const float* bv =
-                            &base_all[static_cast<size_t>(c.row_id) * dim];
-                        d = l2sq_simd(q, bv, dim);
-                    } else {
-                        read_fbin_vector(base_data, dim,
-                                         static_cast<uint64_t>(c.row_id),
-                                         base_vec);
-                        d = l2sq_simd(q, base_vec.data(), dim);
-                    }
-                    scored.emplace_back(d, c.row_id);
-                }
-                std::sort(scored.begin(), scored.end(),
-                          [](const auto& a, const auto& b) {
-                              return a.first < b.first;
-                          });
-                const uint32_t topk_n = std::min<uint32_t>(k, scored.size());
-                for (uint32_t i = 0; i < topk_n; i++) {
-                    topk_scored.push_back(scored[i]);
-                }
-            } else {
-                const uint32_t topk_n = std::min<uint32_t>(k, results.size());
-                for (uint32_t i = 0; i < topk_n; i++) {
-                    const auto rid = results[i].row_id;
-                    float d = std::numeric_limits<float>::infinity();
-                    if (rid >= 0 &&
-                        static_cast<uint64_t>(rid) < bh.n) {
-                        if (base_in_ram) {
-                            const float* bv =
-                                &base_all[static_cast<size_t>(rid) * dim];
-                            d = l2sq_simd(q, bv, dim);
-                        } else {
-                            read_fbin_vector(base_data, dim,
-                                             static_cast<uint64_t>(rid),
-                                             base_vec);
-                            d = l2sq_simd(q, base_vec.data(), dim);
-                        }
-                    }
-                    topk_scored.emplace_back(d, rid);
-                }
-            }
-
-            if (qi < gt.n) {
-                const uint32_t* gt_row =
-                    &gt.ids[static_cast<size_t>(qi) * gt.k];
-                const uint32_t gt_k = std::min(gt.k, k);
-                uint32_t hits = 0;
-                for (uint32_t i = 0; i < gt_k; i++) {
-                    const uint32_t g = gt_row[i];
-                    for (const auto& [d, r] : topk_scored) {
-                        (void)d;
-                        if (r >= 0 && static_cast<uint32_t>(r) == g) {
-                            ++hits;
-                            break;
-                        }
-                    }
-                }
-                m.recall_sum = static_cast<double>(hits) /
-                                static_cast<double>(gt_k);
-                m.recall_hits = hits;
-                m.recall_total = gt_k;
-
-                if (have_gt_dists && base_in_ram) {
-                    const uint32_t gt_kth_id =
-                        gt.ids[static_cast<size_t>(qi) * gt.k + (gt_k - 1)];
-                    float d_target;
-                    if (gt_kth_id < bh.n) {
-                        const float* bv_kth =
-                            &base_all[static_cast<size_t>(gt_kth_id) * dim];
-                        d_target = l2sq_simd(q, bv_kth, dim);
-                    } else {
-                        d_target = gt.dists[static_cast<size_t>(qi) * gt.k +
-                                             (gt_k - 1)];
-                    }
-                    m.prox_ratios.reserve(topk_scored.size());
-                    for (const auto& [d, r] : topk_scored) {
-                        if (r < 0) continue;
-                        double ratio;
-                        if (d_target <= kEps && d <= kEps) {
-                            ratio = 1.0;
-                        } else if (d <= kEps) {
-                            ratio = kRatioCap;
-                        } else if (d_target <= kEps) {
-                            ratio = 0.0;
-                        } else {
-                            ratio = static_cast<double>(d_target) /
-                                    static_cast<double>(d);
-                        }
-                        m.prox_ratios.push_back(ratio);
-                        if (ratio >= 1.0) ++m.prox_in;
-                        ++m.prox_total;
-                    }
-                }
-            }
-            return m;
+        // Shared rerank/recall/proximity context. Both the single-index and
+        // IVF paths route results through process_results via this struct.
+        const RerankCtx rctx{
+            dim, k, bh.n, do_rerank, base_in_ram,
+            base_in_ram ? &base_all : nullptr,
+            &base_data, &gt, have_gt_dists
         };
 
         // Push all queries to the Searcher pool up front (work-stealing).
         // Workers pull the next query as soon as they finish. The main
-        // thread collects futures in order and runs process_query (rerank
+        // thread collects futures in order and runs process_results (rerank
         // + recall + proximity) inline. This is serial post-processing but
         // uses SIMD l2sq_distance (nk_sqeuclidean_f32) for the rerank.
         //
@@ -449,6 +517,7 @@ int main(int argc, char* argv[]) {
          scfg.k = fetch_k;
          scfg.L_search = L;
          scfg.io_limit = io_limit;
+         scfg.early_exit_patience = early_exit_req;
 
         const auto t_start = Clock::now();
         std::vector<std::future<std::vector<sextant::Candidate>>> futs;
@@ -467,7 +536,8 @@ int main(int argc, char* argv[]) {
             auto results = futs[qi].get();
             const auto q_end = Clock::now();
             const double per_q_us = US(q_end - q_start).count();
-            QueryMetrics m = process_query(qi, std::move(results), per_q_us);
+            QueryMetrics m = process_results(rctx, queries, qi,
+                                             std::move(results), per_q_us);
             latencies_us.push_back(m.latency_us);
             recall_sum += m.recall_sum;
             recall_hits += m.recall_hits;
@@ -588,6 +658,267 @@ int main(int argc, char* argv[]) {
                        << std::setprecision(1) << tl_rate << "%"
                        << " (hits=" << tl_h << " misses=" << tl_m << ")\n";
           }
+    } catch (const Error& e) {
+        std::cerr << "benchmark: " << e.what() << "\n";
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "benchmark: " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// IVF benchmark path.
+//
+// Mirrors the single-index flow but uses IVFIndex + IVFSearcher. Queries run
+// SYNCHRONOUSLY (IVFSearcher has no search_one_async yet — per-shard
+// parallelism is Milestone 3). Rerank/recall/proximity are shared with the
+// single-index path via process_results.
+//
+// `index` is the prefix; the shards live in `<index>.shards/`. cache_size_req
+// is passed through to each shard's Index::read. n_probe_req (0 = index
+// default) is forwarded as scfg.n_probe.
+// ---------------------------------------------------------------------------
+ int run_ivf_benchmark(const std::string& index,
+                      const std::string& query_path,
+                      const std::string& base_data,
+                      const std::string& gt_path,
+                      uint32_t k, uint32_t L, uint32_t rerank,
+                      uint32_t io_limit, uint32_t limit,
+                      uint32_t n_threads_hint,
+                      uint64_t cache_size_req,
+                      uint32_t n_probe_req,
+                      uint32_t early_exit_req) {
+    try {
+        std::unique_ptr<sextant::IVFIndex> ivf_idx =
+            sextant::IVFIndex::read(index + ".shards", cache_size_req);
+        sextant::IVFSearcher ivf_searcher(*ivf_idx, n_threads_hint);
+
+        const uint32_t dim = ivf_idx->dim;
+        const uint32_t K = ivf_idx->K;
+
+        FbinHeader qh;
+        if (!read_fbin_header(query_path, qh) || qh.dim != dim) {
+            std::cerr << "benchmark: invalid query file '" << query_path
+                      << "' (dim=" << qh.dim << ", expected " << dim << ")\n";
+            return 1;
+        }
+        if (qh.n == 0) {
+            std::cerr << "benchmark: query file is empty\n";
+            return 1;
+        }
+
+        FbinHeader bh{};
+        if (!read_fbin_header(base_data, bh) || bh.dim != dim) {
+            std::cerr << "benchmark: invalid base-data '" << base_data
+                      << "' (dim=" << bh.dim << ", expected " << dim << ")\n";
+            return 1;
+        }
+
+        GroundTruth gt = read_ground_truth(gt_path);
+        if (gt.k < k) {
+            std::cerr << "benchmark: ground-truth k=" << gt.k
+                      << " < requested k=" << k << "\n";
+            return 1;
+        }
+
+        const uint32_t n_queries = std::min<uint32_t>(
+            qh.n, limit ? limit : qh.n);
+        if (gt.n < n_queries) {
+            spdlog::warn("benchmark: ground-truth has {} queries but running {}",
+                         gt.n, n_queries);
+        }
+
+        const bool do_rerank = rerank > 1;
+        const uint32_t fetch_k = do_rerank
+                                     ? std::min<uint32_t>(k * rerank, bh.n)
+                                     : k;
+
+        const uint32_t effective_n_probe = n_probe_req > 0
+            ? n_probe_req
+            : ivf_idx->n_probe_default;
+
+        std::cout << "[benchmark] (IVF mode, sequential shard search)\n";
+        std::cout << "[benchmark] queries: " << n_queries << ", k: " << k
+                  << ", L: " << L << ", rerank: " << rerank
+                  << ", K (shards): " << K
+                  << ", n_probe: " << effective_n_probe
+                  << ", threads: " << ivf_searcher.num_threads() << "\n";
+
+        // Read all query vectors into RAM.
+        std::vector<float> queries(static_cast<size_t>(n_queries) * dim);
+        {
+            std::ifstream qf(query_path, std::ios::binary);
+            qf.seekg(8);
+            qf.read(reinterpret_cast<char*>(queries.data()),
+                    static_cast<std::streamsize>(queries.size() *
+                                                 sizeof(float)));
+            if (!qf) {
+                std::cerr << "benchmark: short read on query file\n";
+                return 1;
+            }
+        }
+
+        // Optionally read the whole base file for fast rerank.
+        std::vector<float> base_all;
+        bool base_in_ram = false;
+        {
+            std::ifstream bf(base_data, std::ios::binary | std::ios::ate);
+            if (bf) {
+                const std::streamoff sz = bf.tellg();
+                if (sz > 8 &&
+                    static_cast<uint64_t>(sz) <= uint64_t{4} * 1024 * 1024 *
+                                                      1024) {
+                    base_all.resize(static_cast<size_t>(sz - 8) / sizeof(float));
+                    bf.seekg(8);
+                    bf.read(reinterpret_cast<char*>(base_all.data()),
+                            static_cast<std::streamsize>(base_all.size() *
+                                                         sizeof(float)));
+                    base_in_ram = bf.good();
+                    if (base_in_ram) {
+                        spdlog::info("benchmark: loaded {} base vectors into RAM",
+                                     bh.n);
+                    }
+                }
+            }
+        }
+
+        const bool have_gt_dists = !gt.dists.empty();
+        const RerankCtx rctx{
+            dim, k, bh.n, do_rerank, base_in_ram,
+            base_in_ram ? &base_all : nullptr,
+            &base_data, &gt, have_gt_dists
+        };
+
+        // IVFSearcher.search is synchronous (no search_one_async). Loop over
+        // queries, timing each call. n_probe is forwarded via SearchConfig.
+        sextant::SearchConfig scfg;
+        scfg.k = fetch_k;
+        scfg.L_search = L;
+        scfg.io_limit = io_limit;
+        scfg.n_probe = n_probe_req;  // 0 → IVFSearcher uses index default.
+        scfg.early_exit_patience = early_exit_req;
+
+        std::vector<double> latencies_us;
+        latencies_us.reserve(n_queries);
+
+        double recall_sum = 0.0;
+        uint64_t recall_hits = 0, recall_total = 0;
+        uint64_t prox_in = 0, prox_total = 0;
+        std::vector<double> prox_ratios;
+
+        // Push all queries to the IVF pool up front (work-stealing across
+        // queries — mirrors the merged-graph Searcher path). Workers pull the
+        // next query as soon as they finish. The main thread collects futures
+        // in order and runs process_results (rerank + recall + proximity)
+        // inline.
+        //
+        // Marker for `perf record -p <pid>` attach: printed right before the
+        // timed region so profiling tools can trigger on actual program state
+        // instead of an unreliable wall-clock delay (see optimization plan,
+        // "Profiling discipline").
+        std::cout << "[benchmark] starting timed search\n";
+        const auto t_start = Clock::now();
+        std::vector<std::future<std::vector<sextant::Candidate>>> futs;
+        futs.reserve(n_queries);
+        for (uint32_t qi = 0; qi < n_queries; qi++) {
+            const float* q = &queries[static_cast<size_t>(qi) * dim];
+            futs.push_back(ivf_searcher.search_one_async(q, scfg.k, scfg));
+        }
+        for (uint32_t qi = 0; qi < n_queries; qi++) {
+            const auto q_start = Clock::now();
+            auto results = futs[qi].get();
+            const auto q_end = Clock::now();
+            const double per_q_us = US(q_end - q_start).count();
+            QueryMetrics m = process_results(rctx, queries, qi,
+                                             std::move(results), per_q_us);
+            latencies_us.push_back(m.latency_us);
+            recall_sum += m.recall_sum;
+            recall_hits += m.recall_hits;
+            recall_total += m.recall_total;
+            if (!m.prox_ratios.empty()) {
+                prox_ratios.insert(prox_ratios.end(),
+                                   m.prox_ratios.begin(),
+                                   m.prox_ratios.end());
+            }
+            prox_in += m.prox_in;
+            prox_total += m.prox_total;
+        }
+        const auto t_end = Clock::now();
+        const double total_sec =
+            std::chrono::duration<double>(t_end - t_start).count();
+
+        const double mean_recall =
+            (n_queries > 0) ? recall_sum / static_cast<double>(n_queries)
+                            : 0.0;
+        const double micro_recall =
+            (recall_total > 0)
+                ? static_cast<double>(recall_hits) /
+                      static_cast<double>(recall_total)
+                : 0.0;
+
+        std::sort(latencies_us.begin(), latencies_us.end());
+        const double p50_us = percentile(latencies_us, 50.0);
+        const double p99_us = percentile(latencies_us, 99.0);
+        const double qps =
+            (total_sec > 0.0)
+                ? static_cast<double>(n_queries) / total_sec
+                : 0.0;
+
+        std::cout << "[benchmark] recall@" << k << ": "
+                  << std::fixed << std::setprecision(4) << mean_recall << "\n";
+        std::cout << "[benchmark] recall@" << k << " (micro-avg): "
+                  << std::fixed << std::setprecision(4) << micro_recall << "\n";
+
+        // Proximity report (same format as the single-index path).
+        if (have_gt_dists && prox_total > 0) {
+            const double in_band =
+                static_cast<double>(prox_in) /
+                static_cast<double>(prox_total);
+            double prox_sum = 0.0;
+            std::vector<double> miss_ratios;
+            miss_ratios.reserve(prox_total - prox_in);
+            for (double r : prox_ratios) {
+                prox_sum += r;
+                if (r < 1.0) miss_ratios.push_back(r);
+            }
+            const double mean_ratio = prox_sum /
+                static_cast<double>(prox_total);
+            std::cout << "[benchmark] proximity: in-band="
+                      << std::fixed << std::setprecision(4) << in_band
+                      << " (" << prox_in << "/" << prox_total
+                      << " results at/inside d" << k << ")"
+                      << ", mean_ratio=" << std::setprecision(4)
+                      << mean_ratio << "\n";
+            std::cout << "[benchmark] proximity: miss_ratio";
+            if (miss_ratios.empty()) {
+                std::cout << "=n/a (no out-of-band results)\n";
+            } else {
+                std::sort(miss_ratios.begin(), miss_ratios.end());
+                const double mp25 = percentile(miss_ratios, 25.0);
+                const double mp50 = percentile(miss_ratios, 50.0);
+                const double mp75 = percentile(miss_ratios, 75.0);
+                const double mp90 = percentile(miss_ratios, 90.0);
+                std::cout << " p25=" << std::fixed
+                          << std::setprecision(4) << mp25
+                          << " p50=" << mp50
+                          << " p75=" << mp75
+                          << " p90=" << mp90
+                          << " (over " << miss_ratios.size()
+                          << " out-of-band; 1.0=target edge)\n";
+            }
+        }
+        std::cout << "[benchmark] latency p50: " << std::fixed
+                  << std::setprecision(3) << p50_us / 1000.0 << "ms, p99: "
+                  << p99_us / 1000.0 << "ms\n";
+        std::cout << "[benchmark] total search time: " << std::fixed
+                  << std::setprecision(3) << total_sec << "s\n";
+        std::cout << "[benchmark] QPS: " << std::fixed
+                  << std::setprecision(1) << qps << "\n";
+        // NOTE: cache diagnostics (graph_reads/code_reads/w-tinylfu/tl-l1) are
+        // omitted here — those are Searcher-scoped; aggregating per-shard
+        // caches is Milestone 3+ work.
     } catch (const Error& e) {
         std::cerr << "benchmark: " << e.what() << "\n";
         return 1;

@@ -862,23 +862,37 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
     p.build_ram_budget = base.build_ram_budget;
     p.pq_max_distortion = base.pq_max_distortion;
 
-    // Recompute K from the final R (K depends on per-vec size).
+    // Recompute K from the final R (K depends on per-vec size). Must match
+    // resolve_params' K logic: explicit override > max(ram_driven, recall_floor).
     {
+        constexpr uint32_t kKMax = 512;
         const uint32_t code_sz = static_cast<uint32_t>(p.pq_m);
         const uint32_t node_sz =
             ((16u + static_cast<uint32_t>(p.R) * 4u + 7u) & ~7u);
         const uint64_t per_vec = code_sz + node_sz;
-        uint32_t k = 1;
-        uint64_t max_per_partition = 0;
-        if (per_vec > 0 && p.build_ram_budget > 0) {
-            max_per_partition = p.build_ram_budget / per_vec;
-            if (max_per_partition > 0) {
-                k = static_cast<uint32_t>(
-                    (total_n + max_per_partition - 1) / max_per_partition);
-                if (k < 1) k = 1;
+
+        if (overrides.partition_count > 0) {
+            p.partition_count = std::min(overrides.partition_count, kKMax);
+        } else {
+            uint32_t ram_driven_k = 1;
+            if (per_vec > 0 && p.build_ram_budget > 0) {
+                const uint64_t max_per_partition = p.build_ram_budget / per_vec;
+                if (max_per_partition > 0) {
+                    ram_driven_k = static_cast<uint32_t>(
+                        (total_n + max_per_partition - 1) / max_per_partition);
+                    if (ram_driven_k < 1) ram_driven_k = 1;
+                }
             }
+            uint32_t recall_driven_k = 1;
+            if (overrides.ivf_mode) {
+                recall_driven_k = static_cast<uint32_t>(
+                    std::max<double>(2.0,
+                                     std::sqrt(static_cast<double>(total_n)) / 8.0));
+                recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
+            }
+            p.partition_count = std::min(std::max(ram_driven_k, recall_driven_k),
+                                          kKMax);
         }
-        p.partition_count = k;
     }
 
     spdlog::info("[sextant] estimate_config: final → R={} alpha={:.1f} "

@@ -105,12 +105,26 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             "NN distance is larger than at k=10, so proximity is looser at "
             "higher k.",
             false, 100);
-    }
-    if (mode == Mode::Build || mode == Mode::Autobuild) {
+        // build-ram drives K (partition count) resolution, so analyze must
+        // accept it too — K is one of the resolved params analyze reports.
         p.add<uint64_t>("build-ram", 0,
             "Build RAM budget in bytes (forces partitioning if small). "
-            "0 = auto (50% of physical RAM).",
+            "0 = auto (50% of physical RAM). Affects K (partition count) "
+            "resolution in analyze/autobuild.",
             false, 0);
+        // IVF + partition-count affect K resolution — analyze previews them.
+        p.add("ivf", 0,
+            "Resolve params for IVF-probe mode: applies a recall-driven "
+            "partition-count floor of sqrt(N)/8 (clamped [2, 256]) so the "
+            "IVF path has enough shards for good routing. Analyze shows the "
+            "resulting K; autobuild then builds the shard set. See "
+            "docs/ivf_probe_design.md.");
+        p.add<uint32_t>("partition-count", 0,
+            "Partition count (K) override. 0 = auto (RAM-driven, plus the "
+            "sqrt(N)/8 recall floor when --ivf is set).",
+            false, 0);
+    }
+    if (mode == Mode::Build || mode == Mode::Autobuild) {
         p.add<uint32_t>("prune-candidate-cap", 0,
             "Cap on the robust-prune candidate pool (max-occlusion in "
             "DiskANN). 0 = auto (= max(L_build, R+1)).",
@@ -118,6 +132,19 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
         p.add<uint32_t>("n-search-entry-points", 0,
             "Multi-start: number of entry points to seed each search from "
             "(top-M closest to the query). 0 = default (4).",
+            false, 0);
+        // build-ram also accepted by build (forces partitioning / sets K).
+        if (mode == Mode::Build) {
+            p.add<uint64_t>("build-ram", 0,
+                "Build RAM budget in bytes (forces partitioning if small). "
+                "0 = auto (50% of physical RAM).",
+                false, 0);
+        }
+    }
+    if (mode == Mode::Autobuild) {
+        p.add<uint32_t>("ivf-n-probe", 0,
+            "IVF default n_probe (shards probed per query). 0 = auto "
+            "(max(1, K/4)). Only meaningful with --ivf.",
             false, 0);
     }
 }
@@ -160,6 +187,12 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     try {
         if (p.exist("n-search-entry-points")) {
             cfg.n_search_entry_points = p.get<uint32_t>("n-search-entry-points");
+        }
+    } catch (...) {}
+    // partition-count: same guard (only on Build/Autobuild).
+    try {
+        if (p.exist("partition-count")) {
+            cfg.partition_count = p.get<uint32_t>("partition-count");
         }
     } catch (...) {}
     return cfg;

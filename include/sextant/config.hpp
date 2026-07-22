@@ -111,6 +111,18 @@ struct BuildConfig {
     /// principal components. The rotation matrix is serialized with the
     /// quantizer. Adds a one-time ~20s eigendecomposition at d=768.
     bool pq_opq = false;
+
+    /// Partition count override. 0 = auto (resolved from build_ram_budget,
+    /// plus a recall-driven floor when `ivf_mode` is true). >0 forces exactly
+    /// this many partitions. Only meaningful for partitioned / IVF builds.
+    uint32_t partition_count = 0;
+
+    /// IVF-probe mode. When true, resolve_params applies a recall-driven
+    /// partition-count floor of `clamp(sqrt(N)/8, 2, 256)` so the IVF path
+    /// has enough shards for good routing even when RAM would allow K=1.
+    /// See docs/ivf_probe_design.md "K selection". The recall floor is a
+    /// lower bound — the RAM-driven K still wins when it's larger.
+    bool ivf_mode = false;
 };
 
 /// Result of a build operation.
@@ -130,6 +142,23 @@ struct SearchConfig {
     uint32_t k = 10;
     uint32_t L_search = 200;
     uint32_t io_limit = 0;  ///< 0 = unlimited (visit as many nodes as L_search allows)
+
+    /// IVF-probe: number of shards to probe per query. 0 = auto (max(1, K/4)).
+    /// Ignored for single-shard (non-IVF) indexes.
+    uint32_t n_probe = 0;
+
+    /// IVF-probe merge oversampling: each probed shard is searched at
+    /// k_local = k × merge_oversample, then results are merged/deduped and
+    /// truncated to k. 1 = no oversampling. Ignored for single-shard indexes.
+    uint32_t merge_oversample = 2;
+
+    /// Search-time early-exit patience (post-convergence stall count before
+    /// terminating beam_search). 0 = disabled (full L_search). UINT32_MAX =
+    /// defer to the index's baked-in value (back-compat default). Any other
+    /// value overrides at query time. Build-time beam_search is NEVER affected
+    /// (it always runs to completion regardless of this or the index value).
+    /// IVF uses this to pass a higher patience than the merged default.
+    uint32_t early_exit_patience = 0xFFFFFFFFu;  // kDeferToParams
 };
 
 /// Adaptive parameters resolved from dataset/machine properties (Issue 37).

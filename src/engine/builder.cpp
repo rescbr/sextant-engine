@@ -27,6 +27,7 @@
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "storage/direct_io.hpp"
+#include "storage/memgraph.hpp"      // complete type for Index's unique_ptr<MemGraph>
 #include "storage/sidecar_header.hpp"
 #include "util/fp16.hpp"
 
@@ -752,7 +753,8 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     // --- 2. Partition via k-means on PQ codes ---
     auto assignment = partition_codes(*index_.quantizer, index_.codes_buffer, n,
                                       index_.code_size, params.partition_count,
-                                      params.closure_factor);
+                                      params.closure_factor, /*iterations=*/10,
+                                      params.num_threads);
     const uint32_t K = static_cast<uint32_t>(assignment.shards.size());
 
     // --- 3. Per-shard build ---
@@ -1129,6 +1131,353 @@ BuildResult Builder::build_partitioned(VectorSource& source,
 }
 
 // ===========================================================================
+// build_ivf — IVF-probe build (K independent shard Indexes + FP16 centroids).
+//
+// Pipeline (see docs/ivf_probe_design.md "Build pipeline"):
+//   1. Global pass1 (quantizer train) + pass2 (encode all N) via prepare_codes.
+//      The quantizer is trained ONCE and shared across every shard — per-shard
+//      retraining would defeat the partitioned build.
+//   2. partition_codes → PartitionAssignment (shards[] membership + centroids[]
+//      PQ codes).
+//   3. Per shard k: materialize shard-local codes/nodes/vecs, install a CLONE
+//      of the global quantizer into a fresh shard Index, and delegate to
+//      build_shard_into_ which wires a R_shard VamanaCore, constructs the graph,
+//      and flushes standard sidecars to <index_path>.shards/shard_NNNN/.
+//   4. centroids.bin: decode each of K centroid PQ codes → FP32 (decode_code)
+//      → FP16 (cast_fp32_to_fp16), raw write (K × dim × float16_t, no header).
+//   5. manifest: line-oriented text (ready / K / dim / n_probe_default /
+//      closure_factor) — the IVFIndex::read commit point.
+//
+// The shard Index + Builder are destroyed after each flush; only sidecar files
+// persist. No merge step (unlike build_partitioned). Each shard reopens via
+// Index::read unchanged; the whole IVF index via IVFIndex::read.
+// ===========================================================================
+BuildResult Builder::build_ivf(VectorSource& source, const std::string& index_path,
+                                const ResolvedParams& params,
+                                uint32_t n_probe_default) {
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // --- 1. Global quantizer (train once) + encode all N ---
+    prepare_codes(source, params);
+
+    const uint32_t n = static_cast<uint32_t>(index_.count);
+    const uint32_t K = std::max<uint32_t>(2u, params.partition_count);
+    const float closure_factor = params.closure_factor;
+
+    spdlog::info("[sextant] build_ivf: N={} K={} closure_factor={:.4f} → '{}.shards'",
+                 n, K, closure_factor, index_path);
+
+    // --- 2. Partition via k-means on PQ codes (closure overlap) ---
+    auto assignment = partition_codes(*index_.quantizer, index_.codes_buffer, n,
+                                       index_.code_size, K, closure_factor,
+                                       /*iterations=*/10, params.num_threads);
+    if (assignment.shards.size() != K) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_ivf: partition returned K=" +
+                        std::to_string(assignment.shards.size()) +
+                        " (expected " + std::to_string(K) + ")");
+    }
+
+    // Per-shard degree: R_shard = 2R/3 (same as build_partitioned's K>1 path).
+    // The reopened shard records R = R_shard in .meta so Index::read computes
+    // node_size = static_node_size(R_shard, code_size).
+    const uint16_t R_shard = static_cast<uint16_t>(
+        std::max<uint32_t>(8u, (2u * params.R) / 3u));
+    const uint32_t shard_node_size =
+        VamanaCore::static_node_size(R_shard, index_.code_size);
+    spdlog::info("[sextant] build_ivf: R_shard={} (2R/3, R={})", R_shard, params.R);
+
+    // Shard params carry R = R_shard so write_sidecars_ emits the final layout
+    // at R_shard (matching the build layout) and the serialized ResolvedParams
+    // reopen the shard at the correct node_size.
+    ResolvedParams shard_params = params;
+    shard_params.R = R_shard;
+    shard_params.partition_count = 1;  // each shard is itself a single partition
+    shard_params.closure_factor = closure_factor;
+
+    // Commit point: the .shards directory groups all shards + centroids + the
+    // manifest. Create it up front; per-shard subdirs are created below.
+    const std::string shards_dir = index_path + ".shards";
+    std::error_code ec;
+    std::filesystem::create_directories(shards_dir, ec);
+    if (ec) {
+        throw Error(ErrorCode::IoError,
+                    "build_ivf: cannot create shards dir '" + shards_dir +
+                        "': " + ec.message());
+    }
+
+    // --- 3. Per-shard construct + flush ---
+    uint32_t shards_written = 0;
+    for (uint32_t k = 0; k < K; k++) {
+        auto& members = assignment.shards[k];
+        const uint32_t shard_n = static_cast<uint32_t>(members.size());
+        char dirbuf[32];
+        std::snprintf(dirbuf, sizeof(dirbuf), "shard_%04u", k + 1);  // 1-indexed
+        const std::string shard_prefix = shards_dir + "/" + dirbuf;
+        if (shard_n == 0) {
+            spdlog::warn("[sextant] build_ivf: shard {} empty, skipping (no "
+                         "sidecars written)", k);
+            continue;
+        }
+
+        // Fresh shard Index: a CLONE of the global quantizer (so the shard
+        // Builder can serialize it independently in write_meta_file, and the
+        // reopened shard reconstructs its own VamanaCore). Clone via
+        // serialize+deserialize — the only supported deep-copy path.
+        auto shard_index = std::make_unique<Index>();
+        shard_index->dim = index_.dim;
+        shard_index->count = shard_n;
+        shard_index->code_size = index_.code_size;
+        shard_index->node_size = shard_node_size;  // build layout = R_shard
+        shard_index->params = shard_params;
+        shard_index->path = shard_prefix;
+
+        {
+            std::vector<uint8_t> qblob;
+            index_.quantizer->serialize(qblob);
+            shard_index->quantizer = std::make_unique<PqQuantizer>(
+                MetricKind::L2Sq, index_.dim, /*m=*/1, /*bits=*/8);  // placeholder
+            shard_index->quantizer->deserialize(qblob.data(), qblob.size());
+        }
+
+        // Materialize shard-local buffers (local 0..shard_n-1). Each global
+        // code/vec is memcpy'd once to its shard — O(N) total across shards.
+        const size_t codes_bytes =
+            static_cast<size_t>(shard_n) * index_.code_size;
+        const size_t nodes_bytes =
+            static_cast<size_t>(shard_n) * shard_node_size;
+        const size_t vecs_bytes =
+            static_cast<size_t>(shard_n) * index_.dim * sizeof(float16_t);
+        AlignedBuf scodes(kDiskAlign, codes_bytes);
+        AlignedBuf snodes(kDiskAlign, nodes_bytes);
+        AlignedBuf svecs(kDiskAlign, vecs_bytes);
+        std::memset(scodes.get(), 0, codes_bytes);
+        std::memset(snodes.get(), 0, nodes_bytes);
+        for (uint32_t i = 0; i < shard_n; i++) {
+            const uint32_t gid = members[i];
+            std::memcpy(scodes.as<uint8_t>() +
+                            static_cast<size_t>(i) * index_.code_size,
+                        index_.codes_buffer +
+                            static_cast<size_t>(gid) * index_.code_size,
+                        index_.code_size);
+            std::memcpy(svecs.as<float16_t>() +
+                            static_cast<size_t>(i) * index_.dim,
+                        index_.raw_vecs_buffer +
+                            static_cast<size_t>(gid) * index_.dim,
+                        index_.dim * sizeof(float16_t));
+        }
+        // Hand ownership of the aligned buffers to the shard Index. They are
+        // freed by ~Index (aligned_free). The fresh shard Builder + VamanaCore
+        // read through these pointers during construct + flush.
+        shard_index->codes_buffer = scodes.as<uint8_t>(); scodes.release();
+        shard_index->nodes_buffer = snodes.as<uint8_t>(); snodes.release();
+        shard_index->raw_vecs_buffer = svecs.as<float16_t>(); svecs.release();
+
+        spdlog::info("[sextant] build_ivf: shard {}/{} ({} vectors, RAM≈{:.1f}MB)",
+                     k + 1, K, shard_n,
+                     (codes_bytes + nodes_bytes + vecs_bytes) / 1e6);
+
+        build_shard_into_(*shard_index, shard_params, members, k, K, shard_prefix);
+        // shard_index destroyed here — only the flushed sidecars persist.
+        ++shards_written;
+    }
+
+    if (shards_written == 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_ivf: every shard was empty (K=" +
+                        std::to_string(K) + ", N=" + std::to_string(n) + ")");
+    }
+
+    // --- 4. centroids.bin: K × dim × float16_t (decoded from PQ centroid codes) ---
+    // Each centroid PQ code is reverse-mapped to FP32 via the quantizer's
+    // codebook (decode_code), then cast to FP16 for routing (symmetry with the
+    // FP16 search tier; see design "Centroid format"). Raw write, no header.
+    {
+        const std::string path = shards_dir + "/centroids.bin";
+        DirectFile f(path, true);
+        const size_t vec_bytes = static_cast<size_t>(index_.dim) * sizeof(float16_t);
+        // Block-aligned ring buffer to amortize syscalls (same pattern as
+        // write_sidecars_'s .codes / .ball streams).
+        const size_t block_cap = kBlockSize;  // 256KB
+        const uint32_t vecs_per_block =
+            std::max<uint32_t>(1u, static_cast<uint32_t>(block_cap / vec_bytes));
+        const size_t buf_cap = static_cast<size_t>(vecs_per_block) * vec_bytes;
+        AlignedBuf ring(kDiskAlign, buf_cap);
+
+        std::vector<float> centroid_f32(index_.dim);
+        std::vector<float16_t> centroid_f16(index_.dim);
+        uint64_t write_off = 0;
+        uint32_t in_block = 0;
+        for (uint32_t k = 0; k < K; k++) {
+            // An empty shard still has a centroid code from partition_codes;
+            // decode it regardless so centroids.bin stays K-contiguous (the
+            // manifest records K and IVFIndex::read expects K × dim).
+            const auto& code = assignment.centroids[k];
+            if (code.size() != index_.code_size) {
+                throw Error(ErrorCode::InvalidParam,
+                            "build_ivf: centroid " + std::to_string(k) +
+                                " has wrong code size");
+            }
+            index_.quantizer->decode_code(code.data(), centroid_f32.data());
+            cast_fp32_to_fp16(centroid_f32.data(), centroid_f16.data(), index_.dim);
+            std::memcpy(ring.as<uint8_t>() +
+                            static_cast<size_t>(in_block) * vec_bytes,
+                        centroid_f16.data(), vec_bytes);
+            if (++in_block >= vecs_per_block) {
+                write_padded(f, ring.get(),
+                             static_cast<size_t>(in_block) * vec_bytes, write_off);
+                write_off += static_cast<size_t>(in_block) * vec_bytes;
+                in_block = 0;
+            }
+        }
+        if (in_block > 0) {
+            write_padded(f, ring.get(),
+                         static_cast<size_t>(in_block) * vec_bytes, write_off);
+        }
+        f.sync();
+        spdlog::info("[sextant] wrote {} ({} centroids × dim={} FP16, {} bytes)",
+                     path, K, index_.dim,
+                     static_cast<uint64_t>(K) * vec_bytes);
+    }
+
+    // --- 5. manifest (line-oriented text; IVFIndex::read commit point) ---
+    // Written LAST via temp + rename so its presence signals a complete build.
+    {
+        const uint32_t n_probe = n_probe_default > 0
+                                     ? n_probe_default
+                                     : std::max(1u, K / 4u);
+        const std::string path = shards_dir + "/manifest";
+        const std::string tmp = path + ".tmp";
+        {
+            DirectFile f(tmp, true);
+            std::string commit =
+                std::string("ready\n") +
+                std::to_string(K) + "\n" +
+                std::to_string(index_.dim) + "\n" +
+                std::to_string(n_probe) + "\n" +
+                std::to_string(closure_factor) + "\n";
+            write_padded(f, commit.data(), commit.size(), 0);
+            f.sync();
+        }
+        std::error_code rec;
+        std::filesystem::rename(tmp, path, rec);
+        if (rec) {
+            throw Error(ErrorCode::IoError,
+                        "build_ivf: manifest rename failed: " + rec.message());
+        }
+        spdlog::info("[sextant] wrote {} (K={} n_probe_default={} closure_factor="
+                     "{:.4f})", path, K, n_probe, closure_factor);
+    }
+
+    // The global build buffers (codes/raw_vecs on index_) are no longer needed;
+    // free them so the Builder doesn't hold N-sized RAM after the build.
+    if (index_.codes_buffer) { aligned_free(index_.codes_buffer); index_.codes_buffer = nullptr; }
+    if (index_.raw_vecs_buffer) { aligned_free(index_.raw_vecs_buffer); index_.raw_vecs_buffer = nullptr; }
+    // index_ never allocated nodes_buffer for IVF (no merged graph).
+
+    const auto t1 = std::chrono::steady_clock::now();
+    spdlog::info("[sextant] build_ivf complete (K={}, {}/{} shards written) "
+                 "in {:.2f}s", K, shards_written, K,
+                 std::chrono::duration<double>(t1 - t0).count());
+
+    BuildResult result;
+    result.index_path = shards_dir;
+    result.n_vectors = index_.count;
+    result.dim = index_.dim;
+    result.R = params.R;
+    result.L_build = params.L_build;
+    result.pq_m = index_.quantizer ? index_.quantizer->m() : params.pq_m;
+    result.pq_bits = index_.quantizer ? index_.quantizer->bits() : params.pq_bits;
+    result.build_time_sec = std::chrono::duration<double>(t1 - t0).count();
+    return result;
+}
+
+// ===========================================================================
+// build_shard_into_ — construct + flush ONE IVF shard via a fresh Builder.
+//
+// The shard Index arrives with: cloned quantizer, materialized shard-local
+// codes/nodes/vecs buffers (local 0..shard_n-1; node row_id = global ID), and
+// metadata (count/dim/code_size/node_size=R_shard/path) set. This helper:
+//   - wires a fresh VamanaCore at R_shard over the shard buffers;
+//   - binds a fresh Builder to the shard Index (reentrant — the top-level
+//     Builder's index_ is untouched);
+//   - runs the canonical construct loop (construct_into), then the unchanged
+//     flush pipeline (snap_entry_points_ → compute_bfs_reorder_ →
+//     write_sidecars_). The fresh Builder has empty entry_centroids_, so
+//     snap_entry_points_ falls back to core.compute_entry_points().
+// The quantizer is NEVER retrained here; `members` only remaps shard-local
+// IDs → global row IDs during construct.
+// ===========================================================================
+void Builder::build_shard_into_(Index& shard_index,
+                                 const ResolvedParams& shard_params,
+                                 const std::vector<uint32_t>& members,
+                                 uint32_t shard_k, uint32_t K,
+                                 const std::string& shard_prefix) {
+    const uint32_t shard_n = static_cast<uint32_t>(shard_index.count);
+    const uint16_t R_shard = shard_params.R;
+
+    // Fresh VamanaCore for this shard at R_shard, bound to the shard buffers.
+    VamanaParams vp_shard =
+        VamanaParams::from_resolved(shard_params, shard_index.dim, R_shard);
+    shard_index.core = std::make_unique<VamanaCore>(vp_shard, *shard_index.quantizer);
+    shard_index.core->set_build_codes(shard_index.codes_buffer, shard_n);
+    shard_index.core->set_build_nodes(shard_index.nodes_buffer);
+    shard_index.core->set_build_vecs(shard_index.raw_vecs_buffer);
+    shard_index.core->prepare_for_build(shard_n);
+
+    // FlatNodeStore over the shard buffers so beam_search (used inside
+    // insert_build_from_code) goes through the store interface — same setup as
+    // the K==1 path in build_partitioned.
+    shard_index.flat_store = std::make_unique<FlatNodeStore>(
+        shard_index.nodes_buffer, shard_index.codes_buffer,
+        shard_index.node_size, shard_index.code_size);
+    shard_index.core->set_store(shard_index.flat_store.get());
+
+    // Fresh Builder bound to the shard Index. This is reentrant: the top-level
+    // Builder (running build_ivf) keeps its own index_ untouched. The fresh
+    // Builder's private flush helpers operate on shard_index exclusively.
+    Builder shard_builder(shard_index);
+
+    // Parallel construct via the canonical loop. Row IDs are remapped to the
+    // GLOBAL IDs (the on-disk neighbor row_id must be the global vector ID so
+    // IVF search results map back to the source dataset).
+    const uint32_t shard_lut_sz = shard_index.quantizer->lut_size();
+    const uint32_t nthreads = shard_params.num_threads > 0
+                                  ? shard_params.num_threads
+                                  : std::thread::hardware_concurrency();
+    const std::string label =
+        "build_ivf shard " + std::to_string(shard_k + 1) + "/" + std::to_string(K);
+    {
+        VamanaCore::BuildVecLoan build_vec_loan(*shard_index.core);
+        shard_builder.construct_into(
+            *shard_index.core, shard_n,
+            [&members](uint32_t local_id) {
+                return static_cast<RowId>(members[local_id]);
+            },
+            shard_lut_sz, nthreads, label.c_str());
+        // raw_vecs_buffer loan released here — no longer needed post-construct.
+    }
+
+    // Flush pipeline. Entry-point selection is the IVF Workstream A1 path:
+    // sub-clustered k-means medoids (k'=8 × M=1 = 8 entry points per shard),
+    // replacing the stride-sampling fallback. This sets index_.sub_centroids /
+    // sub_centroid_medoids / sub_medoids_per_cluster on shard_index so
+    // write_sidecars_ can emit the `.epc` sidecar. (A3 validated that scaling
+    // to M=4/32 entry points trades +0.4pp recall for −6% QPS locally — not
+    // worth it when recall is already 0.98+. A2 validated that sub-cluster
+    // indexing saves ~nothing vs the default multi-start, so it's off by
+    // default; the .epc infra remains for future use.) Run on shard_builder
+    // (bound to shard_index) — NOT on this top-level IVF Builder.
+    shard_builder.compute_sub_cluster_entry_points_(shard_params,
+                                                     /*n_sub=*/8,
+                                                     /*medoids_per_cluster=*/1);
+    auto bfs = shard_builder.compute_bfs_reorder_(shard_params);
+    shard_builder.write_sidecars_(shard_prefix, bfs, shard_params);
+    // flat_store / core / buffers freed when shard_index is destroyed by the
+    // caller (build_ivf).
+}
+
+// ===========================================================================
 // compute_bfs_reorder_ — pure BFS reorder of build IDs → disk positions.
 // write_sidecars_  — streams all four sidecars using the precomputed reorder.
 // ===========================================================================
@@ -1191,6 +1540,254 @@ void Builder::snap_entry_points_(const ResolvedParams& params) {
     index_.core->set_entry_points(std::move(medoid_ids));
     spdlog::info("[sextant] entry points: {} k-means medoids (FP32 centroids, "
                  "FP16 snap)", index_.core->entry_points().size());
+}
+
+// ===========================================================================
+// compute_sub_cluster_entry_points_ (IVF Workstream A1)
+//
+// For an IVF shard, run a small k-means (k' = n_sub) on the shard's PQ codes
+// to find k' sub-clusters, then snap each sub-centroid to its medoid (the
+// shard member nearest the sub-centroid by FP16 L2sq). The k' medoid LOCAL IDs
+// become the shard's entry points, and the k' sub-centroids (decoded to FP16)
+// are stored on index_.sub_centroids for A2's query-adaptive selection.
+//
+// This replaces the stride-sampling fallback that build_shard_into_ inherited
+// (16 arbitrary evenly-spaced IDs with no awareness of shard structure). The
+// sub-clustered medoids are spread across the shard's internal regions, so
+// beam_search's approach phase is shorter → fewer distance evals → directly
+// attacks the IVF work-multiplicity gap.
+//
+// The sub-centroids are PQ codes (k-means works in PQ-code space, same as
+// partition_codes); they're decoded to FP32 then cast to FP16 for storage so
+// A2 can compare them against the query's FP16 vector with l2sq_f16 (the same
+// primitive routing + the MemGraph ball use).
+//
+// Degenerate cases (shard too small for k' sub-clusters): clamps k' to
+// min(n_sub, shard_n) and, if that yields <2 sub-clusters, defers to
+// snap_entry_points_ (stride sampling) and returns 0.
+// ===========================================================================
+uint32_t Builder::compute_sub_cluster_entry_points_(const ResolvedParams& params,
+                                                     uint32_t n_sub,
+                                                     uint32_t medoids_per_cluster) {
+    const uint32_t shard_n = static_cast<uint32_t>(index_.count);
+    if (shard_n == 0 || !index_.core || !index_.quantizer ||
+        !index_.codes_buffer || !index_.raw_vecs_buffer || n_sub == 0) {
+        // Stride-sampled fallback (mirrors snap_entry_points_). core may be
+        // null only if count==0, in which case there's nothing to do.
+        if (index_.core && shard_n > 0) {
+            index_.core->compute_entry_points();
+        }
+        return 0;
+    }
+
+    // Clamp k' to the shard size. If fewer than 2 sub-clusters are possible,
+    // the sub-clustering adds no value over stride sampling.
+    uint32_t k_sub = std::min(n_sub, shard_n);
+    if (k_sub < 2) {
+        if (index_.core) index_.core->compute_entry_points();
+        return 0;
+    }
+
+    const uint32_t code_size = index_.code_size;
+    const Dim dim = index_.dim;
+    PqQuantizer& q = *index_.quantizer;
+
+    // --- k-means on PQ codes (k' = k_sub) ---
+    // Initialize centroids as k' distinct random member codes (k-means++-ish
+    // seeding isn't worth the cost at k'=8). Refine for a few iterations.
+    std::mt19937_64 rng(0xA1A2A3A4ULL);
+    std::vector<std::vector<uint8_t>> centroids(k_sub,
+        std::vector<uint8_t>(code_size, 0));
+    {
+        std::vector<uint32_t> picks;
+        picks.reserve(k_sub);
+        std::uniform_int_distribution<uint32_t> dist(0, shard_n - 1);
+        while (picks.size() < k_sub) {
+            const uint32_t idx = dist(rng);
+            if (std::find(picks.begin(), picks.end(), idx) == picks.end()) {
+                picks.push_back(idx);
+            }
+        }
+        for (uint32_t c = 0; c < k_sub; c++) {
+            std::memcpy(centroids[c].data(),
+                        index_.codes_buffer +
+                            static_cast<size_t>(picks[c]) * code_size,
+                        code_size);
+        }
+    }
+
+    auto code_at = [&](uint32_t local_id) {
+        return index_.codes_buffer + static_cast<size_t>(local_id) * code_size;
+    };
+
+    constexpr uint32_t kIters = 8;
+    std::vector<uint32_t> assign(shard_n);
+    std::vector<uint32_t> counts(k_sub);
+    for (uint32_t iter = 0; iter < kIters; iter++) {
+        // Assignment step: nearest centroid by PQ code distance.
+        std::fill(counts.begin(), counts.end(), 0);
+        for (uint32_t i = 0; i < shard_n; i++) {
+            float best = std::numeric_limits<float>::max();
+            uint32_t best_c = 0;
+            for (uint32_t c = 0; c < k_sub; c++) {
+                const float d = q.code_distance(code_at(i), centroids[c].data());
+                if (d < best) { best = d; best_c = c; }
+            }
+            assign[i] = best_c;
+            counts[best_c]++;
+        }
+        // Update step: per-cluster PQ-code mean. PQ codes have no closed-form
+        // mean, so recompute each centroid as the code minimizing total
+        // within-cluster distance — i.e. the medoid. This is slower than a
+        // continuous mean but k'×shard_n is small (seconds) and keeps the
+        // centroid a valid code (snap-to-medoid below then becomes a no-op for
+        // the centroid itself). For efficiency we approximate: pick the member
+        // with the smallest sum of distances to its cluster (1-pass scan,
+        // sub-sampled when the cluster is large).
+        for (uint32_t c = 0; c < k_sub; c++) {
+            if (counts[c] == 0) {
+                // Reseed empty cluster from a random member.
+                std::uniform_int_distribution<uint32_t> dist(0, shard_n - 1);
+                std::memcpy(centroids[c].data(), code_at(dist(rng)), code_size);
+                continue;
+            }
+            // Sub-sample the cluster for the medoid search when large: cap the
+            // candidate evaluation at 256 members per cluster (at k'=8, that's
+            // 2048 code_distance calls/iter — negligible).
+            std::vector<uint32_t> members_c;
+            members_c.reserve(std::min<uint32_t>(counts[c], 256u));
+            const uint32_t stride =
+                counts[c] > 256 ? (counts[c] + 255) / 256 : 1;
+            for (uint32_t i = 0; i < shard_n && members_c.size() < 256; i++) {
+                if (assign[i] == c && (i % stride == 0 || members_c.empty())) {
+                    members_c.push_back(i);
+                }
+            }
+            float best_sum = std::numeric_limits<float>::max();
+            uint32_t best_medoid = members_c.empty() ? 0 : members_c[0];
+            for (uint32_t m : members_c) {
+                float sum = 0;
+                for (uint32_t j : members_c) {
+                    sum += q.code_distance(code_at(m), code_at(j));
+                }
+                if (sum < best_sum) { best_sum = sum; best_medoid = m; }
+            }
+            std::memcpy(centroids[c].data(), code_at(best_medoid), code_size);
+        }
+    }
+
+    // --- Final assignment (in case the last update changed centroids) ---
+    std::fill(counts.begin(), counts.end(), 0);
+    for (uint32_t i = 0; i < shard_n; i++) {
+        float best = std::numeric_limits<float>::max();
+        uint32_t best_c = 0;
+        for (uint32_t c = 0; c < k_sub; c++) {
+            const float d = q.code_distance(code_at(i), centroids[c].data());
+            if (d < best) { best = d; best_c = c; }
+        }
+        assign[i] = best_c;
+        counts[best_c]++;
+    }
+
+    // --- Decode sub-centroids to FP16 and snap each to its top-M FP16 medoids ---
+    // The k-means centroid is already a member code (medoid update above), but
+    // to be safe we snap each decoded sub-centroid to its top-M nearest members
+    // by FP16 L2sq (M = medoids_per_cluster). This gives k' × M entry points
+    // spread across the shard's regions. A2/A3 indexes into them by sub-cluster
+    // (k' FP16 distances) instead of scanning all k'×M, so E can grow without
+    // search-time penalty.
+    const uint32_t M = std::max(1u, medoids_per_cluster);
+    index_.sub_centroids.resize(static_cast<size_t>(k_sub) * dim);
+    index_.sub_centroid_medoids.assign(
+        static_cast<size_t>(k_sub) * M, 0);
+    index_.sub_medoids_per_cluster = M;
+
+    // Parallel medoid snap: each sub-cluster scans its own members (the
+    // assignment already partitioned them), so the work is balanced when the
+    // clusters are balanced. Fall back to scanning all members if a cluster is
+    // tiny (frontier safety). Thread c writes disjoint slices:
+    //   sub_centroids[c*dim .. (c+1)*dim)
+    //   sub_centroid_medoids[c*M .. (c+1)*M)
+    std::vector<std::thread> pool;
+    auto snap_one = [&](uint32_t c) {
+        // Per-thread scratch (snap_one runs on worker threads concurrently).
+        std::vector<float> cf32(dim);
+        std::vector<float16_t> cf16(dim);
+        q.decode_code(centroids[c].data(), cf32.data());
+        cast_fp32_to_fp16(cf32.data(), cf16.data(), dim);
+        // Write the sub-centroid FP16 into the shared buffer (disjoint slice).
+        std::memcpy(index_.sub_centroids.data() + static_cast<size_t>(c) * dim,
+                    cf16.data(), dim * sizeof(float16_t));
+        // Find the top-M nearest members by FP16 L2sq within this cluster.
+        // Use a max-heap of size M (pop the farthest when full) — O(N log M).
+        const float16_t* vecs = index_.raw_vecs_buffer;
+        struct Med { float d; uint32_t id; };
+        auto med_cmp = [](const Med& a, const Med& b) { return a.d < b.d; };
+        std::vector<Med> heap;  // max-heap by d (front = worst)
+        heap.reserve(M + 1);
+        const uint32_t cluster_count = counts[c];
+        for (uint32_t i = 0; i < shard_n; i++) {
+            if (cluster_count > 0 && assign[i] != c) continue;
+            const float d = l2sq_f16(cf16.data(),
+                                     vecs + static_cast<size_t>(i) * dim, dim);
+            if (heap.size() < M) {
+                heap.push_back({d, i});
+                std::push_heap(heap.begin(), heap.end(), med_cmp);
+            } else if (d < heap.front().d) {
+                std::pop_heap(heap.begin(), heap.end(), med_cmp);
+                heap.back() = {d, i};
+                std::push_heap(heap.begin(), heap.end(), med_cmp);
+            }
+        }
+        // If the cluster had fewer than M members, heap is short — top up with
+        // nearest members from ANY cluster so each sub-cluster contributes M
+        // medoids (keeps the row-major layout uniform for A2).
+        if (heap.size() < M) {
+            for (uint32_t i = 0; i < shard_n && heap.size() < M; i++) {
+                bool dup = false;
+                for (const auto& m : heap) if (m.id == i) { dup = true; break; }
+                if (dup) continue;
+                const float d = l2sq_f16(cf16.data(),
+                                         vecs + static_cast<size_t>(i) * dim, dim);
+                heap.push_back({d, i});
+                std::push_heap(heap.begin(), heap.end(), med_cmp);
+            }
+        }
+        // Sort ascending by distance so slot 0 is the nearest (primary medoid).
+        std::sort(heap.begin(), heap.end(), med_cmp);
+        uint32_t* out = index_.sub_centroid_medoids.data() +
+                        static_cast<size_t>(c) * M;
+        for (uint32_t s = 0; s < M && s < heap.size(); s++) {
+            out[s] = heap[s].id;
+        }
+    };
+    for (uint32_t c = 0; c < k_sub; c++) pool.emplace_back(snap_one, c);
+    for (auto& t : pool) t.join();
+
+    // Dedup medoids across sub-clusters (two sub-centroids may snap to the same
+    // member). The deduped set is what the core uses for the default multi-
+    // start path (A2, when active, picks one sub-cluster's slice instead).
+    std::vector<uint32_t> medoids = index_.sub_centroid_medoids;
+    std::sort(medoids.begin(), medoids.end());
+    medoids.erase(std::unique(medoids.begin(), medoids.end()), medoids.end());
+    // Top up with unused members if dedup reduced the count below a useful
+    // floor (n_search_entry_points). This guards against degenerate shards
+    // where many sub-clusters collapse to a few dense regions.
+    const uint32_t ep_floor = std::min<uint32_t>(shard_n, 4u);
+    if (medoids.size() < ep_floor) {
+        for (uint32_t i = 0; i < shard_n && medoids.size() < ep_floor; i++) {
+            if (std::find(medoids.begin(), medoids.end(), i) == medoids.end()) {
+                medoids.push_back(i);
+            }
+        }
+    }
+
+    index_.core->set_entry_points(std::move(medoids));
+    spdlog::info("[sextant] IVF shard entry points: {} sub-clustered medoids "
+                 "(k'={}, M={}/{}, shard_n={}, {} unique entry points)",
+                 k_sub * M, k_sub, M, medoids_per_cluster, shard_n,
+                 index_.core->entry_points().size());
+    return k_sub;
 }
 
 
@@ -1419,6 +2016,56 @@ void Builder::write_sidecars_(const std::string& index_path,
         f.sync();
         spdlog::info("[sextant] wrote {} ({} FP16 vectors, {} bytes each)",
                      path, ball_ids.size(), index_.dim * sizeof(float16_t));
+    }
+
+    // ----- .epc (IVF shard entry-point sub-centroids, A1/A2) -----
+    // IVF-only: emitted when build_shard_into_ populated index_.sub_centroids
+    // (the merged path leaves it empty, so no .epc is written for K==1). Stores
+    // k' × dim FP16 sub-centroids followed by k' × u32 medoid disk-positions
+    // (BFS-remapped from build-local IDs). IVFIndex::read loads this so A2 can
+    // pick the closest sub-cluster per query and seed beam_search from its
+    // medoid via forced_entry_points. Layout:
+    //   [SidecarHeader][k_sub × dim × float16_t][k_sub × u32 disk-pos medoids]
+    // The header's n_vectors field carries k_sub (the sub-cluster count).
+    if (!index_.sub_centroids.empty()) {
+        const std::string path = index_path + ".epc";
+        const uint32_t k_sub = static_cast<uint32_t>(
+            index_.sub_centroids.size() / index_.dim);
+        const uint32_t M = index_.sub_medoids_per_cluster;
+        const uint32_t n_medoids = static_cast<uint32_t>(
+            index_.sub_centroid_medoids.size());
+        DirectFile f(path, true);
+        SidecarHeader h;
+        fill_header(h, kMagicEpc, k_sub, index_.dim, uuid);
+        write_padded(f, &h, sizeof(h), 0);
+
+        const size_t vec_bytes = static_cast<size_t>(index_.dim) * sizeof(float16_t);
+        const size_t centroid_bytes = static_cast<size_t>(k_sub) * vec_bytes;
+        // Payload: [u16 M][k_sub × dim FP16 sub-centroids][k_sub × M u32 medoids]
+        // (medoids are BFS-remapped from build-local IDs to disk positions,
+        // mirroring .meta's entry-point remap above).
+        std::vector<uint8_t> payload;
+        payload.reserve(sizeof(uint16_t) + centroid_bytes +
+                        n_medoids * sizeof(uint32_t));
+        const uint16_t m16 = static_cast<uint16_t>(M);
+        payload.insert(payload.end(),
+                       reinterpret_cast<const uint8_t*>(&m16),
+                       reinterpret_cast<const uint8_t*>(&m16) + sizeof(m16));
+        payload.insert(payload.end(),
+                       reinterpret_cast<const uint8_t*>(index_.sub_centroids.data()),
+                       reinterpret_cast<const uint8_t*>(index_.sub_centroids.data())
+                           + centroid_bytes);
+        for (uint32_t i = 0; i < n_medoids; i++) {
+            uint32_t disk_id = index_.sub_centroid_medoids[i];
+            if (disk_id < n) disk_id = bfs.remap[disk_id];
+            payload.insert(payload.end(),
+                           reinterpret_cast<const uint8_t*>(&disk_id),
+                           reinterpret_cast<const uint8_t*>(&disk_id) + sizeof(disk_id));
+        }
+        write_padded(f, payload.data(), payload.size(), sizeof(h));
+        f.sync();
+        spdlog::info("[sextant] wrote {} (k'={} M={} sub-centroids × dim={} FP16 "
+                     "+ {} medoid IDs)", path, k_sub, M, index_.dim, n_medoids);
     }
 
     // ----- .manifest (atomic commit — written LAST via temp + rename) -----
@@ -1767,113 +2414,6 @@ void Builder::prepare_codes(VectorSource& source, const ResolvedParams& params) 
     spdlog::info("[sextant] prepare_codes: loaded {} FP16 vectors", loaded);
 
     pass2_encode(source, params);
-}
-
-// =============================================================================
-// build_shards_unmerged — IVF-probe measurement helper.
-// Builds K independent Vamana graphs (one per k-means shard) and returns them
-// in-memory WITHOUT merging. Used to measure the cross-shard-edge recall loss
-// vs the merged-graph baseline. See docs/optimization_levers_and_attribution.md
-// lever #1.
-// =============================================================================
-std::vector<Builder::ShardOutput> Builder::build_shards_unmerged(
-    const ResolvedParams& params, uint32_t K, float closure_factor_override) {
-    if (index_.codes_buffer == nullptr || index_.count == 0) {
-        throw Error(ErrorCode::InvalidParam,
-                    "build_shards_unmerged: Index has no encoded codes "
-                    "(run pass1_sample_and_train + pass2_encode first)");
-    }
-    if (K < 2) {
-        throw Error(ErrorCode::InvalidParam,
-                    "build_shards_unmerged: K must be >= 2");
-    }
-    const uint32_t n = static_cast<uint32_t>(index_.count);
-    const float cf = closure_factor_override > 0.0f
-                         ? closure_factor_override
-                         : params.closure_factor;
-
-    // --- 1. Partition via k-means on PQ codes (closure_factor overlap) ---
-    ResolvedParams shard_params = params;
-    shard_params.partition_count = K;
-    shard_params.closure_factor = cf;
-    auto assignment = partition_codes(*index_.quantizer, index_.codes_buffer,
-                                       n, index_.code_size, K, cf);
-    if (assignment.shards.size() != K) {
-        throw Error(ErrorCode::InvalidParam,
-                    "build_shards_unmerged: partition returned wrong K");
-    }
-
-    // Per-shard Vamana uses R_shard = 2R/3 (same as build_partitioned).
-    const uint16_t R_shard = static_cast<uint16_t>(
-        std::max<uint32_t>(8u, (2u * params.R) / 3u));
-    const uint32_t shard_node_size =
-        VamanaCore::static_node_size(R_shard, index_.code_size);
-    spdlog::info("[sextant] build_shards_unmerged: K={}, R_shard={}, "
-                 "closure_factor={:.4f}", K, R_shard, cf);
-
-    VamanaParams vp_shard = VamanaParams::from_resolved(params, index_.dim, R_shard);
-    const uint32_t shard_lut_sz =
-        index_.quantizer ? index_.quantizer->lut_size() : 0;
-    const uint32_t nthreads = params.num_threads > 0
-                                  ? params.num_threads
-                                  : std::thread::hardware_concurrency();
-
-    std::vector<ShardOutput> out(K);
-    for (uint32_t k = 0; k < K; k++) {
-        auto& members = assignment.shards[k];
-        const uint32_t shard_n = static_cast<uint32_t>(members.size());
-        if (shard_n == 0) {
-            spdlog::warn("[sextant] shard {} empty", k);
-            continue;
-        }
-        spdlog::info("[sextant] building shard {}/{} ({} vectors)", k, K, shard_n);
-
-        ShardOutput s;
-        s.shard_n = shard_n;
-        s.codes.resize(static_cast<size_t>(shard_n) * index_.code_size, 0);
-        s.vecs.resize(static_cast<size_t>(shard_n) * index_.dim, 0);
-        s.nodes.resize(static_cast<size_t>(shard_n) * shard_node_size, 0);
-        s.local_to_global.resize(shard_n);
-        for (uint32_t i = 0; i < shard_n; i++) {
-            const uint32_t gid = members[i];
-            s.local_to_global[i] = gid;
-            std::memcpy(s.codes.data() + static_cast<size_t>(i) * index_.code_size,
-                        index_.codes_buffer + static_cast<size_t>(gid) * index_.code_size,
-                        index_.code_size);
-            if (index_.raw_vecs_buffer) {
-                std::memcpy(s.vecs.data() + static_cast<size_t>(i) * index_.dim,
-                            index_.raw_vecs_buffer + static_cast<size_t>(gid) * index_.dim,
-                            index_.dim * sizeof(float16_t));
-            }
-        }
-        // Centroid PQ code (for routing).
-        s.centroid_code.assign(assignment.centroids[k].begin(),
-                               assignment.centroids[k].end());
-
-        // Build the shard's VamanaCore.
-        s.core = std::make_unique<VamanaCore>(vp_shard, *index_.quantizer);
-        s.core->set_build_codes(s.codes.data(), shard_n);
-        s.core->set_build_nodes(s.nodes.data());
-        s.core->set_build_vecs(s.vecs.data());
-        s.core->prepare_for_build(shard_n);
-        VamanaCore::BuildVecLoan loan(*s.core);
-
-        const std::string label = "shard " + std::to_string(k) + "/" + std::to_string(K);
-        construct_into(*s.core, shard_n,
-                       [&members](uint32_t local_id) {
-                           return static_cast<RowId>(members[local_id]);
-                       },
-                       shard_lut_sz, nthreads, label.c_str());
-        s.core->compute_entry_points();
-
-        // Wire a FlatNodeStore over the local buffers for search.
-        s.store = std::make_unique<FlatNodeStore>(
-            s.nodes.data(), s.codes.data(), shard_node_size, index_.code_size);
-        s.core->set_store(s.store.get());
-
-        out[k] = std::move(s);
-    }
-    return out;
 }
 
 }  // namespace sextant
