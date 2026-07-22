@@ -28,6 +28,7 @@
 #include "quant/pq_quantizer.hpp"
 #include "storage/direct_io.hpp"
 #include "storage/sidecar_header.hpp"
+#include "util/fp16.hpp"
 
 #include <ctpl/ctpl_stl_tls.h>
 
@@ -717,9 +718,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
                                   static_cast<size_t>(rid) * index_.dim;
                     const float* src = chunk.vectors +
                                        static_cast<size_t>(r) * index_.dim;
-                    for (uint32_t d = 0; d < index_.dim; d++) {
-                        dst[d] = static_cast<float16_t>(src[d]);
-                    }
+                    cast_fp32_to_fp16(src, dst, index_.dim);
                     loaded++;
                 }
             }
@@ -1172,12 +1171,11 @@ void Builder::snap_entry_points_(const ResolvedParams& params) {
     // parallel across centroids.
     std::vector<uint32_t> medoid_ids(k);
     std::vector<std::thread> pool;
-    auto worker = [&](uint32_t c) {
-        const float* centroid = entry_centroids_.data() + static_cast<size_t>(c) * index_.dim;
-        // Convert centroid to FP16 for l2sq_f16 comparison.
-        std::vector<float16_t> centroid_f16(index_.dim);
-        for (uint32_t d = 0; d < index_.dim; d++)
-            centroid_f16[d] = static_cast<float16_t>(centroid[d]);
+        auto worker = [&](uint32_t c) {
+            const float* centroid = entry_centroids_.data() + static_cast<size_t>(c) * index_.dim;
+            // Convert centroid to FP16 for l2sq_f16 comparison.
+            std::vector<float16_t> centroid_f16(index_.dim);
+            cast_fp32_to_fp16(centroid, centroid_f16.data(), index_.dim);
         float best_d = std::numeric_limits<float>::infinity();
         uint32_t best_id = 0;
         for (uint32_t i = 0; i < n; i++) {
@@ -1647,9 +1645,7 @@ void Builder::insert(const float* vec, Dim dim, RowId row_id) {
             aligned_free(index_.raw_vecs_buffer);
         }
         float16_t* dst = nb.as<float16_t>() + static_cast<size_t>(new_internal) * index_.dim;
-        for (uint32_t d = 0; d < index_.dim; d++) {
-            dst[d] = static_cast<float16_t>(vec[d]);
-        }
+        cast_fp32_to_fp16(vec, dst, index_.dim);
         index_.raw_vecs_buffer = nb.as<float16_t>();
         nb.release();
     }
@@ -1774,9 +1770,7 @@ void Builder::prepare_codes(VectorSource& source, const ResolvedParams& params) 
                                  static_cast<size_t>(rid) * index_.dim;
                 const float* src = chunk.vectors +
                                    static_cast<size_t>(r) * index_.dim;
-                for (uint32_t d = 0; d < index_.dim; d++) {
-                    dst[d] = static_cast<float16_t>(src[d]);
-                }
+                cast_fp32_to_fp16(src, dst, index_.dim);
                 loaded++;
             }
         }

@@ -21,6 +21,7 @@
 
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
+#include "util/fp16.hpp"
 #include "storage/direct_io.hpp"
 #include "storage/memgraph.hpp"
 #include "storage/node_store.hpp"
@@ -112,9 +113,7 @@ std::unique_ptr<Index> Estimator::build_mini_(const float* sample,
             float16_t* dst =
                 vecs.as<float16_t>() + static_cast<size_t>(i) * dim;
             const float* svec = sample + static_cast<size_t>(i) * dim;
-            for (uint32_t d = 0; d < dim; d++) {
-                dst[d] = static_cast<float16_t>(svec[d]);
-            }
+            cast_fp32_to_fp16(svec, dst, dim);
         }
         mini->raw_vecs_buffer = vecs.as<float16_t>(); vecs.release();
     }
