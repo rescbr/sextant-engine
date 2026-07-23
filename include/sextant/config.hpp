@@ -152,6 +152,17 @@ struct SearchConfig {
     /// truncated to k. 1 = no oversampling. Ignored for single-shard indexes.
     uint32_t merge_oversample = 2;
 
+    /// IVF-probe multi-probe ratio (Voronoi-boundary recall recovery). After
+    /// picking the n_probe nearest centroids, extend the probe set to include
+    /// ANY centroid whose distance ≤ ratio × d[n_probe-1] (the n_probe-th
+    /// nearest centroid's distance). 1.0 = strict n_probe (off, back-compat).
+    /// Values >1.0 catch true NNs that live in boundary shards routing missed.
+    /// Increases recall at variable per-query cost (boundary queries probe more
+    /// shards). See docs/ivf_routing_analysis.md. Measured (c4a K=32, np=4):
+    /// ratio=1.05 recovers ~3pp routing recall for +1.9 avg shards/query.
+    /// Ignored for single-shard indexes.
+    float multiprobe_ratio = 1.0f;
+
     /// Search-time early-exit patience (post-convergence stall count before
     /// terminating beam_search). 0 = disabled (full L_search). UINT32_MAX =
     /// defer to the index's baked-in value (back-compat default). Any other

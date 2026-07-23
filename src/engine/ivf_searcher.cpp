@@ -93,7 +93,14 @@ std::vector<Candidate> IVFSearcher::search_body_(const float* query, uint32_t k,
     }
     cast_fp32_to_fp16(query, w.query_fp16.data(), index_.dim);
 
-    // --- 1. Route: FP16 L2sq to each centroid, pick n_probe nearest ---
+    // --- 1. Route: FP16 L2sq to each centroid, pick n_probe nearest (+multi-probe) ---
+    // Multi-probe (config.multiprobe_ratio > 1.0): after picking the n_probe
+    // nearest centroids, extend the probe set to include any centroid whose
+    // distance ≤ ratio × d[n_probe-1]. This recovers true NNs in boundary
+    // shards that strict nearest-centroid routing misses (Voronoi-boundary
+    // ambiguity). See docs/ivf_routing_analysis.md. The probe set is variable
+    // per query — unambiguous queries (large gap to the (n_probe+1)-th
+    // centroid) probe exactly n_probe; boundary queries probe more.
     w.cent_dists.clear();
     for (uint32_t c = 0; c < K; c++) {
         if (!index_.shards[c]) {
@@ -105,16 +112,30 @@ std::vector<Candidate> IVFSearcher::search_body_(const float* query, uint32_t k,
         const float d = l2sq_f16(w.query_fp16.data(), centroid, index_.dim);
         w.cent_dists.push_back({d, c});
     }
-    std::nth_element(w.cent_dists.begin(),
-                     w.cent_dists.begin() + static_cast<long>(n_probe),
-                     w.cent_dists.end(),
-                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    // Sort ascending by distance. K is small (≤64), so a full sort is cheap
+    // and lets us apply the multi-probe threshold cleanly.
+    std::sort(w.cent_dists.begin(), w.cent_dists.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    // Determine the probe set size: at least n_probe, extended by the ratio.
+    uint32_t n_probe_eff = n_probe;
+    const float ratio = config.multiprobe_ratio;
+    if (ratio > 1.0f && n_probe < K) {
+        const float d_nth = w.cent_dists[n_probe - 1].first;
+        const float thresh = ratio * d_nth;
+        for (uint32_t p = n_probe; p < K; p++) {
+            if (w.cent_dists[p].first <= thresh) n_probe_eff++;
+            else break;  // sorted ascending
+        }
+    }
+    n_probe_eff = std::min(n_probe_eff, K);
 
-    // --- 2. Search the n_probe nearest shards SERIALY on this worker.
-    // Each shard's VamanaCore::search is const + takes the worker's tls, so
-    // this is thread-safe. The tls is resized lazily on shard-count mismatch
-    // (handled inside VamanaCore::search). This bypasses the shard's own
-    // Searcher/pool entirely — no nested pool, no per-probe future-wait.
+    // --- 2. Search the probed shards SERIALY on this worker.
+    // n_probe_eff = n_probe (strict) or n_probe + multi-probe extensions
+    // (boundary shards within the ratio threshold). Each shard's VamanaCore::
+    // search is const + takes the worker's tls, so this is thread-safe. The
+    // tls is resized lazily on shard-count mismatch (handled inside
+    // VamanaCore::search). This bypasses the shard's own Searcher/pool
+    // entirely — no nested pool, no per-probe future-wait.
     //
     // IVF Workstream A2/A3: when the shard carries sub-cluster entry-point data
     // (shard_sub_centroids, k'×dim FP16; shard_sub_medoids, k'×M disk-pos IDs),
@@ -131,7 +152,7 @@ std::vector<Candidate> IVFSearcher::search_body_(const float* query, uint32_t k,
     bq.query_lut = lut_ptr;
     bq.query_fp16 = w.query_fp16.data();
     w.scored.clear();
-    for (uint32_t p = 0; p < n_probe; p++) {
+    for (uint32_t p = 0; p < n_probe_eff; p++) {
         const uint32_t c = w.cent_dists[p].second;
         auto& shard = index_.shards[c];
         if (!shard || !shard->core) continue;

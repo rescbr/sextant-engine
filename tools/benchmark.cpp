@@ -298,7 +298,8 @@ QueryMetrics process_results(const RerankCtx& ctx,
                       uint32_t n_threads_hint,
                       uint64_t cache_size_req,
                       uint32_t n_probe_req,
-                      uint32_t early_exit_req);
+                      uint32_t early_exit_req,
+                      float multiprobe_ratio_req);
 
 int main(int argc, char* argv[]) {
     sextant::init_logging();
@@ -334,6 +335,12 @@ int main(int argc, char* argv[]) {
                     "Default: defer to the index's baked-in value. Higher = "
                     "deeper shard search (more recall, less QPS).",
                     false, 0xFFFFFFFFu);
+    p.add<float>("multiprobe-ratio", 0,
+                 "IVF multi-probe ratio: extend the probe set to all centroids "
+                 "within ratio × d[n_probe-1]. 1.0 = strict n_probe (off). "
+                 ">1.0 recovers boundary-shard recall at variable per-query cost. "
+                 "See docs/ivf_routing_analysis.md. Recommended: 1.05.",
+                 false, 1.0f);
     p.parse_check(argc, argv);
 
     // Set log level (must come after init_logging() above and before any
@@ -384,16 +391,17 @@ int main(int argc, char* argv[]) {
 
     const uint32_t n_probe_req = p.get<uint32_t>("n-probe");
     const uint32_t early_exit_req = p.get<uint32_t>("early-exit-patience");
+    const float multiprobe_ratio_req = p.get<float>("multiprobe-ratio");
 
     // IVF dispatch: if `<index>.shards/` is a directory, this is an IVF-probe
     // index — open via IVFIndex::read and run queries through IVFSearcher
     // (synchronous; per-shard parallelism is Milestone 3). The single-index
     // path below is unchanged when `.shards/` is absent.
     if (std::filesystem::is_directory(index + ".shards")) {
-         return run_ivf_benchmark(index, query_path, base_data, gt_path,
-                                 k, L, rerank, io_limit, limit,
-                                 n_threads_hint, cache_size_req,
-                                 n_probe_req, early_exit_req);
+    return run_ivf_benchmark(index, query_path, base_data, gt_path,
+                             k, L, rerank, io_limit, limit,
+                             n_threads_hint, cache_size_req,
+                             n_probe_req, early_exit_req, multiprobe_ratio_req);
     }
 
     try {
@@ -689,7 +697,8 @@ int main(int argc, char* argv[]) {
                       uint32_t n_threads_hint,
                       uint64_t cache_size_req,
                       uint32_t n_probe_req,
-                      uint32_t early_exit_req) {
+                      uint32_t early_exit_req,
+                      float multiprobe_ratio_req) {
     try {
         std::unique_ptr<sextant::IVFIndex> ivf_idx =
             sextant::IVFIndex::read(index + ".shards", cache_size_req);
@@ -744,6 +753,7 @@ int main(int argc, char* argv[]) {
                   << ", L: " << L << ", rerank: " << rerank
                   << ", K (shards): " << K
                   << ", n_probe: " << effective_n_probe
+                  << ", multiprobe_ratio: " << multiprobe_ratio_req
                   << ", threads: " << ivf_searcher.num_threads() << "\n";
 
         // Read all query vectors into RAM.
@@ -799,6 +809,7 @@ int main(int argc, char* argv[]) {
         scfg.io_limit = io_limit;
         scfg.n_probe = n_probe_req;  // 0 → IVFSearcher uses index default.
         scfg.early_exit_patience = early_exit_req;
+        scfg.multiprobe_ratio = multiprobe_ratio_req;
 
         std::vector<double> latencies_us;
         latencies_us.reserve(n_queries);
