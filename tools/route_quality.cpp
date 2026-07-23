@@ -143,31 +143,84 @@ int main(int argc, char** argv) {
         return acc;
     };
 
-    // --- Compute each base vector's primary shard (argmin L2sq to centroids).
+    // --- Compute each base vector's shard membership (closure-expanded).
+    // A vector belongs to shard c if d(vec, centroid_c) ≤ closure_factor × d_best
+    // — EXACTLY matching partition.cpp's assignment. This is the authoritative
+    // membership; "primary shard" (argmin) would UNDERCOUNT coverage because it
+    // ignores the build-time overlap that already puts boundary vectors in 2+
+    // shards. We store membership as a flat CSR: shard_members_offsets[v],
+    // shard_members[v][].
     // O(N × K × dim) — the dominant cost. Parallelize across vectors.
-    std::vector<uint8_t> primary_shard(N);
+    const float closure = ivf->closure_factor;
+    std::vector<uint32_t> mem_offsets(N + 1, 0);  // CSR offsets
+    {
+        std::vector<std::thread> pool;
+        uint32_t nthreads = std::max(1u, std::thread::hardware_concurrency());
+        uint32_t per = (N + nthreads - 1) / nthreads;
+        // First pass: count members per vector (accumulate CSR offsets).
+        auto worker = [&](uint32_t /*tid*/, uint32_t lo, uint32_t hi) {
+            std::vector<float> dists(K);
+            for (uint32_t v = lo; v < hi; v++) {
+                float best = std::numeric_limits<float>::max();
+                if (fp32_route) {
+                    const float* vec = base_f32_route.data() + static_cast<size_t>(v) * dim;
+                    for (uint32_t c = 0; c < K; c++) {
+                        dists[c] = base_dist(vec, cent_f32.data() + static_cast<size_t>(c) * dim);
+                        if (dists[c] < best) best = dists[c];
+                    }
+                } else {
+                    const float16_t* vec = base_f16.data() + static_cast<size_t>(v) * dim;
+                    for (uint32_t c = 0; c < K; c++) {
+                        dists[c] = l2sq_f16(vec, centroids + static_cast<size_t>(c) * dim, dim);
+                        if (dists[c] < best) best = dists[c];
+                    }
+                }
+                const float thresh = closure * best;
+                uint32_t cnt = 0;
+                for (uint32_t c = 0; c < K; c++) if (dists[c] <= thresh) cnt++;
+                mem_offsets[v + 1] = cnt;
+            }
+        };
+        for (uint32_t t = 0; t < nthreads; t++) {
+            uint32_t lo = t * per, hi = std::min(N, lo + per);
+            if (lo < hi) pool.emplace_back(worker, t, lo, hi);
+        }
+        for (auto& th : pool) th.join();
+        // CSR prefix sum.
+        for (uint32_t v = 0; v < N; v++) mem_offsets[v + 1] += mem_offsets[v];
+        // Report avg replication for sanity (should match the build log).
+        double avg_repl = static_cast<double>(mem_offsets[N]) / N;
+        std::fprintf(stderr, "[route] closure=%.4f, avg replication %.3f×\n",
+                     closure, avg_repl);
+    }
+    // Second pass: fill members.
+    std::vector<uint8_t> members(mem_offsets[N]);
     {
         std::vector<std::thread> pool;
         uint32_t nthreads = std::max(1u, std::thread::hardware_concurrency());
         uint32_t per = (N + nthreads - 1) / nthreads;
         auto worker = [&](uint32_t lo, uint32_t hi) {
+            std::vector<float> dists(K);
             for (uint32_t v = lo; v < hi; v++) {
                 float best = std::numeric_limits<float>::max();
-                uint32_t best_c = 0;
                 if (fp32_route) {
                     const float* vec = base_f32_route.data() + static_cast<size_t>(v) * dim;
                     for (uint32_t c = 0; c < K; c++) {
-                        const float d = base_dist(vec, cent_f32.data() + static_cast<size_t>(c) * dim);
-                        if (d < best) { best = d; best_c = c; }
+                        dists[c] = base_dist(vec, cent_f32.data() + static_cast<size_t>(c) * dim);
+                        if (dists[c] < best) best = dists[c];
                     }
                 } else {
                     const float16_t* vec = base_f16.data() + static_cast<size_t>(v) * dim;
                     for (uint32_t c = 0; c < K; c++) {
-                        const float d = l2sq_f16(vec, centroids + static_cast<size_t>(c) * dim, dim);
-                        if (d < best) { best = d; best_c = c; }
+                        dists[c] = l2sq_f16(vec, centroids + static_cast<size_t>(c) * dim, dim);
+                        if (dists[c] < best) best = dists[c];
                     }
                 }
-                primary_shard[v] = static_cast<uint8_t>(best_c);
+                const float thresh = closure * best;
+                uint32_t pos = mem_offsets[v];
+                for (uint32_t c = 0; c < K; c++) {
+                    if (dists[c] <= thresh) members[pos++] = static_cast<uint8_t>(c);
+                }
             }
         };
         for (uint32_t t = 0; t < nthreads; t++) {
@@ -176,7 +229,12 @@ int main(int argc, char** argv) {
         }
         for (auto& th : pool) th.join();
     }
-    std::fprintf(stderr, "[route] computed primary shard for all %u vectors\n", N);
+    // Helper: is shard c in vector v's membership set?
+    auto in_membership = [&](uint32_t v, uint8_t c) {
+        const uint32_t lo = mem_offsets[v], hi = mem_offsets[v + 1];
+        for (uint32_t p = lo; p < hi; p++) if (members[p] == c) return true;
+        return false;
+    };
 
     // --- For each query: routed shards (top-n_probe by FP16) + coverage analysis.
     const uint32_t nps[] = {1, 2, 4, 8, 16, 32};
@@ -206,41 +264,53 @@ int main(int argc, char** argv) {
         std::sort(routed.begin(), routed.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
 
-        // For each true NN (up to gt_k), find its primary shard. Build per-eval_k
-        // shard-hit histograms: hits_k[ki][c] = # true NNs (among first eval_ks[ki]) in shard c.
+        // For each true NN (up to gt_k), tally hits per shard. With closure
+        // overlap, an NN is a member of multiple shards — count it in EACH of
+        // its member shards (for oracle). hits_k[ki][c] = # NNs (among first
+        // eval_ks[ki]) that are members of shard c.
         std::vector<std::vector<uint32_t>> hits(2, std::vector<uint32_t>(K, 0));
         uint32_t eval_ks[2] = {std::min(10u, gt_k), std::min(100u, gt_k)};
         uint32_t max_eval = std::max(eval_ks[0], eval_ks[1]);
         for (uint32_t j = 0; j < max_eval; j++) {
             const uint32_t nn = gt_ids[static_cast<size_t>(qi) * gt_k + j];
             if (nn >= N) continue;
-            const uint8_t sh = primary_shard[nn];
-            for (uint32_t ki = 0; ki < 2; ki++) {
-                if (j < eval_ks[ki]) hits[ki][sh]++;
+            for (uint32_t p = mem_offsets[nn]; p < mem_offsets[nn + 1]; p++) {
+                const uint8_t sh = members[p];
+                for (uint32_t ki = 0; ki < 2; ki++) {
+                    if (j < eval_ks[ki]) hits[ki][sh]++;
+                }
             }
         }
 
-        // For each (routed_np, eval_k): coverage = sum of hits over routed top-np / eval_k.
+        // For each (routed_np, eval_k): coverage = fraction of NNs covered by
+        // the routed probe set. An NN is covered if ANY of its member shards is
+        // in the routed top-np (closure-aware).
         for (uint32_t ni = 0; ni < 6; ni++) {
             const uint32_t np = std::min(nps[ni], K);
             for (uint32_t ki = 0; ki < 2; ki++) {
                 const uint32_t ek = eval_ks[ki];
                 if (ek == 0) continue;
-                // Routed coverage: hits among routed[0..np).
+                // Routed coverage (closure-aware): NN covered if any member
+                // shard ∈ routed[0..np).
                 uint32_t r_sum = 0, total = 0;
                 for (uint32_t j = 0; j < ek; j++) {
                     const uint32_t nn = gt_ids[static_cast<size_t>(qi) * gt_k + j];
                     if (nn < N) {
                         total++;
-                        // Is nn's primary shard in routed top-np?
                         for (uint32_t p = 0; p < np; p++) {
-                            if (routed[p].second == primary_shard[nn]) { r_sum++; break; }
+                            if (in_membership(nn, static_cast<uint8_t>(routed[p].second))) {
+                                r_sum++; break;
+                            }
                         }
                     }
                 }
                 routed_cov[ni][ki] += (total > 0) ? static_cast<double>(r_sum) / total : 0.0;
 
-                // Oracle coverage: pick the np shards with the most hits (for this eval_k).
+                // Oracle (upper bound via greedy set-cover): pick the np shards
+                // covering the most NNs (closure-aware: an NN covered if any
+                // member shard picked). hits[ki][c] already tallies per-shard
+                // membership; greedy picks the np highest-hit shards. This is
+                // an upper bound on perfect routing with closure overlap.
                 std::vector<std::pair<uint32_t, uint32_t>> h(K);  // (hits, shard)
                 for (uint32_t c = 0; c < K; c++) h[c] = {hits[ki][c], c};
                 std::partial_sort(h.begin(), h.begin() + np, h.end(),
@@ -248,8 +318,17 @@ int main(int argc, char** argv) {
                                       if (a.first != b.first) return a.first > b.first;
                                       return a.second < b.second;
                                   });
+                // Greedy coverage: count NNs covered by any of the top-np shards.
                 uint32_t o_sum = 0;
-                for (uint32_t p = 0; p < np; p++) o_sum += h[p].first;
+                for (uint32_t j = 0; j < ek; j++) {
+                    const uint32_t nn = gt_ids[static_cast<size_t>(qi) * gt_k + j];
+                    if (nn >= N) continue;
+                    for (uint32_t p = 0; p < np; p++) {
+                        if (in_membership(nn, static_cast<uint8_t>(h[p].second))) {
+                            o_sum++; break;
+                        }
+                    }
+                }
                 oracle_cov[ni][ki] += (total > 0) ? static_cast<double>(o_sum) / total : 0.0;
 
                 // Multi-probe coverage: extend the probe set to all centroids
@@ -270,14 +349,19 @@ int main(int argc, char** argv) {
                 if (multiprobe_ratio > 0.0f) {
                     const float d_np = routed[np - 1].first;
                     const float thresh = multiprobe_ratio * d_np;
+                    // Build the multi-probe shard set (top-np + within-ratio).
                     uint32_t m_sum = 0, total2 = 0;
                     for (uint32_t j = 0; j < ek; j++) {
                         const uint32_t nn = gt_ids[static_cast<size_t>(qi) * gt_k + j];
                         if (nn < N) {
                             total2++;
+                            // NN covered if any of its member shards is in the
+                            // multi-probe set (top-np OR within ratio).
                             for (uint32_t p = 0; p < K; p++) {
-                                if (routed[p].first > thresh && p >= np) break;
-                                if (routed[p].second == primary_shard[nn]) { m_sum++; break; }
+                                if (p >= np && routed[p].first > thresh) break;
+                                if (in_membership(nn, static_cast<uint8_t>(routed[p].second))) {
+                                    m_sum++; break;
+                                }
                             }
                         }
                     }
