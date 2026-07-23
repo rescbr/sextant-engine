@@ -697,6 +697,21 @@ BuildResult Builder::build_partitioned(VectorSource& source,
         spdlog::info("[sextant] loading raw vectors as FP16 ({:.1f}MB) for "
                       "HDC (FP16 prune)",
                      vecs_bytes / 1e6);
+        // FP32 build mode: also load FP32 vectors for exact build distances.
+        // +N×dim×4 bytes RAM (e.g. +4.1GB at 1.34M). Gated by env var.
+        static const bool fp32_build = []() {
+            const char* e = std::getenv("SEXTANT_FP32_BUILD");
+            return e && e[0] == '1';
+        }();
+        AlignedBuf fp32_vecs;
+        if (fp32_build) {
+            const size_t fp32_bytes =
+                static_cast<size_t>(index_.count) * index_.dim * sizeof(float);
+            fp32_vecs = AlignedBuf(kDiskAlign, fp32_bytes);
+            spdlog::info("[sextant] FP32 build mode: loading raw FP32 vectors "
+                         "({:.1f}MB) for exact build distances",
+                         fp32_bytes / 1e6);
+        }
         source.reset();
         Chunk chunk{};
         uint64_t loaded = 0;
@@ -709,12 +724,20 @@ BuildResult Builder::build_partitioned(VectorSource& source,
                     const float* src = chunk.vectors +
                                        static_cast<size_t>(r) * index_.dim;
                     cast_fp32_to_fp16(src, dst, index_.dim);
+                    if (fp32_build) {
+                        std::memcpy(fp32_vecs.as<float>() +
+                                        static_cast<size_t>(rid) * index_.dim,
+                                    src, index_.dim * sizeof(float));
+                    }
                     loaded++;
                 }
             }
         }
         spdlog::info("[sextant] loaded {} raw vectors as FP16", loaded);
         index_.raw_vecs_buffer = vecs.as<float16_t>(); vecs.release();
+        if (fp32_build) {
+            index_.fp32_vecs_buffer = fp32_vecs.as<float>(); fp32_vecs.release();
+        }
     }
 
     // =====================================================================
@@ -741,6 +764,9 @@ BuildResult Builder::build_partitioned(VectorSource& source,
         index_.core->set_store(index_.flat_store.get());
 
         index_.core->set_build_vecs(index_.raw_vecs_buffer);
+        if (index_.fp32_vecs_buffer) {
+            index_.core->set_build_fp32_vecs(index_.fp32_vecs_buffer);
+        }
         VamanaCore::BuildVecLoan build_vec_loan(*index_.core);
 
         parallel_construct(params);

@@ -28,6 +28,7 @@ Index::~Index() {
     if (codes_buffer) aligned_free(codes_buffer);
     if (nodes_buffer) aligned_free(nodes_buffer);
     if (raw_vecs_buffer) aligned_free(raw_vecs_buffer);
+    if (fp32_vecs_buffer) aligned_free(fp32_vecs_buffer);
 }
 
 NodeStore* Index::top_store() const {

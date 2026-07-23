@@ -77,6 +77,7 @@ struct Index {
     uint8_t* codes_buffer = nullptr;
     uint8_t* nodes_buffer = nullptr;
     float16_t* raw_vecs_buffer = nullptr;
+    float* fp32_vecs_buffer = nullptr;  ///< FP32 build mode only (SEXTANT_FP32_BUILD). Null otherwise.
 
     /// IVF shard sub-cluster entry-point centroids (A1/A2/A3, Workstream A).
     /// Populated ONLY by Builder::build_shard_into_ for IVF shards (empty for

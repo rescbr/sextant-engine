@@ -116,6 +116,47 @@ inline float l2sq_f16(const float16_t* a, const float16_t* b, uint32_t dim) {
 #endif
 }
 
+/// L2-squared distance between two FP32 vectors. NEON FMA (4-wide) or AVX2
+/// FMA (8-wide). Used by the FP32 build mode (SEXTANT_FP32_BUILD=1) where
+/// exact distances are preferred over PQ LUT for graph construction. No
+/// widening/quantization — full FP32 precision throughout.
+inline float l2sq_f32(const float* a, const float* b, uint32_t dim) {
+#if defined(SEXTANT_HAS_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    uint32_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        float32x4_t diff = vsubq_f32(va, vb);
+        acc = vfmaq_f32(acc, diff, diff);
+    }
+    float r = vaddvq_f32(acc);
+    for (; i < dim; i++) { float diff = a[i] - b[i]; r += diff * diff; }
+    return r;
+#elif defined(SEXTANT_HAS_AVX2)
+    __m256 acc = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 diff = _mm256_sub_ps(va, vb);
+        acc = _mm256_fmadd_ps(diff, diff, acc);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float r = _mm_cvtss_f32(sum);
+    for (; i < dim; i++) { float diff = a[i] - b[i]; r += diff * diff; }
+    return r;
+#else
+    float r = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) { float diff = a[i] - b[i]; r += diff * diff; }
+    return r;
+#endif
+}
+
 /// Parameters for the Vamana graph.
 struct VamanaParams {
     Dim dim = 0;
@@ -207,6 +248,7 @@ struct BuildContext {
     const uint8_t* codes = nullptr;            // count × code_size
     uint8_t* nodes = nullptr;                  // count × node_size
     const float16_t* vecs = nullptr;           // count × dim raw FP16 vectors
+    const float* fp32_vecs = nullptr;          // count × dim raw FP32 vectors (FP32 build mode)
     std::unique_ptr<Mutex[]> node_locks;       // sharded lock pool
     uint32_t num_locks = 0;
     std::atomic<uint32_t>* progress = nullptr;  // dynamic L_build signal
@@ -267,6 +309,7 @@ struct BuildContext {
 struct BeamQuery {
     const float* query_lut = nullptr;
     const float16_t* query_fp16 = nullptr;
+    const float* query_fp32 = nullptr;       // FP32 build mode: direct FP32 distance
     const uint8_t* hdc_anchor = nullptr;
     const float* anchor_lut = nullptr;
     const std::vector<uint32_t>* forced_entry_points = nullptr;
@@ -405,6 +448,10 @@ public:
     void set_build_vecs(const float16_t* vecs) {
         if (!build_ctx_) init_build_context();
         build_ctx_->vecs = vecs;
+    }
+    void set_build_fp32_vecs(const float* vecs) {
+        if (!build_ctx_) init_build_context();
+        build_ctx_->fp32_vecs = vecs;
     }
 
     void clear_build_buffers() {
