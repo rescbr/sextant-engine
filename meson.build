@@ -19,7 +19,10 @@ foreach flag : warning_flags
     endif
 endforeach
 
-release_flags = ['-O3']
+# Release: -O3 -g (debug symbols are free — they don't affect codegen, only
+# the symbol table, and they make profiling/lldb usable in production builds).
+# Debug: -O0 -g3 + sanitizers (for catching memory errors in tests).
+release_flags = ['-O3', '-g']
 debug_flags = ['-O0', '-g3', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
 
 is_debug = get_option('debug')

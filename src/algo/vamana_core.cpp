@@ -261,8 +261,18 @@ void VamanaCore::beam_search_into(
     // no LUT gather, no PQ code pin/unpin). Otherwise fall back to the PQ
     // path. Priority among PQ modes: anchor_lut > hdc_anchor > query_lut.
     auto dist_to = [&](uint32_t id) {
-        if (query_fp16 && store_) {
-            const float16_t* fp16 = store_->precise_vec(id);
+        if (query_fp16) {
+            // FP16 distance: prefer the store's precise_vec (MemGraph ball
+            // nodes at search time), then fall back to the flat build buffers
+            // (FP16 build mode). The store_ check must NOT short-circuit the
+            // build_ctx_ fallback — FlatNodeStore has store_ != null but no
+            // precise_vec (returns null), so we must check build_ctx_->vecs
+            // even when store_ is set.
+            const float16_t* fp16 = nullptr;
+            if (store_) fp16 = store_->precise_vec(id);
+            if (!fp16 && build_ctx_ && build_ctx_->vecs) {
+                fp16 = build_ctx_->vec_ptr(id, params_.dim);
+            }
             if (fp16) {
                 return l2sq_f16(query_fp16, fp16, params_.dim);
             }
@@ -1063,18 +1073,28 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
         return;
     }
 
-    // Produce the distance LUT for beam_search. HDC builds a per-anchor LUT
-    // from the node's own PQ code, falling back to direct code-to-code lookup
-    // when the LUT build fails.
+    // Distance mode for the build's beam_search. Two modes:
+    //  - PQ (default): per-anchor LUT from the node's own PQ code. L1-resident,
+    //    fast (m sequential reads). The graph topology inherits PQ's navigation
+    //    quality (candidates are PQ-navigated).
+    //  - FP16 (SEXTANT_FP16_BUILD=1): use l2sq_f16 against the raw FP16 vectors.
+    //    Decouples graph topology from PQ quality — candidates are found via
+    //    exact (FP16) distances, producing a higher-quality graph. Build-time-
+    //    only; search uses PQ regardless. ~2-3× build time (l2sq_f16 is dim-wide
+    //    vs m LUT lookups). See docs/build_search_decoupling.md.
     const float* query_lut = nullptr;
     const uint8_t* hdc_anchor = nullptr;
     const float* anchor_lut = nullptr;
-    {
+    const float16_t* build_query_fp16 = nullptr;
+    static const bool fp16_build = []() {
+        const char* e = std::getenv("SEXTANT_FP16_BUILD");
+        return e && e[0] == '1';
+    }();
+    if (fp16_build && build_ctx_ && build_ctx_->vecs != nullptr) {
+        build_query_fp16 = build_vec_ptr(internal_id);
+    } else {
         // HDC: LUT from own PQ code. anchor_lut[s*K + cid] =
-        // cross_distance_table[s*K*K + anchor_code[s]*K + cid]. This is 8KB
-        // (m=32,K=256) and stays L1-resident. beam_search then uses
-        // lut_distance — 32 sequential reads from a contiguous buffer —
-        // instead of scattered code_distance reads into the 8MB table.
+        // cross_distance_table[s*K*K + anchor_code[s]*K + cid].
         const uint8_t* anchor_code =
             build_ctx_->codes + static_cast<size_t>(internal_id) * code_size_;
         float* alut = tls.anchor_lut.data();
@@ -1104,6 +1124,7 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     probe.query_lut = query_lut;
     probe.hdc_anchor = hdc_anchor;
     probe.anchor_lut = anchor_lut;
+    probe.query_fp16 = build_query_fp16;
     beam_search_into(tls.search_result, probe, L_build,
                      0 /* io_limit=0 → unlimited */, tls,
                      kNeverExit /* build NEVER early-exits; see beam_search_into docs */);
