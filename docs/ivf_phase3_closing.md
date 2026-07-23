@@ -150,15 +150,15 @@ Past wins came from trading RAM access for compute (FHM fused convert+multiply
 to cut loads; Direct-SDC eliminated the LUT gather memcpy). The same principle
 applies here:
 
-**Heap data structure (18.4% of beam_search).** The frontier/W are binary
-heaps of size L=400 — each push/pop is O(log L) ≈ 9 comparisons, each touching
-a cache line in the ~4.8KB heap (spans ~19 cache lines). At high N the heap
-sifts thrash cache. A **bucket queue** (O(1) push by quantized distance into
-fixed buckets) trades the comparisons for a small indexed array — compute-cheap,
-cache-dense. The challenge: distance values are wide-range floats needing
-log-scale or adaptive bucketing. This is invasive but attacks the biggest
-beam_search-internal chunk after PQ eval, and it's the kind of RAM→compute
-trade that worked for FHM.
+**Heap data structure (18.4% of beam_search) — TESTED, NEGATIVE.** Replaced
+the frontier binary heap with a bucket queue (O(1) push/pop). The bucket
+queue DID reduce heap self-time (18.4% → 16.9% on c4a), but the approximate
+pop ordering (within a bucket, any element) made the search explore nodes in
+slightly worse distance order → more hops → more PQ evals (lut_distance_batch4
+rose 19.7% → 27.6%). Net: −6.7% QPS. Same lesson as the frontier-saturation-
+skip: the frontier's pop precision matters; approximate ordering degrades
+convergence and the extra evals cost more than the heap savings. Header kept
+at `src/algo/bucket_queue.hpp`; beam_search wiring reverted.
 
 **Neighbor-list copy (part of libc 12.9%).** Each node expansion memcpys the
 neighbor list (R×4 bytes = 256B at R=64) out of the pinned node into a stack
