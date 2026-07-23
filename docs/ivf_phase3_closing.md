@@ -89,47 +89,35 @@ The ~1.5× QPS gap is the n_probe multiplier on a diffuse, already-optimized
 cost base. The remaining QPS levers are operating-point knobs (n_probe,
 patience, K, multi-probe ratio) trading recall for speed — not algorithmic wins.
 
-## OPQ: revisit (the one open algorithmic lever)
+## OPQ: already tested at scale — 0pp (do NOT revisit)
 
-The prior OPQ test (`t13a_opq_findings.md`) used **FHT random rotation** — a
-fixed random orthogonal transform. It hurt recall because arxiv-nomic
-embeddings are already variance-balanced (normalized/spherized), so random
-rotation adds noise, especially from the 256 zero-pad dims (768→1024) diluting
-the signal.
+OPQ (PCA rotation — the real data-adaptive SVD rotation, not the earlier FHT
+random rotation) **was implemented and tested at full 1.34M scale** (commits
+`7a39697`, `f7d4977`; documented in `docs/quantization_findings.md`). Results:
+- arxiv100k: PQ-only recall@100 0.8955 → 0.9058 (+1.03pp)
+- **arxiv-nomic 1.34M: 0.7300 → 0.7300 (0pp)**
 
-**That was not OPQ.** The actual OPQ paper (Ge et al., "Optimized Product
-Quantization," TPAMI 2013) uses **data-adaptive rotation learned via SVD /
-alternating minimization** — R is chosen to balance variance across subspaces
-*for the specific dataset*. `docs/quantization_improvements.md` already flags
-this distinction (Approach 1, "Why we tried OPQ before and it didn't help") and
-recommends revisiting at k=100.
+The +1pp on arxiv100k is a small-scale artifact that vanishes at production
+scale. The PQ-only ceiling (0.73) is NOT a codebook-quality problem — it's a
+structural concentration-of-measure problem: at large N the k-th NN distance
+shrinks (tighter neighborhoods), so PQ's fixed absolute error becomes
+relatively larger regardless of codebook quality. A 7.9% MSE improvement
+doesn't change the fundamental geometry.
 
-### Why it matters now
-- The PQ-only ceiling is 0.73 at k=100 (concentration of measure). This is what
-  forces rerank=2 (the 12% rerank tax). If OPQ lifts the ceiling to 0.80-0.85
-  (literature estimate), rerank could drop to ~1.5 or the recall target could
-  be hit at lower L.
-- OPQ is the one untested algorithmic lever that attacks the **root cause**
-  (PQ distortion) rather than the symptoms (eval count, routing, parallelism).
-- It helps BOTH merged and IVF equally (same quantizer).
+**All three quantization-improvement approaches were tested and failed at
+production scale** (`docs/quantization_findings.md`):
+1. Per-vector direction proxy (ScaNN λ weighting): recall *degraded*.
+2. Per-subspace covariance weighting (scale-transform): −0.56pp.
+3. OPQ (PCA rotation): 0pp at scale.
 
-### What to do differently this time
-1. **SVD-based rotation**, not FHT. Learn R from the data covariance (Jacobi
-   eigendecomposition of the d×d covariance, one-time at training).
-2. **Test at k=100** (the regime where plain PQ is weak; OPQ's benefit is
-   largest at low PQ-only recall).
-3. **Watch the zero-pad issue.** FHT padded 768→1024 and the 256 zero dims
-   diluted the signal. The SVD rotation should be on the native 768-dim
-   covariance, no padding.
-4. **Measure distortion**, not just recall — the `probe_pq_config` machinery
-   already reports per-config distortion; OPQ should lower it vs plain PQ at
-   the same (m, bits).
+The rerank tax (12.4%) is therefore **irreducible via quantizer changes** on
+this dataset — rerank is how both paths get from the 0.73 PQ ceiling to the
+0.91 target, and no codebook improvement raises that ceiling at scale.
 
-### Marked for revisit
-`docs/quantization_improvements.md` §"Phase 1: Revisit OPQ at k=100" is the
-entry point. This is a follow-up task, not a Phase 3 deliverable — but it's
-the most promising untested lever for raising the recall ceiling (and thus
-reducing the rerank tax) across both search paths.
+**Do not revisit OPQ or anisotropic.** The ceiling is structural. The only
+known way ScaNN reaches ~0.90 PQ-only is via its full anisotropic *training*
+pipeline (not just rotation), which is a fundamentally different and much
+heavier quantizer — out of scope for this architecture.
 
 ## Recommended operating points (from the K sweep + multi-probe)
 
@@ -154,78 +142,68 @@ not further IVF micro-optimization.
 Every lever identified across the session, ranked by estimated promise, with
 status. This is the exhaustive answer to "what else can improve things."
 
-### Tier 1 — promising, unexplored or under-explored
+### Tier 1 — the remaining structural levers (memory-access-bound)
 
-**OPQ (SVD rotation, not FHT).** The PQ-only ceiling is 0.73 at k=100, which
-forces the rerank=2 tax (12.4% of query time). Real OPQ (data-adaptive SVD
-rotation) is estimated to lift the ceiling to 0.80-0.85, reducing rerank
-multiplier and raising recall for BOTH paths. The prior FHT test was random
-rotation, not OPQ. **Highest-promise untested lever** — attacks the root cause
-(PQ distortion). See `docs/quantization_improvements.md`.
+These are the levers the profile actually supports. The constraint is memory
+access pattern / RAM bandwidth (the sublinear thread scaling: 4.3× at 8t).
+Past wins came from trading RAM access for compute (FHM fused convert+multiply
+to cut loads; Direct-SDC eliminated the LUT gather memcpy). The same principle
+applies here:
 
-**ScaNN-style anisotropic quantization.** Replaces isotropic MSE with a
-weighted objective that minimizes error along the query direction. Estimated
-10-25% recall improvement (larger than OPQ alone). More complex (modified
-k-means objective) but compatible with the ADC infrastructure. The approach
-that achieves SOTA on VIBE.
+**Heap data structure (18.4% of beam_search).** The frontier/W are binary
+heaps of size L=400 — each push/pop is O(log L) ≈ 9 comparisons, each touching
+a cache line in the ~4.8KB heap (spans ~19 cache lines). At high N the heap
+sifts thrash cache. A **bucket queue** (O(1) push by quantized distance into
+fixed buckets) trades the comparisons for a small indexed array — compute-cheap,
+cache-dense. The challenge: distance values are wide-range floats needing
+log-scale or adaptive bucketing. This is invasive but attacks the biggest
+beam_search-internal chunk after PQ eval, and it's the kind of RAM→compute
+trade that worked for FHM.
 
-**FP16 rerank.** Rerank (12.4%) is memory-bound on FP32 base-vector loads.
-Loading/storing FP16 base vectors for rerank would halve the memory traffic.
-The rerank is the query engine's job (`rerank_ownership.md`), but the engine
-could expose an FP16 base path. Risk: rerank precision (FP16 has ~3 decimal
-digits; for rerank's fine-grained re-sorting this may cost recall). Needs A/B.
+**Neighbor-list copy (part of libc 12.9%).** Each node expansion memcpys the
+neighbor list (R×4 bytes = 256B at R=64) out of the pinned node into a stack
+buffer to enable batch4. At thousands of expansions/query this is real traffic.
+Eliminating it means **processing neighbors in-place from the pinned node** —
+but batch4 needs contiguous code pointers, and `pin_code` returns a per-node
+pointer (scattered). The trade: gather the 4 code pointers from the in-place
+neighbor list (4 loads) and batch4 them directly, skipping the memcpy. This is
+the same gather pattern `lut_distance_batch4` already uses internally.
 
-### Tier 2 — real but small
+**PQ batch4 entry-point multi-start (7.1% scalar chunk).** The entry-point
+seeding evaluates 8 (A1) entry points via scalar `lut_distance` one-at-a-time.
+Batching into `lut_distance_batch4` (2 calls of 4) is a pure code cleanup —
+same compute, fewer call overheads, better instruction-level parallelism. No
+recall risk.
 
-**Batch the entry-point multi-start scan.** The multi-start seeding
-(`beam_search_into:349-383`) evaluates entry points via scalar `lut_distance`,
-contributing to the 7.1% scalar-PQ chunk. With A1's 8 entry points, batching
-these into one `lut_distance_batch4` call (2 batches of 4) would cut ~half of
-that 7%. Small, easy, no recall risk. Pure code-cleanup win.
+**Batch4 remainder (scalar tail).** When `pq_n % 4 != 0`, the last 1-3
+neighbors go through scalar `lut_distance`. A masked SVE2 op processes the
+remainder at batch4 throughput. Small but free.
 
-**Batch4 remainder handling.** The PQ batch4 loop's scalar tail (lines 686-701)
-fires when `pq_n % 4 != 0`. With R=64 and partial visits, remainders are
-common. A masked batch4 (process the final 1-3 neighbors via a masked SVE2
-op instead of scalar fallback) would recover the tail. Small.
+### Tier 2 — tested, dead ends (do NOT revisit)
 
-**`preprocess_query` caching across similar queries.** The LUT rebuild is 4.5%
-(O(m·K) per query). Already amortized in IVF (shared across n_probe shards).
-For workloads with repeated/near-duplicate queries, a small LUT cache could
-help — but most ANN workloads have unique queries, so limited applicability.
-
-### Tier 3 — structural, not fixable without redesign
-
-**Heap operations (18.4%).** The frontier/W heaps scale with L, which drives
-recall. A bucket-queue (O(1) push by quantized distance) could help, but the
-distance distribution is wide (needs log-scale or adaptive bucketing) and the
-gain is bounded — DynamicWidth + early-exit already suppress most wasteful
-pushes. Invasive for uncertain gain.
-
-**neighbors_buf memcpy (part of libc 12.9%).** Copying the neighbor list out
-of each pinned node enables batch processing. Eliminating it requires
-restructuring pin semantics (process in-place). Risky, load-bearing.
-
-**libc memcpy/memset residual.** Heap sifting, vector resizing, pin buffers.
-Death by a thousand cuts; no single concentration.
-
-### Tier 4 — tested, dead ends (documented for reference)
-
+- **OPQ (PCA rotation)**: implemented (`7a39697`), 0pp at 1.34M scale. The PQ
+  ceiling is structural (concentration of measure), not codebook-quality.
+- **Anisotropic PQ** (both per-vector and per-subspace): tested (`820d3cd`,
+  `26b54da`), recall degraded or flat.
 - **A2/A3** (entry-point selection/count): neutral-to-negative.
 - **B1** (two-level parallelism): throughput-negative (memory-bandwidth wall).
 - **C1** (frontier-saturation skip): redundant with DynamicWidth + early-exit.
 - **FP32 routing**: identical to FP16 (PQ-decoded centroids).
-- **FHT-OPQ**: hurt recall (random rotation ≠ real OPQ).
+- **FP16 rerank**: out of scope (query engine's job per `rerank_ownership.md`)
+  AND increases storage (FP16 base vectors). Rejected on both grounds.
+- **FHT-OPQ**: random rotation, hurt recall (distinct from PCA-OPQ above).
 
 ### The honest meta-conclusion
 
-The diffuse profile (no symbol >20%) means **the engine is well-optimized** —
-there is no concentrated inefficiency left to exploit. The Tier 1 levers (OPQ,
-anisotropic, FP16 rerank) are all **quantization-side** improvements that raise
-recall at the source, reducing the downstream rerank/eval pressure. They help
-both merged and IVF equally. The Tier 2 levers are small code-cleanups.
+The diffuse profile (no symbol >20%) means **the engine is well-optimized at
+the algorithm level**. Every quantization-side lever (OPQ, anisotropic) has
+been tested and fails at production scale due to concentration of measure —
+the 0.73 PQ ceiling is structural, so the rerank tax is irreducible via the
+quantizer.
 
-The IVF/merged QPS gap is not closeable by engine micro-optimization — it's the
-n_probe structural multiplier. The path to higher QPS at matched recall runs
-through the quantizer (OPQ/anisotropic → less rerank needed → lower fetch_k →
-less of everything), not through beam_search or routing.
+The remaining levers are **memory-access-pattern optimizations** (heap → bucket
+queue, eliminate neighbor memcpy, batch the scalar tails) — the same class of
+RAM→compute trade that produced the FHM win. These help both merged and IVF
+equally. They won't close the IVF/merged n_probe multiplier gap (that's
+structural), but they'd lift the whole performance baseline.
 

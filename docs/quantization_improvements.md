@@ -166,33 +166,58 @@ achieving the best of both. This is likely the recipe to replicate.
 
 ## Recommendation
 
-**Phase 1: Revisit OPQ at k=100 — with SVD rotation, NOT FHT.**
+**STATUS (2026-07-23): all three approaches below have been prototyped and
+measured. Summary of what's dead vs alive.**
 
-The previous OPQ test (`t13a_opq_findings.md`) used **FHT random rotation**
-(a fixed random orthogonal transform), which *hurt* recall on arxiv-nomic
-because the embeddings are already variance-balanced and the 256 zero-pad dims
-(768→1024) diluted the signal. **That was not real OPQ.** Random rotation ≠
-the data-adaptive rotation the OPQ paper (Ge et al., TPAMI 2013) describes.
+### What's DEAD (do not revisit as parameter tweaks)
 
-Real OPQ learns R from the data covariance (SVD / alternating minimization) to
-balance variance across subspaces for the specific dataset. This is untested.
-At k=100, the PQ-only ceiling is 0.73 — OPQ's estimated lift to 0.80-0.85
-(literature for similar dimensionality) would reduce the rerank multiplier
-(the 12% rerank tax in the c4a profile) and raise the recall ceiling for BOTH
-merged and IVF. See `docs/ivf_phase3_closing.md` §"OPQ: revisit."
+**OPQ via PCA rotation (`7a39697`):** +1.03pp on arxiv100k, **0pp at 1.34M
+scale** (0.7300 → 0.7300). The rotation decorrelates cross-subspace structure
+(a second-order effect); the first-order limit — 256 centroids per 8-dim
+subspace can't represent recall@100 at scale — is untouched by rotation.
+Concentration of measure makes PQ's fixed absolute error relatively larger at
+high N regardless of codebook quality.
 
-What to do differently:
-1. SVD-based rotation on the native 768-dim covariance (no zero-pad).
-2. Measure at k=100 (where plain PQ is weak; OPQ's benefit is largest).
-3. Validate distortion drops vs plain PQ at the same (m, bits) — the
-   `probe_pq_config` machinery already reports this.
+**Per-vector anisotropic proxy (`820d3cd`):** recall *degraded* monotonically
+with λ. Per-vector direction ≠ expected query direction.
 
-**Phase 2: Implement ScaNN-style anisotropic quantization.** Higher impact
-(10-25% recall improvement) and directly targets the ranking problem. More
-complex to implement (modified k-means objective) but compatible with our
-ADC infrastructure. This is the approach that achieves SOTA on VIBE.
+**Per-subspace covariance scale-transform (`26b54da`):** −0.56pp. The global
+anisotropy is spread across 96 subspaces; each 8-dim sub-covariance is nearly
+isotropic, so per-subspace weighting can't redistribute error.
 
-**Phase 3: Combined OPQ + anisotropic.** If both individually help, combine
+### What's ALIVE but architecturally heavy (genuine Tier-1 lever)
+
+**ScaNN-style full-vector anisotropic quantization.** The reason ScaNN reaches
+~0.90 PQ-only (vs our 0.73) is that it **does not use per-subspace PQ for
+search-time distance**. It uses a single full-vector quantizer trained with an
+anisotropic objective that weights quantization error by its impact on ranking.
+This escapes the per-subspace-independence limit entirely — the ceiling is
+structural for *our* quantizer (m=96/bits=8 PQ), not for quantization in
+general.
+
+Why the prior anisotropic attempts didn't capture this: they applied anisotropic
+*weighting* to the existing per-subspace PQ. ScaNN's mechanism is a different
+*codebook structure* (full-vector, not per-subspace) trained end-to-end with
+the anisotropic objective. That's a major architectural change — different
+quantizer, different training pipeline, different search-time distance — not a
+parameter tweak.
+
+This is the only known quantization-side escape from the 0.73 ceiling. It's
+untested in Sextant and would be a substantial implementation effort. If
+pursued, it would help BOTH merged and IVF equally (same quantizer) and could
+reduce or eliminate the 12% rerank tax.
+
+**SymphonyQG-style multi-level reordering.** Uses a coarse quantizer for
+initial ranking + a finer one for refinement, avoiding the FP32 rerank
+bandwidth. Also architecturally heavy; avoids rerank rather than improving PQ.
+
+### The honest framing
+The PQ-only ceiling (0.73) is structural for **per-subspace PQ at (m=96,
+bits=8)**. It is NOT structural for quantization in general — ScaNN and
+SymphonyQG escape it via fundamentally different quantizer architectures that
+we have not built. The dead ends above are dead because they're parameter
+tweaks to the existing quantizer; the alive lever requires building a different
+quantizer.
 them. This is SymphonyQG's recipe.
 
 ---
