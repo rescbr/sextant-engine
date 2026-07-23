@@ -166,10 +166,26 @@ achieving the best of both. This is likely the recipe to replicate.
 
 ## Recommendation
 
-**Phase 1: Revisit OPQ at k=100.** The previous OPQ test was at k=10 where
-plain PQ already worked well. At k=100, the PQ-only ceiling is 0.73 — OPQ's
-5-15% improvement is now meaningful. Low implementation cost (rotation matrix
-training + one matmul per query). Quick to prototype and measure.
+**Phase 1: Revisit OPQ at k=100 — with SVD rotation, NOT FHT.**
+
+The previous OPQ test (`t13a_opq_findings.md`) used **FHT random rotation**
+(a fixed random orthogonal transform), which *hurt* recall on arxiv-nomic
+because the embeddings are already variance-balanced and the 256 zero-pad dims
+(768→1024) diluted the signal. **That was not real OPQ.** Random rotation ≠
+the data-adaptive rotation the OPQ paper (Ge et al., TPAMI 2013) describes.
+
+Real OPQ learns R from the data covariance (SVD / alternating minimization) to
+balance variance across subspaces for the specific dataset. This is untested.
+At k=100, the PQ-only ceiling is 0.73 — OPQ's estimated lift to 0.80-0.85
+(literature for similar dimensionality) would reduce the rerank multiplier
+(the 12% rerank tax in the c4a profile) and raise the recall ceiling for BOTH
+merged and IVF. See `docs/ivf_phase3_closing.md` §"OPQ: revisit."
+
+What to do differently:
+1. SVD-based rotation on the native 768-dim covariance (no zero-pad).
+2. Measure at k=100 (where plain PQ is weak; OPQ's benefit is largest).
+3. Validate distortion drops vs plain PQ at the same (m, bits) — the
+   `probe_pq_config` machinery already reports this.
 
 **Phase 2: Implement ScaNN-style anisotropic quantization.** Higher impact
 (10-25% recall improvement) and directly targets the ranking problem. More
