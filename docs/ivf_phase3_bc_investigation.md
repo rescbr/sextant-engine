@@ -1,8 +1,8 @@
 # IVF Phase 3 — B & C Investigation Plan
 
-**Status:** Investigation framing, 2026-07-23. Supersedes the B/C sections of
-`~/.local/state/maki/plans/ivf-phase3-graph-intelligence.md` in light of the
-routing study and c4a profiling results.
+**Status:** SUPERSEDED by `ivf_phase3_closing.md` (complete lever inventory).
+This doc's B/C framing was the precursor; the closing doc has the final
+measured results for every lever. Kept for historical context.
 
 ## Context that reshapes B and C
 

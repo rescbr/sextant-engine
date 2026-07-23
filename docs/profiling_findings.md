@@ -1,4 +1,10 @@
-# Sextant profiling findings — 2026-07-20
+# Sextant profiling findings — 2026-07-20 (PRE-FHM baseline)
+
+> **Note (2026-07-23):** This is the PRE-optimization baseline profile. The
+> session's FHM l2sq_f16 (+4%), memcpy elimination (+2%), and batch4 remainder
+> (+2%) optimizations changed the profile significantly. For the current
+> post-optimization profile, see the beam-search-profile memory entry and the
+> bucket-queue experiment results in `ivf_phase3_closing.md`.
 
 Profiled on GCP c4a-standard-8-lssd (Axion / Neoverse-V2, 8 vCPU), ARM SVE2
 build at `-O3 -g -march=armv8-a+sve2` with clang 23. Dataset: arxiv_nomic
