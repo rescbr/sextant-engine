@@ -146,3 +146,86 @@ Phase 3 is complete. The IVF path is production-viable for its intended roles
 (1B scale, high recall, distributed). The single-node QPS gap to merged is
 structural and documented. The next algorithmic lever is OPQ (separate task),
 not further IVF micro-optimization.
+
+---
+
+## Appendix: complete improvement-lever inventory
+
+Every lever identified across the session, ranked by estimated promise, with
+status. This is the exhaustive answer to "what else can improve things."
+
+### Tier 1 — promising, unexplored or under-explored
+
+**OPQ (SVD rotation, not FHT).** The PQ-only ceiling is 0.73 at k=100, which
+forces the rerank=2 tax (12.4% of query time). Real OPQ (data-adaptive SVD
+rotation) is estimated to lift the ceiling to 0.80-0.85, reducing rerank
+multiplier and raising recall for BOTH paths. The prior FHT test was random
+rotation, not OPQ. **Highest-promise untested lever** — attacks the root cause
+(PQ distortion). See `docs/quantization_improvements.md`.
+
+**ScaNN-style anisotropic quantization.** Replaces isotropic MSE with a
+weighted objective that minimizes error along the query direction. Estimated
+10-25% recall improvement (larger than OPQ alone). More complex (modified
+k-means objective) but compatible with the ADC infrastructure. The approach
+that achieves SOTA on VIBE.
+
+**FP16 rerank.** Rerank (12.4%) is memory-bound on FP32 base-vector loads.
+Loading/storing FP16 base vectors for rerank would halve the memory traffic.
+The rerank is the query engine's job (`rerank_ownership.md`), but the engine
+could expose an FP16 base path. Risk: rerank precision (FP16 has ~3 decimal
+digits; for rerank's fine-grained re-sorting this may cost recall). Needs A/B.
+
+### Tier 2 — real but small
+
+**Batch the entry-point multi-start scan.** The multi-start seeding
+(`beam_search_into:349-383`) evaluates entry points via scalar `lut_distance`,
+contributing to the 7.1% scalar-PQ chunk. With A1's 8 entry points, batching
+these into one `lut_distance_batch4` call (2 batches of 4) would cut ~half of
+that 7%. Small, easy, no recall risk. Pure code-cleanup win.
+
+**Batch4 remainder handling.** The PQ batch4 loop's scalar tail (lines 686-701)
+fires when `pq_n % 4 != 0`. With R=64 and partial visits, remainders are
+common. A masked batch4 (process the final 1-3 neighbors via a masked SVE2
+op instead of scalar fallback) would recover the tail. Small.
+
+**`preprocess_query` caching across similar queries.** The LUT rebuild is 4.5%
+(O(m·K) per query). Already amortized in IVF (shared across n_probe shards).
+For workloads with repeated/near-duplicate queries, a small LUT cache could
+help — but most ANN workloads have unique queries, so limited applicability.
+
+### Tier 3 — structural, not fixable without redesign
+
+**Heap operations (18.4%).** The frontier/W heaps scale with L, which drives
+recall. A bucket-queue (O(1) push by quantized distance) could help, but the
+distance distribution is wide (needs log-scale or adaptive bucketing) and the
+gain is bounded — DynamicWidth + early-exit already suppress most wasteful
+pushes. Invasive for uncertain gain.
+
+**neighbors_buf memcpy (part of libc 12.9%).** Copying the neighbor list out
+of each pinned node enables batch processing. Eliminating it requires
+restructuring pin semantics (process in-place). Risky, load-bearing.
+
+**libc memcpy/memset residual.** Heap sifting, vector resizing, pin buffers.
+Death by a thousand cuts; no single concentration.
+
+### Tier 4 — tested, dead ends (documented for reference)
+
+- **A2/A3** (entry-point selection/count): neutral-to-negative.
+- **B1** (two-level parallelism): throughput-negative (memory-bandwidth wall).
+- **C1** (frontier-saturation skip): redundant with DynamicWidth + early-exit.
+- **FP32 routing**: identical to FP16 (PQ-decoded centroids).
+- **FHT-OPQ**: hurt recall (random rotation ≠ real OPQ).
+
+### The honest meta-conclusion
+
+The diffuse profile (no symbol >20%) means **the engine is well-optimized** —
+there is no concentrated inefficiency left to exploit. The Tier 1 levers (OPQ,
+anisotropic, FP16 rerank) are all **quantization-side** improvements that raise
+recall at the source, reducing the downstream rerank/eval pressure. They help
+both merged and IVF equally. The Tier 2 levers are small code-cleanups.
+
+The IVF/merged QPS gap is not closeable by engine micro-optimization — it's the
+n_probe structural multiplier. The path to higher QPS at matched recall runs
+through the quantizer (OPQ/anisotropic → less rerank needed → lower fetch_k →
+less of everything), not through beam_search or routing.
+
