@@ -102,5 +102,46 @@ enough to find the right regions? That's a different (and more answerable)
 question than "can 4-bit do everything." Option B would answer it.
 
 ## Status
-Not started. Option A is the recommended first experiment — low-cost,
-build-time-only, answers whether build navigation quality is a lever at all.
+Option A tested (2026-07-23) — **NEGATIVE RESULT.** FP16 build does not improve
+graph quality on arxiv100k. See results below.
+
+## Option A results (FP16 beam_search during build)
+
+arxiv100k, merged, R=26, L_build=100, pq_m=96/8-bit, 8 threads:
+
+| build mode | recall@100 | QPS | R̄ | clustering | dead_ends | build time |
+|------------|-----------|-----|----|----|-----------|------------|
+| PQ (default) | 0.9242 | 6186 | 53.38 | 0.0992 | 0.0000 | 48s |
+| FP16 | 0.9189 | 6248 | 53.71 | 0.1040 | 0.0000 | 48s |
+
+**FP16 build gives slightly LOWER recall (−0.5pp) and slightly higher QPS (+1%).**
+Graph stats are nearly identical.
+
+### Why it doesn't help
+8-bit PQ navigation is already good enough at this scale — the candidate pools
+found by PQ beam_search are not meaningfully improved by FP16. Moreover, FP16
+distances have FP16 precision (3 decimal digits) while PQ LUT distances
+accumulate per-subspace in FP32, so the build's candidate ranking is actually
+*less precise* with FP16 than with the PQ LUT. FP16 isn't "exact" — it has its
+own quantization error, which on this dataset slightly degrades edge selection.
+
+### Why build time didn't increase
+The predicted 2-3× build-time slowdown didn't materialize (48s vs 48s). The
+estimator's mini-builds (which also use FP16 under the env var) dominate the
+analyze phase, and FHM makes l2sq_f16 fast enough that the per-eval cost is
+comparable to the PQ LUT path at these sample sizes.
+
+### Conclusion
+Option A is dead. The build/search coupling through the shared quantizer is not
+a meaningful lever at 8-bit PQ — the 8-bit PQ navigation is already sufficient
+for graph construction. Option B (dual-quantizer for 4-bit search) is the only
+remaining decoupling path, and it's architecturally heavy. The 0.73 PQ recall
+ceiling remains structural for per-subspace PQ; the only escape is a different
+quantizer architecture (ScaNN-style, documented separately).
+
+### Bug fixed during the experiment
+The `dist_to` lambda was restructured to not short-circuit on `store_` when
+`precise_vec` returns null. FlatNodeStore has `store_ != null` but no
+`precise_vec` (returns null), so the old code would skip the `build_ctx_->vecs`
+fallback. This was a latent bug that only surfaces when `query_fp16` is set in
+build mode (the FP16 build experiment). Fixed in commit 3c9c17f.
