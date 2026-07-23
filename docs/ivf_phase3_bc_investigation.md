@@ -89,28 +89,21 @@ node; many are N_rbu (read-but-unexplored — pushed to the frontier, never
 popped). DynamicWidth narrows the beam to suppress N_rbu, but doesn't skip
 evaluating them in the first place.
 
-### C1 (revised) — Frontier-saturation early-termination
+### C1 (revised) — Frontier-saturation early-termination — **TESTED, DEAD END**
 **Idea:** during a node's neighbor expansion, if K consecutive evaluated
 neighbors all fail to enter W (the frontier is saturated for this node), skip
-the rest. Works WITHOUT sorted neighbors — it's a heuristic that once the
-frontier is full and recent neighbors aren't improving it, the rest probably
-won't either.
+the rest.
 
-**Tension with batch4:** PQ eval is batch4 (4 codes per SVE2 gather). Checking
-after each neighbor wastes the batch. Resolution: check after each batch4 chunk
-— if all 4 failed to enter W and W is full, skip the remaining batches for this
-node. Coarse-grained (every 4 neighbors), preserves SIMD throughput.
+**Result (c4a K=32, np=4/8, L=400):** recall flat (0.9040 ± 0.001), QPS ±2%
+noise across skip thresholds 0-8. Same on arxiv100k local.
 
-**Expected impact:** cuts evals per expansion by ~20-40% (the tail of a node's
-neighbors rarely beat a saturated frontier). At 27% of beam_search time, a 30%
-eval reduction → ~8% beam_search speedup → ~5-6% end-to-end (beam_search is
-~68% inclusive). Modest but real, and it helps BOTH merged and IVF equally
-(rising tide).
+**Why it fails:** DynamicWidth + early-exit already suppress the evals it
+targets. By the time W is full AND saturated (the trigger), the search is near
+convergence and about to terminate. The 27% PQ-eval chunk is PRODUCTIVE work
+during active search, not wasteful tail evals. Reverted.
 
-**Risk:** recall. The skipped neighbors might include rare good ones. Must A/B
-carefully — the skip threshold (K consecutive misses) and the "W full" guard
-need tuning. Start conservative (K=8, only skip when W is full AND the node is
-past the approach phase).
+**Lesson:** beam_search is already well-optimized at the per-node level. No
+per-node early-termination helps because the search-level early-exit handles it.
 
 ### C2 (plan's) — Coarse position per node (1 byte)
 Store a 1-byte sub-cluster ID per node (from A1's k-means). When visiting a
