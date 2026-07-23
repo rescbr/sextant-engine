@@ -761,22 +761,19 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
         spdlog::info("[sextant] estimate_config: R locked by override → {} ",
                      R_full);
     } else {
-        // R validation sweep REMOVED (2026-07-23). The sweep built 2 more
-        // mini-indices at R_full±16 and picked the smallest R meeting the
-        // target gate. But the validation searches at L=2000/rerank=10 are
-        // EXHAUSTIVE on the ≤200K mini-build — proximity saturates to ~1.0
-        // for every R tested, so the gate can't discriminate. The sweep was
-        // degenerate: it always picked max(32, R_full−16) regardless of the
-        // dataset's actual full-scale difficulty. Combined with the ±a few %
-        // run-to-run variance in OPT-SNG's R̄ (from thread-scheduling in the
-        // work-stealing construct loop — see docs/estimator_r_selection.md),
-        // this produced R=32/48/64 inconsistently across runs on the same data.
-        //
-        // OPT-SNG (R̄ × log(N)/log(sample) with clustering/dead_end guardrails)
-        // is the principled predictor and is trusted as-is. For reproducible
-        // benchmarking, pin R explicitly via --max-node-neighbors.
-        spdlog::info("[sextant] estimate_config: R={} (OPT-SNG; validation "
-                     "sweep removed — degenerate at sample scale)", R_full);
+        // R is the OPT-SNG prediction (R̄ × log(N)/log(sample), with
+        // clustering/dead_end guardrails above). An earlier version added a
+        // validation sweep here (build R_full±16, pick smallest meeting the
+        // gate), but it was degenerate: validation searches at L=2000/rerank=10
+        // are exhaustive on the ≤200K mini-build, so proximity saturates to
+        // ~1.0 for every R and the gate can't discriminate. The sweep always
+        // picked max(32, R_full−16) regardless of dataset difficulty. Removed;
+        // OPT-SNG is trusted directly. The ±a few % run-to-run variance in R̄
+        // (from thread scheduling in the work-stealing construct loop — see
+        // docs/estimator_r_selection.md) is measurement noise, not a bug; pin
+        // R via --max-node-neighbors for reproducible benchmarking.
+        spdlog::info("[sextant] estimate_config: R={} (OPT-SNG prediction)",
+                     R_full);
     }
 
     // --- 8. Final param resolution ---
