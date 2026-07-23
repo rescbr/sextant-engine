@@ -172,11 +172,28 @@ measured. Summary of what's dead vs alive.**
 ### What's DEAD (do not revisit as parameter tweaks)
 
 **OPQ via PCA rotation (`7a39697`):** +1.03pp on arxiv100k, **0pp at 1.34M
-scale** (0.7300 → 0.7300). The rotation decorrelates cross-subspace structure
-(a second-order effect); the first-order limit — 256 centroids per 8-dim
-subspace can't represent recall@100 at scale — is untouched by rotation.
-Concentration of measure makes PQ's fixed absolute error relatively larger at
-high N regardless of codebook quality.
+scale** (0.7300 → 0.7300). This implemented the rotation half of OPQ — PCA
+eigendecomposition of the data covariance, R = V^T, rotate training data +
+queries to the eigenbasis before PQ splitting. This is the standard "OPQ via
+PCA initialization." It is NOT the full OPQ algorithm (Ge et al., TPAMI 2013),
+which **alternates** between fixing R and re-optimizing codebooks (k-means on
+rotated space), then fixing codebooks and re-optimizing R, iterating to
+convergence (typically 10-25 iterations). The PCA-init version is a lower
+bound on what full OPQ achieves.
+
+However: the reason PCA-init gave 0pp at scale is NOT primarily "the rotation
+wasn't iterated." The first-order limit is the per-subspace-independence
+assumption itself (256 centroids per 8-dim subspace can't represent recall@100
+at 1.34M). Cross-subspace decorrelation — what both PCA-init and full
+alternating OPQ improve — is a second-order effect. The 7.9% MSE improvement
+from PCA rotation didn't move recall at scale; a few more percent MSE from
+iterating is unlikely to either on arxiv-nomic (already variance-balanced/
+spherized embeddings with weak cross-subspace correlation).
+
+Status: **PCA-init OPQ is DEAD (validated). Full alternating OPQ is formally
+untested but low expected value (<30% chance of meaningful gain at 1.34M given
+the PCA-init result + the dataset's decorrelation profile).** Not worth the
+implementation effort vs the architectural alternatives below.
 
 **Per-vector anisotropic proxy (`820d3cd`):** recall *degraded* monotonically
 with λ. Per-vector direction ≠ expected query direction.
