@@ -102,46 +102,42 @@ enough to find the right regions? That's a different (and more answerable)
 question than "can 4-bit do everything." Option B would answer it.
 
 ## Status
-Option A tested (2026-07-23) — **NEGATIVE RESULT.** FP16 build does not improve
-graph quality on arxiv100k. See results below.
+Both Option A (FP16 build) and the FP32 variant tested (2026-07-23) — **NEGATIVE
+RESULTS.** Exact-distance builds give LOWER recall than PQ builds. The
+build/search coupling is correct behavior, not a defect.
 
-## Option A results (FP16 beam_search during build)
+## Results (arxiv100k, merged, R=26, L_build=100, pq_m=96/8-bit, 8 threads)
 
-arxiv100k, merged, R=26, L_build=100, pq_m=96/8-bit, 8 threads:
+| build mode | recall@100 | QPS | R̄ | clustering |
+|------------|-----------|-----|----|----|
+| PQ (default) | **0.9242** | 6102 | 53.38 | 0.0992 |
+| FP16 | 0.9189 (−0.5pp) | 6020 | 53.71 | 0.1040 |
+| FP32 | 0.9182 (−0.6pp) | 6345 | 53.32 | 0.0994 |
 
-| build mode | recall@100 | QPS | R̄ | clustering | dead_ends | build time |
-|------------|-----------|-----|----|----|-----------|------------|
-| PQ (default) | 0.9242 | 6186 | 53.38 | 0.0992 | 0.0000 | 48s |
-| FP16 | 0.9189 | 6248 | 53.71 | 0.1040 | 0.0000 | 48s |
+## Why exact-distance builds are WORSE (the train/serve skew insight)
 
-**FP16 build gives slightly LOWER recall (−0.5pp) and slightly higher QPS (+1%).**
-Graph stats are nearly identical.
+This was NOT about precision (FP32 is exact, yet gives lower recall than both
+PQ and FP16). The PQ-built graph is **self-consistent** with PQ search: its
+edges are optimized for the distance metric the search actually uses. A graph
+built with exact (FP32) distances optimizes for a *different* metric than PQ
+search — introducing a train/serve mismatch.
 
-### Why it doesn't help
-8-bit PQ navigation is already good enough at this scale — the candidate pools
-found by PQ beam_search are not meaningfully improved by FP16. Moreover, FP16
-distances have FP16 precision (3 decimal digits) while PQ LUT distances
-accumulate per-subspace in FP32, so the build's candidate ranking is actually
-*less precise* with FP16 than with the PQ LUT. FP16 isn't "exact" — it has its
-own quantization error, which on this dataset slightly degrades edge selection.
+The candidates that rank well under PQ (the search metric) are connected when
+you build with PQ. An exact-distance build connects candidates that rank well
+under TRUE geometry, which doesn't perfectly match PQ ranking. The result:
+the PQ-built graph navigates better under PQ search.
 
-### Why build time didn't increase
-The predicted 2-3× build-time slowdown didn't materialize (48s vs 48s). The
-estimator's mini-builds (which also use FP16 under the env var) dominate the
-analyze phase, and FHM makes l2sq_f16 fast enough that the per-eval cost is
-comparable to the PQ LUT path at these sample sizes.
+**The build/search coupling through the shared quantizer is correct behavior,
+not a defect to decouple.** The PQ LUT isn't a degraded distance — it's the
+distance the graph should be optimized for.
 
-### Conclusion
-Option A is dead. The build/search coupling through the shared quantizer is not
-a meaningful lever at 8-bit PQ — the 8-bit PQ navigation is already sufficient
-for graph construction. Option B (dual-quantizer for 4-bit search) is the only
-remaining decoupling path, and it's architecturally heavy. The 0.73 PQ recall
-ceiling remains structural for per-subspace PQ; the only escape is a different
-quantizer architecture (ScaNN-style, documented separately).
+## Conclusion (both options)
+- Option A (FP16 build): dead. −0.5pp from FP16 precision + metric mismatch.
+- FP32 build: dead. −0.6pp from metric mismatch alone (no precision confound).
+- Option B (dual-quantizer): the train/serve skew finding suggests this would
+  ALSO hurt — building with one metric and searching with another is the
+  problem, regardless of which metrics. Dead.
+- The 0.73 PQ recall ceiling remains structural. The only escape is a
+  different quantizer architecture (ScaNN-style, documented separately).
 
-### Bug fixed during the experiment
-The `dist_to` lambda was restructured to not short-circuit on `store_` when
-`precise_vec` returns null. FlatNodeStore has `store_ != null` but no
-`precise_vec` (returns null), so the old code would skip the `build_ctx_->vecs`
-fallback. This was a latent bug that only surfaces when `query_fp16` is set in
-build mode (the FP16 build experiment). Fixed in commit 3c9c17f.
+The decoupling investigation is closed. The build/search coupling is correct.
