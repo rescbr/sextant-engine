@@ -742,99 +742,42 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
                      "R ≥ 64", gstats.dead_end_frac);
     }
 
+    // Clamp R to [16, 128]. The floor was 32 (carried over from the Engine
+    // extraction, matching the DiskANN/Vamana literature's commonly-cited
+    // minimum). Lowered to 16 after measuring dead_end_frac=0.0000 at R=32
+    // (R̄=22) on arxiv-nomic — the graph is healthy well below 32 on this
+    // dataset. 16 is the practical minimum: below it, robust_prune's reciprocal
+    // edges can't maintain connectivity on denser-cluster datasets. The
+    // dead_ends>0.05 guardrail (floors R≥64) handles datasets that genuinely
+    // need more degree. Let OPT-SNG predict freely in [16, 128]; don't clamp
+    // the prediction unless the guardrails fire.
     uint16_t R_full = static_cast<uint16_t>(
-        std::round(std::clamp(R_predicted, 32.0, 128.0)));
+        std::round(std::clamp(R_predicted, 16.0, 128.0)));
     spdlog::info("[sextant] estimate_config: R predicted={:.1f} → R_full={}",
                  R_predicted, R_full);
 
     if (overrides.R != 0) {
         R_full = overrides.R;
-        spdlog::info("[sextant] estimate_config: R locked by override → {} "
-                     "(skipping validation sweep)", R_full);
+        spdlog::info("[sextant] estimate_config: R locked by override → {} ",
+                     R_full);
     } else {
-        // --- 7. R sweep validation (only when R is estimated) ---
-        // Build 2 more mini-indices at R_full-16 and R_full+16 (clamp ≥32).
-        // Dual-gate: the sweep-best is the smallest R meeting the target gate
-        // (cheapest). If none meet, keep the OPT-SNG prediction.
-         spdlog::info("[sextant] estimate_config: R validation sweep (k={})...",
-                      target_k);
-         const auto t_valid_start = std::chrono::steady_clock::now();
-        constexpr uint32_t kValidRerank = 10;
-        // L must exceed fetch_k = k × rerank (same rationale as the alpha sweep).
-        const uint32_t kValidL =
-            std::max<uint32_t>(target_k * kValidRerank * 2u, 200u);
-
-        struct RPoint { uint16_t R; double proximity; double recall; };
-        std::vector<RPoint> rpoints;
-
-        // Measure the prediction point R_full (reuse ref_mini if R_full==64).
-        if (R_full == 64) {
-            const auto sq = measure_search_(
-                *ref_mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-                qidx, kValidL, target_k, kValidRerank);
-            rpoints.push_back({R_full, sq.proximity, sq.recall});
-            spdlog::info("[sextant]   R={}  recall@{}={:.4f}  proximity={:.4f}{}",
-                         R_full, target_k, sq.recall, sq.proximity,
-                         meets_target(sq) ? " ✓" : "");
-        } else {
-            ResolvedParams rp = base;
-            rp.R = R_full; rp.alpha = alpha_rec;
-            rp.pq_m = pq_m; rp.pq_bits = pq_bits;
-            auto mini = build_mini_(sample.data(), sample_n, dim, rp);
-            const auto sq = measure_search_(
-                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-                qidx, kValidL, target_k, kValidRerank);
-            rpoints.push_back({R_full, sq.proximity, sq.recall});
-            spdlog::info("[sextant]   R={}  recall@{}={:.4f}  proximity={:.4f}{}",
-                         R_full, target_k, sq.recall, sq.proximity,
-                         meets_target(sq) ? " ✓" : "");
-        }
-
-        for (int delta : {-16, +16}) {
-            uint16_t r = static_cast<uint16_t>(std::max(32, int(R_full) + delta));
-            ResolvedParams rp = base;
-            rp.R = r; rp.alpha = alpha_rec;
-            rp.pq_m = pq_m; rp.pq_bits = pq_bits;
-            const auto t0 = std::chrono::steady_clock::now();
-            auto mini = build_mini_(sample.data(), sample_n, dim, rp);
-            const auto sq = measure_search_(
-                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-                qidx, kValidL, target_k, kValidRerank);
-            const auto t1 = std::chrono::steady_clock::now();
-            rpoints.push_back({r, sq.proximity, sq.recall});
-            spdlog::info("[sextant]   R={}  recall@{}={:.4f}  proximity={:.4f}"
-                         "{}  ({:.1f}s)", r, target_k, sq.recall, sq.proximity,
-                         meets_target(sq) ? " ✓" : "",
-                         std::chrono::duration<double>(t1 - t0).count());
-        }
-
-        // Dual-gate selection: among R values meeting the target gate, pick the
-        // smallest (cheapest). If none meet, keep the OPT-SNG prediction.
-        uint16_t smallest_meeting = 0;
-        for (const auto& rp : rpoints) {
-            const bool meets =
-                (recall_thresh == 0.0 || rp.recall >= recall_thresh) &&
-                (prox_thresh == 0.0 || rp.proximity >= prox_thresh);
-            if (meets && (smallest_meeting == 0 || rp.R < smallest_meeting)) {
-                smallest_meeting = rp.R;
-            }
-        }
-        if (smallest_meeting != 0 && smallest_meeting != R_full) {
-            spdlog::info("[sextant]   validation: smallest R meeting target "
-                         "gate = {} (prediction was {}) → using sweep-best",
-                         smallest_meeting, R_full);
-            R_full = smallest_meeting;
-        } else if (smallest_meeting != 0) {
-            spdlog::info("[sextant]   validation: R={} meets target gate "
-                         "(matches prediction)", R_full);
-        } else {
-            spdlog::warn("[sextant]   validation: no R in sweep met target "
-                         "gate; keeping OPT-SNG prediction R={}", R_full);
-        }
-         spdlog::debug("[sextant] estimate_config: R validation sweep took {:.2f}s",
-                       std::chrono::duration<double>(
-                           std::chrono::steady_clock::now() - t_valid_start).count());
-     }
+        // R validation sweep REMOVED (2026-07-23). The sweep built 2 more
+        // mini-indices at R_full±16 and picked the smallest R meeting the
+        // target gate. But the validation searches at L=2000/rerank=10 are
+        // EXHAUSTIVE on the ≤200K mini-build — proximity saturates to ~1.0
+        // for every R tested, so the gate can't discriminate. The sweep was
+        // degenerate: it always picked max(32, R_full−16) regardless of the
+        // dataset's actual full-scale difficulty. Combined with the ±a few %
+        // run-to-run variance in OPT-SNG's R̄ (from thread-scheduling in the
+        // work-stealing construct loop — see docs/estimator_r_selection.md),
+        // this produced R=32/48/64 inconsistently across runs on the same data.
+        //
+        // OPT-SNG (R̄ × log(N)/log(sample) with clustering/dead_end guardrails)
+        // is the principled predictor and is trusted as-is. For reproducible
+        // benchmarking, pin R explicitly via --max-node-neighbors.
+        spdlog::info("[sextant] estimate_config: R={} (OPT-SNG; validation "
+                     "sweep removed — degenerate at sample scale)", R_full);
+    }
 
     // --- 8. Final param resolution ---
     ResolvedParams p;
