@@ -576,18 +576,29 @@ void VamanaCore::beam_search_into(
                     }
                 }
             }
-            // Remainder.
-            for (; idx < nu; idx++) {
-                const float d = quantizer_.lut_distance(unvisited_codes[idx], batch_lut);
-                const uint32_t id = unvisited_ids[idx];
-                if (W.size() < L_current || d < W.front().dist) {
-                    frontier.push_back({d, id});
-                    std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
-                    W.push_back({d, id});
-                    std::push_heap(W.begin(), W.end(), WorkingCmp{});
-                    if (W.size() > L_current) {
-                        std::pop_heap(W.begin(), W.end(), WorkingCmp{});
-                        W.pop_back();
+            // Remainder (1-3 neighbors): pad to batch4, discard extras.
+            if (idx < nu) {
+                const uint32_t rem = nu - idx;
+                const uint8_t* pad = unvisited_codes[0];
+                float dists[4];
+                quantizer_.lut_distance_batch4(
+                    unvisited_codes[idx],
+                    rem > 1 ? unvisited_codes[idx + 1] : pad,
+                    rem > 2 ? unvisited_codes[idx + 2] : pad,
+                    pad,
+                    batch_lut, dists);
+                for (uint32_t b = 0; b < rem; b++) {
+                    const uint32_t id = unvisited_ids[idx + b];
+                    const float d = dists[b];
+                    if (W.size() < L_current || d < W.front().dist) {
+                        frontier.push_back({d, id});
+                        std::push_heap(frontier.begin(), frontier.end(), FrontierCmp{});
+                        W.push_back({d, id});
+                        std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                        if (W.size() > L_current) {
+                            std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                            W.pop_back();
+                        }
                     }
                 }
             }
@@ -685,20 +696,33 @@ void VamanaCore::beam_search_into(
                         }
                     }
                 }
-                // Remainder.
-                for (; idx < pq_n; idx++) {
-                    const float d = quantizer_.lut_distance(pq_codes[idx],
-                                                             batch_lut);
-                    const uint32_t id = pq_ids[idx];
-                    if (W.size() < L_current || d < W.front().dist) {
-                        frontier.push_back({d, id});
-                        std::push_heap(frontier.begin(), frontier.end(),
-                                       FrontierCmp{});
-                        W.push_back({d, id});
-                        std::push_heap(W.begin(), W.end(), WorkingCmp{});
-                        if (W.size() > L_current) {
-                            std::pop_heap(W.begin(), W.end(), WorkingCmp{});
-                            W.pop_back();
+                // Remainder (1-3 neighbors): pad to a full batch4 and discard
+                // the extra slots, avoiding the scalar lut_distance fallback.
+                // The extra slots compute a real distance (against pq_codes[0])
+                // but are never read — same cost as the batch4 path.
+                if (idx < pq_n) {
+                    const uint32_t rem = pq_n - idx;
+                    const uint8_t* pad = pq_codes[0];
+                    float dists[4];
+                    quantizer_.lut_distance_batch4(
+                        pq_codes[idx],
+                        rem > 1 ? pq_codes[idx + 1] : pad,
+                        rem > 2 ? pq_codes[idx + 2] : pad,
+                        pad,
+                        batch_lut, dists);
+                    for (uint32_t b = 0; b < rem; b++) {
+                        const uint32_t id = pq_ids[idx + b];
+                        const float d = dists[b];
+                        if (W.size() < L_current || d < W.front().dist) {
+                            frontier.push_back({d, id});
+                            std::push_heap(frontier.begin(), frontier.end(),
+                                           FrontierCmp{});
+                            W.push_back({d, id});
+                            std::push_heap(W.begin(), W.end(), WorkingCmp{});
+                            if (W.size() > L_current) {
+                                std::pop_heap(W.begin(), W.end(), WorkingCmp{});
+                                W.pop_back();
+                            }
                         }
                     }
                 }
