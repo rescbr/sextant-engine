@@ -1,9 +1,22 @@
 # Sextant — Remaining Tasks
 
-> Status as of 2026-07-12. Phase 1 is functionally complete (build, search,
-> insert, partitioned build, CLI, 71 tests passing) with search-path R&D
-> applied (PageShuffle, PageSearch, MemGraph, DynamicWidth, PinResult).
-> This document lists what remains, ordered by impact.
+> **Status (updated 2026-07-23):** Phase 1 functionally complete. IVF-probe
+> Phase 1-3 complete (query-parallel searcher, early-exit split, sub-clustered
+> entry points, multi-probe, routing study, K sweep). The engine-level
+> optimization arc is exhausted (see `docs/ivf_phase3_closing.md` for the
+> complete lever inventory). Remaining tasks below are from the original Phase 1
+> planning; many are already done. The forward path is either the DuckDB
+> extension (Phase 2) or the ScaNN-style anisotropic quantizer rearchitecture
+> (`docs/anisotropic_rearchitecture.md`).
+>
+> **Architecture note:** The old `Engine` god-object is GONE (Layers 0-5
+> refactor). References to `Engine::open()`, `Engine::build()`, etc. below are
+> historical — the current classes are `Builder`, `Searcher`, `IVFSearcher`,
+> `Estimator`, `Index`, `IVFIndex`.
+
+Phase 1 was functionally complete (build, search, insert, partitioned build,
+CLI, 71 tests passing) with search-path R&D applied (PageShuffle, PageSearch,
+MemGraph, DynamicWidth, PinResult).
 
 ## SIFT-1M validated performance
 

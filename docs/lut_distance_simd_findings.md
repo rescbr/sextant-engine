@@ -1,4 +1,12 @@
-# PQ LUT SIMD — negative result
+# PQ LUT SIMD — negative result (for single-code path)
+
+> **Update (2026-07-23):** The single-code `lut_distance` scalar path was
+> partially eliminated by the batch4 remainder fix (commit 6e1d7ff) — the
+> 1-3 neighbor tail now uses a padded `lut_distance_batch4` call instead of
+> scalar fallback. The single-code `lut_distance` still exists for entry-point
+> seeding (which is rare and on FP16-ball nodes anyway) and for non-LUT build
+> paths. The SIMD investigation below remains valid: the single-code path
+> can't be SIMD-accelerated without a LUT layout change.
 
 > Investigated 2026-07-20. Three SIMD attempts (manual SVE intrinsics v1,
 > manual v2, clang auto-vec) all failed to meaningfully speed up
