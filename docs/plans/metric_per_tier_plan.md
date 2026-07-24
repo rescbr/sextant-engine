@@ -315,31 +315,44 @@ ScaNN's objective minimizes the error in ⟨q, x̃⟩. The natural search-time
 estimator is **IP-ADC**: `⟨q, x̃⟩ = Σ_s ⟨q_sub_s, c_sub_s⟩`. Phase 1 already
 shipped IP-ADC for the PQ tier. Phase 2 reuses it.
 
-## Architecture: templated VamanaCore<TQuantizer>
+## Architecture: inheritance (train virtual, hot path non-virtual)
 
-Template `VamanaCore` on quantizer type. `VamanaCore<PqQuantizer>` and
-`VamanaCore<AnisotropicPqQuantizer>` compile from one source into two
-instantiations. Source stays DRY; binary marginally larger. Zero
-virtual-dispatch overhead in the 27%-of-profile distance call; compiler inlines
-`distance()` per specialization.
+**Decision (revised from the original templating plan):** Make
+`PqQuantizer::train()` the only virtual method. `AnisotropicPqQuantizer`
+subclasses `PqQuantizer` and overrides ONLY `train()`. All hot-path methods
+(`lut_distance`, `code_distance`, `lut_distance_batch4`, `code_distance_batch4`,
+`build_code_lut`, `preprocess_query`) stay non-virtual — `VamanaCore` calls them
+monomorphically through `PqQuantizer&`, zero dispatch overhead, inlinable.
 
-File layout:
-- `src/algo/vamana_core.hpp` — class template definition, short method bodies
-- `src/algo/vamana_core_impl.hpp` — big methods (`beam_search_into` etc.),
-  included from the `.hpp`. Implementation must be visible for inlining.
-- `src/algo/vamana_core.cpp` — explicit instantiations for both quantizer types.
+This achieves the same hot-path monomorphism as full templating at ~120 lines
+instead of ~1300. `VamanaCore`, `Index`, and the 5 construction sites stay
+unchanged. `Builder` constructs `AnisotropicPqQuantizer` when `--quantizer
+anisotropic-pq` is set, owning it via the base `unique_ptr<PqQuantizer>`.
+
+**Why not full `VamanaCore<TQuantizer>` templating:** the ScaNN paper confirms
+anisotropy lives entirely in training; search is standard ADC. The hot path is
+identical for both quantizers. Templating would be 1300 lines of mechanical
+refactor (base class, impl header split, explicit instantiations, factory, 5
+construction-site updates) for zero hot-path benefit. YAGNI. If a later phase
+discovers the hot path needs polymorphism (e.g., anisotropic weighting at query
+time), revisit then.
+
+**Why this works:** C++ non-virtual interface (NVI) idiom. The base class's
+non-virtual methods resolve at compile time to `PqQuantizer`'s implementation.
+`AnisotropicPqQuantizer` inherits those methods unchanged — its only difference
+is the trained codebook (produced by its virtual `train()` override). The hot
+path sees a `PqQuantizer` with a differently-trained codebook, nothing more.
 
 ### The quantizer classes
 
-`PqQuantizer` stays as-is (proven, shipped, 170-line header). First template arg.
+`PqQuantizer` stays as-is (proven, shipped). One change: `train()` becomes
+virtual (the only virtual method). All hot-path methods stay non-virtual.
 
-`AnisotropicPqQuantizer` is a NEW class (not a subclass — templates don't need
-inheritance). Same public method surface as `PqQuantizer`:
-- `code_size()`, `m()`, `bits()`, `K()`, `sub_dim()` — identical.
-- `train(samples, n)` — **the anisotropic Lloyd's algorithm.** The research
-  component. Constructed with `MetricKind::InnerProduct`.
-- `encode(vec, out)`, `preprocess_query(q, out)`, `lut_distance(code, lut)`,
-  `lut_distance_batch4(...)`, `lut_size()` — identical to PqQuantizer (driven by
+`AnisotropicPqQuantizer` is a NEW subclass of `PqQuantizer`. It overrides ONLY
+`train()` — everything else (encode, preprocess_query, lut_distance, batch4,
+code_distance, build_code_lut, serialize, deserialize) is inherited unchanged.
+The inherited methods operate on whatever codebook `train()` produced, so they
+work identically — only the trained codebook bytes differ.
   the `metric_` flag to IP, which Phase 1 validated).
 - `build_code_lut`, `code_distance*`, `build_cross_distance_table` — identical
   (HDC build mode, IP metric).
@@ -366,22 +379,24 @@ entry into two code paths. Explore both in P2.4.
 
 ## Phase 2 sequencing
 
-### P2.1: Templated VamanaCore<TQuantizer> — pure refactor
-Template `VamanaCore` on quantizer type. `PqQuantizer` is the only
-specialization. Extract implementation to `vamana_core_impl.hpp`. All existing
-tests pass byte-identical. No behavior change.
-**Risk:** compile-time/header-bloat.
-**Gate:** all tests green; c4a PQ QPS unchanged.
+### P2.1: Make PqQuantizer::train() virtual — minimal refactor
+Make `PqQuantizer::train()` the only virtual method (add `virtual` keyword;
+the hot-path methods stay non-virtual). This is the only change to the existing
+code — ~1 line. All existing tests pass byte-identical. No behavior change.
+**Risk:** none. Virtual dispatch on `train()` is called O(1) per build.
+**Gate:** all tests green.
 
 ### P2.2: AnisotropicPqQuantizer skeleton — standard k-means
-Implement `AnisotropicPqQuantizer` with **standard L2 k-means** training (NOT
-anisotropic yet — copy `PqQuantizer::train`), constructed with
-`MetricKind::InnerProduct`. Validate plumbing: train → encode →
-preprocess_query (IP LUT) → lut_distance → serialize → deserialize. Verify
-IP-ADC distances match brute-force dot product.
+Implement `AnisotropicPqQuantizer` as a subclass of `PqQuantizer` overriding
+ONLY `train()`. The first version copies `PqQuantizer::train` verbatim (NOT
+anisotropic yet — just to validate the plumbing). Add `--quantizer
+anisotropic-pq` config flag + CLI; `Builder` constructs the subclass when set.
+Validate plumbing: train → encode → preprocess_query → lut_distance →
+serialize → deserialize. The inherited hot-path methods should produce
+identical results to `PqQuantizer` since the codebook is trained identically.
 **Risk:** serialization format (same tag + flag, or new tag).
-**Gate:** standard-k-means + IP metric produces recall matching Phase 1's
-config B on arxiv100k. Proves plumbing before research.
+**Gate:** anisotropic-pq with standard-k-means produces recall identical to
+plain pq on arxiv100k. Proves plumbing before research.
 
 ### P2.3: Anisotropic training — THE RESEARCH (measures both L2sq-ADC and IP-ADC)
 Implement ScaNN's anisotropic Lloyd's algorithm in `train()`:

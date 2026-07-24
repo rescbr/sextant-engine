@@ -17,6 +17,11 @@ public:
     PqQuantizer(MetricKind metric, Dim dim, uint16_t m, uint8_t bits = 8,
                 uint64_t seed = 0xC0DE1234ULL);
 
+    /// Virtual destructor: PqQuantizer is held via unique_ptr<PqQuantizer> and
+    /// subclassed by AnisotropicPqQuantizer. Without this, deleting through the
+    /// base pointer would be UB.
+    virtual ~PqQuantizer() = default;
+
     /// Number of bytes per PQ code.
     uint32_t code_size() const;
 
@@ -34,8 +39,11 @@ public:
     uint8_t bits() const { return bits_; }
 
     /// Train the codebook via batch k-means++ on a sample of vectors.
-    /// `samples` is `n × dim` float32, row-major.
-    void train(const float* samples, uint64_t n);
+    /// `samples` is `n × dim` float32, row-major. Virtual so AnisotropicPqQuantizer
+    /// can override with ScaNN's anisotropic Lloyd's algorithm; the hot-path
+    /// methods (lut_distance, batch4, code_distance) stay non-virtual —
+    /// VamanaCore calls them monomorphically through PqQuantizer&.
+    virtual void train(const float* samples, uint64_t n);
 
     /// Enable/disable covariance-based anisotropic codebook training.
     ///
