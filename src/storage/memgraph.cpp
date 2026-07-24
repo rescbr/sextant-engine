@@ -120,30 +120,12 @@ MemGraph::MemGraph(const std::string& graph_path, const std::string& codes_path,
 
     materialize(graph_buf.data(), codes_buf.data());
 
-    // Optionally load the `.ball` FP16 sidecar (ball-only vectors in the same
-    // collected/local-index order produced by materialize). Enables the hybrid
-    // FP16+PQ distance path in beam_search. Absent or mismatched → PQ-only.
-    if (!vecs_path.empty()) {
-        std::error_code ec;
-        if (std::filesystem::exists(vecs_path, ec)) {
-            DirectFile f(vecs_path, /*create=*/false);
-            SidecarHeader h;
-            read_at(f, reinterpret_cast<uint8_t*>(&h), sizeof(h), 0);
-            const uint32_t ball_count = static_cast<uint32_t>(h.n_vectors);
-            if (h.dim == dim_ && ball_count == cached_count_) {
-                fp16_data_.resize(static_cast<size_t>(ball_count) * dim_);
-                read_payload(f, reinterpret_cast<uint8_t*>(fp16_data_.data()),
-                             static_cast<size_t>(ball_count) * dim_ *
-                                 sizeof(float16_t));
-                spdlog::info("[sextant] MemGraph: loaded {} FP16 vectors from {}",
-                             ball_count, vecs_path);
-            } else {
-                spdlog::warn("[sextant] MemGraph: .ball dim={}/ball_count={} != "
-                             "expected dim={}/cached_count={}, skipping FP16",
-                             h.dim, ball_count, dim_, cached_count_);
-            }
-        }
-    }
+    // The .ball FP16 sidecar is no longer loaded for search. The FP16 tier
+    // was measured to hurt recall (premature convergence) and QPS (FP16 compute
+    // is more expensive than PQ-ADC LUT sum). See results/p2.3-noball/.
+    // The .ball file is still written at build time for the FP16 prune.
+    // Keeping the vecs_path parameter for API compatibility; just skip loading.
+    (void)vecs_path;
 }
 
 void MemGraph::collect_neighborhood(const uint8_t* nodes, uint32_t total_count,
@@ -228,16 +210,20 @@ void MemGraph::materialize(const uint8_t* nodes, const uint8_t* codes) {
 }
 
 const float16_t* MemGraph::precise_vec(uint32_t id) const {
-    // When metric is set to InnerProduct via set_metric(), the FP16 ball tier
-    // is disabled. This is used by --no-ball to force pure PQ-ADC search
-    // (testing whether the FP16 tier helps or hurts for a given quantizer/metric).
-    if (metric_ == MetricKind::InnerProduct) return nullptr;
-    if (fp16_data_.empty() || dim_ == 0) return nullptr;
-    const uint32_t local = (id < id_to_local_.size())
-        ? id_to_local_[id]
-        : std::numeric_limits<uint32_t>::max();
-    if (local == std::numeric_limits<uint32_t>::max()) return nullptr;
-    return fp16_data_.data() + static_cast<size_t>(local) * dim_;
+    // The FP16 ball tier is DISABLED. The .ball sidecar is no longer loaded
+    // at search time — all distances go through PQ-ADC for consistency and
+    // performance. Measured on c4a 1.34M: disabling the FP16 tier gives
+    // identical or higher recall (the true distances caused premature search
+    // convergence, reducing exploration) AND higher QPS (PQ-ADC LUT sum is
+    // cheaper than FP16 dim-wide distance compute). See the no-ball experiment
+    // in results/p2.3-noball/.
+    //
+    // The .ball file is still WRITTEN at build time (the build-time FP16 prune
+    // in robust_prune_into uses l2sq_f16 against raw FP16 vectors — that's a
+    // separate concern affecting graph quality, not search). We just don't
+    // load it for search.
+    (void)id;
+    return nullptr;
 }
 
 // ===========================================================================
