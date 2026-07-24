@@ -222,11 +222,11 @@ void VamanaCore::beam_search_into(
     const float* query_lut = q.query_lut;
     const float16_t* query_fp16 = q.query_fp16;
     const float* query_fp32 = q.query_fp32;
-    const uint8_t* hdc_anchor = q.hdc_anchor;
+    const uint8_t* anchor_code = q.anchor_code;
     const float* anchor_lut = q.anchor_lut;
     const std::vector<uint32_t>* forced_entry_points = q.forced_entry_points;
     const MetricKind metric = quantizer_.metric();  // drives simd::dist_f16/simd::dist_f32 dispatch
-    (void)query_lut; (void)query_fp16; (void)hdc_anchor;
+    (void)query_lut; (void)query_fp16; (void)anchor_code;
     (void)anchor_lut; (void)forced_entry_points;  // captured by dist_to below
     out.clear();
     if (count_ == 0 || L == 0) {
@@ -261,7 +261,7 @@ void VamanaCore::beam_search_into(
     // available AND the store exposes an FP16 vector for this node (MemGraph
     // ball nodes), use simd::l2sq_f16 (sequential FP16 compute — prefetcher-friendly,
     // no LUT gather, no PQ code pin/unpin). Otherwise fall back to the PQ
-    // path. Priority among PQ modes: anchor_lut > hdc_anchor > query_lut.
+    // path. Priority among PQ modes: anchor_lut > anchor_code > query_lut.
     auto dist_to = [&](uint32_t id) {
         if (query_fp32 && build_ctx_ && build_ctx_->fp32_vecs) {
             // FP32 build mode: exact distance, no quantization.
@@ -291,8 +291,8 @@ void VamanaCore::beam_search_into(
         float d;
         if (anchor_lut) {
             d = quantizer_.lut_distance(code_ptr, anchor_lut);
-        } else if (hdc_anchor) {
-            d = quantizer_.code_distance(hdc_anchor, code_ptr);
+        } else if (anchor_code) {
+            d = quantizer_.code_distance(anchor_code, code_ptr);
         } else {
             d = quantizer_.lut_distance(code_ptr, query_lut);
         }
@@ -552,7 +552,7 @@ void VamanaCore::beam_search_into(
             (store_ == nullptr);
 
         if (can_batch) {
-            // HDC build uses the per-anchor LUT (anchor_lut); the LUT
+            // PQ-construct build uses the per-anchor LUT (anchor_lut); the LUT
             // path uses the per-query LUT (query_lut). lut_distance(_batch4) takes a
             // plain const float* LUT, so either works.
             const float* batch_lut = anchor_lut ? anchor_lut : query_lut;
@@ -1035,7 +1035,7 @@ void VamanaCore::connect_and_prune(uint32_t new_internal_id,
 
 // ===========================================================================
 // insert_build_from_code — the sole build entry point. LUT is always built
-// via build_code_lut from the node's own PQ code (HDC). The prune query vec
+// via build_code_lut from the node's own PQ code (PQ-construct). The prune query vec
 // comes from build_vec_ptr(internal_id) when build_ctx_->vecs is set (FP16 prune).
 // ===========================================================================
 
@@ -1046,7 +1046,7 @@ void VamanaCore::insert_build_from_code(uint32_t internal_id, RowId row_id,
 
 void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
                                      VamanaTLS& tls) {
-    // HDC mode requires the build_ctx_->codes buffer (own PQ code).
+    // PQ-construct mode requires the build_ctx_->codes buffer (own PQ code).
     // build_ctx_->nodes is always required.
     if (!build_ctx_ || !build_ctx_->nodes || !build_ctx_->codes) {
         throw Error(ErrorCode::InvalidParam,
@@ -1091,7 +1091,7 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     //    only; search uses PQ regardless. ~2-3× build time (simd::l2sq_f16 is dim-wide
     //    vs m LUT lookups). See docs/build_search_decoupling.md.
     const float* query_lut = nullptr;
-    const uint8_t* hdc_anchor = nullptr;
+    const uint8_t* anchor_code = nullptr;
     const float* anchor_lut = nullptr;
     const float16_t* build_query_fp16 = nullptr;
     const float* build_query_fp32 = nullptr;
@@ -1109,14 +1109,14 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     } else if (fp16_build && build_ctx_ && build_ctx_->vecs != nullptr) {
         build_query_fp16 = build_vec_ptr(internal_id);
     } else {
-        // HDC: LUT from own PQ code. anchor_lut[s*K + cid] =
+        // PQ-construct: LUT from own PQ code. anchor_lut[s*K + cid] =
         // cross_distance_table[s*K*K + anchor_code[s]*K + cid].
-        const uint8_t* anchor_code =
+        const uint8_t* own_code =
             build_ctx_->codes + static_cast<size_t>(internal_id) * code_size_;
         float* alut = tls.anchor_lut.data();
-        const bool lut_ok = quantizer_.build_code_lut(anchor_code, alut);
+        const bool lut_ok = quantizer_.build_code_lut(own_code, alut);
         anchor_lut = lut_ok ? alut : nullptr;
-        hdc_anchor = lut_ok ? nullptr : anchor_code;
+        anchor_code = lut_ok ? nullptr : own_code;
     }
 
     // InsertBuild tail: beam_search → robust_prune → connect_and_prune.
@@ -1138,7 +1138,7 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     // since beam_search drains a max-heap then reverses → ascending.
     BeamQuery probe;
     probe.query_lut = query_lut;
-    probe.hdc_anchor = hdc_anchor;
+    probe.anchor_code = anchor_code;
     probe.anchor_lut = anchor_lut;
     probe.query_fp16 = build_query_fp16;
     probe.query_fp32 = build_query_fp32;

@@ -1,5 +1,5 @@
 // resolve_params — auto-default parameter resolution (Issue 37).
-// The two-pass streaming + parallel HDC construct lives in engine.cpp; this
+// The two-pass streaming + parallel PQ-construct lives in engine.cpp; this
 // translation unit owns the auto-default resolution logic.
 
 #include "resolve_params.hpp"

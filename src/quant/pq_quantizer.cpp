@@ -622,7 +622,7 @@ void PqQuantizer::build_cross_distance_table() {
     // approximation properties than PQ-IP — measured: building the graph
     // with IP cross-distances drops IP search recall 15pp (0.76→0.61 on
     // arxiv100k) because IP code-to-code distances have higher variance.
-    // The L2sq HDC produces a graph robust to both search metrics.
+    // The L2sq PQ-construct produces a graph robust to both search metrics.
     for (uint32_t s = 0; s < m_; s++) {
         const float* book = codebook_.data() + size_t(s) * K_ * sub_dim_;
         float* table = cross_distance_table_.data() + size_t(s) * K_ * K_;
@@ -786,7 +786,7 @@ float PqQuantizer::lut_distance(const uint8_t* code, const float* lut) const {
 }
 
 // ---------------------------------------------------------------------------
-// PQ code LUT (HDC build mode)
+// PQ code LUT (PQ-construct build mode)
 // ---------------------------------------------------------------------------
 
 bool PqQuantizer::build_code_lut(const uint8_t* code, float* out) const {

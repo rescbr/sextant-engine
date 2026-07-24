@@ -748,16 +748,16 @@ TEST(Engine, OpenRejectsMissingIndex) {
 }
 
 // ---------------------------------------------------------------------------
-// HDC build mode: build with PQ-distance construct and verify
+// PQ-construct build mode: build with PQ-distance construct and verify
 // the index is valid and searchable.
 // ---------------------------------------------------------------------------
-TEST(Engine, BuildHDCMode) {
+TEST(Engine, BuildPQConstructMode) {
     const uint32_t n = 800;
     const uint32_t dim = 64;
     const std::string fbin =
-        write_random_fbin("engine_hdc_data.fbin", n, dim);
+        write_random_fbin("engine_pqconstruct_data.fbin", n, dim);
     const std::string index_path =
-        (std::filesystem::temp_directory_path() / "engine_hdc_idx").string();
+        (std::filesystem::temp_directory_path() / "engine_pqconstruct_idx").string();
     remove_sidecars(index_path);
 
     {
@@ -783,7 +783,7 @@ TEST(Engine, BuildHDCMode) {
             << "empty sidecar: " << p;
     }
 
-    // Open and search — basic smoke test that the HDC-built graph works.
+    // Open and search — basic smoke test that the PQ-construct-built graph works.
     {
         auto idx = Index::read(index_path);
         Searcher searcher(*idx);

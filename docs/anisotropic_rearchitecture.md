@@ -74,7 +74,7 @@ Replace `PqQuantizer` with a new `AnisotropicQuantizer` (or parallel class):
 - `beam_search_into`'s distance evaluation (the `dist_to` lambda, the FP16/PQ
   split, `pin_codes`): restructures around the new distance call. The FP16-ball
   tier (MemGraph) stays; the PQ tier is replaced by the anisotropic distance.
-- HDC build mode (anchor LUT, cross-distance table): PQ-specific — either
+- PQ-construct build mode (anchor LUT, cross-distance table): PQ-specific — either
   removed or paralleled.
 
 ### 4. Coupling — 56 call sites across 17 files

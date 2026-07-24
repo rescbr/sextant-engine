@@ -1,6 +1,6 @@
 // Builder — bulk-build + mutate an Index.
 //
-// Owns the two-pass streaming + parallel HDC construct pipeline plus the
+// Owns the two-pass streaming + parallel PQ-construct pipeline plus the
 // post-build mutators (insert/flush). Methods moved here from engine.cpp;
 // Engine keeps thin inline delegating wrappers in the header (deleted in
 // Phase E along with Engine itself).
@@ -10,7 +10,7 @@
 //   2. allocate flat codes + nodes buffers         [build_partitioned]
 //   3. Pass 1: reservoir sample (256K) + PQ train  [pass1_sample_and_train]
 //   4. Pass 2: encode all vectors → codes buffer   [pass2_encode]
-//   5. Parallel HDC construct via CTPL             [parallel_construct]
+//   5. Parallel PQ-construct via CTPL             [parallel_construct]
 //   6. Finalize: compute_entry_points              [snap_entry_points_]
 //   7. Flush sidecars (.graph/.codes/.meta/.ball/.manifest)  [write_sidecars_]
 
@@ -520,7 +520,7 @@ void Builder::pass2_encode(VectorSource& source,
 }
 
 // ===========================================================================
-// Parallel construct (HDC, Issue 29 Mode C)
+// Parallel construct (PQ-construct, Issue 29 Mode C)
 // ===========================================================================
 
 void Builder::parallel_construct(const ResolvedParams& params) {
@@ -547,7 +547,7 @@ void Builder::construct_into(VamanaCore& core, uint32_t count,
                             const char* label) {
     if (count == 0) return;
     nthreads = std::max(1u, nthreads);
-    spdlog::info("[sextant] {}: {} nodes across {} threads (HDC)", label, count,
+    spdlog::info("[sextant] {}: {} nodes across {} threads (PQ-construct)", label, count,
                  nthreads);
 
     // The very first insert must be serialized before spawning tasks: it
@@ -654,7 +654,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     using engine_detail::fill_header;
     using engine_detail::read_exact;
 
-    // Partitioned build uses HDC shard construct exclusively — RAM savings
+    // Partitioned build uses PQ-construct shard exclusively — RAM savings
     // matter more than marginal quality at large scale.
 
     spdlog::info("[sextant] build: N={} K={} closure_factor={:.4f}",
@@ -701,7 +701,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
             static_cast<size_t>(index_.count) * index_.dim * sizeof(float16_t);
         AlignedBuf vecs(kDiskAlign, vecs_bytes);
         spdlog::info("[sextant] loading raw vectors as FP16 ({:.1f}MB) for "
-                      "HDC (FP16 prune)",
+                      "PQ-construct (FP16 prune)",
                      vecs_bytes / 1e6);
         // FP32 build mode: also load FP32 vectors for exact build distances.
         // +N×dim×4 bytes RAM (e.g. +4.1GB at 1.34M). Gated by env var.

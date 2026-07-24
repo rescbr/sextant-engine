@@ -84,7 +84,7 @@ struct VamanaTLS {
     std::vector<Candidate> connect_buffer;  // connect_and_prune overflow candidate pool
     std::vector<Candidate> recip_targets;   // snapshot of selected for reciprocal loop
     std::vector<float> lut_buffer;  // Reusable PQ distance LUT (m*K floats).
-    /// Per-anchor LUT for HDC build: anchor_lut[s*K+cid] = cross_table[s*K*K + anchor_code[s]*K + cid].
+    /// Per-anchor LUT for PQ-construct build: anchor_lut[s*K+cid] = cross_table[s*K*K + anchor_code[s]*K + cid].
     /// Built once per insert_build_from_code; 8KB (m=32,K=256), L1-resident.
     std::vector<float> anchor_lut;
     std::vector<uint8_t> removed_flags;  // robust_prune removed bitset (bytes, not bools)
@@ -170,11 +170,11 @@ struct BuildContext {
 ///
 ///   **Build path** (called by insert_build_core):
 ///   - `query_lut`     — generic PQ LUT (default build mode).
-///   - `hdc_anchor`    — when non-null, distances are computed via direct
+///   - `anchor_code`    — when non-null, distances are computed via direct
 ///                       code-to-code lookup (code_distance) instead of the
 ///                       materialized LUT. Skips the 32KB LUT gather.
 ///   - `anchor_lut`    — when non-null, takes priority over both query_lut
-///                       and hdc_anchor: distances are gathered from this
+///                       and anchor_code: distances are gathered from this
 ///                       8KB per-anchor LUT (L1-resident) via lut_distance.
 ///
 ///   **Common**:
@@ -185,7 +185,7 @@ struct BeamQuery {
     const float* query_lut = nullptr;
     const float16_t* query_fp16 = nullptr;
     const float* query_fp32 = nullptr;       // FP32 build mode: direct FP32 distance
-    const uint8_t* hdc_anchor = nullptr;
+    const uint8_t* anchor_code = nullptr;
     const float* anchor_lut = nullptr;
     const std::vector<uint32_t>* forced_entry_points = nullptr;
 };
@@ -203,7 +203,7 @@ public:
     /// Prepare for building `count` nodes.
     void prepare_for_build(uint32_t count);
 
-    /// Insert a node during parallel build (HDC mode: LUT from PQ code).
+    /// Insert a node during parallel build (PQ-construct mode: LUT from PQ code).
     /// Each thread calls this for disjoint node-ID ranges.
     void insert_build_from_code(uint32_t internal_id, RowId row_id,
                                 VamanaTLS& tls);
@@ -216,7 +216,7 @@ public:
 
     /// BeamSearch from entry points. Returns candidates.
     ///
-    /// `q` bundles the query inputs (LUT + optional FP16/HDC anchor/forced
+    /// `q` bundles the query inputs (LUT + optional FP16/PQ-construct anchor/forced
     /// entry points). See BeamQuery for the distance-mode taxonomy.
     /// `early_exit_patience`: search-time early-exit patience (0 = disabled,
     /// UINT32_MAX = defer to params_.early_exit_patience). Build callers MUST

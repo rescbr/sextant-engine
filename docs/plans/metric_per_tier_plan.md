@@ -355,7 +355,7 @@ The inherited methods operate on whatever codebook `train()` produced, so they
 work identically — only the trained codebook bytes differ.
   the `metric_` flag to IP, which Phase 1 validated).
 - `build_code_lut`, `code_distance*`, `build_cross_distance_table` — identical
-  (HDC build mode, IP metric).
+  (PQ-construct build mode, IP metric).
 - `decode_code`, `serialize`, `deserialize` — identical structure, different
   codebook bytes.
 
