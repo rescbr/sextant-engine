@@ -200,6 +200,45 @@ local SSD. Disk-resident Vamana graph + PQ codes. At 1B scale the index is
 in-memory QPS. We are raising our recall ceiling to cut the rerank tax that
 dominates disk-resident throughput.
 
+### Phase 1 finding (P1.5, measured): plain PQ + L2sq-ADC dominates plain PQ + IP-ADC
+
+On arxiv-nomic 1.34M at production scale (c4a, R=32, pq_m=96/bits=8):
+- L2sq-ADC ceiling: 0.9940 (with rerank=10).
+- IP-ADC ceiling: 0.5629. Cannot reach 0.90 at any config.
+- IP is 1.2-2.0× faster per eval but the recall gap dominates on the Pareto curve.
+
+The IP-ADC recall collapse traces entirely to the `‖x̃‖²` per-code variance
+(noise term in `‖q−x̃‖² = ‖q‖² − 2⟨q,x̃⟩ + ‖x̃‖²` that IP-ADC omits). On
+normalized data at scale, this noise scrambles the top-100 ranking.
+
+### Phase 2 hypothesis: anisotropic training asymmetrically helps IP-ADC
+
+The `‖x̃‖²` variance is not fixed — it depends on the training objective.
+Standard k-means minimizes reconstruction MSE isotropically, which leaves
+`‖x̃‖²` free to vary. **ScaNN's anisotropic objective weights parallel
+quantization error higher** (parallel = along the query direction). This is
+exactly the error component that generates `‖x̃‖²` drift. Hypothesis:
+anisotropic training tightens `‖x̃‖²` enough that IP-ADC recall matches
+L2sq-ADC recall — at which point IP's per-eval cost advantage (1.4-1.6× QPS)
+wins on the Pareto curve.
+
+This requires measuring a 2×2 matrix:
+
+|                  | L2sq-ADC         | IP-ADC           |
+|------------------|------------------|------------------|
+| **Plain PQ**     | A: 0.99 (P1.5)   | B: 0.56 (P1.5)   |
+| **Anisotropic PQ** | C: ?           | D: ? (ScaNN)     |
+
+The Phase 2 prize is **D vs C on the Pareto curve** (with A as baseline).
+Three outcomes:
+- D dominates C → IP wins (anisotropic closes the recall gap, IP's cost wins).
+- C dominates D → L2sq wins even with anisotropic training.
+- Recall tie → IP wins by cost.
+
+Phase 2 MUST measure both C and D, not just D. The original plan assumed
+"anisotropic PQ uses IP-ADC" — but P1.5 showed that's not the right default
+for plain PQ, so the anisotropic effect on L2sq-ADC must be measured too.
+
 ## The reframe (correcting the prior scope)
 
 `docs/anisotropic_rearchitecture.md` had two premises the research and math
@@ -344,29 +383,46 @@ IP-ADC distances match brute-force dot product.
 **Gate:** standard-k-means + IP metric produces recall matching Phase 1's
 config B on arxiv100k. Proves plumbing before research.
 
-### P2.3: Anisotropic training — THE RESEARCH
+### P2.3: Anisotropic training — THE RESEARCH (measures both L2sq-ADC and IP-ADC)
 Implement ScaNN's anisotropic Lloyd's algorithm in `train()`:
-- Assignment: argmin over c of `η·‖r∥(x,c)‖² + ‖r⊥(x,c)‖²`.
-- Update: closed-form per-subspace solve (Theorem 4.2).
+- Assignment step: argmin over c of `η·‖r∥(x,c)‖² + ‖r⊥(x,c)‖²`.
+- Update step: closed-form per-subspace solve (Theorem 4.2).
 - T = 0.2 default (η ≈ 4.125). Sweep T ∈ {0.1, 0.2, 0.3, 0.5} on arxiv100k.
 - Warm-start from standard k-means (P2.2's train), iterate 10-25 Lloyd rounds.
 
-Validate locally on arxiv100k first, then arxiv-nomic 1.34M on c4a.
-**Target: PQ-only recall@100 ≥ 0.85 on 1.34M** (or Phase 1's config B recall +5pp,
-whichever is higher — Phase 1 establishes the real baseline).
+**Measure BOTH metrics after training** (the 2×2 matrix from the mission section):
+- Config C: anisotropic PQ + L2sq-ADC.
+- Config D: anisotropic PQ + IP-ADC.
+Both share the same trained codebook; only the search-time ADC differs. The
+comparison is the core Phase 2 research question: does anisotropic training
+close the `‖x̃‖²`-variance gap enough for IP-ADC to match L2sq-ADC recall?
+
+Validate locally on arxiv100k first (fast iteration on the training algorithm),
+then arxiv-nomic 1.34M on c4a.
+**Target: anisotropic IP-ADC recall ≥ 0.85 on 1.34M, AND anisotropic IP-ADC
+within 2-3pp of anisotropic L2sq-ADC** (so IP's cost advantage wins on Pareto).
 **Risk:** the genuine research risk. ScaNN's exact finite-d η isn't fully
 documented (we use the d→∞ limit). May require iteration on the objective.
-**Gate:** PQ-only recall on 1.34M. If < Phase 1's config B + 3pp, ceiling holds
-— document and stop. If between that and 0.85, escalate to m=192 (P2.5).
+**Gate:** anisotropic IP-ADC recall on 1.34M. If < 0.78, ceiling holds —
+document and stop. If 0.78-0.85 but >5pp below anisotropic L2sq-ADC, IP still
+loses on Pareto — document and decide whether to ship anisotropic-L2sq.
+If ≥ 0.85 AND within 2-3pp of L2sq, escalate to P2.4 for the full Pareto curve.
 
-### P2.4: beam_search integration — end-to-end Pareto curve
+### P2.4: beam_search integration — end-to-end Pareto curve (2×2 matrix)
 Wire `AnisotropicPqQuantizer` into `VamanaCore<AnisotropicPqQuantizer>`.
 Builder/Searcher branch on `quantizer` config. Measure end-to-end Pareto curve
 (recall@100 vs QPS) on arxiv-nomic 1.34M on c4a at rerank ∈ {1, 2, 3, 5, 10}.
 
-**Metric selection per tier (from Phase 1):** the default uses whichever config
-won in Phase 1 (likely C: IP/IP-FHM for normalized data). The anisotropic
-quantizer inherits Phase 1's per-tier metric choices — no new metric decision here.
+**Measure all four configs** of the 2×2 matrix:
+- A: plain PQ + L2sq-ADC (Phase 1 baseline — already measured).
+- B: plain PQ + IP-ADC (Phase 1 — already measured).
+- C: anisotropic PQ + L2sq-ADC.
+- D: anisotropic PQ + IP-ADC (the ScaNN target).
+
+The C-vs-D Pareto comparison is the Phase 2 verdict. If D dominates C, IP wins
+(anisotropic closed the gap, IP's cost wins). If C dominates D, L2sq wins even
+with anisotropic training. Either way, the anisotropic recall lift (C or D over
+A) is the rerank-tax reduction prize.
 
 **Risk:** hot-path regression for the PQ path (mitigated by templating).
 **Gate:** anisotropic Pareto curve dominates Phase 1's best config on arxiv-nomic.
@@ -382,19 +438,33 @@ default, update docs.
 
 ## Phase 2 success criteria
 
-**Primary (the prize):** AnisotropicPqQuantizer's recall@100-vs-QPS Pareto curve
-on arxiv-nomic 1.34M dominates Phase 1's best config, at the same 96B/vec code
-budget. Measured at rerank ∈ {1, 2, 3, 5, 10}.
+**Primary (the Pareto prize):** Configuration D (anisotropic PQ + IP-ADC) beats
+Configuration C (anisotropic PQ + L2sq-ADC) on the recall@100-vs-QPS Pareto
+curve on arxiv-nomic 1.34M. Measured at rerank ∈ {1, 2, 3, 5, 10}.
+
+This is the actual research question: does anisotropic training close the
+IP-vs-L2sq recall gap enough for IP's cost advantage to win? P1.5 showed IP
+loses badly with plain PQ (0.56 vs 0.99 ceiling). If anisotropic training
+lifts IP-ADC to within 2-3pp of L2sq-ADC, IP wins on Pareto.
+
+**Secondary (recall lift, regardless of metric):** anisotropic PQ lifts the
+PQ-only recall ceiling above 0.80 at k=100 on 1.34M (vs 0.73 plain). This is
+the rerank-tax reduction prize — it matters for BOTH L2sq-ADC and IP-ADC
+configs (C and D). Even if IP loses to L2sq on Pareto, an anisotropic-L2sq
+recall lift reduces the rerank multiplier and improves disk-resident QPS.
 
 **Aspirational checkpoints:**
-- PQ-only recall@100 ≥ 0.85 on 1.34M ⟹ rerank=2-3 where rerank=10 was needed
-  ⟹ ~3-5× SSD bandwidth reduction per query.
-- PQ-only recall@100 ≥ 0.90 on 1.34M ⟹ rerank=1 might suffice for recall@100 ≥ 0.90.
+- Anisotropic IP-ADC recall ≥ 0.85 on 1.34M ⟹ rerank=2-3 where rerank=10
+  was needed ⟹ ~3-5× SSD bandwidth reduction per query.
+- Anisotropic IP-ADC recall ≥ 0.90 on 1.34M ⟹ rerank=1 might suffice.
 
 **Stop conditions:**
-- PQ-only recall < Phase 1's config B + 3pp at m=96 AND m=192 ⟹ ceiling holds.
-- Anisotropic Pareto dominated by Phase 1's best at every rerank ⟹ negative result.
-- Hot-path regression on the PQ path ⟹ bug in templating; fix before proceeding.
+- Anisotropic IP-ADC recall < 0.78 at m=96 AND m=192 ⟹ the `‖x̃‖²` variance
+  can't be controlled by training; ceiling holds for IP. Document and stop.
+- Configuration C (anisotropic L2sq-ADC) dominates D at every rerank AND
+  lifts the ceiling above 0.85 ⟹ L2sq wins, ship anisotropic-L2sq as the
+  production quantizer.
+- Configuration D dominates C at every rerank ⟹ IP wins, ship anisotropic-IP.
 
 ## Phase 2 estimated effort
 
