@@ -1,16 +1,26 @@
 # Sextant Distance Computation Architecture
 
-## Two-tier distance: PQ-ADC navigation + FP32 rerank
+## Standard PQ-ADC + FP32 rerank
 
-Sextant uses a **two-tier distance** architecture for search:
-1. **PQ-ADC** for graph navigation (all nodes, no precision tiers).
-2. **FP32 rerank** for final top-k selection (caller responsibility).
+Sextant uses the standard PQ-ANN distance architecture:
+1. **PQ-ADC** for graph navigation (asymmetric: query unquantized, database PQ-quantized).
+2. **FP32 rerank** for final top-k selection (standard practice in DiskANN/FAISS/ScaNN).
 
-The former three-tier HDC design (FP16 ball → PQ ADC → FP32 rerank) was
-**simplified to two tiers** on 2026-07-24 after measuring that the FP16 ball
-tier actively hurt recall (premature convergence) and QPS (FP16 compute is
-more expensive than PQ-ADC LUT sum). See `results/p2.3-noball/` and commit
-`2dca950`.
+The former three-tier "HDC" design (FP16 ball → PQ ADC → FP32 rerank) was
+**retired** on 2026-07-24. The FP16 ball tier — which was presented as Sextant's
+novel contribution — turned out to actively hurt recall (premature convergence)
+and QPS (FP16 compute more expensive than PQ-ADC LUT sum). See
+`results/p2.3-noball/` and commit `2dca950`.
+
+**This is not novel.** ADC + rerank is the standard PQ-ANN architecture used
+by DiskANN, FAISS, ScaNN, and others. The "HDC" framing was based on the FP16
+ball tier providing a precision advantage; with that tier removed, there's no
+hybrid — it's plain ADC navigation + rerank, same as everyone else.
+
+What IS ours in this area: the **f32-accumulated SIMD kernels** (`simd::`
+namespace) and the **pq_matvec_f32** LUT construction kernel, which are ~3×
+faster than NumKong's f64-accumulating equivalents at our shapes. That's an
+implementation optimization, not an architectural contribution.
 
 ## Build-time FP16 prune
 
