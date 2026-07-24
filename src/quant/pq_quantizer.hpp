@@ -156,7 +156,10 @@ public:
     /// Deserialize from a buffer. Replaces current state.
     void deserialize(const uint8_t* in, size_t size);
 
-private:
+protected:
+    // Members accessible to AnisotropicPqQuantizer (the subclass overriding
+    // train()). Kept non-public so external code can't mutate the codebook
+    // or bypass the training invariants.
     MetricKind metric_;
     Dim dim_;
     uint16_t m_;
@@ -195,6 +198,7 @@ private:
 
     /// Populate `centroid_sqnorms_` from the trained codebook. Called at the
     /// end of train(); cheap (m*K tiny norm computations, ~12K at m=96).
+    /// Protected so AnisotropicPqQuantizer::train can call it after refining.
     void compute_centroid_sqnorms_();
 };
 
