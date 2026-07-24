@@ -155,6 +155,48 @@ std::vector<Candidate> IVFSearcher::search_body_(const float* query, uint32_t k,
     bq.query_lut = lut_ptr;
     bq.query_fp16 = w.query_fp16.data();
     w.scored.clear();
+
+    // L division: treat config.L_search as a GLOBAL beam-width budget across
+    // all n_probe shards, not per-shard. The prior path passed the full L to
+    // every shard (total work = n_probe × L), which made the user-facing L
+    // knob decoupled from IVF behavior — L=25 and L=400 gave identical recall
+    // AND QPS at n_probe=5 (each shard's search converges naturally in <25
+    // pops, so the extra budget was simply unused). Dividing restores the
+    // knob's meaning.
+    //
+    // Floor at the shard's actual R (R_shard, already persisted per-shard in
+    // .meta and reopened via `shard->params.R`). Beam_search needs L ≥ R for
+    // graph traversal to make sense (at least one full neighbor expansion);
+    // below R, the search can't reach beyond the entry point's immediate
+    // neighborhood. Flooring at R_shard (typically ~23 for R=35, since
+    // R_shard = 2R/3) finally exposes the L knob: L=400 np=21 → L_shard=23
+    // (the floor); L=400 np=5 → L_shard=80; L=100 np=2 → L_shard=50.
+    //
+    // Earlier floors (k_local=200, then k=100) were far above natural
+    // convergence, making the L knob a no-op for any reasonable L.
+    //
+    // All shards in an index share the same R_shard (set at build time from
+    // the global R), so reading it from the first shard is safe.
+    const uint32_t R_shard = index_.shards.empty() ? 1u
+        : static_cast<uint32_t>(index_.shards[0]->params.R);
+    const uint32_t L_shard = std::max(R_shard,
+        config.L_search / std::max(1u, n_probe_eff));
+
+    // One-time hint when the user's L is being clamped hard by the floor.
+    // Helps users who pass --search-beam-width 800 expecting more recall —
+    // for IVF the recall knob is n_probe, not L (shards converge in ~R_shard
+    // pops regardless of L_shard).
+    static std::once_flag hint_flag;
+    std::call_once(hint_flag, [&]() {
+        const uint32_t L_effective = L_shard * std::max(1u, n_probe_eff);
+        if (L_effective < config.L_search / 2 && config.L_search > L_shard * 4) {
+            spdlog::info("[sextant] IVF: L_search={} divided by n_probe={} → "
+                         "L_shard={} (floored at R_shard={}). The effective "
+                         "recall knob for IVF is --n-probe, not L.",
+                         config.L_search, n_probe_eff, L_shard, R_shard);
+        }
+    });
+
     for (uint32_t p = 0; p < n_probe_eff; p++) {
         const uint32_t c = w.cent_dists[p].second;
         auto& shard = index_.shards[c];
@@ -198,7 +240,7 @@ std::vector<Candidate> IVFSearcher::search_body_(const float* query, uint32_t k,
             bq.forced_entry_points = nullptr;
         }
 
-        auto cands = shard->core->search(bq, k_local, config.L_search,
+        auto cands = shard->core->search(bq, k_local, L_shard,
                                           config.io_limit, w.tls,
                                           config.early_exit_patience);
         for (const auto& cand : cands) {

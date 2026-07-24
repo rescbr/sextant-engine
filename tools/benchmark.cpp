@@ -348,8 +348,10 @@ int main(int argc, char* argv[]) {
                  "IVF multi-probe ratio: extend the probe set to all centroids "
                  "within ratio × d[n_probe-1]. 1.0 = strict n_probe (off). "
                  ">1.0 recovers boundary-shard recall at variable per-query cost. "
-                 "See docs/ivf_routing_analysis.md. Recommended: 1.05.",
-                 false, 1.0f);
+                 "Default 1.05 — measured +11.8pp recall at np=1 for +0.51 avg "
+                 "shards/query (c4a K=21 arxiv-nomic 1.34M). Set to 1.0 to disable. "
+                 "See docs/ivf_routing_analysis.md.",
+                 false, 1.05f);
     p.parse_check(argc, argv);
 
     // Set log level (must come after init_logging() above and before any
