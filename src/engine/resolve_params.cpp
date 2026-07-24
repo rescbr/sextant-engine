@@ -119,6 +119,16 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                      "(OPQ PCA rotation ENABLED)");
     }
 
+    // --- anisotropic_pq (ScaNN-style anisotropic training) ---
+    // Pure pass-through; defaults to off. When on, Builder constructs
+    // AnisotropicPqQuantizer (subclass of PqQuantizer overriding train()).
+    p.anisotropic_pq = overrides.anisotropic_pq;
+    if (p.anisotropic_pq) {
+        spdlog::info("[sextant] anisotropic_pq = on [override] "
+                     "(ScaNN-style anisotropic training; see "
+                     "docs/plans/metric_per_tier_plan.md Phase 2)");
+    }
+
     // --- max_occlusion ---
     if (overrides.max_occlusion != 0) {
         p.max_occlusion = overrides.max_occlusion;

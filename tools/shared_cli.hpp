@@ -78,6 +78,16 @@ inline void add_common_flags(cmdline::parser& p) {
         "SIMD). The rotation is serialized with the quantizer. Boolean flag "
         "(the value is ignored); covariance determines the rotation.",
         false, 0.0f);
+    p.add<std::string>("quantizer", 0,
+        "Quantizer type: 'pq' (default, standard k-means) or 'anisotropic-pq' "
+        "(ScaNN-style anisotropic Lloyd's training; search path identical). "
+        "See docs/plans/metric_per_tier_plan.md Phase 2.",
+        false, "pq");
+    p.add<float>("anisotropy-threshold", 0,
+        "ScaNN anisotropic threshold T for anisotropic-pq training (default "
+        "0.2 → η ≈ 4.125). Higher T weights parallel quantization error more. "
+        "Only meaningful with --quantizer anisotropic-pq. See ScaNN paper §3.",
+        false, 0.2f);
     p.add<uint32_t>("threads", 0,
         "Threads for build/mini-builds (0 = hardware_concurrency).",
         false, 0);
@@ -176,6 +186,7 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     cfg.pq_max_distortion = p.get<float>("pq-max-distortion");
     cfg.pq_anisotropy = (p.get<float>("pq-anisotropy") > 0.0f);
     cfg.pq_opq = (p.get<float>("pq-opq") > 0.0f);
+    cfg.anisotropic_pq = (p.get<std::string>("quantizer") == "anisotropic-pq");
     cfg.num_threads       = p.get<uint32_t>("threads");
     {
         const std::string m = p.get<std::string>("metric");

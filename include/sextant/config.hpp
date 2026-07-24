@@ -105,6 +105,13 @@ struct BuildConfig {
     /// One-time build-time cost.
     bool pq_anisotropy = false;
 
+    /// Use ScaNN-style anisotropic PQ (AnisotropicPqQuantizer subclass). When
+    /// true, Builder constructs AnisotropicPqQuantizer instead of PqQuantizer.
+    /// The subclass overrides train() with ScaNN's anisotropic Lloyd's
+    /// algorithm; all hot-path methods are inherited unchanged from PqQuantizer.
+    /// See docs/plans/metric_per_tier_plan.md Phase 2.
+    bool anisotropic_pq = false;
+
     /// OPQ (PCA rotation). When true, a d×d PCA rotation is learned from the
     /// training-sample covariance and applied to vectors before PQ encoding
     /// and to queries before LUT construction, so PQ splits align with the
@@ -200,6 +207,7 @@ struct ResolvedParams {
     uint32_t early_exit_patience = 0;  ///< Search early-exit: terminate after N stalled pops post-convergence (0 = disabled; set by resolve_params when recall_target is set)
     bool pq_anisotropy = false;  ///< PQ covariance-based anisotropic codebook training. Threaded into PqQuantizer::train.
     bool pq_opq = false;          ///< OPQ PCA rotation. Threaded into PqQuantizer::train.
+    bool anisotropic_pq = false;  ///< Use AnisotropicPqQuantizer (ScaNN-style training).
 };
 
 /// Estimation diagnostics produced by `Engine::estimate_config` (and the

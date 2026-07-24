@@ -26,6 +26,7 @@
 
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
+#include "quant/anisotropic_pq_quantizer.hpp"
 #include "storage/direct_io.hpp"
 #include "storage/memgraph.hpp"      // complete type for Index's unique_ptr<MemGraph>
 #include "storage/sidecar_header.hpp"
@@ -355,8 +356,13 @@ void Builder::pass1_sample_and_train(VectorSource& source,
     }
 
     // Construct + train the quantizer at the resolved params.
-    index_.quantizer = std::make_unique<PqQuantizer>(
-        params.metric, index_.dim, pq_m, pq_bits);
+    if (params.anisotropic_pq) {
+        index_.quantizer = std::make_unique<AnisotropicPqQuantizer>(
+            params.metric, index_.dim, pq_m, pq_bits);
+    } else {
+        index_.quantizer = std::make_unique<PqQuantizer>(
+            params.metric, index_.dim, pq_m, pq_bits);
+    }
     if (params.pq_anisotropy) {
         index_.quantizer->set_anisotropy(1.0f);
     }
