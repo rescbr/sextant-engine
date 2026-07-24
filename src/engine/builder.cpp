@@ -1966,89 +1966,13 @@ void Builder::write_sidecars_(const std::string& index_path,
         write_meta_file(params, remapped_eps, uuid);
     }
 
-    // ----- .ball (FP16 for the MemGraph entry-point ball) -----
-    // Ball-only: stores FP16 vectors for the nodes within 3 hops of the entry
-    // points. At search time, beam_search uses simd::l2sq_f16 for these nodes (high
-    // precision in the approach phase) and PQ for the rest. Scales: the file
-    // size is bounded by ball size (entry_points × R^hops), not N.
-    //
-    // The entries are in the SAME BFS-visit order as MemGraph's `collected_`
-    // vector at open time. The build-time BFS here runs on index_.nodes_buffer
-    // (build-order, neighbors in build-order); the open-time BFS runs on the
-    // .graph file (disk-order, neighbors remapped via bfs.remap). The visit
-    // ORDER is identical because the remap preserves neighbor-list ordering
-    // (only IDs change, not positions). So .ball position i == MemGraph local
-    // index i.
-    {
-        const std::string path = index_path + ".ball";
-        constexpr uint32_t kVecsNumHops = 3;
-        // Run the same BFS MemGraph runs at open time: from the (build-order)
-        // entry points, 3 hops, on index_.nodes_buffer (build-order). Collect
-        // build-order IDs in BFS-visit order.
-        std::vector<uint8_t> visited(n, 0);
-        struct BfsItem { uint32_t id; uint32_t hop; };
-        std::deque<BfsItem> bfs_queue;
-        std::vector<uint32_t> ball_ids;
-        const auto& eps = index_.core->entry_points();  // build-order IDs
-        for (uint32_t ep : eps) {
-            if (ep < n && !visited[ep]) {
-                visited[ep] = 1;
-                bfs_queue.push_back({ep, 0});
-            }
-        }
-        while (!bfs_queue.empty()) {
-            const BfsItem it = bfs_queue.front();
-            bfs_queue.pop_front();
-            ball_ids.push_back(it.id);
-            if (it.hop >= kVecsNumHops) continue;
-            const uint8_t* node =
-                index_.nodes_buffer + static_cast<size_t>(it.id) * build_node_size;
-            const uint16_t ncount = VamanaCore::get_neighbor_count(node);
-            for (uint16_t i = 0; i < ncount; i++) {
-                const uint32_t nb = VamanaCore::get_neighbor(node, i);
-                if (nb < n && !visited[nb]) {
-                    visited[nb] = 1;
-                    bfs_queue.push_back({nb, it.hop + 1});
-                }
-            }
-        }
-
-        // Write .ball: header + ball_ids.size() × dim × float16_t, streamed
-        // through a block-aligned ring buffer (like .codes above) to amortize
-        // syscalls.
-        DirectFile f(path, true);
-        SidecarHeader h;
-        fill_header(h, kMagicVecs, ball_ids.size(), index_.dim, uuid);
-        write_padded(f, &h, sizeof(h), 0);
-
-        const size_t vec_bytes = static_cast<size_t>(index_.dim) * sizeof(float16_t);
-        const size_t block_cap = kBlockSize;  // 256KB
-        const uint32_t vecs_per_block =
-            std::max<uint32_t>(1u, static_cast<uint32_t>(block_cap / vec_bytes));
-        const size_t buf_cap = static_cast<size_t>(vecs_per_block) * vec_bytes;
-        AlignedBuf ring(kDiskAlign, buf_cap);
-        uint64_t write_off = sizeof(h);
-        uint32_t in_block = 0;
-        for (uint32_t bid : ball_ids) {
-            const float16_t* vec =
-                index_.raw_vecs_buffer + static_cast<size_t>(bid) * index_.dim;
-            std::memcpy(ring.as<uint8_t>() + static_cast<size_t>(in_block) * vec_bytes,
-                        vec, vec_bytes);
-            if (++in_block >= vecs_per_block) {
-                write_padded(f, ring.get(),
-                             static_cast<size_t>(in_block) * vec_bytes, write_off);
-                write_off += static_cast<size_t>(in_block) * vec_bytes;
-                in_block = 0;
-            }
-        }
-        if (in_block > 0) {
-            write_padded(f, ring.get(),
-                         static_cast<size_t>(in_block) * vec_bytes, write_off);
-        }
-        f.sync();
-        spdlog::info("[sextant] wrote {} ({} FP16 vectors, {} bytes each)",
-                     path, ball_ids.size(), index_.dim * sizeof(float16_t));
-    }
+    // ----- .ball (FP16 for the MemGraph entry-point ball) — SKIPPED -----
+    // The .ball sidecar was used by the FP16 ball tier at search time, which
+    // is now permanently disabled (precise_vec returns nullptr). The file is
+    // no longer loaded. Skipping the write saves I/O + disk space at build
+    // time (~100MB at 1.34M for the 3-hop neighborhood × dim × 2 bytes).
+    // The raw_vecs_buffer (all vectors as FP16 in RAM) is still loaded for
+    // the build-time FP16 prune in robust_prune_into — that's separate.
 
     // ----- .epc (IVF shard entry-point sub-centroids, A1/A2) -----
     // IVF-only: emitted when build_shard_into_ populated index_.sub_centroids
