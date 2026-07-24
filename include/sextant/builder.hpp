@@ -109,6 +109,20 @@ public:
                           const ResolvedParams& params,
                           uint32_t n_probe_default = 0);
 
+    /// BuildConfig overload: resolves params first (picks up the IVF K
+    /// heuristic when --partition-count is not explicit), then forwards to
+    /// the ResolvedParams overload. Mirrors Builder::build's two-overload
+    /// pattern.
+    BuildResult build_ivf(VectorSource& source, const std::string& index_path,
+                          const BuildConfig& config,
+                          uint32_t n_probe_default = 0) {
+        index_.count = source.count();
+        index_.dim = source.dim();
+        return build_ivf(source, index_path,
+                         resolve_params(index_.count, index_.dim, config),
+                         n_probe_default);
+    }
+
 private:
     Index& index_;
 

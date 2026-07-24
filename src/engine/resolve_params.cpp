@@ -241,15 +241,21 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                 }
             }
 
-            // Recall-driven floor (IVF only). sqrt(N)/8, clamped [2, 256].
-            // At arxiv-nomic 1.34M this is ~144; at arxiv100k ~39. Below this,
-            // IVF routing can't place queries precisely enough.
+            // Recall-driven floor (IVF only). Target ~64K vectors per shard —
+            // the standard ANN-practice shard size (DiskANN/FAISS IVF). The
+            // prior sqrt(N)/8 formula over-partitioned badly at scale
+            // (K=144 at 1.34M; the K-sweep showed recall DEGRADES past K=32).
+            // Heuristic: K = clamp(N / 65536, 2, 256).
+            //   arxiv-nomic 1.34M → K=21 (was 144 — measured sweet spot 16-32)
+            //   arxiv100k        → K=2   (was 39)
+            //   100M             → K=256 (capped)
             uint32_t recall_driven_k = 1;
             std::string recall_note;
             if (overrides.ivf_mode) {
+                constexpr uint64_t kTargetShardSize = 65536;
                 recall_driven_k = static_cast<uint32_t>(
-                    std::max<double>(2.0,
-                                     std::sqrt(static_cast<double>(n_vectors)) / 8.0));
+                    std::max<uint64_t>(2u,
+                        (n_vectors + kTargetShardSize - 1) / kTargetShardSize));
                 recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
                 recall_note = std::string(", recall_floor=") +
                               std::to_string(recall_driven_k);

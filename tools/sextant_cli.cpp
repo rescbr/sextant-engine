@@ -82,10 +82,15 @@ int cmd_build(int argc, char* argv[]) {
     sextant::BuildConfig cfg = build_config_from_parser(p);
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
+    cfg.ivf_mode         = p.exist("ivf");
 
     sextant::Index idx;
-    sextant::BuildResult result = sextant::Builder(idx).build(source, index_path, cfg);
-    std::cout << "built index '" << index_path << "': n=" << result.n_vectors
+    sextant::Builder builder(idx);
+    sextant::BuildResult result = cfg.ivf_mode
+        ? builder.build_ivf(source, index_path, cfg)
+        : builder.build(source, index_path, cfg);
+    std::cout << "built " << (cfg.ivf_mode ? "IVF " : "")
+              << "index '" << index_path << "': n=" << result.n_vectors
               << " dim=" << result.dim
               << " R=" << result.R
               << " L_build=" << result.L_build

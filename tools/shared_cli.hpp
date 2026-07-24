@@ -95,6 +95,26 @@ inline void add_common_flags(cmdline::parser& p) {
     p.add<std::string>("metric", 0, "l2sq or ip", false, "l2sq");
     p.add<std::string>("log-level", 0,
         "Log level: debug, info, warn, error", false, "info");
+
+    // K-driving params (build-ram, ivf, partition-count) are common to all
+    // modes — build needs them to actually partition, analyze previews them,
+    // autobuild threads them through. The K heuristic (target ~64K
+    // vectors/shard, clamped [2, 256]) lives in resolve_params; explicit
+    // --partition-count wins.
+    p.add<uint64_t>("build-ram", 0,
+        "Build RAM budget in bytes (forces partitioning if small). "
+        "0 = auto (50% of physical RAM). Affects K (partition count) "
+        "resolution.",
+        false, 0);
+    p.add("ivf", 0,
+        "Build in IVF-probe mode: K independent shard indices + FP16 "
+        "routing centroids, instead of one merged graph. With no "
+        "--partition-count, K is auto-resolved (target ~64K vectors/shard, "
+        "clamped [2, 256]). See docs/ivf_probe_design.md.");
+    p.add<uint32_t>("partition-count", 0,
+        "Partition count (K) override. 0 = auto (RAM-driven, plus the "
+        "shard-size heuristic when --ivf is set).",
+        false, 0);
 }
 
 /// Add mode-specific extras. Call after add_common_flags.
@@ -116,24 +136,6 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             "NN distance is larger than at k=10, so proximity is looser at "
             "higher k.",
             false, 100);
-        // build-ram drives K (partition count) resolution, so analyze must
-        // accept it too — K is one of the resolved params analyze reports.
-        p.add<uint64_t>("build-ram", 0,
-            "Build RAM budget in bytes (forces partitioning if small). "
-            "0 = auto (50% of physical RAM). Affects K (partition count) "
-            "resolution in analyze/autobuild.",
-            false, 0);
-        // IVF + partition-count affect K resolution — analyze previews them.
-        p.add("ivf", 0,
-            "Resolve params for IVF-probe mode: applies a recall-driven "
-            "partition-count floor of sqrt(N)/8 (clamped [2, 256]) so the "
-            "IVF path has enough shards for good routing. Analyze shows the "
-            "resulting K; autobuild then builds the shard set. See "
-            "docs/ivf_probe_design.md.");
-        p.add<uint32_t>("partition-count", 0,
-            "Partition count (K) override. 0 = auto (RAM-driven, plus the "
-            "sqrt(N)/8 recall floor when --ivf is set).",
-            false, 0);
     }
     if (mode == Mode::Build || mode == Mode::Autobuild) {
         p.add<uint32_t>("prune-candidate-cap", 0,
@@ -144,13 +146,7 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             "Multi-start: number of entry points to seed each search from "
             "(top-M closest to the query). 0 = default (4).",
             false, 0);
-        // build-ram also accepted by build (forces partitioning / sets K).
-        if (mode == Mode::Build) {
-            p.add<uint64_t>("build-ram", 0,
-                "Build RAM budget in bytes (forces partitioning if small). "
-                "0 = auto (50% of physical RAM).",
-                false, 0);
-        }
+        // (build-ram, ivf, partition-count are in add_common_flags now.)
     }
     if (mode == Mode::Autobuild) {
         p.add<uint32_t>("ivf-n-probe", 0,

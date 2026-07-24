@@ -872,9 +872,13 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
             }
             uint32_t recall_driven_k = 1;
             if (overrides.ivf_mode) {
+                // Target ~64K vectors/shard (DiskANN/FAISS IVF practice).
+                // Prior sqrt(N)/8 over-partitioned: K=144 at 1.34M where the
+                // measured sweet spot is 16-32 (recall degrades past 32).
+                constexpr uint64_t kTargetShardSize = 65536;
                 recall_driven_k = static_cast<uint32_t>(
-                    std::max<double>(2.0,
-                                     std::sqrt(static_cast<double>(total_n)) / 8.0));
+                    std::max<uint64_t>(2u,
+                        (total_n + kTargetShardSize - 1) / kTargetShardSize));
                 recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
             }
             p.partition_count = std::min(std::max(ram_driven_k, recall_driven_k),
