@@ -163,10 +163,10 @@ struct BuildContext {
 ///
 ///   **Search path** (called by search()):
 ///   - `query_lut`     — PQ lookup table (m*K floats). Always set.
-///   - `query_fp16`    — when non-null AND the store exposes FP16 vectors
-///                       for the candidate node (MemGraph ball nodes),
-///                       distances use simd::l2sq_f16 instead of PQ lut_distance
-///                       (hybrid FP16+PQ precision).
+///   - `query_fp16`    — set at search but only consumed when build_ctx_->vecs
+///                       is non-null (build mode); the search-time FP16 ball
+///                       tier is retired. Distances use simd::l2sq_f16 instead
+///                       of PQ lut_distance on the build path.
 ///
 ///   **Build path** (called by insert_build_core):
 ///   - `query_lut`     — generic PQ LUT (default build mode).

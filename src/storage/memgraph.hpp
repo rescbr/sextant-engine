@@ -43,15 +43,9 @@ public:
 
     /// Open a MemGraph from sidecar files. Reads the BFS neighborhood from
     /// .graph and .codes into RAM. `graph_path`/`codes_path` are the full
-    /// sidecar paths (each begins with a SidecarHeader). `vecs_path`, if
-    /// non-empty and present, is an OPTIONAL `.ball` sidecar of FP16 vectors
-    /// for the ball nodes (in collected/local-index order); enables the
-    /// hybrid FP16+PQ distance path. `dim` is the vector dimensionality
-    /// (needed for `.ball` indexing and validation).
+    /// sidecar paths (each begins with a SidecarHeader).
     MemGraph(const std::string& graph_path, const std::string& codes_path,
-             const std::string& vecs_path,
              uint32_t node_size, uint32_t code_size, uint32_t total_count,
-             uint32_t dim,
              const std::vector<uint32_t>& entry_points,
              uint32_t num_hops = 3);
 
@@ -67,17 +61,8 @@ public:
     /// pin_node/pin_code check MemGraph first, fall through to backing store.
     void set_backing(NodeStore* backing) { backing_ = backing; }
 
-    /// Set the distance metric. When IP, the FP16 tier is disabled (precise_vec
-    /// returns nullptr) to avoid frontier scale-mismatch between FP16 true
-    /// distances and PQ-ADC distances. See docs/p2.3_anisotropic_results.md.
-    void set_metric(MetricKind m) { (void)m; }  // no-op; FP16 tier permanently disabled
-
     /// How many nodes are in the MemGraph.
     uint32_t cached_count() const { return cached_count_; }
-
-    /// Optional: return a higher-precision vector for `id` (the FP16 ball
-    /// vector for ball nodes). Override of NodeStore::precise_vec.
-    const float16_t* precise_vec(uint32_t id) const override;
 
     /// True if `id` is in the MemGraph.
     bool is_cached(uint32_t id) const {
@@ -107,16 +92,8 @@ private:
     uint32_t node_size_;
     uint32_t code_size_;
     uint32_t total_count_;
-    uint32_t dim_ = 0;
     uint32_t cached_count_ = 0;
     NodeStore* backing_ = nullptr;
-    MetricKind metric_ = MetricKind::L2Sq;  // unused; FP16 tier permanently disabled
-
-    // FP16 ball vectors loaded from the `.ball` sidecar. Empty if no `.ball`
-    // was supplied / present (PQ-only fallback). When non-empty, holds
-    // cached_count_ × dim_ float16_t in collected/local-index order — position
-    // i is the FP16 vector for the node at local index i.
-    std::vector<float16_t> fp16_data_;
 
     // Collected during BFS, consumed by materialize().
     std::vector<uint32_t> collected_;

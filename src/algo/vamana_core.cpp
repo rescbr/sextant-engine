@@ -258,10 +258,10 @@ void VamanaCore::beam_search_into(
     };
 
     // Distance to a candidate node. Hybrid precision: when `query_fp16` is
-    // available AND the store exposes an FP16 vector for this node (MemGraph
-    // ball nodes), use simd::l2sq_f16 (sequential FP16 compute — prefetcher-friendly,
-    // no LUT gather, no PQ code pin/unpin). Otherwise fall back to the PQ
-    // path. Priority among PQ modes: anchor_lut > anchor_code > query_lut.
+    // available AND build_ctx_->vecs is populated (build mode), use simd::l2sq_f16
+    // (sequential FP16 compute — prefetcher-friendly, no LUT gather, no PQ
+    // code pin/unpin). Otherwise fall back to the PQ path. Priority among
+    // PQ modes: anchor_lut > anchor_code > query_lut.
     auto dist_to = [&](uint32_t id) {
         if (query_fp32 && build_ctx_ && build_ctx_->fp32_vecs) {
             // FP32 build mode: exact distance, no quantization.
@@ -270,15 +270,11 @@ void VamanaCore::beam_search_into(
                             params_.dim);
         }
         if (query_fp16) {
-            // FP16 distance: prefer the store's precise_vec (MemGraph ball
-            // nodes at search time), then fall back to the flat build buffers
-            // (FP16 build mode). The store_ check must NOT short-circuit the
-            // build_ctx_ fallback — FlatNodeStore has store_ != null but no
-            // precise_vec (returns null), so we must check build_ctx_->vecs
-            // even when store_ is set.
+            // FP16 distance: the flat build buffers (FP16 build mode).
+            // The search-time precise_vec path is retired (the FP16 ball
+            // tier was measured to hurt recall — see results/p2.3-noball/).
             const float16_t* fp16 = nullptr;
-            if (store_) fp16 = store_->precise_vec(id);
-            if (!fp16 && build_ctx_ && build_ctx_->vecs) {
+            if (build_ctx_ && build_ctx_->vecs) {
                 fp16 = build_ctx_->vec_ptr(id, params_.dim);
             }
             if (fp16) {
@@ -625,12 +621,9 @@ void VamanaCore::beam_search_into(
             //
             // Layer 4 perf: batch the distance evaluation. Collect all
             // unvisited neighbor IDs first (no locks, no virtual calls),
-            // then:
-            //   - FP16-path nodes (MemGraph ball nodes with precise_vec):
-            //     compute simd::l2sq_f16 per-node (no code pinning needed).
-            //   - PQ-path nodes: batch-pin all codes via ONE pin_codes call
-            //     (lock per shard, not per node), then lut_distance_batch4
-            //     over the returned pointers (SVE2 4-way gather).
+            // then batch-pin all codes via ONE pin_codes call
+            // (lock per shard, not per node), then lut_distance_batch4
+            // over the returned pointers (SVE2 4-way gather).
             //
             // The build-path fallback (no store_, no LUT) still goes through
             // dist_to per-node — it's the rare untrained-quantizer test path.
@@ -644,11 +637,6 @@ void VamanaCore::beam_search_into(
                 uint32_t pq_ids[1024];
                 const uint8_t* pq_codes[1024];
                 uint32_t pq_n = 0;
-                // FP16-path nodes (MemGraph ball nodes). Computed per-node
-                // since each has a distinct FP16 vector.
-                uint32_t fp16_ids[1024];
-                const float16_t* fp16_vecs[1024];
-                uint32_t fp16_n = 0;
 
                 for (uint16_t i = 0; i < n; i++) {
                     const uint32_t nb_internal = nb_ptr[i];
@@ -656,39 +644,11 @@ void VamanaCore::beam_search_into(
                     mark_visited(nb_internal);
                     if (io_limit > 0 && io_count >= io_limit) continue;
                     io_count++;
-
-                    if (query_fp16) {
-                        const float16_t* fp16 = store_->precise_vec(nb_internal);
-                        if (fp16) {
-                            fp16_ids[fp16_n] = nb_internal;
-                            fp16_vecs[fp16_n] = fp16;
-                            ++fp16_n;
-                            continue;
-                        }
-                    }
                     pq_ids[pq_n++] = nb_internal;
                 }
 
                 // Batch-pin PQ codes (one lock per shard).
                 store_->pin_codes(pq_ids, pq_n, pq_codes);
-
-                // FP16 distances (per-node, but no locking — MemGraph RAM).
-                for (uint32_t i = 0; i < fp16_n; i++) {
-                    const float d = simd::dist_f16(metric, query_fp16, fp16_vecs[i],
-                                              params_.dim);
-                    const uint32_t id = fp16_ids[i];
-                    if (W.size() < L_current || d < W.front().dist) {
-                        frontier.push_back({d, id});
-                        std::push_heap(frontier.begin(), frontier.end(),
-                                       FrontierCmp{});
-                        W.push_back({d, id});
-                        std::push_heap(W.begin(), W.end(), WorkingCmp{});
-                        if (W.size() > L_current) {
-                            std::pop_heap(W.begin(), W.end(), WorkingCmp{});
-                            W.pop_back();
-                        }
-                    }
-                }
 
                 // PQ distances: batch4 via SVE2 (4 codes per gather pass).
                 uint32_t idx = 0;

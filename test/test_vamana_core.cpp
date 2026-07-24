@@ -168,7 +168,7 @@ TEST(VamanaCore, BuildGraphConnected) {
 }
 
 // ---------------------------------------------------------------------------
-// HDC build path (insert_build_from_code) — structural invariant.
+// PQ-construct build path (insert_build_from_code) — structural invariant.
 // ---------------------------------------------------------------------------
 
 TEST(VamanaCore, InsertBuildFromCode) {

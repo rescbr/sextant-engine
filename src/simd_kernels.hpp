@@ -37,8 +37,7 @@ namespace simd {
 
 /// L2-squared distance between two FP16 vectors. FP32 accumulation (no
 /// overflow), FP16 per-element precision. Used by the FP16 prune occlusion
-/// check, the partitioned-build merge truncation, IVF routing, and (the big
-/// one) beam_search's MemGraph ball distance for approach-phase nodes.
+/// check, the partitioned-build merge truncation, and IVF routing.
 ///
 /// ARM NEON path: prefers FEAT_FHM (`vfmlalq_low/high_f16`) when available —
 /// the FHM instructions fuse FP16→FP32 widening with multiply-accumulate and
@@ -123,8 +122,8 @@ inline float l2sq_f16(const float16_t* a, const float16_t* b, uint32_t dim) {
 /// FP16 vector op per 8 elements). For L2-normalized data, IP ranking is
 /// equivalent to L2sq ranking on TRUE distances (`‖q−x‖² = 2 − 2⟨q,x⟩`), so
 /// this is the cheaper drop-in for normalized-data configs. Used by the same
-/// FP16 tiers (MemGraph ball, routing, rerank, occlusion) when the configured
-/// metric is InnerProduct.
+/// FP16 paths (routing, rerank, occlusion) when the configured metric is
+/// InnerProduct.
 inline float dot_f16(const float16_t* a, const float16_t* b, uint32_t dim);
 
 #if defined(SEXTANT_HAS_NEON)

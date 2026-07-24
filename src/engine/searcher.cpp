@@ -85,8 +85,9 @@ std::vector<Candidate> Searcher::search_body_(const float* query, uint32_t k,
         index_.quantizer->preprocess_query(query, lut.data());
     }
 
-    // Convert the query to FP16 for the hybrid FP16+PQ distance path
-    // (MemGraph ball nodes use simd::l2sq_f16; the rest use PQ lut_distance).
+    // Convert the query to FP16. The FP16 distance path fires only during
+    // build (build_ctx_->vecs); at search time the quantizer LUT path is
+    // taken. Kept for symmetry with the build search path.
     std::vector<float16_t> query_fp16(index_.dim);
     for (uint32_t d = 0; d < index_.dim; d++) {
         query_fp16[d] = static_cast<float16_t>(query[d]);

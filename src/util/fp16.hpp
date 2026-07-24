@@ -5,7 +5,7 @@
 ///
 /// Used at build time (encode pass, partitioned shard copy, entry-point
 /// k-means centroid snap) where we cast large streams of FP32 vectors to
-/// FP16 for the FP16 prune / MemGraph ball. The scalar fallback
+/// FP16 for the FP16 prune. The scalar fallback
 /// (per-element `static_cast<float16_t>`) maxes one core at ~2 GB/s and is
 /// audible as coil whine on laptops; the SIMD paths hit ~16 GB/s.
 ///

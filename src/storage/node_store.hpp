@@ -69,17 +69,6 @@ public:
     /// True if this store can serve SSD reads (PagedNodeStore or MemGraph
     /// with a paged backing store). Used to gate DynamicWidth.
     virtual bool is_paged() const = 0;
-
-    /// Optional: return a higher-precision vector for `id` if the store has
-    /// one (e.g. MemGraph caches FP16 "ball" vectors for the entry-point
-    /// neighborhood). Default: no precise vector (PQ-only path).
-    ///
-    /// Contract: this is a *policy hook* — the store advertises "I can give
-    /// you a more precise vector for this node" and the algorithm decides
-    /// whether to use it. The actual storage format (FP16, FP32, ...) is
-    /// private to the store; the algorithm only needs the typed pointer and
-    /// the dim (from VamanaParams).
-    virtual const float16_t* precise_vec(uint32_t id) const { (void)id; return nullptr; }
 };
 
 /// Flat buffer backing. Used during build and for small indices at search.

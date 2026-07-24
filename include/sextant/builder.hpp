@@ -3,7 +3,7 @@
 /// @file builder.hpp
 /// Builder — bulk-build + mutate an Index.
 ///
-/// Owns the build pipeline (resolve → reservoir/encode → parallel HDC
+/// Owns the build pipeline (resolve → reservoir/encode → parallel PQ-construct
 /// construct → flush sidecars) and the post-build mutators (insert/flush).
 /// Shares the Index with the caller (Searcher reads it; Estimator builds
 /// temporary in-RAM Indices via Builder).
@@ -61,7 +61,7 @@ public:
     void insert(const float* vec, Dim dim, RowId row_id);
 
     /// Flush any pending state to disk (.meta + .manifest commit; regenerates
-    /// .graph/.codes/.ball when flat buffers are dirty).
+    /// .graph/.codes when flat buffers are dirty).
     void flush();
 
     // --- PQ selection probe (build-time, no Index mutation) ---
@@ -128,7 +128,7 @@ private:
                         uint32_t lut_sz, uint32_t nthreads, const char* label);
 
     /// Build one IVF shard and flush it as a complete production Index to
-    /// `shard_prefix.*` (standard sidecars: .graph/.codes/.meta/.ball/
+    /// `shard_prefix.*` (standard sidecars: .graph/.codes/.meta/
     /// .manifest). The shard Index is fully populated by the caller:
     ///   - a CLONE of the global quantizer (so write_meta_file can serialize
     ///     it independently, and the reopened shard reconstructs its own

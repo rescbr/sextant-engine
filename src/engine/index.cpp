@@ -246,16 +246,10 @@ std::unique_ptr<Index> Index::read(const std::string& index_path,
         }
         idx->memgraph = std::make_unique<MemGraph>(
             index_path + ".graph", index_path + ".codes",
-            index_path + ".ball",   // FP16 ball sidecar (optional — PQ fallback)
             idx->node_size, idx->code_size,
-            static_cast<uint32_t>(idx->count), idx->dim,
+            static_cast<uint32_t>(idx->count),
             eps, /*num_hops=*/3);
         idx->memgraph->set_backing(idx->paged_store.get());
-        // Propagate the quantizer's metric so MemGraph can disable its FP16
-        // tier for IP-ADC (frontier scale-mismatch avoidance).
-        if (idx->quantizer) {
-            idx->memgraph->set_metric(idx->quantizer->metric());
-        }
 
         const uint64_t cached_bytes =
             static_cast<uint64_t>(idx->memgraph->cached_count()) *

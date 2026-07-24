@@ -398,9 +398,9 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
     // For L2-normalized data, IP and L2sq are rank-equivalent on true distances
     // (||q-x||² = 2 - 2<q,x>), and IP is cheaper per eval. For non-normalized
     // data they diverge sharply (SIFT-1M: IP recall collapses 0.99→0.66).
-    // We measure the coefficient of variation (CV = stddev/mean) of the norms:
-    // CV < 0.05 ⇒ normalized (recommend IP); CV > 0.10 ⇒ not (recommend L2sq).
-    // See docs/plans/metric_per_tier_plan.md Phase 1.
+    // Normalization requires BOTH mean≈1 (within ±5%) AND tight spread
+    // (cv < 0.05). SIFT-1M has tight norms (cv≈0.001) but mean≈508 — NOT
+    // normalized. See docs/plans/metric_per_tier_plan.md Phase 1.
     double norm_mean = 0.0, norm_stddev = 0.0;
     double norm_min = std::numeric_limits<float>::infinity();
     double norm_max = 0.0;
@@ -823,54 +823,6 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
                      R_full);
     }
 
-    // --- 7b. Metric recommendation: dual-mini-index search recall at R_full ---
-    // Build a mini-index under EACH metric at the PRODUCTION R (R_full), run
-    // production-style search probes (rerank=10), measure recall@k against GT.
-    // Recommend the higher. MUST use R_full, not the R=64 reference mini above:
-    // the metric effect is operating-point-dependent (empirically flips with R —
-    // at low R IP's cheaper eval wins; at high R L2sq's cleaner quantizer wins).
-    // Using the wrong R gives a recommendation for a different operating point
-    // than the production index will actually use. Cost: up to two extra
-    // mini-builds (~10-30s each) when --metric-reco=both.
-    double ip_recall_adc = -1.0;
-    double l2sq_recall_adc = -1.0;
-    {
-        const std::string& reco_str = overrides.metric_reco;
-        const bool do_both = (reco_str == "both" || reco_str.empty());
-        const bool want_ip = do_both ||
-            (reco_str == "ip") ||
-            (overrides.metric == MetricKind::InnerProduct && reco_str != "l2sq");
-        const bool want_l2sq = do_both ||
-            (reco_str == "l2sq") ||
-            (overrides.metric == MetricKind::L2Sq && reco_str != "ip");
-        ResolvedParams metric_params = ref_params;
-        metric_params.R = R_full;  // PRODUCTION R, not the R=64 reference
-        const uint32_t metric_L = std::max<uint32_t>(target_k * 2, 100u);
-        spdlog::info("[sextant] estimate_config: metric recommendation probe "
-                     "(R={}, L={}, rerank=10, k={})", R_full, metric_L, target_k);
-        if (want_l2sq) {
-            metric_params.metric = MetricKind::L2Sq;
-            auto mini = build_mini_(sample.data(), sample_n, dim, metric_params);
-            const auto sq = measure_search_(
-                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-                qidx, metric_L, target_k, 10);
-            l2sq_recall_adc = sq.recall;
-        }
-        if (want_ip) {
-            metric_params.metric = MetricKind::InnerProduct;
-            auto mini = build_mini_(sample.data(), sample_n, dim, metric_params);
-            const auto sq = measure_search_(
-                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
-                qidx, metric_L, target_k, 10);
-            ip_recall_adc = sq.recall;
-        }
-        if (ip_recall_adc >= 0.0 || l2sq_recall_adc >= 0.0) {
-            spdlog::info("[sextant] estimate_config: search recall@{} (R={}) — "
-                         "IP={} L2sq={}", target_k, R_full,
-                         ip_recall_adc, l2sq_recall_adc);
-        }
-    }
-
     // --- 8. Final param resolution ---
     ResolvedParams p;
     p.R = R_full;
@@ -950,8 +902,6 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
             /*norm_min=*/norm_min,
             /*norm_max=*/norm_max,
             /*norm_cv=*/norm_cv,
-            /*ip_recall_adc=*/ip_recall_adc,
-            /*l2sq_recall_adc=*/l2sq_recall_adc,
         },
     };
 }

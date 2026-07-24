@@ -12,6 +12,7 @@
 
 #include <cmdline/cmdline.h>
 
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
@@ -133,15 +134,6 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             "Partition count (K) override. 0 = auto (RAM-driven, plus the "
             "sqrt(N)/8 recall floor when --ivf is set).",
             false, 0);
-        // Metric-recommendation strategy: build mini-indexes under both metrics
-        // (default) and measure end-to-end search recall@k for each, OR probe
-        // only the requested metric. 'both' is the authoritative signal but
-        // costs an extra mini-build (~10-30s). See docs/plans/metric_per_tier_plan.md.
-        p.add<std::string>("metric-reco", 0,
-            "Metric recommendation strategy for analyze: 'both' (build "
-            "mini-indexes under L2sq AND IP, measure search recall@k for each), "
-            "'l2sq', or 'ip' (probe only the named metric). Default 'both'.",
-            false, "both");
     }
     if (mode == Mode::Build || mode == Mode::Autobuild) {
         p.add<uint32_t>("prune-candidate-cap", 0,
@@ -263,30 +255,20 @@ inline void print_analysis_(sextant::VectorSource& source,
     std::cout << "  dead-end fraction:    " << std::setprecision(4)
               << diag.dead_end_frac << "\n";
 
-    // Metric recommendation. Authoritative signal: measured recall of IP-ADC vs
-    // L2sq-ADC against brute-force ground truth (computed in estimate_config
-    // after the reference mini-index is built). Recommend the higher-recall
-    // metric; on a tie, prefer IP (cheaper per eval). For normalized data the
-    // two are close; for non-normalized data L2sq wins by a wide margin
-    // (SIFT-1M: L2sq 0.99 vs IP 0.66). Original-norm stats shown as context.
+    // Metric recommendation. Heuristic signal: L2 norm distribution over
+    // the sampled vectors. Two conditions indicate L2-normalized data where
+    // IP and L2sq are rank-equivalent (||q-x||² = 2 - 2<q,x>) and IP is
+    // cheaper per eval:
+    //   1. mean norm ≈ 1   (within ±5%)
+    //   2. tight norms      (cv < 0.05)
+    // Both conditions are required: SIFT-1M has cv≈0.001 (very tight) but
+    // mean=508 — definitely NOT normalized; IP collapses recall there.
+    // Non-normalized data with wide norms (cv > 0.10) requires L2sq.
     if (diag.norm_mean > 0.0) {
         std::cout << "  L2 norm:              mean=" << std::setprecision(4)
                   << diag.norm_mean << " cv=" << diag.norm_cv
                   << " range=[" << diag.norm_min << ", " << diag.norm_max
                   << "]\n";
-    }
-    if (diag.ip_recall_adc >= 0.0 && diag.l2sq_recall_adc >= 0.0) {
-        const bool ip_wins = diag.ip_recall_adc >= diag.l2sq_recall_adc;
-        const char* reco_metric = ip_wins ? "ip" : "l2sq";
-        std::cout << "  PQ-ADC recall:        IP="
-                  << std::setprecision(4) << diag.ip_recall_adc
-                  << "  L2sq=" << diag.l2sq_recall_adc << "\n";
-        std::cout << "  recommended metric:   " << reco_metric;
-        if (std::string(reco_metric) != metric_str) {
-            std::cout << "  [you passed --metric " << metric_str
-                      << " — see note below]";
-        }
-        std::cout << "\n";
     }
     std::cout << "\n";
 
@@ -319,26 +301,41 @@ inline void print_analysis_(sextant::VectorSource& source,
         std::cout << " --threads " << cfg.num_threads;
     std::cout << "\n";
 
-    // Prominent metric mismatch warning. The user passed --metric X but the
-    // measured PQ-ADC recall recommends Y. This is the one place we second-guess
-    // the user, because picking the wrong metric silently destroys recall on
-    // non-normalized data (SIFT-1M: 0.99 → 0.66).
-    if (diag.ip_recall_adc >= 0.0 && diag.l2sq_recall_adc >= 0.0) {
-        const bool ip_wins = diag.ip_recall_adc >= diag.l2sq_recall_adc;
-        const char* reco = ip_wins ? "ip" : "l2sq";
-        if (std::string(reco) != metric_str) {
-            std::cout << "\n  ⚠ metric mismatch: measured PQ-ADC recall IP="
-                      << std::setprecision(4) << diag.ip_recall_adc
-                      << " vs L2sq=" << diag.l2sq_recall_adc
-                      << ". Recommended --metric " << reco << ", you passed "
-                      << "--metric " << metric_str << ".\n";
-            if (ip_wins) {
-                std::cout << "    IP matches or beats L2sq on recall and is "
-                          << "cheaper per eval; use IP.\n";
-            } else {
-                std::cout << "    L2sq has higher recall on this data (IP-ADC "
-                          << "misranks when ||x̃||² varies across codes).\n";
-            }
+    // Metric note based on the norm distribution heuristic. Picking the
+    // wrong metric silently destroys recall on non-normalized data
+    // (SIFT-1M: 0.99 → 0.66). We only emit a note when there's something
+    // actionable: mismatch between the user's --metric choice and what the
+    // heuristic suggests, OR when the signal is borderline so the user
+    // knows it's weak. "Normalized" requires BOTH mean≈1 AND cv<0.05.
+    if (diag.norm_mean > 0.0) {
+        const bool near_unit = (std::abs(diag.norm_mean - 1.0) <= 0.05);
+        const bool tight = (diag.norm_cv < 0.05);
+        const bool normalized = near_unit && tight;
+        // Borderline = mean near 1 but cv loose, OR cv tight but mean far from 1.
+        // If both signals point the same direction (mean near 1 AND cv tight,
+        // or mean far from 1 AND cv loose), the classification is confident.
+        const bool borderline = !normalized &&
+            ((near_unit && diag.norm_cv >= 0.05 && diag.norm_cv <= 0.20) ||
+             (tight && !near_unit && std::abs(diag.norm_mean - 1.0) <= 0.30));
+        if (normalized && metric_str == "l2sq") {
+            std::cout << "\n  note: data appears L2-normalized (norm_mean="
+                      << std::setprecision(4) << diag.norm_mean
+                      << ", norm_cv=" << diag.norm_cv
+                      << "). IP and L2sq are rank-equivalent here; IP is "
+                      << "cheaper per eval. --metric ip may be faster.\n";
+        } else if (!normalized && !borderline && metric_str == "ip") {
+            std::cout << "\n  [warning] data is NOT normalized (norm_mean="
+                      << std::setprecision(4) << diag.norm_mean
+                      << ", norm_cv=" << diag.norm_cv
+                      << "). IP misranks on non-normalized data (recall "
+                      << "collapse). Recommend --metric l2sq.\n";
+        } else if (borderline) {
+            std::cout << "\n  note: norm_mean=" << std::setprecision(4)
+                      << diag.norm_mean
+                      << ", norm_cv=" << diag.norm_cv
+                      << " - borderline (not clearly normalized). The metric "
+                      << "choice may affect recall; benchmark both if recall "
+                      << "is critical.\n";
         }
     }
 }

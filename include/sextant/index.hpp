@@ -114,14 +114,13 @@ struct Index {
     /// else flat_store. Null if no store is installed.
     NodeStore* top_store() const;
 
-    /// Read an index from sidecar files (.meta + .graph + .codes + .ball +
+    /// Read an index from sidecar files (.meta + .graph + .codes +
     /// .manifest). Replaces the former Engine::open / Engine::load_sidecars.
     ///
     /// Validates the atomic .manifest commit point, loads the quantizer +
     /// entry points + params from .meta, reconstructs the search VamanaCore,
     /// installs a PagedNodeStore over .graph/.codes, and builds a MemGraph
-    /// (3-hop BFS neighborhood of the entry points) over the PagedNodeStore
-    /// + optional .ball FP16 sidecar.
+    /// (3-hop BFS neighborhood of the entry points) over the PagedNodeStore.
     ///
     /// `cache_size_override` (0 = auto from index size + physical RAM) sets
     /// the L2 (BlockCache) budget. The cache rebalance enable/disable flag

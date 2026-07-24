@@ -11,7 +11,7 @@
 /// On-disk layout under `<prefix>.shards/`:
 ///   centroids.bin   — K × dim × float16_t (the routing centroids)
 ///   manifest.json   — { K, n_probe_default, closure_factor, dim }
-///   shard_0001/     — standard Sextant index (.graph/.codes/.meta/.ball/.manifest)
+///   shard_0001/     — standard Sextant index (.graph/.codes/.meta/.manifest)
 ///   ...
 ///   shard_K/
 ///

@@ -78,14 +78,11 @@ MemGraph::MemGraph(const uint8_t* all_nodes, const uint8_t* all_codes,
 }
 
 MemGraph::MemGraph(const std::string& graph_path, const std::string& codes_path,
-                   const std::string& vecs_path,
-                   uint32_t node_size, uint32_t code_size, uint32_t total_count,
-                   uint32_t dim,
-                   const std::vector<uint32_t>& entry_points, uint32_t num_hops)
+                     uint32_t node_size, uint32_t code_size, uint32_t total_count,
+                     const std::vector<uint32_t>& entry_points, uint32_t num_hops)
     : node_size_(node_size),
       code_size_(code_size),
-      total_count_(total_count),
-      dim_(dim) {
+      total_count_(total_count) {
     if (node_size_ == 0) {
         throw Error(ErrorCode::InvalidParam, "MemGraph: node_size must be > 0");
     }
@@ -119,13 +116,6 @@ MemGraph::MemGraph(const std::string& graph_path, const std::string& codes_path,
     }
 
     materialize(graph_buf.data(), codes_buf.data());
-
-    // The .ball FP16 sidecar is no longer loaded for search. The FP16 tier
-    // was measured to hurt recall (premature convergence) and QPS (FP16 compute
-    // is more expensive than PQ-ADC LUT sum). See results/p2.3-noball/.
-    // The .ball file is still written at build time for the FP16 prune.
-    // Keeping the vecs_path parameter for API compatibility; just skip loading.
-    (void)vecs_path;
 }
 
 void MemGraph::collect_neighborhood(const uint8_t* nodes, uint32_t total_count,
@@ -207,23 +197,6 @@ void MemGraph::materialize(const uint8_t* nodes, const uint8_t* codes) {
     // Free the BFS scratch; collected_ is no longer needed after materialize.
     collected_.clear();
     collected_.shrink_to_fit();
-}
-
-const float16_t* MemGraph::precise_vec(uint32_t id) const {
-    // The FP16 ball tier is DISABLED. The .ball sidecar is no longer loaded
-    // at search time — all distances go through PQ-ADC for consistency and
-    // performance. Measured on c4a 1.34M: disabling the FP16 tier gives
-    // identical or higher recall (the true distances caused premature search
-    // convergence, reducing exploration) AND higher QPS (PQ-ADC LUT sum is
-    // cheaper than FP16 dim-wide distance compute). See the no-ball experiment
-    // in results/p2.3-noball/.
-    //
-    // The .ball file is still WRITTEN at build time (the build-time FP16 prune
-    // in robust_prune_into uses l2sq_f16 against raw FP16 vectors — that's a
-    // separate concern affecting graph quality, not search). We just don't
-    // load it for search.
-    (void)id;
-    return nullptr;
 }
 
 // ===========================================================================

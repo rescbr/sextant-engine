@@ -12,7 +12,7 @@
 //   4. Pass 2: encode all vectors → codes buffer   [pass2_encode]
 //   5. Parallel PQ-construct via CTPL             [parallel_construct]
 //   6. Finalize: compute_entry_points              [snap_entry_points_]
-//   7. Flush sidecars (.graph/.codes/.meta/.ball/.manifest)  [write_sidecars_]
+//   7. Flush sidecars (.graph/.codes/.meta/.manifest)  [write_sidecars_]
 
 #include "sextant/builder.hpp"
 
@@ -1329,7 +1329,7 @@ BuildResult Builder::build_ivf(VectorSource& source, const std::string& index_pa
         DirectFile f(path, true);
         const size_t vec_bytes = static_cast<size_t>(index_.dim) * sizeof(float16_t);
         // Block-aligned ring buffer to amortize syscalls (same pattern as
-        // write_sidecars_'s .codes / .ball streams).
+        // write_sidecars_'s .codes stream).
         const size_t block_cap = kBlockSize;  // 256KB
         const uint32_t vecs_per_block =
             std::max<uint32_t>(1u, static_cast<uint32_t>(block_cap / vec_bytes));
@@ -1591,8 +1591,8 @@ void Builder::snap_entry_points_(const ResolvedParams& params) {
 //
 // The sub-centroids are PQ codes (k-means works in PQ-code space, same as
 // partition_codes); they're decoded to FP32 then cast to FP16 for storage so
-// A2 can compare them against the query's FP16 vector with simd::l2sq_f16 (the same
-// primitive routing + the MemGraph ball use).
+// A2 can compare them against the query's FP16 vector with simd::l2sq_f16
+// (the same primitive used for routing).
 //
 // Degenerate cases (shard too small for k' sub-clusters): clamps k' to
 // min(n_sub, shard_n) and, if that yields <2 sub-clusters, defers to
@@ -1966,13 +1966,13 @@ void Builder::write_sidecars_(const std::string& index_path,
         write_meta_file(params, remapped_eps, uuid);
     }
 
-    // ----- .ball (FP16 for the MemGraph entry-point ball) — SKIPPED -----
-    // The .ball sidecar was used by the FP16 ball tier at search time, which
-    // is now permanently disabled (precise_vec returns nullptr). The file is
-    // no longer loaded. Skipping the write saves I/O + disk space at build
-    // time (~100MB at 1.34M for the 3-hop neighborhood × dim × 2 bytes).
-    // The raw_vecs_buffer (all vectors as FP16 in RAM) is still loaded for
-    // the build-time FP16 prune in robust_prune_into — that's separate.
+    // ----- .ball sidecar (FP16 vectors for the entry-point ball) — NOT WRITTEN -----
+    // The FP16 ball tier was retired (it caused premature search convergence
+    // and lower QPS — see results/p2.3-noball/). The .ball sidecar is no
+    // longer loaded at search, so we don't write it. This saves I/O + disk
+    // space at build time (~100MB at 1.34M for the 3-hop neighborhood × dim
+    // × 2 bytes). The raw_vecs_buffer (all vectors as FP16 in RAM) is still
+    // loaded for the build-time FP16 prune in robust_prune_into — separate.
 
     // ----- .epc (IVF shard entry-point sub-centroids, A1/A2) -----
     // IVF-only: emitted when build_shard_into_ populated index_.sub_centroids

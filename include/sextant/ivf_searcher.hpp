@@ -25,8 +25,8 @@
 ///     Indexes directly via the IVFIndex. Cache-rebalance / diagnostics hooks
 ///     from the Searcher class are intentionally dropped from the hot path.
 ///
-/// Routing uses FP16 L2sq (`l2sq_f16`) — the same primitive the MemGraph
-/// ball uses for tier-1 distance — keeping the whole query path in FP16.
+/// Routing uses FP16 L2sq (`l2sq_f16`) against the IVF centroids — keeping
+/// the whole query path in FP16.
 
 #include "algo/vamana_core.hpp"
 #include "sextant/config.hpp"

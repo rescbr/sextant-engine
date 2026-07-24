@@ -26,9 +26,9 @@ public:
     uint32_t code_size() const;
 
     /// Configured distance metric. Drives `preprocess_query` (LUT semantics:
-    /// L2sq distance vs negated IP) and the FP16/FP32 true-distance tiers
-    /// (MemGraph ball, routing, rerank) via the `dist_f16`/`dist_f32` dispatch
-    /// helpers in `vamana_core.hpp`. For L2-normalized data both metrics are
+    /// L2sq distance vs negated IP) and the FP16/FP32 true-distance paths
+    /// (routing, rerank) via the `dist_f16`/`dist_f32` dispatch helpers in
+    /// `vamana_core.hpp`. For L2-normalized data both metrics are
     /// rank-equivalent on true distances; IP is cheaper per eval.
     MetricKind metric() const { return metric_; }
 
@@ -118,7 +118,7 @@ public:
     uint32_t K() const { return K_; }
     uint32_t sub_dim() const { return sub_dim_; }
 
-    /// Build a LUT from a PQ code (for HDC build mode).
+    /// Build a LUT from a PQ code (for PQ-construct build mode).
     bool build_code_lut(const uint8_t* code, float* out) const;
 
     /// Code-to-code distance via the cross-distance table.
