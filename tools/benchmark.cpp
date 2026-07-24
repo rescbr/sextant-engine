@@ -22,6 +22,7 @@
 #include "sextant/logging.hpp"
 #include "quant/pq_quantizer.hpp"  // PqQuantizer::metric() for rerank dispatch
 #include "simd_kernels.hpp"        // simd::dist_f32 — f32-accumulated rerank kernels
+#include "storage/memgraph.hpp"    // MemGraph::set_metric for --no-ball
 // NOTE: NumKong (<numkong/numkong.h>) was used here for the rerank distance
 // kernels; replaced by simd::dist_f32 (f32-accumulated, ~2x faster than
 // NumKong's f64 nk_sqeuclidean_f32/nk_dot_f32). Don't re-add unless a specific
@@ -331,6 +332,9 @@ int main(int argc, char* argv[]) {
                      "Search LRU cache size in bytes (0 = auto)", false, 0);
     p.add("no-cache-rebalance", 0,
           "Disable adaptive graph/code cache rebalancing (default: enabled in paged mode)");
+    p.add("no-ball", 0,
+          "Disable the MemGraph FP16 ball tier (force all nodes through PQ-ADC). "
+          "Tests pure-PQ-ADC recall without the FP16 true-distance tier.");
     p.add<std::string>("log-level", 0,
                        "Log level: debug, info, warn, error",
                        false, "info");
@@ -416,6 +420,11 @@ int main(int argc, char* argv[]) {
     try {
         std::unique_ptr<sextant::Index> idx =
             sextant::Index::read(index, cache_size_req);
+        if (p.exist("no-ball") && idx->memgraph) {
+            // Disable the FP16 tier: force all nodes through PQ-ADC.
+            idx->memgraph->set_metric(sextant::MetricKind::InnerProduct);
+            spdlog::info("benchmark: --no-ball: FP16 tier disabled");
+        }
         sextant::Searcher searcher(*idx, n_threads_hint);
         if (p.exist("no-cache-rebalance")) {
             searcher.set_cache_rebalance_enabled(false);

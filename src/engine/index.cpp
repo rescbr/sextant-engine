@@ -251,6 +251,11 @@ std::unique_ptr<Index> Index::read(const std::string& index_path,
             static_cast<uint32_t>(idx->count), idx->dim,
             eps, /*num_hops=*/3);
         idx->memgraph->set_backing(idx->paged_store.get());
+        // Propagate the quantizer's metric so MemGraph can disable its FP16
+        // tier for IP-ADC (frontier scale-mismatch avoidance).
+        if (idx->quantizer) {
+            idx->memgraph->set_metric(idx->quantizer->metric());
+        }
 
         const uint64_t cached_bytes =
             static_cast<uint64_t>(idx->memgraph->cached_count()) *

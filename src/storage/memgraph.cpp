@@ -228,6 +228,10 @@ void MemGraph::materialize(const uint8_t* nodes, const uint8_t* codes) {
 }
 
 const float16_t* MemGraph::precise_vec(uint32_t id) const {
+    // When metric is set to InnerProduct via set_metric(), the FP16 ball tier
+    // is disabled. This is used by --no-ball to force pure PQ-ADC search
+    // (testing whether the FP16 tier helps or hurts for a given quantizer/metric).
+    if (metric_ == MetricKind::InnerProduct) return nullptr;
     if (fp16_data_.empty() || dim_ == 0) return nullptr;
     const uint32_t local = (id < id_to_local_.size())
         ? id_to_local_[id]

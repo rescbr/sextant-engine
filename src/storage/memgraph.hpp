@@ -67,6 +67,11 @@ public:
     /// pin_node/pin_code check MemGraph first, fall through to backing store.
     void set_backing(NodeStore* backing) { backing_ = backing; }
 
+    /// Set the distance metric. When IP, the FP16 tier is disabled (precise_vec
+    /// returns nullptr) to avoid frontier scale-mismatch between FP16 true
+    /// distances and PQ-ADC distances. See docs/p2.3_anisotropic_results.md.
+    void set_metric(MetricKind m) { metric_ = m; }
+
     /// How many nodes are in the MemGraph.
     uint32_t cached_count() const { return cached_count_; }
 
@@ -105,6 +110,7 @@ private:
     uint32_t dim_ = 0;
     uint32_t cached_count_ = 0;
     NodeStore* backing_ = nullptr;
+    MetricKind metric_ = MetricKind::L2Sq;  // drives FP16 tier dispatch
 
     // FP16 ball vectors loaded from the `.ball` sidecar. Empty if no `.ball`
     // was supplied / present (PQ-only fallback). When non-empty, holds
