@@ -177,8 +177,17 @@ private:
     /// Codebook: m segments × K centroids × sub_dim floats.
     std::vector<float> codebook_;
 
+    /// Per-centroid squared L2 norms: m × K floats. Computed at train() time
+    /// for the fast L2sq path via decomposition (||q-c||² = ||q||² - 2<q,c> + ||c||²).
+    /// Empty when not yet computed.
+    std::vector<float> centroid_sqnorms_;
+
     /// Cross-distance table: m × K × K floats (code-to-code).
     std::vector<float> cross_distance_table_;
+
+    /// Populate `centroid_sqnorms_` from the trained codebook. Called at the
+    /// end of train(); cheap (m*K tiny norm computations, ~12K at m=96).
+    void compute_centroid_sqnorms_();
 };
 
 }  // namespace sextant

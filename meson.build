@@ -139,3 +139,6 @@ subdir('tools')
 
 # --- Tests --------------------------------------------------------------------
 subdir('test')
+
+# --- Microbenchmarks / exploratory scripts -----------------------------------
+subdir('scripts')

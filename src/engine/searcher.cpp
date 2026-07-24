@@ -86,7 +86,7 @@ std::vector<Candidate> Searcher::search_body_(const float* query, uint32_t k,
     }
 
     // Convert the query to FP16 for the hybrid FP16+PQ distance path
-    // (MemGraph ball nodes use l2sq_f16; the rest use PQ lut_distance).
+    // (MemGraph ball nodes use simd::l2sq_f16; the rest use PQ lut_distance).
     std::vector<float16_t> query_fp16(index_.dim);
     for (uint32_t d = 0; d < index_.dim; d++) {
         query_fp16[d] = static_cast<float16_t>(query[d]);

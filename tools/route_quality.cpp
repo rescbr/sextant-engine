@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
                 } else {
                     const float16_t* vec = base_f16.data() + static_cast<size_t>(v) * dim;
                     for (uint32_t c = 0; c < K; c++) {
-                        dists[c] = l2sq_f16(vec, centroids + static_cast<size_t>(c) * dim, dim);
+                        dists[c] = simd::l2sq_f16(vec, centroids + static_cast<size_t>(c) * dim, dim);
                         if (dists[c] < best) best = dists[c];
                     }
                 }
@@ -212,7 +212,7 @@ int main(int argc, char** argv) {
                 } else {
                     const float16_t* vec = base_f16.data() + static_cast<size_t>(v) * dim;
                     for (uint32_t c = 0; c < K; c++) {
-                        dists[c] = l2sq_f16(vec, centroids + static_cast<size_t>(c) * dim, dim);
+                        dists[c] = simd::l2sq_f16(vec, centroids + static_cast<size_t>(c) * dim, dim);
                         if (dists[c] < best) best = dists[c];
                     }
                 }
@@ -256,7 +256,7 @@ int main(int argc, char** argv) {
         } else {
             const float16_t* q = qf16.data() + static_cast<size_t>(qi) * dim;
             for (uint32_t c = 0; c < K; c++) {
-                cdists[c] = {l2sq_f16(q, centroids + static_cast<size_t>(c) * dim, dim), c};
+                cdists[c] = {simd::l2sq_f16(q, centroids + static_cast<size_t>(c) * dim, dim), c};
             }
         }
         // Routed order: sort ascending by distance (full sort; K is small).

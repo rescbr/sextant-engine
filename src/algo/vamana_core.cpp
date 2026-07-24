@@ -23,7 +23,7 @@
 #include <thread>
 
 // --- FP16 L2-squared distance (native FP16 storage) ------------------------
-// l2sq_f16 is defined in vamana_core.hpp (header-only inline) so it can be
+// simd::l2sq_f16 is defined in vamana_core.hpp (header-only inline) so it can be
 // shared by robust_prune_into (vamana_core.cpp) and the merge truncation
 // (engine.cpp). The SIMD detection (#if SEXTANT_HAS_NEON / AVX2+F16C) is
 // also in the header.
@@ -225,7 +225,7 @@ void VamanaCore::beam_search_into(
     const uint8_t* hdc_anchor = q.hdc_anchor;
     const float* anchor_lut = q.anchor_lut;
     const std::vector<uint32_t>* forced_entry_points = q.forced_entry_points;
-    const MetricKind metric = quantizer_.metric();  // drives dist_f16/dist_f32 dispatch
+    const MetricKind metric = quantizer_.metric();  // drives simd::dist_f16/simd::dist_f32 dispatch
     (void)query_lut; (void)query_fp16; (void)hdc_anchor;
     (void)anchor_lut; (void)forced_entry_points;  // captured by dist_to below
     out.clear();
@@ -259,13 +259,13 @@ void VamanaCore::beam_search_into(
 
     // Distance to a candidate node. Hybrid precision: when `query_fp16` is
     // available AND the store exposes an FP16 vector for this node (MemGraph
-    // ball nodes), use l2sq_f16 (sequential FP16 compute — prefetcher-friendly,
+    // ball nodes), use simd::l2sq_f16 (sequential FP16 compute — prefetcher-friendly,
     // no LUT gather, no PQ code pin/unpin). Otherwise fall back to the PQ
     // path. Priority among PQ modes: anchor_lut > hdc_anchor > query_lut.
     auto dist_to = [&](uint32_t id) {
         if (query_fp32 && build_ctx_ && build_ctx_->fp32_vecs) {
             // FP32 build mode: exact distance, no quantization.
-            return dist_f32(metric, query_fp32,
+            return simd::dist_f32(metric, query_fp32,
                             build_ctx_->fp32_vecs + static_cast<size_t>(id) * params_.dim,
                             params_.dim);
         }
@@ -282,7 +282,7 @@ void VamanaCore::beam_search_into(
                 fp16 = build_ctx_->vec_ptr(id, params_.dim);
             }
             if (fp16) {
-                return dist_f16(metric, query_fp16, fp16, params_.dim);
+                return simd::dist_f16(metric, query_fp16, fp16, params_.dim);
             }
         }
         const uint8_t* code_ptr = store_
@@ -627,7 +627,7 @@ void VamanaCore::beam_search_into(
             // unvisited neighbor IDs first (no locks, no virtual calls),
             // then:
             //   - FP16-path nodes (MemGraph ball nodes with precise_vec):
-            //     compute l2sq_f16 per-node (no code pinning needed).
+            //     compute simd::l2sq_f16 per-node (no code pinning needed).
             //   - PQ-path nodes: batch-pin all codes via ONE pin_codes call
             //     (lock per shard, not per node), then lut_distance_batch4
             //     over the returned pointers (SVE2 4-way gather).
@@ -674,7 +674,7 @@ void VamanaCore::beam_search_into(
 
                 // FP16 distances (per-node, but no locking — MemGraph RAM).
                 for (uint32_t i = 0; i < fp16_n; i++) {
-                    const float d = dist_f16(metric, query_fp16, fp16_vecs[i],
+                    const float d = simd::dist_f16(metric, query_fp16, fp16_vecs[i],
                                               params_.dim);
                     const uint32_t id = fp16_ids[i];
                     if (W.size() < L_current || d < W.front().dist) {
@@ -836,7 +836,7 @@ void VamanaCore::robust_prune_into(
         for (size_t i = 0; i < buf.size(); i++) {
             const float16_t* pp_vec =
                 build_ctx_->vecs + static_cast<size_t>(buf[i].row_id) * params_.dim;
-            buf[i].dist = l2sq_f16(query_vec, pp_vec, params_.dim);
+            buf[i].dist = simd::l2sq_f16(query_vec, pp_vec, params_.dim);
         }
         std::sort(buf.begin(), buf.end(),
                   [](const Candidate& a, const Candidate& b) {
@@ -889,7 +889,7 @@ void VamanaCore::robust_prune_into(
                     continue;
                 }
                 const float16_t* pp_vec = vec_at(pp_idx);
-                const float d_pp = l2sq_f16(p_vec, pp_vec, params_.dim);
+                const float d_pp = simd::l2sq_f16(p_vec, pp_vec, params_.dim);
                 if (alpha * d_pp <= buf[pp_idx].dist)
                     removed[pp_idx] = 1;
             }
@@ -1085,10 +1085,10 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     //  - PQ (default): per-anchor LUT from the node's own PQ code. L1-resident,
     //    fast (m sequential reads). The graph topology inherits PQ's navigation
     //    quality (candidates are PQ-navigated).
-    //  - FP16 (SEXTANT_FP16_BUILD=1): use l2sq_f16 against the raw FP16 vectors.
+    //  - FP16 (SEXTANT_FP16_BUILD=1): use simd::l2sq_f16 against the raw FP16 vectors.
     //    Decouples graph topology from PQ quality — candidates are found via
     //    exact (FP16) distances, producing a higher-quality graph. Build-time-
-    //    only; search uses PQ regardless. ~2-3× build time (l2sq_f16 is dim-wide
+    //    only; search uses PQ regardless. ~2-3× build time (simd::l2sq_f16 is dim-wide
     //    vs m LUT lookups). See docs/build_search_decoupling.md.
     const float* query_lut = nullptr;
     const uint8_t* hdc_anchor = nullptr;

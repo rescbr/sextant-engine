@@ -1,6 +1,6 @@
 #include "sextant/ivf_searcher.hpp"
 
-#include "algo/vamana_core.hpp"  // dist_f16
+#include "algo/vamana_core.hpp"  // simd::dist_f16
 #include "quant/pq_quantizer.hpp"
 #include "sextant/error.hpp"
 #include "util/fp16.hpp"
@@ -112,7 +112,7 @@ std::vector<Candidate> IVFSearcher::search_body_(const float* query, uint32_t k,
         }
         const float16_t* centroid =
             index_.centroids.data() + static_cast<size_t>(c) * index_.dim;
-        const float d = dist_f16(metric, w.query_fp16.data(), centroid, index_.dim);
+        const float d = simd::dist_f16(metric, w.query_fp16.data(), centroid, index_.dim);
         w.cent_dists.push_back({d, c});
     }
     // Sort ascending by distance. K is small (≤64), so a full sort is cheap
@@ -183,7 +183,7 @@ std::vector<Candidate> IVFSearcher::search_body_(const float* query, uint32_t k,
             for (uint32_t sc = 0; sc < k_sub; sc++) {
                 const float16_t* cen =
                     sub_centroids.data() + static_cast<size_t>(sc) * index_.dim;
-                const float d = dist_f16(metric, w.query_fp16.data(), cen, index_.dim);
+                const float d = simd::dist_f16(metric, w.query_fp16.data(), cen, index_.dim);
                 if (d < best_d) { best_d = d; best_sc = sc; }
             }
             // Seed from that sub-cluster's M medoids (disk positions already).

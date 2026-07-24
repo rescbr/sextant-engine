@@ -12,8 +12,6 @@
 //   benchmark --index myindex --queries query.fbin --base-data base.fbin \
 //             --ground-truth gt.gt --k 10 --L 200 --rerank 10
 
-#include <numkong/numkong.h>
-
 #include "fbin_io.hpp"
 #include "sextant/config.hpp"
 #include "sextant/ivf_searcher.hpp"
@@ -23,6 +21,11 @@
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
 #include "quant/pq_quantizer.hpp"  // PqQuantizer::metric() for rerank dispatch
+#include "simd_kernels.hpp"        // simd::dist_f32 — f32-accumulated rerank kernels
+// NOTE: NumKong (<numkong/numkong.h>) was used here for the rerank distance
+// kernels; replaced by simd::dist_f32 (f32-accumulated, ~2x faster than
+// NumKong's f64 nk_sqeuclidean_f32/nk_dot_f32). Don't re-add unless a specific
+// nk_ call is needed. NumKong remains linked for breadth — see pq_quantizer.cpp.
 
 #include <cmdline/cmdline.h>
 
@@ -113,37 +116,14 @@ double percentile(std::vector<double>& sorted_us, double pct) {
      return sorted_us[lo] + frac * (sorted_us[hi] - sorted_us[lo]);
  }
 
-/// SIMD L2-squared distance between two FP32 vectors. Uses numkong's
-/// SVE2/NEON kernel (~4-8× faster than the scalar fallback for 768-dim).
-/// Falls back to the scalar fbin_io::l2sq_distance if numkong reports an
-/// error (shouldn't happen for valid inputs).
-inline float l2sq_simd(const float* a, const float* b, uint32_t dim) {
-    nk_f64_t acc = 0;
-    nk_sqeuclidean_f32(a, b, dim, &acc);
-    return static_cast<float>(acc);
-}
-
-/// SIMD dot product between two FP32 vectors. Used for IP-mode rerank.
-inline float dot_simd(const float* a, const float* b, uint32_t dim) {
-    nk_f64_t acc = 0;
-    nk_dot_f32(a, b, dim, &acc);
-    return static_cast<float>(acc);
-}
-
 /// Rerank distance under a metric. Returns a value ordered consistently with
 /// a min-heap / ascending sort (L2sq: ascending; IP: negated dot, so smaller
-/// = higher dot product = nearer). Mirrors `dist_f32` in vamana_core.hpp but
-/// lives here so the benchmark's rerank matches the engine's metric without a
-/// dependency on the engine headers.
+/// = higher dot product = nearer). Delegates to `simd::dist_f32` in simd_kernels.hpp
+/// — f32-accumulated, ~2× the throughput of NumKong's f64-accumulating
+/// `nk_sqeuclidean_f32` / `nk_dot_f32` at dim=768. Rerank is 12% of profile.
 inline float rerank_dist(sextant::MetricKind metric,
                          const float* a, const float* b, uint32_t dim) {
-    switch (metric) {
-    case sextant::MetricKind::InnerProduct:
-        return -dot_simd(a, b, dim);
-    case sextant::MetricKind::L2Sq:
-    default:
-        return l2sq_simd(a, b, dim);
-    }
+    return sextant::simd::dist_f32(metric, a, b, dim);
 }
 
 /// Per-query metrics produced by a worker thread. The main thread aggregates

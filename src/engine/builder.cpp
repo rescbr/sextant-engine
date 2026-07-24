@@ -688,7 +688,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     // Load raw vectors as FP16 for the FP16 prune. Used by BOTH K=1 (full
     // graph) and K>1 (per-shard copy). They enable the FP16 prune (exact FP16
     // L2sq occlusion check instead of PQ code_distance). Stored as FP16 (half
-    // the RAM of FP32) and consumed directly by l2sq_f16 — no per-call
+    // the RAM of FP32) and consumed directly by simd::l2sq_f16 — no per-call
     // conversion.
     {
         const size_t vecs_bytes =
@@ -938,7 +938,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
              const float16_t* nb_vec =
                  index_.raw_vecs_buffer + static_cast<size_t>(gnb) * index_.dim;
              const float d = index_.raw_vecs_buffer
-                 ? l2sq_f16(my_vec, nb_vec, index_.dim)
+                 ?simd::l2sq_f16(my_vec, nb_vec, index_.dim)
                  : index_.quantizer->code_distance(
                        index_.codes_buffer + static_cast<size_t>(gid) * index_.code_size,
                        index_.codes_buffer + static_cast<size_t>(gnb) * index_.code_size);
@@ -1043,7 +1043,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
                          const float16_t* rv =
                              index_.raw_vecs_buffer + static_cast<size_t>(r) * index_.dim;
                          const float d = index_.raw_vecs_buffer
-                             ? l2sq_f16(cv, rv, index_.dim)
+                             ?simd::l2sq_f16(cv, rv, index_.dim)
                              : index_.quantizer->code_distance(
                                  index_.codes_buffer + static_cast<size_t>(c) * index_.code_size,
                                  index_.codes_buffer + static_cast<size_t>(r) * index_.code_size);
@@ -1537,13 +1537,13 @@ void Builder::snap_entry_points_(const ResolvedParams& params) {
     std::vector<std::thread> pool;
         auto worker = [&](uint32_t c) {
             const float* centroid = entry_centroids_.data() + static_cast<size_t>(c) * index_.dim;
-            // Convert centroid to FP16 for l2sq_f16 comparison.
+            // Convert centroid to FP16 for simd::l2sq_f16 comparison.
             std::vector<float16_t> centroid_f16(index_.dim);
             cast_fp32_to_fp16(centroid, centroid_f16.data(), index_.dim);
         float best_d = std::numeric_limits<float>::infinity();
         uint32_t best_id = 0;
         for (uint32_t i = 0; i < n; i++) {
-            const float d = l2sq_f16(centroid_f16.data(),
+            const float d = simd::l2sq_f16(centroid_f16.data(),
                                      index_.raw_vecs_buffer + static_cast<size_t>(i) * index_.dim,
                                      index_.dim);
             if (d < best_d) { best_d = d; best_id = i; }
@@ -1585,7 +1585,7 @@ void Builder::snap_entry_points_(const ResolvedParams& params) {
 //
 // The sub-centroids are PQ codes (k-means works in PQ-code space, same as
 // partition_codes); they're decoded to FP32 then cast to FP16 for storage so
-// A2 can compare them against the query's FP16 vector with l2sq_f16 (the same
+// A2 can compare them against the query's FP16 vector with simd::l2sq_f16 (the same
 // primitive routing + the MemGraph ball use).
 //
 // Degenerate cases (shard too small for k' sub-clusters): clamps k' to
@@ -1754,7 +1754,7 @@ uint32_t Builder::compute_sub_cluster_entry_points_(const ResolvedParams& params
         const uint32_t cluster_count = counts[c];
         for (uint32_t i = 0; i < shard_n; i++) {
             if (cluster_count > 0 && assign[i] != c) continue;
-            const float d = l2sq_f16(cf16.data(),
+            const float d = simd::l2sq_f16(cf16.data(),
                                      vecs + static_cast<size_t>(i) * dim, dim);
             if (heap.size() < M) {
                 heap.push_back({d, i});
@@ -1773,7 +1773,7 @@ uint32_t Builder::compute_sub_cluster_entry_points_(const ResolvedParams& params
                 bool dup = false;
                 for (const auto& m : heap) if (m.id == i) { dup = true; break; }
                 if (dup) continue;
-                const float d = l2sq_f16(cf16.data(),
+                const float d = simd::l2sq_f16(cf16.data(),
                                          vecs + static_cast<size_t>(i) * dim, dim);
                 heap.push_back({d, i});
                 std::push_heap(heap.begin(), heap.end(), med_cmp);
@@ -1962,7 +1962,7 @@ void Builder::write_sidecars_(const std::string& index_path,
 
     // ----- .ball (FP16 for the MemGraph entry-point ball) -----
     // Ball-only: stores FP16 vectors for the nodes within 3 hops of the entry
-    // points. At search time, beam_search uses l2sq_f16 for these nodes (high
+    // points. At search time, beam_search uses simd::l2sq_f16 for these nodes (high
     // precision in the approach phase) and PQ for the rest. Scales: the file
     // size is bounded by ball size (entry_points × R^hops), not N.
     //
