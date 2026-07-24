@@ -22,6 +22,7 @@
 #include "sextant/ivf_index.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
+#include "quant/pq_quantizer.hpp"  // PqQuantizer::metric() for rerank dispatch
 
 #include <cmdline/cmdline.h>
 
@@ -122,6 +123,29 @@ inline float l2sq_simd(const float* a, const float* b, uint32_t dim) {
     return static_cast<float>(acc);
 }
 
+/// SIMD dot product between two FP32 vectors. Used for IP-mode rerank.
+inline float dot_simd(const float* a, const float* b, uint32_t dim) {
+    nk_f64_t acc = 0;
+    nk_dot_f32(a, b, dim, &acc);
+    return static_cast<float>(acc);
+}
+
+/// Rerank distance under a metric. Returns a value ordered consistently with
+/// a min-heap / ascending sort (L2sq: ascending; IP: negated dot, so smaller
+/// = higher dot product = nearer). Mirrors `dist_f32` in vamana_core.hpp but
+/// lives here so the benchmark's rerank matches the engine's metric without a
+/// dependency on the engine headers.
+inline float rerank_dist(sextant::MetricKind metric,
+                         const float* a, const float* b, uint32_t dim) {
+    switch (metric) {
+    case sextant::MetricKind::InnerProduct:
+        return -dot_simd(a, b, dim);
+    case sextant::MetricKind::L2Sq:
+    default:
+        return l2sq_simd(a, b, dim);
+    }
+}
+
 /// Per-query metrics produced by a worker thread. The main thread aggregates
 /// these — no shared mutable state during the benchmark loop.
 struct QueryMetrics {
@@ -152,6 +176,11 @@ struct RerankCtx {
     const std::string* base_data;         // path for read_fbin_vector fallback
     const GroundTruth* gt;
     bool have_gt_dists;
+    /// Metric for rerank distance. Matches the index's quantizer metric so the
+    /// rerank reordering is consistent with the engine's search-time metric.
+    /// For L2-normalized data both metrics give the same final top-k; the
+    /// rerank cost (dot vs l2sq) is what differs and affects the measured QPS.
+    sextant::MetricKind metric = sextant::MetricKind::L2Sq;
 };
 
 /// Rerank + recall + proximity post-processing shared by the single-index
@@ -183,12 +212,12 @@ QueryMetrics process_results(const RerankCtx& ctx,
             if (ctx.base_in_ram) {
                 const float* bv =
                     &(*ctx.base_all)[static_cast<size_t>(c.row_id) * ctx.dim];
-                d = l2sq_simd(q, bv, ctx.dim);
+                d = rerank_dist(ctx.metric, q, bv, ctx.dim);
             } else {
                 read_fbin_vector(*ctx.base_data, ctx.dim,
                                  static_cast<uint64_t>(c.row_id),
                                  base_vec);
-                d = l2sq_simd(q, base_vec.data(), ctx.dim);
+                d = rerank_dist(ctx.metric, q, base_vec.data(), ctx.dim);
             }
             scored.emplace_back(d, c.row_id);
         }
@@ -210,12 +239,12 @@ QueryMetrics process_results(const RerankCtx& ctx,
                 if (ctx.base_in_ram) {
                     const float* bv =
                         &(*ctx.base_all)[static_cast<size_t>(rid) * ctx.dim];
-                    d = l2sq_simd(q, bv, ctx.dim);
+                    d = rerank_dist(ctx.metric, q, bv, ctx.dim);
                 } else {
                     read_fbin_vector(*ctx.base_data, ctx.dim,
                                      static_cast<uint64_t>(rid),
                                      base_vec);
-                    d = l2sq_simd(q, base_vec.data(), ctx.dim);
+                    d = rerank_dist(ctx.metric, q, base_vec.data(), ctx.dim);
                 }
             }
             topk_scored.emplace_back(d, rid);
@@ -250,7 +279,7 @@ QueryMetrics process_results(const RerankCtx& ctx,
             if (gt_kth_id < ctx.n_base) {
                 const float* bv_kth =
                     &(*ctx.base_all)[static_cast<size_t>(gt_kth_id) * ctx.dim];
-                d_target = l2sq_simd(q, bv_kth, ctx.dim);
+                d_target = rerank_dist(ctx.metric, q, bv_kth, ctx.dim);
             } else {
                 d_target = gt.dists[static_cast<size_t>(qi) * gt.k +
                                      (gt_k - 1)];
@@ -505,10 +534,12 @@ int main(int argc, char* argv[]) {
 
         // Shared rerank/recall/proximity context. Both the single-index and
         // IVF paths route results through process_results via this struct.
+        const sextant::MetricKind idx_metric =
+            idx->quantizer ? idx->quantizer->metric() : sextant::MetricKind::L2Sq;
         const RerankCtx rctx{
             dim, k, bh.n, do_rerank, base_in_ram,
             base_in_ram ? &base_all : nullptr,
-            &base_data, &gt, have_gt_dists
+            &base_data, &gt, have_gt_dists, idx_metric
         };
 
         // Push all queries to the Searcher pool up front (work-stealing).
@@ -795,10 +826,19 @@ int main(int argc, char* argv[]) {
         }
 
         const bool have_gt_dists = !gt.dists.empty();
+        // All shards share the same trained quantizer (built together); pull
+        // the metric from the first present shard's quantizer.
+        sextant::MetricKind ivf_metric = sextant::MetricKind::L2Sq;
+        for (const auto& shard : ivf_idx->shards) {
+            if (shard && shard->quantizer) {
+                ivf_metric = shard->quantizer->metric();
+                break;
+            }
+        }
         const RerankCtx rctx{
             dim, k, bh.n, do_rerank, base_in_ram,
             base_in_ram ? &base_all : nullptr,
-            &base_data, &gt, have_gt_dists
+            &base_data, &gt, have_gt_dists, ivf_metric
         };
 
         // IVFSearcher.search is synchronous (no search_one_async). Loop over

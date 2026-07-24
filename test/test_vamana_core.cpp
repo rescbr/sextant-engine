@@ -3,8 +3,10 @@
 #include "quant/pq_quantizer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <queue>
+#include <random>
 #include <vector>
 
 namespace sextant {
@@ -348,6 +350,96 @@ TEST(VamanaCore, BeamSearchDynamicWidth) {
     // With the stub quantizer (all distances 0), candidates are unsorted-by-
     // distance but structurally valid. Result count must not exceed L.
     EXPECT_LE(results.size(), 32u);
+}
+
+// ---------------------------------------------------------------------------
+// SIMD distance kernels: l2sq_f16, dot_f16, dot_f32
+// ---------------------------------------------------------------------------
+
+TEST(VamanaCore, SimdDistancesF16Correctness) {
+    // Random FP16 vectors; verify SIMD kernels match scalar reference within
+    // FP16 precision (relative tolerance ~1e-3, abs tolerance ~1e-2 for small sums).
+    const uint32_t dim = 768;
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> uf(-1.0f, 1.0f);
+    std::vector<float16_t> a(dim), b(dim);
+    for (uint32_t i = 0; i < dim; i++) {
+        a[i] = static_cast<float16_t>(uf(rng));
+        b[i] = static_cast<float16_t>(uf(rng));
+    }
+    // Scalar references.
+    float ref_l2sq = 0, ref_dot = 0;
+    for (uint32_t i = 0; i < dim; i++) {
+        const float da = static_cast<float>(a[i]);
+        const float db = static_cast<float>(b[i]);
+        ref_l2sq += (da - db) * (da - db);
+        ref_dot += da * db;
+    }
+    const float got_l2sq = l2sq_f16(a.data(), b.data(), dim);
+    const float got_dot = dot_f16(a.data(), b.data(), dim);
+    EXPECT_NEAR(got_l2sq, ref_l2sq, std::max(1e-2f, std::abs(ref_l2sq) * 1e-3f));
+    EXPECT_NEAR(got_dot, ref_dot, std::max(1e-2f, std::abs(ref_dot) * 1e-3f));
+}
+
+TEST(VamanaCore, SimdDistancesOddDim) {
+    // Remainder path: dim not divisible by 8. Verify zero-padding keeps result exact.
+    const uint32_t dim = 765;  // 95 full groups of 8 + 5 remainder
+    std::mt19937 rng(777);
+    std::uniform_real_distribution<float> uf(-1.0f, 1.0f);
+    std::vector<float16_t> a(dim), b(dim);
+    for (uint32_t i = 0; i < dim; i++) {
+        a[i] = static_cast<float16_t>(uf(rng));
+        b[i] = static_cast<float16_t>(uf(rng));
+    }
+    float ref_l2sq = 0, ref_dot = 0;
+    for (uint32_t i = 0; i < dim; i++) {
+        const float da = static_cast<float>(a[i]);
+        const float db = static_cast<float>(b[i]);
+        ref_l2sq += (da - db) * (da - db);
+        ref_dot += da * db;
+    }
+    EXPECT_NEAR(l2sq_f16(a.data(), b.data(), dim), ref_l2sq,
+                std::max(1e-2f, std::abs(ref_l2sq) * 1e-3f));
+    EXPECT_NEAR(dot_f16(a.data(), b.data(), dim), ref_dot,
+                std::max(1e-2f, std::abs(ref_dot) * 1e-3f));
+}
+
+TEST(VamanaCore, SimdDotF32Correctness) {
+    const uint32_t dim = 768;
+    std::mt19937 rng(999);
+    std::uniform_real_distribution<float> uf(-1.0f, 1.0f);
+    std::vector<float> a(dim), b(dim);
+    for (uint32_t i = 0; i < dim; i++) { a[i] = uf(rng); b[i] = uf(rng); }
+    float ref = 0;
+    for (uint32_t i = 0; i < dim; i++) ref += a[i] * b[i];
+    EXPECT_NEAR(dot_f32(a.data(), b.data(), dim), ref, std::abs(ref) * 1e-5f);
+}
+
+TEST(VamanaCore, DistDispatchHelpers) {
+    // dist_f16/dist_f32 return IP negated (so min-heap ordering works) and
+    // L2sq unchanged.
+    const uint32_t dim = 16;
+    float16_t a16[dim], b16[dim];
+    float a32[dim], b32[dim];
+    for (uint32_t i = 0; i < dim; i++) {
+        a16[i] = static_cast<float16_t>(0.5f);
+        b16[i] = static_cast<float16_t>(0.5f);
+        a32[i] = 0.5f;
+        b32[i] = 0.5f;
+    }
+    // All-equal vectors: L2sq = 0, dot = dim * 0.25.
+    EXPECT_NEAR(l2sq_f16(a16, b16, dim), 0.0f, 1e-5f);
+    EXPECT_NEAR(dot_f16(a16, b16, dim), dim * 0.25f, 1e-2f);
+    // IP dispatch returns -dot (nearer = smaller).
+    EXPECT_NEAR(dist_f16(MetricKind::InnerProduct, a16, b16, dim),
+                -dot_f16(a16, b16, dim), 1e-5f);
+    EXPECT_NEAR(dist_f16(MetricKind::L2Sq, a16, b16, dim),
+                l2sq_f16(a16, b16, dim), 1e-5f);
+    // FP32 dispatch.
+    EXPECT_NEAR(dist_f32(MetricKind::InnerProduct, a32, b32, dim),
+                -dot_f32(a32, b32, dim), 1e-5f);
+    EXPECT_NEAR(dist_f32(MetricKind::L2Sq, a32, b32, dim),
+                l2sq_f32(a32, b32, dim), 1e-5f);
 }
 
 }  // namespace

@@ -249,7 +249,12 @@ Estimator::SearchQuality Estimator::measure_search_(
         auto results = mini.core->search(eq, fetch_k, L, /*io_limit=*/0, tls);
         if (results.empty()) continue;
 
-        // Rerank by true L2sq distance computed from the FP32 sample buffer.
+        // Rerank by true distance computed from the FP32 sample buffer.
+        // Metric follows the mini-index's quantizer so the rerank is consistent
+        // with the search metric (rank-equivalent for normalized data; for
+        // non-normalized data using L2sq rerank on an IP search would mask
+        // navigation errors and inflate the measured recall).
+        const MetricKind mini_metric = q.metric();
         std::vector<std::pair<float, int32_t>> scored;
         scored.reserve(results.size());
         for (const auto& c : results) {
@@ -257,12 +262,22 @@ Estimator::SearchQuality Estimator::measure_search_(
                 static_cast<uint64_t>(c.row_id) >= sample_n) continue;
             const float* bv =
                 sample + static_cast<size_t>(c.row_id) * dim;
-            double d = 0.0;
-            for (uint32_t d2 = 0; d2 < dim; d2++) {
-                const double diff = double(qv[d2]) - double(bv[d2]);
-                d += diff * diff;
+            float d;
+            if (mini_metric == MetricKind::InnerProduct) {
+                double dot = 0.0;
+                for (uint32_t d2 = 0; d2 < dim; d2++) {
+                    dot += double(qv[d2]) * double(bv[d2]);
+                }
+                d = static_cast<float>(-dot);  // negate so ascending = nearest
+            } else {
+                double l2 = 0.0;
+                for (uint32_t d2 = 0; d2 < dim; d2++) {
+                    const double diff = double(qv[d2]) - double(bv[d2]);
+                    l2 += diff * diff;
+                }
+                d = static_cast<float>(l2);
             }
-            scored.emplace_back(float(d), c.row_id);
+            scored.emplace_back(d, c.row_id);
         }
         std::sort(scored.begin(), scored.end(),
                   [](const auto& a, const auto& b) {
@@ -378,6 +393,38 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
     }
     spdlog::info("[sextant] estimate_config: sampled {} / {} vectors",
                  sample_n, seen);
+
+    // --- 1b. Measure L2 norm distribution to detect normalization ---
+    // For L2-normalized data, IP and L2sq are rank-equivalent on true distances
+    // (||q-x||² = 2 - 2<q,x>), and IP is cheaper per eval. For non-normalized
+    // data they diverge sharply (SIFT-1M: IP recall collapses 0.99→0.66).
+    // We measure the coefficient of variation (CV = stddev/mean) of the norms:
+    // CV < 0.05 ⇒ normalized (recommend IP); CV > 0.10 ⇒ not (recommend L2sq).
+    // See docs/plans/metric_per_tier_plan.md Phase 1.
+    double norm_mean = 0.0, norm_stddev = 0.0;
+    double norm_min = std::numeric_limits<float>::infinity();
+    double norm_max = 0.0;
+    if (sample_n > 0) {
+        double sum = 0.0, sum_sq = 0.0;
+        for (uint64_t i = 0; i < sample_n; i++) {
+            const float* v = sample.data() + static_cast<size_t>(i) * dim;
+            double n2 = 0.0;
+            for (Dim d = 0; d < dim; d++) { n2 += double(v[d]) * double(v[d]); }
+            const double n = std::sqrt(n2);
+            sum += n;
+            sum_sq += n * n;
+            if (n < norm_min) norm_min = n;
+            if (n > norm_max) norm_max = n;
+        }
+        norm_mean = sum / double(sample_n);
+        const double var = std::max(0.0, sum_sq / double(sample_n) -
+                                            norm_mean * norm_mean);
+        norm_stddev = std::sqrt(var);
+    }
+    double norm_cv = (norm_mean > 1e-6) ? norm_stddev / norm_mean : 0.0;
+    spdlog::info("[sextant] estimate_config: norm mean={:.4f} stddev={:.4f} "
+                 "cv={:.4f} (min={:.4f} max={:.4f})",
+                 norm_mean, norm_stddev, norm_cv, norm_min, norm_max);
 
     // --- Resolve the measurement k and quality targets ---
     // target_k: the k at which recall/proximity are measured. Clamp to
@@ -776,6 +823,54 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
                      R_full);
     }
 
+    // --- 7b. Metric recommendation: dual-mini-index search recall at R_full ---
+    // Build a mini-index under EACH metric at the PRODUCTION R (R_full), run
+    // production-style search probes (rerank=10), measure recall@k against GT.
+    // Recommend the higher. MUST use R_full, not the R=64 reference mini above:
+    // the metric effect is operating-point-dependent (empirically flips with R —
+    // at low R IP's cheaper eval wins; at high R L2sq's cleaner quantizer wins).
+    // Using the wrong R gives a recommendation for a different operating point
+    // than the production index will actually use. Cost: up to two extra
+    // mini-builds (~10-30s each) when --metric-reco=both.
+    double ip_recall_adc = -1.0;
+    double l2sq_recall_adc = -1.0;
+    {
+        const std::string& reco_str = overrides.metric_reco;
+        const bool do_both = (reco_str == "both" || reco_str.empty());
+        const bool want_ip = do_both ||
+            (reco_str == "ip") ||
+            (overrides.metric == MetricKind::InnerProduct && reco_str != "l2sq");
+        const bool want_l2sq = do_both ||
+            (reco_str == "l2sq") ||
+            (overrides.metric == MetricKind::L2Sq && reco_str != "ip");
+        ResolvedParams metric_params = ref_params;
+        metric_params.R = R_full;  // PRODUCTION R, not the R=64 reference
+        const uint32_t metric_L = std::max<uint32_t>(target_k * 2, 100u);
+        spdlog::info("[sextant] estimate_config: metric recommendation probe "
+                     "(R={}, L={}, rerank=10, k={})", R_full, metric_L, target_k);
+        if (want_l2sq) {
+            metric_params.metric = MetricKind::L2Sq;
+            auto mini = build_mini_(sample.data(), sample_n, dim, metric_params);
+            const auto sq = measure_search_(
+                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+                qidx, metric_L, target_k, 10);
+            l2sq_recall_adc = sq.recall;
+        }
+        if (want_ip) {
+            metric_params.metric = MetricKind::InnerProduct;
+            auto mini = build_mini_(sample.data(), sample_n, dim, metric_params);
+            const auto sq = measure_search_(
+                *mini, sample.data(), sample_n, dim, truth.ids, truth.dists,
+                qidx, metric_L, target_k, 10);
+            ip_recall_adc = sq.recall;
+        }
+        if (ip_recall_adc >= 0.0 || l2sq_recall_adc >= 0.0) {
+            spdlog::info("[sextant] estimate_config: search recall@{} (R={}) — "
+                         "IP={} L2sq={}", target_k, R_full,
+                         ip_recall_adc, l2sq_recall_adc);
+        }
+    }
+
     // --- 8. Final param resolution ---
     ResolvedParams p;
     p.R = R_full;
@@ -850,6 +945,13 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
             /*avg_degree=*/gstats.avg_degree,
             /*clustering_coeff=*/gstats.clustering_coeff,
             /*dead_end_frac=*/gstats.dead_end_frac,
+            /*norm_mean=*/norm_mean,
+            /*norm_stddev=*/norm_stddev,
+            /*norm_min=*/norm_min,
+            /*norm_max=*/norm_max,
+            /*norm_cv=*/norm_cv,
+            /*ip_recall_adc=*/ip_recall_adc,
+            /*l2sq_recall_adc=*/l2sq_recall_adc,
         },
     };
 }

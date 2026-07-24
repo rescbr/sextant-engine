@@ -678,7 +678,7 @@ void PqQuantizer::decode_code(const uint8_t* code, float* out) const {
 // Query preprocessing (PQ LUT)
 // ---------------------------------------------------------------------------
 
-void PqQuantizer::preprocess_query(const float* query, float* out) const {
+void PqQuantizer::preprocess_query_as(MetricKind metric, const float* query, float* out) const {
     // PQ LUT: out[s * K + c] = d(query_sub_s, centroid[s][c]).
     //   L2SQ: L2 squared distance.
     //   IP:   -dot(query_sub, centroid).
@@ -700,7 +700,7 @@ void PqQuantizer::preprocess_query(const float* query, float* out) const {
         float* row = out + s * K_;
         for (uint32_t c = 0; c < K_; c++) {
             const float* cen = slot_book + c * sub_dim_;
-            switch (metric_) {
+            switch (metric) {
             case MetricKind::L2Sq:
                 row[c] = l2sq_f32(q_sub, cen, sub_dim_);
                 break;
@@ -710,6 +710,10 @@ void PqQuantizer::preprocess_query(const float* query, float* out) const {
             }
         }
     }
+}
+
+void PqQuantizer::preprocess_query(const float* query, float* out) const {
+    preprocess_query_as(metric_, query, out);
 }
 
 // ---------------------------------------------------------------------------

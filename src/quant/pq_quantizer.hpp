@@ -20,6 +20,13 @@ public:
     /// Number of bytes per PQ code.
     uint32_t code_size() const;
 
+    /// Configured distance metric. Drives `preprocess_query` (LUT semantics:
+    /// L2sq distance vs negated IP) and the FP16/FP32 true-distance tiers
+    /// (MemGraph ball, routing, rerank) via the `dist_f16`/`dist_f32` dispatch
+    /// helpers in `vamana_core.hpp`. For L2-normalized data both metrics are
+    /// rank-equivalent on true distances; IP is cheaper per eval.
+    MetricKind metric() const { return metric_; }
+
     /// Number of PQ segments.
     uint16_t m() const { return m_; }
 
@@ -81,8 +88,15 @@ public:
     void build_cross_distance_table();
 
     /// Preprocess a query vector into a LUT for PQ distance estimation.
-    /// `out` must hold lut_size() floats.
+    /// `out` must hold lut_size() floats. Uses the configured `metric_`.
     void preprocess_query(const float* query, float* out) const;
+
+    /// Preprocess a query into a LUT under an explicit metric, regardless of the
+    /// configured `metric_`. Used by `Estimator::estimate_config` to measure
+    /// IP-ADC vs L2sq-ADC ranking agreement (the metric-recommendation signal):
+    /// builds both LUTs on the same query and compares top-k overlap.
+    /// L2sq: out[s*K+c] = ||q_sub - c||².  IP: out[s*K+c] = -<q_sub, c>.
+    void preprocess_query_as(MetricKind metric, const float* query, float* out) const;
 
     /// Estimate distance from a query LUT to a PQ code.
     float lut_distance(const uint8_t* code, const float* lut) const;

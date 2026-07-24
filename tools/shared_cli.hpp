@@ -123,6 +123,15 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             "Partition count (K) override. 0 = auto (RAM-driven, plus the "
             "sqrt(N)/8 recall floor when --ivf is set).",
             false, 0);
+        // Metric-recommendation strategy: build mini-indexes under both metrics
+        // (default) and measure end-to-end search recall@k for each, OR probe
+        // only the requested metric. 'both' is the authoritative signal but
+        // costs an extra mini-build (~10-30s). See docs/plans/metric_per_tier_plan.md.
+        p.add<std::string>("metric-reco", 0,
+            "Metric recommendation strategy for analyze: 'both' (build "
+            "mini-indexes under L2sq AND IP, measure search recall@k for each), "
+            "'l2sq', or 'ip' (probe only the named metric). Default 'both'.",
+            false, "both");
     }
     if (mode == Mode::Build || mode == Mode::Autobuild) {
         p.add<uint32_t>("prune-candidate-cap", 0,
@@ -241,7 +250,34 @@ inline void print_analysis_(sextant::VectorSource& source,
     std::cout << "  clustering coeff:     " << std::setprecision(4)
               << diag.clustering_coeff << "\n";
     std::cout << "  dead-end fraction:    " << std::setprecision(4)
-              << diag.dead_end_frac << "\n\n";
+              << diag.dead_end_frac << "\n";
+
+    // Metric recommendation. Authoritative signal: measured recall of IP-ADC vs
+    // L2sq-ADC against brute-force ground truth (computed in estimate_config
+    // after the reference mini-index is built). Recommend the higher-recall
+    // metric; on a tie, prefer IP (cheaper per eval). For normalized data the
+    // two are close; for non-normalized data L2sq wins by a wide margin
+    // (SIFT-1M: L2sq 0.99 vs IP 0.66). Original-norm stats shown as context.
+    if (diag.norm_mean > 0.0) {
+        std::cout << "  L2 norm:              mean=" << std::setprecision(4)
+                  << diag.norm_mean << " cv=" << diag.norm_cv
+                  << " range=[" << diag.norm_min << ", " << diag.norm_max
+                  << "]\n";
+    }
+    if (diag.ip_recall_adc >= 0.0 && diag.l2sq_recall_adc >= 0.0) {
+        const bool ip_wins = diag.ip_recall_adc >= diag.l2sq_recall_adc;
+        const char* reco_metric = ip_wins ? "ip" : "l2sq";
+        std::cout << "  PQ-ADC recall:        IP="
+                  << std::setprecision(4) << diag.ip_recall_adc
+                  << "  L2sq=" << diag.l2sq_recall_adc << "\n";
+        std::cout << "  recommended metric:   " << reco_metric;
+        if (std::string(reco_metric) != metric_str) {
+            std::cout << "  [you passed --metric " << metric_str
+                      << " — see note below]";
+        }
+        std::cout << "\n";
+    }
+    std::cout << "\n";
 
     // Resolved params.
     std::cout << "─── Resolved Parameters ───\n";
@@ -271,6 +307,29 @@ inline void print_analysis_(sextant::VectorSource& source,
     if (cfg.num_threads > 0)
         std::cout << " --threads " << cfg.num_threads;
     std::cout << "\n";
+
+    // Prominent metric mismatch warning. The user passed --metric X but the
+    // measured PQ-ADC recall recommends Y. This is the one place we second-guess
+    // the user, because picking the wrong metric silently destroys recall on
+    // non-normalized data (SIFT-1M: 0.99 → 0.66).
+    if (diag.ip_recall_adc >= 0.0 && diag.l2sq_recall_adc >= 0.0) {
+        const bool ip_wins = diag.ip_recall_adc >= diag.l2sq_recall_adc;
+        const char* reco = ip_wins ? "ip" : "l2sq";
+        if (std::string(reco) != metric_str) {
+            std::cout << "\n  ⚠ metric mismatch: measured PQ-ADC recall IP="
+                      << std::setprecision(4) << diag.ip_recall_adc
+                      << " vs L2sq=" << diag.l2sq_recall_adc
+                      << ". Recommended --metric " << reco << ", you passed "
+                      << "--metric " << metric_str << ".\n";
+            if (ip_wins) {
+                std::cout << "    IP matches or beats L2sq on recall and is "
+                          << "cheaper per eval; use IP.\n";
+            } else {
+                std::cout << "    L2sq has higher recall on this data (IP-ADC "
+                          << "misranks when ||x̃||² varies across codes).\n";
+            }
+        }
+    }
 }
 
 }  // namespace sextant_cli

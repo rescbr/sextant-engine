@@ -1,3 +1,19 @@
+> **STATUS (2026-07-24):** Superseded by `docs/plans/metric_per_tier_plan.md`.
+> The scope below is WRONG on two points (documented for history):
+> 1. ScaNN does NOT use a single full-vector codebook. It uses per-subspace PQ
+>    (m=dim/2, 2-dim subspaces) with an anisotropic training objective. The
+>    full-vector VQ was only the pedagogical derivation in the paper.
+> 2. Code-size reduction is NOT the billion-scale prize. The graph dominates
+>    index size (128GB at 1B/R=32 vs 96GB codes). The real lever is rerank
+>    reduction (3.1MB/query SSD reads at rerank=10).
+> 3. (Correction during planning:) ScaNN's objective optimizes ⟨q, x̃⟩, so the
+>    anisotropic path must use IP-ADC, not our default L2sq-ADC. The two are
+>    rank-equivalent on true distances for normalized data, but NOT on the
+>    PQ-ADC estimators (||x̃||² varies per code).
+> Kept for historical context. See `docs/plans/metric_per_tier_plan.md` (Phase 1:
+> per-tier metric selection PR; Phase 2: ScaNN anisotropic PQ research) for the
+> corrected scope.
+
 # ScaNN-style Anisotropic Quantizer — Rearchitecture Scope
 
 **Status:** Design scoping, 2026-07-23. NOT started; documented to define the

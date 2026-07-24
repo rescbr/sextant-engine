@@ -116,6 +116,87 @@ inline float l2sq_f16(const float16_t* a, const float16_t* b, uint32_t dim) {
 #endif
 }
 
+/// Inner product (dot product) between two FP16 vectors. The IP counterpart to
+/// `l2sq_f16`: same FHM 8-wide structure, but skips the subtract (one fewer
+/// FP16 vector op per 8 elements). For L2-normalized data, IP ranking is
+/// equivalent to L2sq ranking on TRUE distances (`‖q−x‖² = 2 − 2⟨q,x⟩`), so
+/// this is the cheaper drop-in for normalized-data configs. Used by the same
+/// FP16 tiers (MemGraph ball, routing, rerank, occlusion) when the configured
+/// metric is InnerProduct.
+inline float dot_f16(const float16_t* a, const float16_t* b, uint32_t dim);
+
+#if defined(SEXTANT_HAS_NEON)
+/// FEAT_FHM 8-wide dot product. Mirrors `l2sq_f16_fhm_` without the subtract.
+__attribute__((target("arch=armv8.2-a+simd+fp16+fp16fml")))
+inline float dot_f16_fhm_(const float16_t* a, const float16_t* b, uint32_t dim) {
+    float32x4_t acc_lo = vdupq_n_f32(0.0f);
+    float32x4_t acc_hi = vdupq_n_f32(0.0f);
+    uint32_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        float16x8_t va = vld1q_f16(reinterpret_cast<const __fp16*>(a + i));
+        float16x8_t vb = vld1q_f16(reinterpret_cast<const __fp16*>(b + i));
+        acc_lo = vfmlalq_low_f16(acc_lo, va, vb);
+        acc_hi = vfmlalq_high_f16(acc_hi, va, vb);
+    }
+    // Remainder (0-7 elements): zero-pad into a full 8-lane FP16 vector and run
+    // one more FHM pair. Padding with 0 contributes 0*a = 0 to the sum, so the
+    // result stays exact for any dim (not just dim % 8 == 0).
+    if (i < dim) {
+        __fp16 tmp_a[8] = {0}, tmp_b[8] = {0};
+        const uint32_t rem = dim - i;
+        for (uint32_t j = 0; j < rem; j++) {
+            tmp_a[j] = a[i + j];
+            tmp_b[j] = b[i + j];
+        }
+        float16x8_t va = vld1q_f16(tmp_a);
+        float16x8_t vb = vld1q_f16(tmp_b);
+        acc_lo = vfmlalq_low_f16(acc_lo, va, vb);
+        acc_hi = vfmlalq_high_f16(acc_hi, va, vb);
+    }
+    return vaddvq_f32(vaddq_f32(acc_lo, acc_hi));
+}
+#endif
+
+inline float dot_f16(const float16_t* a, const float16_t* b, uint32_t dim) {
+#if defined(SEXTANT_HAS_NEON)
+    return dot_f16_fhm_(a, b, dim);
+#elif defined(SEXTANT_HAS_AVX2) && defined(__F16C__)
+    __m256 acc = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 va = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)));
+        __m256 vb = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i)));
+        acc = _mm256_fmadd_ps(va, vb, acc);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float r = _mm_cvtss_f32(sum);
+    for (; i < dim; i++) { r += static_cast<float>(a[i]) * static_cast<float>(b[i]); }
+    return r;
+#else
+    float r = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) { r += static_cast<float>(a[i]) * static_cast<float>(b[i]); }
+    return r;
+#endif
+}
+
+/// Dispatch helper: distance between two FP16 vectors under a metric.
+/// Centralizes the metric switch so call sites don't repeat it. Returns a value
+/// ordered consistently with a min-heap (L2sq: ascending; IP: negated, so
+/// "smaller" = higher dot product = nearer).
+inline float dist_f16(MetricKind metric, const float16_t* a, const float16_t* b, uint32_t dim) {
+    switch (metric) {
+    case MetricKind::InnerProduct:
+        return -dot_f16(a, b, dim);
+    case MetricKind::L2Sq:
+    default:
+        return l2sq_f16(a, b, dim);
+    }
+}
+
 /// L2-squared distance between two FP32 vectors. NEON FMA (4-wide) or AVX2
 /// FMA (8-wide). Used by the FP32 build mode (SEXTANT_FP32_BUILD=1) where
 /// exact distances are preferred over PQ LUT for graph construction. No
@@ -155,6 +236,57 @@ inline float l2sq_f32(const float* a, const float* b, uint32_t dim) {
     for (uint32_t i = 0; i < dim; i++) { float diff = a[i] - b[i]; r += diff * diff; }
     return r;
 #endif
+}
+
+/// Inner product (dot product) between two FP32 vectors. The IP counterpart to
+/// `l2sq_f32`: same FMA structure, without the subtract. Used by rerank and the
+/// FP32 build mode when the configured metric is InnerProduct.
+inline float dot_f32(const float* a, const float* b, uint32_t dim) {
+#if defined(SEXTANT_HAS_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    uint32_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        acc = vfmaq_f32(acc, va, vb);
+    }
+    float r = vaddvq_f32(acc);
+    for (; i < dim; i++) { r += a[i] * b[i]; }
+    return r;
+#elif defined(SEXTANT_HAS_AVX2)
+    __m256 acc = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        acc = _mm256_fmadd_ps(va, vb, acc);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float r = _mm_cvtss_f32(sum);
+    for (; i < dim; i++) { r += a[i] * b[i]; }
+    return r;
+#else
+    float r = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) { r += a[i] * b[i]; }
+    return r;
+#endif
+}
+
+/// Dispatch helper: distance between two FP32 vectors under a metric.
+/// Returns a value ordered consistently with a min-heap (L2sq: ascending;
+/// IP: negated, so "smaller" = higher dot product = nearer).
+inline float dist_f32(MetricKind metric, const float* a, const float* b, uint32_t dim) {
+    switch (metric) {
+    case MetricKind::InnerProduct:
+        return -dot_f32(a, b, dim);
+    case MetricKind::L2Sq:
+    default:
+        return l2sq_f32(a, b, dim);
+    }
 }
 
 /// Parameters for the Vamana graph.

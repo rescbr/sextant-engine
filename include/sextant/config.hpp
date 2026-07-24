@@ -123,6 +123,13 @@ struct BuildConfig {
     /// See docs/ivf_probe_design.md "K selection". The recall floor is a
     /// lower bound — the RAM-driven K still wins when it's larger.
     bool ivf_mode = false;
+
+    /// Metric-recommendation strategy for `Estimator::estimate_config`.
+    /// "both" (default): build mini-indexes under L2sq AND IP, measure
+    /// end-to-end search recall@k for each — the authoritative signal.
+    /// "l2sq"/"ip": probe only the named metric (skips the second mini-build).
+    /// Stored as a string (not an enum) to keep BuildConfig CLI-friendly.
+    std::string metric_reco = "both";
 };
 
 /// Result of a build operation.
@@ -205,6 +212,25 @@ struct EstimationDiagnostics {
     double avg_degree = 0.0;       ///< R̄ from mini-build (0 = unmeasured)
     double clustering_coeff = 0.0; ///< clustering coefficient (0 = unmeasured)
     double dead_end_frac = 0.0;    ///< fraction of nodes with degree ≤ 1
+
+    /// L2 norm statistics over the sampled vectors. Detects L2-normalization
+    /// (tight clustering at ||x|| ≈ 1). `norm_cv` = stddev/mean; 0 = unmeasured.
+    /// NOTE: tight original norms are necessary but NOT sufficient for IP-safety;
+    /// `ip_l2sq_overlap` is the authoritative metric-recommendation signal.
+    double norm_mean = 0.0;
+    double norm_stddev = 0.0;
+    double norm_min = 0.0;
+    double norm_max = 0.0;
+    double norm_cv = 0.0;          ///< 0 = unmeasured; <0.01 ≈ unit-normalized
+
+    /// Mean top-k recall of IP-ADC and L2sq-ADC against brute-force ground truth,
+    /// measured by `Estimator::estimate_config` after the reference mini-index
+    /// is built. The authoritative metric-recommendation signal: if `ip_recall`
+    /// ≥ `l2sq_recall`, IP gives equal or better recall at lower per-eval cost;
+    /// otherwise L2sq is required (IP misranks, recall collapses — SIFT-1M:
+    /// 0.99 → 0.66). -1.0 = unmeasured. See `docs/plans/metric_per_tier_plan.md`.
+    double ip_recall_adc = -1.0;
+    double l2sq_recall_adc = -1.0;
 };
 
 /// Result of `Engine::estimate_config`: resolved build inputs + the measured

@@ -225,6 +225,7 @@ void VamanaCore::beam_search_into(
     const uint8_t* hdc_anchor = q.hdc_anchor;
     const float* anchor_lut = q.anchor_lut;
     const std::vector<uint32_t>* forced_entry_points = q.forced_entry_points;
+    const MetricKind metric = quantizer_.metric();  // drives dist_f16/dist_f32 dispatch
     (void)query_lut; (void)query_fp16; (void)hdc_anchor;
     (void)anchor_lut; (void)forced_entry_points;  // captured by dist_to below
     out.clear();
@@ -264,7 +265,7 @@ void VamanaCore::beam_search_into(
     auto dist_to = [&](uint32_t id) {
         if (query_fp32 && build_ctx_ && build_ctx_->fp32_vecs) {
             // FP32 build mode: exact distance, no quantization.
-            return l2sq_f32(query_fp32,
+            return dist_f32(metric, query_fp32,
                             build_ctx_->fp32_vecs + static_cast<size_t>(id) * params_.dim,
                             params_.dim);
         }
@@ -281,7 +282,7 @@ void VamanaCore::beam_search_into(
                 fp16 = build_ctx_->vec_ptr(id, params_.dim);
             }
             if (fp16) {
-                return l2sq_f16(query_fp16, fp16, params_.dim);
+                return dist_f16(metric, query_fp16, fp16, params_.dim);
             }
         }
         const uint8_t* code_ptr = store_
@@ -673,7 +674,7 @@ void VamanaCore::beam_search_into(
 
                 // FP16 distances (per-node, but no locking — MemGraph RAM).
                 for (uint32_t i = 0; i < fp16_n; i++) {
-                    const float d = l2sq_f16(query_fp16, fp16_vecs[i],
+                    const float d = dist_f16(metric, query_fp16, fp16_vecs[i],
                                               params_.dim);
                     const uint32_t id = fp16_ids[i];
                     if (W.size() < L_current || d < W.front().dist) {
