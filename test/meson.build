@@ -9,6 +9,7 @@ test_sources = [
     'test_block_cache.cpp',
     'test_wtinylfu.cpp',
     'test_pq_quantizer.cpp',
+    'test_pq_fastscan.cpp',
     'test_vamana_core.cpp',
     'test_fbin_source.cpp',
     'test_engine.cpp',

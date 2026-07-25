@@ -29,6 +29,8 @@
 #endif
 
 #include <limits>  // std::numeric_limits (used in argmin_scaled)
+#include <array>   // std::array (seg_min in quantize_lut_u8)
+#include <cstring> // std::memset (fastscan_many zero-init)
 
 namespace sextant {
 namespace simd {
@@ -691,6 +693,404 @@ inline void argmin_scaled(uint32_t n, uint32_t k, uint32_t k_simd,
             changed++;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PQ-FastScan: 4-bank split-table shuffle kernel for 8-bit PQ codes.
+// ---------------------------------------------------------------------------
+//
+// Replaces the per-code gather (`lut_distance_batch4`) with a NEON shuffle
+// that processes 16 codes per inner-loop iteration with zero gather. The 256-
+// entry uint8 LUT row is split into 4 banks of 64 bytes (each bank = one
+// `uint8x16x4_t` table-quad = 4 NEON registers concatenated); four
+// `vqtbl4q_u8` calls with `code>>6` bank-routing cover all 256 codes exactly.
+//
+// Technique: Quicker-ADC (André et al., arXiv:1812.09162 §3.2), ported from
+// AVX512-VBMI `vpermi2b` (7-bit / 128-byte) to NEON `vqtbl4q_u8` (6-bit /
+// 64-byte). See `docs/fastscan_research_2026-07-25.md` for the feasibility
+// analysis that selected this over alternatives (4-bit PQ, nibble-split,
+// UDOT low-rank — all rejected).
+//
+// Why this beats gather: the existing gather path spends ~86% of cycles on
+// scalar index arithmetic (`s*K + code[s]` per code per segment — see
+// `docs/lut_distance_simd_findings.md`). The shuffle kernel computes the
+// index *as* the `tbl` argument, collapsing that overhead. Measured 2.6×
+// over scalar gather on Mac NEON pre-plan; V2 model predicts ~4× (V2's
+// `vqtbl4q` V01-pipe throughput is higher than Apple's for the 4-reg form).
+//
+// ITERATION ORDER IS SEGMENT-MAJOR. The natural "for each block, sum across
+// segments" order reloads the 4 table-quads (16 NEON regs) for every block,
+// and at graph-search batch sizes (16-1024 codes) the LUT-load cost dominates
+// the shuffle savings (microbench: only 1.26× in that order). The fix is
+// FAISS/ScaNN's iteration order: outer loop over segments (load the segment's
+// 4 table-quads once), inner loop over all blocks (look up that one segment's
+// contribution for every block against the hot tables). Per-block partial
+// sums live in a caller-allocated scratch buffer; after the m-segment outer
+// loop, partial sums are the final uint16 accumulator values.
+//
+// This requires the caller to materialize the block list upfront (which the
+// search path already does — up to 1024 neighbors pinned via one pin_codes
+// call before batching). The per-block `fastscan_block16` variant below is
+// retained for tests/small batches but should not be on the hot path.
+
+/// Segment-major FastScan over many 16-code blocks against one LUT.
+///
+/// For each of `m` segments: load that segment's 4 table-quads once, then
+/// shuffle-lookup every block's 16 codes against the hot tables, widening
+/// and accumulating into per-block uint32 partial sums.
+///
+/// Shape contract:
+///   - `blocks`: `n_blocks × m × 16` bytes, segment-major within each block.
+///     Block `b`, segment `s`, code `j` is at `blocks[(b*m + s)*16 + j]`.
+///   - `lut8`: `[m][256]` uint8 LUT (one per query; reused across all blocks).
+///   - `partial_sums`: `n_blocks × 16` uint32, caller-allocated scratch,
+///     zeroed on entry, holds final per-block distances on return. Lane
+///     `(b, j)` is the distance for block `b`'s j-th code.
+///   - `valid_masks`: `n_blocks` uint16 values, bit `j` set ⇒ lane `j` of
+///     block `b` is a real code; cleared ⇒ padding. Invalid lanes receive
+///     0xFFFFFFFF in the output (never argmin-winners).
+inline void fastscan_many(const uint8_t* blocks, uint32_t n_blocks,
+                          const uint8_t* lut8, uint32_t m,
+                          const uint16_t* valid_masks,
+                          uint32_t* partial_sums) {
+#if defined(SEXTANT_HAS_NEON)
+    // Zero the partial sums.
+    std::memset(partial_sums, 0, size_t(n_blocks) * 16 * sizeof(uint32_t));
+
+    // Segment-major outer loop: one segment's tables live in registers
+    // across ALL blocks. This is the key difference from the per-block
+    // variant — LUT loads amortise over n_blocks, not over m.
+    for (uint32_t s = 0; s < m; s++) {
+        const uint8_t* lut_row = lut8 + s * 256;
+
+        // Load this segment's 4 table-quads (16 NEON regs). Live for the
+        // entire inner block loop.
+        uint8x16x4_t T0, T1, T2, T3;
+        for (int r = 0; r < 4; r++) {
+            T0.val[r] = vld1q_u8(lut_row +  0 + r * 16);
+            T1.val[r] = vld1q_u8(lut_row + 64 + r * 16);
+            T2.val[r] = vld1q_u8(lut_row + 128 + r * 16);
+            T3.val[r] = vld1q_u8(lut_row + 192 + r * 16);
+        }
+        const uint8x16_t oob = vdupq_n_u8(0xFF);
+
+        uint32_t b = 0;
+        // 2-block batch: amortises the per-block address-compute and lets
+        // the shuffle pipeline stay full.
+        for (; b + 1 < n_blocks; b += 2) {
+            const uint8_t* blk0 = blocks + (size_t)b * m * 16 + s * 16;
+            const uint8_t* blk1 = blocks + (size_t)(b + 1) * m * 16 + s * 16;
+            const uint8x16_t c0 = vld1q_u8(blk0);
+            const uint8x16_t c1 = vld1q_u8(blk1);
+
+            const uint8x16_t i0 = vandq_u8(c0, vdupq_n_u8(63));
+            const uint8x16_t b0 = vshrq_n_u8(c0, 6);
+            const uint8x16_t i1 = vandq_u8(c1, vdupq_n_u8(63));
+            const uint8x16_t b1 = vshrq_n_u8(c1, 6);
+
+            // 4-bank lookup for each block.
+            uint8x16_t r0 = vdupq_n_u8(0);
+            uint8x16_t r1 = vdupq_n_u8(0);
+            for (uint8_t bk = 0; bk < 4; bk++) {
+                const uint8x16_t bk_v = vdupq_n_u8(bk);
+                const uint8x16_t m0 = vceqq_u8(b0, bk_v);
+                const uint8x16_t m1 = vceqq_u8(b1, bk_v);
+                const uint8x16_t idx0 = vbslq_u8(m0, i0, oob);
+                const uint8x16_t idx1 = vbslq_u8(m1, i1, oob);
+                const uint8x16_t t0 = (bk == 0) ? vqtbl4q_u8(T0, idx0)
+                                      : (bk == 1) ? vqtbl4q_u8(T1, idx0)
+                                      : (bk == 2) ? vqtbl4q_u8(T2, idx0)
+                                                  : vqtbl4q_u8(T3, idx0);
+                const uint8x16_t t1 = (bk == 0) ? vqtbl4q_u8(T0, idx1)
+                                      : (bk == 1) ? vqtbl4q_u8(T1, idx1)
+                                      : (bk == 2) ? vqtbl4q_u8(T2, idx1)
+                                                  : vqtbl4q_u8(T3, idx1);
+                r0 = vorrq_u8(r0, t0);
+                r1 = vorrq_u8(r1, t1);
+            }
+
+            // Widen u8 → u16 → u32 and accumulate into partial_sums.
+            uint32_t* psum0 = partial_sums + (size_t)b * 16;
+            uint32_t* psum1 = partial_sums + (size_t)(b + 1) * 16;
+            const uint32x4_t p00 = vld1q_u32(psum0 +  0);
+            const uint32x4_t p01 = vld1q_u32(psum0 +  4);
+            const uint32x4_t p02 = vld1q_u32(psum0 +  8);
+            const uint32x4_t p03 = vld1q_u32(psum0 + 12);
+            const uint32x4_t p10 = vld1q_u32(psum1 +  0);
+            const uint32x4_t p11 = vld1q_u32(psum1 +  4);
+            const uint32x4_t p12 = vld1q_u32(psum1 +  8);
+            const uint32x4_t p13 = vld1q_u32(psum1 + 12);
+
+            const uint16x8_t lo0 = vmovl_u8(vget_low_u8(r0));
+            const uint16x8_t hi0 = vmovl_u8(vget_high_u8(r0));
+            const uint16x8_t lo1 = vmovl_u8(vget_low_u8(r1));
+            const uint16x8_t hi1 = vmovl_u8(vget_high_u8(r1));
+
+            vst1q_u32(psum0 +  0, vaddw_u16(p00, vget_low_u16(lo0)));
+            vst1q_u32(psum0 +  4, vaddw_u16(p01, vget_high_u16(lo0)));
+            vst1q_u32(psum0 +  8, vaddw_u16(p02, vget_low_u16(hi0)));
+            vst1q_u32(psum0 + 12, vaddw_u16(p03, vget_high_u16(hi0)));
+            vst1q_u32(psum1 +  0, vaddw_u16(p10, vget_low_u16(lo1)));
+            vst1q_u32(psum1 +  4, vaddw_u16(p11, vget_high_u16(lo1)));
+            vst1q_u32(psum1 +  8, vaddw_u16(p12, vget_low_u16(hi1)));
+            vst1q_u32(psum1 + 12, vaddw_u16(p13, vget_high_u16(hi1)));
+        }
+        // Tail block.
+        if (b < n_blocks) {
+            const uint8_t* blk = blocks + (size_t)b * m * 16 + s * 16;
+            const uint8x16_t c = vld1q_u8(blk);
+            const uint8x16_t i = vandq_u8(c, vdupq_n_u8(63));
+            const uint8x16_t bk_v = vshrq_n_u8(c, 6);
+            uint8x16_t r = vdupq_n_u8(0);
+            for (uint8_t bk = 0; bk < 4; bk++) {
+                const uint8x16_t m_v = vceqq_u8(bk_v, vdupq_n_u8(bk));
+                const uint8x16_t idx = vbslq_u8(m_v, i, oob);
+                const uint8x16_t t = (bk == 0) ? vqtbl4q_u8(T0, idx)
+                                      : (bk == 1) ? vqtbl4q_u8(T1, idx)
+                                      : (bk == 2) ? vqtbl4q_u8(T2, idx)
+                                                  : vqtbl4q_u8(T3, idx);
+                r = vorrq_u8(r, t);
+            }
+            uint32_t* psum = partial_sums + (size_t)b * 16;
+            const uint32x4_t p0 = vld1q_u32(psum +  0);
+            const uint32x4_t p1 = vld1q_u32(psum +  4);
+            const uint32x4_t p2 = vld1q_u32(psum +  8);
+            const uint32x4_t p3 = vld1q_u32(psum + 12);
+            const uint16x8_t lo = vmovl_u8(vget_low_u8(r));
+            const uint16x8_t hi = vmovl_u8(vget_high_u8(r));
+            vst1q_u32(psum +  0, vaddw_u16(p0, vget_low_u16(lo)));
+            vst1q_u32(psum +  4, vaddw_u16(p1, vget_high_u16(lo)));
+            vst1q_u32(psum +  8, vaddw_u16(p2, vget_low_u16(hi)));
+            vst1q_u32(psum + 12, vaddw_u16(p3, vget_high_u16(hi)));
+        }
+    }
+
+    // Apply validity masks: invalid lanes → 0xFFFFFFFF (max u32).
+    const uint32x4_t invalid = vdupq_n_u32(0xFFFFFFFFu);
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const uint16_t m_lo = valid_masks[b];
+        uint32_t* psum = partial_sums + (size_t)b * 16;
+        alignas(16) uint32_t mask_q[4][4];
+        for (int q = 0; q < 4; q++) {
+            for (int lane = 0; lane < 4; lane++) {
+                const uint32_t bit = (q * 4 + lane);
+                mask_q[q][lane] = (m_lo >> bit) & 1u ? 0xFFFFFFFFu : 0;
+            }
+        }
+        const uint32x4_t vm0 = vld1q_u32(mask_q[0]);
+        const uint32x4_t vm1 = vld1q_u32(mask_q[1]);
+        const uint32x4_t vm2 = vld1q_u32(mask_q[2]);
+        const uint32x4_t vm3 = vld1q_u32(mask_q[3]);
+        vst1q_u32(psum +  0, vbslq_u32(vm0, vld1q_u32(psum +  0), invalid));
+        vst1q_u32(psum +  4, vbslq_u32(vm1, vld1q_u32(psum +  4), invalid));
+        vst1q_u32(psum +  8, vbslq_u32(vm2, vld1q_u32(psum +  8), invalid));
+        vst1q_u32(psum + 12, vbslq_u32(vm3, vld1q_u32(psum + 12), invalid));
+    }
+#else
+    // Scalar fallback — correctness only.
+    std::memset(partial_sums, 0, size_t(n_blocks) * 16 * sizeof(uint32_t));
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        for (uint32_t s = 0; s < m; s++) {
+            const uint8_t* lut_row = lut8 + s * 256;
+            const uint8_t* code_row = blocks + (size_t)b * m * 16 + s * 16;
+            for (uint32_t j = 0; j < 16; j++) {
+                partial_sums[(size_t)b * 16 + j] += lut_row[code_row[j]];
+            }
+        }
+        for (uint32_t j = 0; j < 16; j++) {
+            if (!((valid_masks[b] >> j) & 1u)) {
+                partial_sums[(size_t)b * 16 + j] = 0xFFFFFFFFu;
+            }
+        }
+    }
+#endif
+}
+
+/// Single-block FastScan — retained for tests and small batches. Loads the
+/// LUT table-quads per segment (no cross-block amortisation); do NOT use on
+/// the hot path. The segment-major `fastscan_many` above is the production
+/// kernel. At graph-search batch sizes this per-block variant measured only
+/// 1.26× over gather (LUT-load bound); `fastscan_many` removes that cost.
+inline void fastscan_block16(const uint8_t* code_block,
+                             const uint8_t* lut8,
+                             uint32_t m,
+                             uint16_t valid_mask,
+                             uint32_t out[16]) {
+#if defined(SEXTANT_HAS_NEON)
+    uint32x4_t acc0 = vdupq_n_u32(0);
+    uint32x4_t acc1 = vdupq_n_u32(0);
+    uint32x4_t acc2 = vdupq_n_u32(0);
+    uint32x4_t acc3 = vdupq_n_u32(0);
+
+    for (uint32_t s = 0; s < m; s++) {
+        const uint8_t* code_row = code_block + s * 16;
+        const uint8_t* lut_row  = lut8 + s * 256;
+
+        const uint8x16_t c16 = vld1q_u8(code_row);
+        const uint8x16_t i16 = vandq_u8(c16, vdupq_n_u8(63));
+        const uint8x16_t b16 = vshrq_n_u8(c16, 6);
+
+        uint8x16x4_t T0, T1, T2, T3;
+        const uint8_t* row_base = lut_row;
+        for (int r = 0; r < 4; r++) {
+            T0.val[r] = vld1q_u8(row_base +  0*16 + r*16);
+            T1.val[r] = vld1q_u8(row_base + 64    + r*16);
+            T2.val[r] = vld1q_u8(row_base + 128   + r*16);
+            T3.val[r] = vld1q_u8(row_base + 192   + r*16);
+        }
+
+        const uint8x16_t oob = vdupq_n_u8(0xFF);
+        uint8x16_t res = vdupq_n_u8(0);
+        for (uint8_t bk = 0; bk < 4; bk++) {
+            const uint8x16_t bank_cmp = vceqq_u8(b16, vdupq_n_u8(bk));
+            const uint8x16_t idx = vbslq_u8(bank_cmp, i16, oob);
+            const uint8x16_t r = (bk == 0) ? vqtbl4q_u8(T0, idx)
+                                  : (bk == 1) ? vqtbl4q_u8(T1, idx)
+                                  : (bk == 2) ? vqtbl4q_u8(T2, idx)
+                                              : vqtbl4q_u8(T3, idx);
+            res = vorrq_u8(res, r);
+        }
+
+        const uint16x8_t lo16 = vmovl_u8(vget_low_u8(res));
+        const uint16x8_t hi16 = vmovl_u8(vget_high_u8(res));
+        acc0 = vaddw_u16(acc0, vget_low_u16(lo16));
+        acc1 = vaddw_u16(acc1, vget_high_u16(lo16));
+        acc2 = vaddw_u16(acc2, vget_low_u16(hi16));
+        acc3 = vaddw_u16(acc3, vget_high_u16(hi16));
+    }
+
+    const uint32x4_t invalid = vdupq_n_u32(0xFFFFFFFFu);
+    const uint16_t m_lo = valid_mask;
+    alignas(16) uint32_t mask_q0[4] = {
+        (m_lo & 0x0001) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x0002) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x0004) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x0008) ? 0xFFFFFFFFu : 0,
+    };
+    alignas(16) uint32_t mask_q1[4] = {
+        (m_lo & 0x0010) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x0020) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x0040) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x0080) ? 0xFFFFFFFFu : 0,
+    };
+    alignas(16) uint32_t mask_q2[4] = {
+        (m_lo & 0x0100) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x0200) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x0400) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x0800) ? 0xFFFFFFFFu : 0,
+    };
+    alignas(16) uint32_t mask_q3[4] = {
+        (m_lo & 0x1000) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x2000) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x4000) ? 0xFFFFFFFFu : 0,
+        (m_lo & 0x8000) ? 0xFFFFFFFFu : 0,
+    };
+    const uint32x4_t vm0 = vld1q_u32(mask_q0);
+    const uint32x4_t vm1 = vld1q_u32(mask_q1);
+    const uint32x4_t vm2 = vld1q_u32(mask_q2);
+    const uint32x4_t vm3 = vld1q_u32(mask_q3);
+    acc0 = vbslq_u32(vm0, acc0, invalid);
+    acc1 = vbslq_u32(vm1, acc1, invalid);
+    acc2 = vbslq_u32(vm2, acc2, invalid);
+    acc3 = vbslq_u32(vm3, acc3, invalid);
+
+    vst1q_u32(out +  0, acc0);
+    vst1q_u32(out +  4, acc1);
+    vst1q_u32(out +  8, acc2);
+    vst1q_u32(out + 12, acc3);
+#else
+    // Scalar fallback — correctness only, not optimised.
+    for (uint32_t j = 0; j < 16; j++) {
+        if (!((valid_mask >> j) & 1u)) {
+            out[j] = 0xFFFFFFFFu;
+            continue;
+        }
+        uint32_t acc = 0;
+        for (uint32_t s = 0; s < m; s++) {
+            const uint8_t code = code_block[s * 16 + j];
+            acc += lut8[s * 256 + code];
+        }
+        out[j] = acc;
+    }
+#endif
+}
+
+/// Quantize a float LUT (`[m][K]` row-major) to uint8 with a per-query-global
+/// `(A, B)` scale, the FAISS `NormTableScaler` approach. One scale across all
+/// m segments preserves cross-segment comparability for argmin; per-segment
+/// mins are summed into the offset B.
+///
+/// Math (forward):
+///   min_s     = min over c of lut_f32[s][c]               (per segment)
+///   max_span  = max over s,c of (lut_f32[s][c] - min_s)   (global)
+///   A         = clamp(255 / max_span, 0, 65535 / (m * 255))  // avoid u16 overflow
+///   B         = sum over s of min_s                       (offset)
+///   lut8[s][c] = round((lut_f32[s][c] - min_s) * A)       (in [0, 255])
+///
+/// Inverse (per final distance):  dist_f32 ≈ (uint16_acc / A) + B.
+/// Callers comparing argmin over a single LUT can use the raw uint16
+/// accumulator directly — the /A +B is monotonic, so doesn't affect ranking.
+///
+/// `scale_out` receives A, `offset_out` receives B. Caller must size `lut8`
+/// to m × K bytes.
+inline void quantize_lut_u8(const float* lut_f32,
+                            uint32_t m, uint32_t K,
+                            uint8_t* lut8,
+                            float* scale_out,
+                            float* offset_out) {
+    // Per-segment min, plus global max_span.
+    float max_span = 0.0f;
+    // m is bounded by the quantizer config (≤256 per config.hpp). Stack array
+    // avoids a heap allocation on every query; called once per query in
+    // Searcher::build_query_lut (not the inner loop, but still on the QPS
+    // critical path — keep it cheap).
+    std::array<float, 256> seg_min{};
+    for (uint32_t s = 0; s < m; s++) {
+        const float* row = lut_f32 + s * K;
+        float mn = row[0];
+        for (uint32_t c = 1; c < K; c++) {
+            if (row[c] < mn) mn = row[c];
+        }
+        seg_min[s] = mn;
+        for (uint32_t c = 0; c < K; c++) {
+            const float span = row[c] - mn;
+            if (span > max_span) max_span = span;
+        }
+    }
+
+    // A = 255 / max_span, clamped so m × 255 × A < 65535 (u16 accumulator
+    // headroom). At m=96 the clamp threshold is 65535/(96*255) ≈ 2.678; for
+    // spans < ~95 the natural A (255/95 ≈ 2.68) is already at the edge, so
+    // the clamp is load-bearing for very tight LUTs. When max_span is 0
+    // (degenerate LUT, e.g. untrained), A=0 → all zeros.
+    float A = 0.0f;
+    if (max_span > 0.0f) {
+        A = 255.0f / max_span;
+        const float A_cap = 65535.0f / (float(m) * 255.0f);
+        if (A > A_cap) A = A_cap;
+    }
+
+    // B = sum of per-segment mins.
+    float B = 0.0f;
+    for (uint32_t s = 0; s < m; s++) B += seg_min[s];
+
+    // Quantize each entry.
+    for (uint32_t s = 0; s < m; s++) {
+        const float* src_row = lut_f32 + s * K;
+        uint8_t* dst_row = lut8 + s * K;
+        const float mn = seg_min[s];
+        for (uint32_t c = 0; c < K; c++) {
+            float q = (src_row[c] - mn) * A;
+            // Round-to-nearest, clamp to [0, 255].
+            int qi = (int)(q + 0.5f);
+            if (qi < 0)   qi = 0;
+            if (qi > 255) qi = 255;
+            dst_row[c] = (uint8_t)qi;
+        }
+    }
+
+    *scale_out  = A;
+    *offset_out = B;
 }
 
 }  // namespace simd

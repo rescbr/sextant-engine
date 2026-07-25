@@ -106,6 +106,28 @@ public:
     /// L2sq: out[s*K+c] = ||q_sub - c||².  IP: out[s*K+c] = -<q_sub, c>.
     void preprocess_query_as(MetricKind metric, const float* query, float* out) const;
 
+    /// Build the uint8-quantized FastScan LUT for a query. Same per-segment
+    /// distances as `preprocess_query` (under the configured metric_), but
+    /// quantized to uint8 with a per-query-global (A, B) scale
+    /// (`simd::quantize_lut_u8` — FAISS `NormTableScaler` approach).
+    ///
+    /// Caller buffers (must be sized before the call):
+    ///   - `lut8`: m × K bytes (use `fastscan_lut_bytes()`).
+    ///   - `scale`/`offset`: one float each (A and B).
+    ///
+    /// `dist_approx = (uint16_acc / A) + B`. For argmin over a single LUT the
+    /// raw uint16 accumulator suffices; the inverse is only needed to compare
+    /// distances across LUTs or to rerank thresholds.
+    void build_fastscan_lut(const float* query,
+                            uint8_t* lut8,
+                            float* scale,
+                            float* offset) const;
+
+    /// Size of the uint8 FastScan LUT in bytes = m × K.
+    uint32_t fastscan_lut_bytes() const {
+        return static_cast<uint32_t>(m_) * K_;
+    }
+
     /// Estimate distance from a query LUT to a PQ code.
     float lut_distance(const uint8_t* code, const float* lut) const;
 
