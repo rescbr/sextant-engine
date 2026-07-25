@@ -14,10 +14,12 @@
 
 #include "fbin_io.hpp"
 #include "sextant/config.hpp"
+#include "sextant/ivf_scan_searcher.hpp"
 #include "sextant/ivf_searcher.hpp"
 #include "sextant/searcher.hpp"
 #include "sextant/index.hpp"
 #include "sextant/ivf_index.hpp"
+#include "sextant/ivf_scan_index.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
 #include "quant/pq_quantizer.hpp"  // PqQuantizer::metric() for rerank dispatch
@@ -307,8 +309,26 @@ QueryMetrics process_results(const RerankCtx& ctx,
                       uint32_t n_threads_hint,
                       uint64_t cache_size_req,
                       uint32_t n_probe_req,
-                      uint32_t early_exit_req,
-                      float multiprobe_ratio_req);
+                       uint32_t early_exit_req,
+                       float multiprobe_ratio_req);
+
+/// IVF-list-scan benchmark path (Option A default). Opened when
+/// `<index>.shards/codebook4.bin` exists. Runs queries through
+/// IVFScanSearcher, which returns top-W candidates by 4-bit PQ distance; the
+/// benchmark then applies exact FP32 rerank (the DB layer's job in
+/// production, done inline here for measurement) and computes recall vs GT.
+/// Returns 0 on success, 1 on error.
+int run_ivf_scan_benchmark(const std::string& index,
+                           const std::string& query_path,
+                           const std::string& base_data,
+                           const std::string& gt_path,
+                           uint32_t k, uint32_t L, uint32_t rerank,
+                           uint32_t io_limit, uint32_t limit,
+                           uint32_t n_threads_hint,
+                           uint64_t cache_size_req,
+                           uint32_t n_probe_req,
+                           uint32_t early_exit_req,
+                           float multiprobe_ratio_req);
 
 int main(int argc, char* argv[]) {
     sextant::init_logging();
@@ -404,15 +424,28 @@ int main(int argc, char* argv[]) {
     const uint32_t early_exit_req = p.get<uint32_t>("early-exit-patience");
     const float multiprobe_ratio_req = p.get<float>("multiprobe-ratio");
 
-    // IVF dispatch: if `<index>.shards/` is a directory, this is an IVF-probe
-    // index — open via IVFIndex::read and run queries through IVFSearcher
-    // (synchronous; per-shard parallelism is Milestone 3). The single-index
-    // path below is unchanged when `.shards/` is absent.
+    // IVF dispatch: if `<index>.shards/` is a directory, this is an IVF
+    // index. Two IVF flavors share the `.shards/` layout:
+    //   - IVF-list-scan (default build path): `<prefix>.shards/codebook4.bin`
+    //     present → open via IVFScanIndex::read, search via IVFScanSearcher.
+    //   - graph-inside-shard (--ivf): no codebook4.bin → open via
+    //     IVFIndex::read, search via IVFSearcher.
+    // The single-index (merged-graph) path below runs when `.shards/` is
+    // absent.
     if (std::filesystem::is_directory(index + ".shards")) {
-    return run_ivf_benchmark(index, query_path, base_data, gt_path,
-                             k, L, rerank, io_limit, limit,
-                             n_threads_hint, cache_size_req,
-                             n_probe_req, early_exit_req, multiprobe_ratio_req);
+        const bool is_scan = std::filesystem::exists(
+            index + ".shards/codebook4.bin");
+        if (is_scan) {
+            return run_ivf_scan_benchmark(
+                index, query_path, base_data, gt_path,
+                k, L, rerank, io_limit, limit,
+                n_threads_hint, cache_size_req,
+                n_probe_req, early_exit_req, multiprobe_ratio_req);
+        }
+        return run_ivf_benchmark(index, query_path, base_data, gt_path,
+                                 k, L, rerank, io_limit, limit,
+                                 n_threads_hint, cache_size_req,
+                                 n_probe_req, early_exit_req, multiprobe_ratio_req);
     }
 
     try {
@@ -952,6 +985,260 @@ int main(int argc, char* argv[]) {
         // NOTE: cache diagnostics (graph_reads/code_reads/w-tinylfu/tl-l1) are
         // omitted here — those are Searcher-scoped; aggregating per-shard
         // caches is Milestone 3+ work.
+    } catch (const Error& e) {
+        std::cerr << "benchmark: " << e.what() << "\n";
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "benchmark: " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// IVF-list-scan benchmark path (Option A default).
+//
+// Mirrors run_ivf_benchmark but uses IVFScanIndex + IVFScanSearcher. The
+// searcher returns the top-W candidates by 4-bit PQ distance (W =
+// config.fastscan_W, default 300). For recall measurement we apply exact
+// FP32 rerank inline (in production this is the DB layer's job). `rerank`
+// and `L` are unused — the scan path has no beam width and rerank is
+// mandatory for meaningful recall.
+// ---------------------------------------------------------------------------
+int run_ivf_scan_benchmark(const std::string& index,
+                           const std::string& query_path,
+                           const std::string& base_data,
+                           const std::string& gt_path,
+                           uint32_t k, uint32_t L, uint32_t rerank,
+                           uint32_t io_limit, uint32_t limit,
+                           uint32_t n_threads_hint,
+                           uint64_t cache_size_req,
+                           uint32_t n_probe_req,
+                           uint32_t early_exit_req,
+                           float multiprobe_ratio_req) {
+    (void)L;             // scan path has no beam width
+    (void)io_limit;      // scan reads the whole shard — no node visit cap
+    (void)cache_size_req;// scan bypasses the BlockCache (sequential stream)
+    (void)early_exit_req;// no graph convergence check
+    (void)rerank;        // rerank is mandatory in the scan benchmark path
+
+    try {
+        std::unique_ptr<sextant::IVFScanIndex> ivf_idx =
+            sextant::IVFScanIndex::read(index + ".shards");
+        sextant::IVFScanSearcher ivf_searcher(*ivf_idx, n_threads_hint);
+
+        const uint32_t dim = ivf_idx->dim;
+        const uint32_t K = ivf_idx->K;
+
+        FbinHeader qh;
+        if (!read_fbin_header(query_path, qh) || qh.dim != dim) {
+            std::cerr << "benchmark: invalid query file '" << query_path
+                      << "' (dim=" << qh.dim << ", expected " << dim << ")\n";
+            return 1;
+        }
+        if (qh.n == 0) {
+            std::cerr << "benchmark: query file is empty\n";
+            return 1;
+        }
+
+        FbinHeader bh{};
+        if (!read_fbin_header(base_data, bh) || bh.dim != dim) {
+            std::cerr << "benchmark: invalid base-data '" << base_data
+                      << "' (dim=" << bh.dim << ", expected " << dim << ")\n";
+            return 1;
+        }
+
+        GroundTruth gt = read_ground_truth(gt_path);
+        if (gt.k < k) {
+            std::cerr << "benchmark: ground-truth k=" << gt.k
+                      << " < requested k=" << k << "\n";
+            return 1;
+        }
+
+        const uint32_t n_queries = std::min<uint32_t>(
+            qh.n, limit ? limit : qh.n);
+        if (gt.n < n_queries) {
+            spdlog::warn("benchmark: ground-truth has {} queries but running {}",
+                         gt.n, n_queries);
+        }
+
+        const uint32_t effective_n_probe = n_probe_req > 0
+            ? n_probe_req
+            : ivf_idx->n_probe_default;
+
+        std::cout << "[benchmark] (IVF-list-scan mode)\n";
+        std::cout << "[benchmark] queries: " << n_queries << ", k: " << k
+                  << ", K (shards): " << K
+                  << ", m4: " << ivf_idx->m4
+                  << ", n_probe: " << effective_n_probe
+                  << ", multiprobe_ratio: " << multiprobe_ratio_req
+                  << ", threads: " << ivf_searcher.num_threads() << "\n";
+
+        // Read all query vectors into RAM.
+        std::vector<float> queries(static_cast<size_t>(n_queries) * dim);
+        {
+            std::ifstream qf(query_path, std::ios::binary);
+            qf.seekg(8);
+            qf.read(reinterpret_cast<char*>(queries.data()),
+                    static_cast<std::streamsize>(queries.size() *
+                                                 sizeof(float)));
+            if (!qf) {
+                std::cerr << "benchmark: short read on query file\n";
+                return 1;
+            }
+        }
+
+        // Read the whole base file into RAM for exact rerank. The scan path
+        // returns candidates by 4-bit distance; without exact rerank the
+        // recall numbers are meaningless (4-bit ranking is too coarse). At
+        // arxiv-nomic 1.34M × 768 × 4 = 4.1 GB this fits a benchmark machine.
+        std::vector<float> base_all;
+        bool base_in_ram = false;
+        {
+            std::ifstream bf(base_data, std::ios::binary | std::ios::ate);
+            if (bf) {
+                const std::streamoff sz = bf.tellg();
+                if (sz > 8 &&
+                    static_cast<uint64_t>(sz) <= uint64_t{4} * 1024 * 1024 *
+                                                      1024) {
+                    base_all.resize(static_cast<size_t>(sz - 8) / sizeof(float));
+                    bf.seekg(8);
+                    bf.read(reinterpret_cast<char*>(base_all.data()),
+                            static_cast<std::streamsize>(base_all.size() *
+                                                         sizeof(float)));
+                    base_in_ram = bf.good();
+                    if (base_in_ram) {
+                        spdlog::info("benchmark: loaded {} base vectors into RAM",
+                                     bh.n);
+                    }
+                }
+            }
+        }
+
+        const bool have_gt_dists = !gt.dists.empty();
+        const sextant::MetricKind scan_metric =
+            ivf_idx->quantizer ? ivf_idx->quantizer->metric()
+                               : sextant::MetricKind::L2Sq;
+        const RerankCtx rctx{
+            dim, k, bh.n, /*do_rerank=*/true, base_in_ram,
+            base_in_ram ? &base_all : nullptr,
+            &base_data, &gt, have_gt_dists, scan_metric
+        };
+
+        // The scan path's W (rerank shortlist) is config.fastscan_W. Default
+        // 300 per the spike's recall-0.99 point. fetch_k is informational
+        // here — the searcher returns min(W, available).
+        sextant::SearchConfig scfg;
+        scfg.k = k;
+        scfg.n_probe = n_probe_req;  // 0 → index default
+        scfg.multiprobe_ratio = multiprobe_ratio_req;
+        // fastscan_W defaults to 300 inside the searcher when 0.
+
+        std::vector<double> latencies_us;
+        latencies_us.reserve(n_queries);
+
+        double recall_sum = 0.0;
+        uint64_t recall_hits = 0, recall_total = 0;
+        uint64_t prox_in = 0, prox_total = 0;
+        std::vector<double> prox_ratios;
+
+        std::cout << "[benchmark] starting timed search\n";
+        const auto t_start = Clock::now();
+        std::vector<std::future<std::vector<sextant::Candidate>>> futs;
+        futs.reserve(n_queries);
+        for (uint32_t qi = 0; qi < n_queries; qi++) {
+            const float* q = &queries[static_cast<size_t>(qi) * dim];
+            futs.push_back(ivf_searcher.search_one_async(q, scfg.k, scfg));
+        }
+        for (uint32_t qi = 0; qi < n_queries; qi++) {
+            const auto q_start = Clock::now();
+            auto results = futs[qi].get();
+            const auto q_end = Clock::now();
+            const double per_q_us = US(q_end - q_start).count();
+            QueryMetrics m = process_results(rctx, queries, qi,
+                                             std::move(results), per_q_us);
+            latencies_us.push_back(m.latency_us);
+            recall_sum += m.recall_sum;
+            recall_hits += m.recall_hits;
+            recall_total += m.recall_total;
+            if (!m.prox_ratios.empty()) {
+                prox_ratios.insert(prox_ratios.end(),
+                                   m.prox_ratios.begin(),
+                                   m.prox_ratios.end());
+            }
+            prox_in += m.prox_in;
+            prox_total += m.prox_total;
+        }
+        const auto t_end = Clock::now();
+        const double total_sec =
+            std::chrono::duration<double>(t_end - t_start).count();
+
+        const double mean_recall =
+            (n_queries > 0) ? recall_sum / static_cast<double>(n_queries)
+                            : 0.0;
+        const double micro_recall =
+            (recall_total > 0)
+                ? static_cast<double>(recall_hits) /
+                      static_cast<double>(recall_total)
+                : 0.0;
+
+        std::sort(latencies_us.begin(), latencies_us.end());
+        const double p50_us = percentile(latencies_us, 50.0);
+        const double p99_us = percentile(latencies_us, 99.0);
+        const double qps =
+            (total_sec > 0.0)
+                ? static_cast<double>(n_queries) / total_sec
+                : 0.0;
+
+        std::cout << "[benchmark] recall@" << k << ": "
+                  << std::fixed << std::setprecision(4) << mean_recall << "\n";
+        std::cout << "[benchmark] recall@" << k << " (micro-avg): "
+                  << std::fixed << std::setprecision(4) << micro_recall << "\n";
+
+        if (have_gt_dists && prox_total > 0) {
+            const double in_band =
+                static_cast<double>(prox_in) /
+                static_cast<double>(prox_total);
+            double prox_sum = 0.0;
+            std::vector<double> miss_ratios;
+            miss_ratios.reserve(prox_total - prox_in);
+            for (double r : prox_ratios) {
+                prox_sum += r;
+                if (r < 1.0) miss_ratios.push_back(r);
+            }
+            const double mean_ratio = prox_sum /
+                static_cast<double>(prox_total);
+            std::cout << "[benchmark] proximity: in-band="
+                      << std::fixed << std::setprecision(4) << in_band
+                      << " (" << prox_in << "/" << prox_total
+                      << " results at/inside d" << k << ")"
+                      << ", mean_ratio=" << std::setprecision(4)
+                      << mean_ratio << "\n";
+            std::cout << "[benchmark] proximity: miss_ratio";
+            if (miss_ratios.empty()) {
+                std::cout << "=n/a (no out-of-band results)\n";
+            } else {
+                std::sort(miss_ratios.begin(), miss_ratios.end());
+                const double mp25 = percentile(miss_ratios, 25.0);
+                const double mp50 = percentile(miss_ratios, 50.0);
+                const double mp75 = percentile(miss_ratios, 75.0);
+                const double mp90 = percentile(miss_ratios, 90.0);
+                std::cout << " p25=" << std::fixed
+                          << std::setprecision(4) << mp25
+                          << " p50=" << mp50
+                          << " p75=" << mp75
+                          << " p90=" << mp90
+                          << " (over " << miss_ratios.size()
+                          << " out-of-band; 1.0=target edge)\n";
+            }
+        }
+        std::cout << "[benchmark] latency p50: " << std::fixed
+                  << std::setprecision(3) << p50_us / 1000.0 << "ms, p99: "
+                  << p99_us / 1000.0 << "ms\n";
+        std::cout << "[benchmark] total search time: " << std::fixed
+                  << std::setprecision(3) << total_sec << "s\n";
+        std::cout << "[benchmark] QPS: " << std::fixed
+                  << std::setprecision(1) << qps << "\n";
     } catch (const Error& e) {
         std::cerr << "benchmark: " << e.what() << "\n";
         return 1;

@@ -851,8 +851,12 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
 
     // Recompute K from the final R (K depends on per-vec size). Must match
     // resolve_params' K logic: explicit override > max(ram_driven, recall_floor).
+    // The K_max and shard-size target are path-dependent: the scan path
+    // (merged_graph=false, the default) targets ~200k/shard with K_max=8192;
+    // the graph paths (--graph or --ivf) target ~64k/shard with K_max=512.
     {
-        constexpr uint32_t kKMax = 512;
+        const bool is_scan = !overrides.merged_graph && !overrides.sharded_graph;
+        const uint32_t kKMax = is_scan ? 8192u : 512u;
         const uint32_t code_sz = static_cast<uint32_t>(p.pq_m);
         const uint32_t node_sz =
             ((16u + static_cast<uint32_t>(p.R) * 4u + 7u) & ~7u);
@@ -871,20 +875,52 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
                 }
             }
             uint32_t recall_driven_k = 1;
-            if (overrides.ivf_mode) {
-                // Target ~64K vectors/shard (DiskANN/FAISS IVF practice).
-                // Prior sqrt(N)/8 over-partitioned: K=144 at 1.34M where the
-                // measured sweet spot is 16-32 (recall degrades past 32).
-                constexpr uint64_t kTargetShardSize = 65536;
-                recall_driven_k = static_cast<uint32_t>(
-                    std::max<uint64_t>(2u,
-                        (total_n + kTargetShardSize - 1) / kTargetShardSize));
-                recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
+            // Any IVF build (scan OR graph-inside-shard) gets a recall floor.
+            // The merged-graph path (--graph with no --ivf and scan off) is
+            // the only path that skips this floor — but is_scan captures that
+            // correctly (is_scan = !graph && !ivf).
+            if (overrides.sharded_graph || is_scan) {
+                if (is_scan) {
+                    // Scan path: target ~200k vectors/shard. Smaller shards =
+                    // less bytes streamed per probe. K_max=8192 (no per-shard
+                    // graph to build — shards are pure code containers).
+                    constexpr uint64_t kTargetShardSize = 200'000;
+                    recall_driven_k = static_cast<uint32_t>(
+                        (total_n + kTargetShardSize - 1) / kTargetShardSize);
+                    recall_driven_k =
+                        std::max<uint32_t>(recall_driven_k, 16u);
+                    recall_driven_k =
+                        std::min<uint32_t>(recall_driven_k, 8192u);
+                } else {
+                    // Graph-inside-shard (--ivf): target ~64K/shard (standard
+                    // DiskANN/FAISS). Prior sqrt(N)/8 over-partitioned.
+                    constexpr uint64_t kTargetShardSize = 65536;
+                    recall_driven_k = static_cast<uint32_t>(
+                        std::max<uint64_t>(2u,
+                            (total_n + kTargetShardSize - 1) / kTargetShardSize));
+                    recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
+                }
             }
             p.partition_count = std::min(std::max(ram_driven_k, recall_driven_k),
                                           kKMax);
         }
     }
+
+    // Propagate path-related fields the mini-build doesn't measure. `base`
+    // came from resolve_params, which already resolved merged_graph and pq4_m
+    // from the overrides; the estimator's mini-build path doesn't touch them.
+    p.merged_graph = base.merged_graph;
+    p.pq4_m = base.pq4_m;
+    p.pq_anisotropy = base.pq_anisotropy;
+    p.pq_opq = base.pq_opq;
+    p.anisotropic_pq = base.anisotropic_pq;
+    p.n_entry_points = base.n_entry_points;
+    p.n_search_entry_points = base.n_search_entry_points;
+    p.target_recall = base.target_recall;
+    p.early_exit_patience = base.early_exit_patience;
+    p.num_threads = base.num_threads;
+    p.build_ram_budget = base.build_ram_budget;
+    p.pq_max_distortion = base.pq_max_distortion;
 
     spdlog::info("[sextant] estimate_config: final → R={} alpha={:.1f} "
                  "pq_m={} pq_bits={} L_build={} K={}",

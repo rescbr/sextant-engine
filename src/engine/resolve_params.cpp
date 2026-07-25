@@ -88,6 +88,21 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     spdlog::info("[sextant] pq_bits = {} [{}]", p.pq_bits == 0 ? "auto" : std::to_string(p.pq_bits),
                  overrides.pq_bits != 0 ? "override" : "auto");
 
+    // --- merged_graph / pq4_m (IVF-list-scan vs merged-graph) ---
+    p.merged_graph = overrides.merged_graph;
+    if (overrides.pq4_m != 0) {
+        p.pq4_m = overrides.pq4_m;
+    } else if (dim > 0) {
+        // Default m for the 4-bit codebook: dim/4 (192 at dim=768 — matches the
+        // validated spike). Kept a multiple of 4 so sub_dim = dim/m is exact.
+        uint32_t m4 = dim / 4;
+        if (m4 == 0) m4 = 1;
+        p.pq4_m = static_cast<uint16_t>(m4);
+    }
+    spdlog::info("[sextant] merged_graph = {} ({} path); pq4_m = {}",
+                 p.merged_graph, p.merged_graph ? "merged-graph" : "IVF-list-scan",
+                 p.pq4_m == 0 ? std::string("auto") : std::to_string(p.pq4_m));
+
     // --- pq_max_distortion ---
     // Upper bound on acceptable PQ distortion (median |1 - pq_dist/true_dist|) for
     // auto (m, bits) selection. Only used when pq_m or pq_bits is auto. The
@@ -211,14 +226,24 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     // Two drivers, take the max (then clamp to [1, K_max]):
     //   ram_driven_K   — from build_ram_budget / per_vec (existing logic).
     //                    Keeps each shard's flat buffers under the RAM budget.
-    //   recall_driven_K — sqrt(N)/8 floor, applied ONLY when ivf_mode is set.
-    //                     Empirical from the arxiv100k IVF sweep: below this K,
-    //                     routing quality drops and n_probe can't recover recall.
+    //   recall_driven_K — applied when sharded_graph is set OR merged_graph is false
+    //                     (i.e. any IVF build — scan or graph-inside-shard).
+    //                     - scan path (merged_graph=false): target ~200k
+    //                       vectors/shard → K = clamp(N/200k, 16, 8192).
+    //                       Larger K than graph because each shard is a pure
+    //                       sequential stream (no graph to traverse) — smaller
+    //                       shards mean less bytes streamed per probe.
+    //                       arxiv-nomic 1.34M → K=8; 1B → K=8192 (clamped).
+    //                     - graph path (merged_graph=true): target ~64k
+    //                       vectors/shard → K = clamp(N/64k, 2, 256). Standard
+    //                       DiskANN/FAISS shard size; bigger K degrades graph
+    //                       routing recall.
     // An explicit partition_count override wins outright.
     // per_vec = code_size + node_size(R, code_size).
     // code_size = pq_m (for pq_bits=8, 1 byte per segment).
     {
-        constexpr uint32_t kKMax = 512;
+        const bool is_scan = !overrides.merged_graph;
+        const uint32_t kKMax = is_scan ? 8192u : 512u;
         const uint32_t code_sz = static_cast<uint32_t>(p.pq_m);
         const uint32_t node_sz =
             ((16u + static_cast<uint32_t>(p.R) * 4u + 7u) & ~7u);
@@ -241,24 +266,37 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                 }
             }
 
-            // Recall-driven floor (IVF only). Target ~64K vectors per shard —
-            // the standard ANN-practice shard size (DiskANN/FAISS IVF). The
-            // prior sqrt(N)/8 formula over-partitioned badly at scale
-            // (K=144 at 1.34M; the K-sweep showed recall DEGRADES past K=32).
-            // Heuristic: K = clamp(N / 65536, 2, 256).
-            //   arxiv-nomic 1.34M → K=21 (was 144 — measured sweet spot 16-32)
-            //   arxiv100k        → K=2   (was 39)
-            //   100M             → K=256 (capped)
+            // Recall-driven floor (any IVF build: scan OR graph-inside-shard).
             uint32_t recall_driven_k = 1;
             std::string recall_note;
-            if (overrides.ivf_mode) {
-                constexpr uint64_t kTargetShardSize = 65536;
-                recall_driven_k = static_cast<uint32_t>(
-                    std::max<uint64_t>(2u,
-                        (n_vectors + kTargetShardSize - 1) / kTargetShardSize));
-                recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
-                recall_note = std::string(", recall_floor=") +
-                              std::to_string(recall_driven_k);
+            if (overrides.sharded_graph || is_scan) {
+                if (is_scan) {
+                    // Scan path: target ~200k vectors/shard. Smaller shards =
+                    // less bytes streamed per probe (each probe reads a full
+                    // shard sequentially). K can be large (≤8192) since
+                    // there's no per-shard graph to build — shards are pure
+                    // code containers.
+                    constexpr uint64_t kTargetShardSize = 200'000;
+                    recall_driven_k = static_cast<uint32_t>(
+                        (n_vectors + kTargetShardSize - 1) / kTargetShardSize);
+                    recall_driven_k =
+                        std::max<uint32_t>(recall_driven_k, 16u);
+                    recall_driven_k =
+                        std::min<uint32_t>(recall_driven_k, 8192u);
+                    recall_note = std::string(", scan_floor=") +
+                                  std::to_string(recall_driven_k);
+                } else {
+                    // Graph-inside-shard path: target ~64K/shard (standard
+                    // DiskANN/FAISS). The prior sqrt(N)/8 formula
+                    // over-partitioned badly at scale (K=144 at 1.34M).
+                    constexpr uint64_t kTargetShardSize = 65536;
+                    recall_driven_k = static_cast<uint32_t>(
+                        std::max<uint64_t>(2u,
+                            (n_vectors + kTargetShardSize - 1) / kTargetShardSize));
+                    recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
+                    recall_note = std::string(", graph_floor=") +
+                                  std::to_string(recall_driven_k);
+                }
             }
 
             uint32_t k = std::max(ram_driven_k, recall_driven_k);
@@ -278,10 +316,12 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                              p.build_ram_budget / 1e6, p.partition_count,
                              max_per_partition, recall_note);
             } else {
-                spdlog::info("[sextant] K (partitions) = {} [recall-driven IVF "
-                             "floor sqrt(N)/8={}; RAM budget {:.1f}MB would allow "
-                             "K={}]", p.partition_count, recall_driven_k,
-                             p.build_ram_budget / 1e6, ram_driven_k);
+                spdlog::info("[sextant] K (partitions) = {} [recall-driven {} "
+                             "floor={}; RAM budget {:.1f}MB would allow K={}]",
+                             p.partition_count,
+                             is_scan ? "scan" : "graph",
+                             recall_driven_k, p.build_ram_budget / 1e6,
+                             ram_driven_k);
             }
         }
     }

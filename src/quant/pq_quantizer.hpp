@@ -128,6 +128,28 @@ public:
         return static_cast<uint32_t>(m_) * K_;
     }
 
+    /// Build the uint4-quantized FastScan LUT for a query (4-bit PQ path,
+    /// Option A). Same per-segment distances as `preprocess_query` (under the
+    /// configured metric_), but quantized to 4-bit values stored one-per-byte
+    /// in `lut4` (m × K bytes; each byte's low nibble holds the value, high
+    /// nibble is 0).
+    ///
+    /// Uses the validated `simd::quantize_lut_u4` scheme: per-segment min
+    /// subtracted, one global scale A = 15/max_span, NO clamp on A. The 4-bit
+    /// kernel's u32 extraction gives wide headroom; clamping crushed precision
+    /// in the spike (recall 0.0006). See `simd::quantize_lut_u4` docs.
+    ///
+    /// Caller buffers (must be sized before the call):
+    ///   - `lut4`: m × K bytes (use `fastscan_lut_bytes()`).
+    ///   - `scale_out`: one float (A; only needed for cross-LUT comparisons,
+    ///     which the scan path never makes — all shards in one query share one
+    ///     LUT). May be nullptr to skip.
+    ///
+    /// Requires `bits_ == 4` (K_ == 16). Throws on misuse.
+    void build_fastscan_lut4(const float* query,
+                             uint8_t* lut4,
+                             float* scale_out) const;
+
     /// Estimate distance from a query LUT to a PQ code.
     float lut_distance(const uint8_t* code, const float* lut) const;
 

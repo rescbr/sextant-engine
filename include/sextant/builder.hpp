@@ -123,6 +123,33 @@ public:
                          n_probe_default);
     }
 
+    /// IVF-list-scan build (Option A — the DEFAULT when merged_graph=false).
+    /// Trains a 4-bit PQ codebook, partitions via k-means on the (separately
+    /// trained) 8-bit routing codes, then per shard: encodes each member at
+    /// 4-bit, packs into FastScan block layout, writes `.codes4` + `.rowids`
+    /// sidecars. NO graph, NO Vamana, NO BFS reorder — shards are pure code
+    /// containers. The 4-bit codebook is shared and written once at
+    /// `<index_path>.shards/codebook4.bin`. The result is openable via
+    /// `IVFScanIndex::read(<index_path>.shards)`.
+    ///
+    /// `pq4_m` is taken from `params.pq4_m` (auto-resolved to dim/4 if 0).
+    BuildResult build_ivf_scan(VectorSource& source,
+                                const std::string& index_path,
+                                const ResolvedParams& params,
+                                uint32_t n_probe_default = 0);
+
+    /// BuildConfig overload for build_ivf_scan (mirrors the build_ivf pattern).
+    BuildResult build_ivf_scan(VectorSource& source,
+                                const std::string& index_path,
+                                const BuildConfig& config,
+                                uint32_t n_probe_default = 0) {
+        index_.count = source.count();
+        index_.dim = source.dim();
+        return build_ivf_scan(source, index_path,
+                              resolve_params(index_.count, index_.dim, config),
+                              n_probe_default);
+    }
+
 private:
     Index& index_;
 

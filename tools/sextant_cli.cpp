@@ -82,15 +82,26 @@ int cmd_build(int argc, char* argv[]) {
     sextant::BuildConfig cfg = build_config_from_parser(p);
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
-    cfg.ivf_mode         = p.exist("ivf");
+    // (cfg.sharded_graph and cfg.merged_graph are set in build_config_from_parser
+    // from the --sharded-graph / --merged-graph flags, with mutual-exclusion
+    // validation.)
 
     sextant::Index idx;
     sextant::Builder builder(idx);
-    sextant::BuildResult result = cfg.ivf_mode
-        ? builder.build_ivf(source, index_path, cfg)
-        : builder.build(source, index_path, cfg);
-    std::cout << "built " << (cfg.ivf_mode ? "IVF " : "")
-              << "index '" << index_path << "': n=" << result.n_vectors
+    sextant::BuildResult result;
+    const char* path_label;
+    if (cfg.sharded_graph) {
+        result = builder.build_ivf(source, index_path, cfg);
+        path_label = "IVF (graph-inside-shard)";
+    } else if (cfg.merged_graph) {
+        result = builder.build(source, index_path, cfg);
+        path_label = "merged-graph";
+    } else {
+        result = builder.build_ivf_scan(source, index_path, cfg);
+        path_label = "IVF-list-scan";
+    }
+    std::cout << "built " << path_label << " index '" << index_path
+              << "': n=" << result.n_vectors
               << " dim=" << result.dim
               << " R=" << result.R
               << " L_build=" << result.L_build
@@ -129,8 +140,7 @@ int cmd_autobuild(int argc, char* argv[]) {
     cfg.recall_target    = p.get<float>("recall-target");
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
-    const bool ivf_mode = p.exist("ivf");
-    cfg.ivf_mode = ivf_mode;
+    // (cfg.sharded_graph and cfg.merged_graph are set in build_config_from_parser.)
 
     sextant::Estimator estimator;
     // estimate_config handles all auto knobs; locked ones override.
@@ -139,13 +149,13 @@ int cmd_autobuild(int argc, char* argv[]) {
     // Print the analysis (shared pretty-print with analyze).
     print_analysis_(source, input, cfg, est.params, est.diag);
 
-    if (ivf_mode) {
-        const uint32_t n_probe_default = p.get<uint32_t>("ivf-n-probe");
+    if (cfg.sharded_graph) {
+        const uint32_t n_probe_default = p.get<uint32_t>("sharded-graph-n-probe");
         sextant::Index idx;
         const sextant::BuildResult result =
             sextant::Builder(idx).build_ivf(source, index_path, est.params,
                                              n_probe_default);
-        std::cout << "\n═══ Build Result (IVF) ═══\n";
+        std::cout << "\n═══ Build Result (IVF graph-inside-shard) ═══\n";
         std::cout << "built IVF index '" << index_path << ".shards': n="
                   << result.n_vectors << " dim=" << result.dim
                   << " K=" << est.params.partition_count
@@ -157,11 +167,28 @@ int cmd_autobuild(int argc, char* argv[]) {
         return 0;
     }
 
-    // Build with the resolved params (in-process, no string round-trip).
+    if (!cfg.merged_graph) {
+        // Default: IVF-list-scan + 4-bit PQ FastScan.
+        const uint32_t n_probe_default = p.get<uint32_t>("scan-n-probe");
+        sextant::Index idx;
+        const sextant::BuildResult result =
+            sextant::Builder(idx).build_ivf_scan(source, index_path,
+                                                  est.params, n_probe_default);
+        std::cout << "\n═══ Build Result (IVF-list-scan) ═══\n";
+        std::cout << "built IVF-scan index '" << index_path << ".shards': n="
+                  << result.n_vectors << " dim=" << result.dim
+                  << " K=" << est.params.partition_count
+                  << " m4=" << static_cast<int>(est.params.pq4_m)
+                  << " pq_bits=4"
+                  << " in " << result.build_time_sec << "s\n";
+        return 0;
+    }
+
+    // --merged-graph: merged-graph (K=1 or partition+merge).
     sextant::Index idx;
     const sextant::BuildResult result =
         sextant::Builder(idx).build(source, index_path, est.params);
-    std::cout << "\n═══ Build Result ═══\n";
+    std::cout << "\n═══ Build Result (merged-graph) ═══\n";
     std::cout << "built index '" << index_path << "': n=" << result.n_vectors
               << " dim=" << result.dim
               << " R=" << result.R
@@ -462,13 +489,19 @@ void print_usage() {
     std::cerr << "Usage: sextant <command> [options]\n"
               << "Commands:\n"
               << "  build      Build an index from a .fbin file (explicit params).\n"
+              << "             Build path selection (mutually exclusive):\n"
+              << "               (default)  IVF-list-scan + 4-bit PQ FastScan\n"
+              << "               --merged-graph  merged-graph (Vamana; K=1 or partition+merge)\n"
+              << "               --sharded-graph graph-inside-shard IVF (prior default)\n"
               << "             Common flags: --input --index --max-node-neighbors (R)\n"
               << "             --beam-width-ceiling (L) --prune-threshold (alpha)\n"
               << "             --pq-segments (m) --pq-bits --threads --metric\n"
-              << "             --build-ram --prune-candidate-cap --log-level\n"
+              << "             --build-ram --prune-candidate-cap --partition-count\n"
+              << "             --log-level\n"
               << "  autobuild  Estimate config (analyze) then build, in-process.\n"
               << "             Accepts all build flags plus estimate knobs:\n"
               << "             --proximity-target --recall-target\n"
+              << "             --scan-n-probe (default path) --sharded-graph-n-probe (--sharded-graph)\n"
               << "  analyze    Read-only dataset-adaptive parameter advisory.\n"
               << "             Flags: --input --metric --proximity-target\n"
               << "             --recall-target --max-node-neighbors --prune-threshold\n"

@@ -96,24 +96,34 @@ inline void add_common_flags(cmdline::parser& p) {
     p.add<std::string>("log-level", 0,
         "Log level: debug, info, warn, error", false, "info");
 
-    // K-driving params (build-ram, ivf, partition-count) are common to all
-    // modes — build needs them to actually partition, analyze previews them,
-    // autobuild threads them through. The K heuristic (target ~64K
-    // vectors/shard, clamped [2, 256]) lives in resolve_params; explicit
-    // --partition-count wins.
+    // K-driving params (build-ram, graph, ivf, partition-count) are common to
+    // all modes — build needs them to actually partition, analyze previews
+    // them, autobuild threads them through. The K heuristic lives in
+    // resolve_params (scan path: target ~200k vectors/shard, clamped
+    // [16, 8192]; graph-inside-shard: target ~64k, clamped [2, 256]);
+    // explicit --partition-count wins.
     p.add<uint64_t>("build-ram", 0,
         "Build RAM budget in bytes (forces partitioning if small). "
         "0 = auto (50% of physical RAM). Affects K (partition count) "
         "resolution.",
         false, 0);
-    p.add("ivf", 0,
-        "Build in IVF-probe mode: K independent shard indices + FP16 "
-        "routing centroids, instead of one merged graph. With no "
-        "--partition-count, K is auto-resolved (target ~64K vectors/shard, "
-        "clamped [2, 256]). See docs/ivf_probe_design.md.");
+    p.add("merged-graph", 0,
+        "Build a merged-graph index (Vamana) instead of the default "
+        "IVF-list-scan + 4-bit PQ FastScan index. The merged-graph path "
+        "wins at low recall / high QPS (recall < 0.88); the default scan "
+        "path wins at recall >= 0.94. K=1 produces a single monolithic "
+        "graph; --partition-count > 1 produces a partition+merge graph. "
+        "See ~/.local/state/maki/plans/sharing-eternal-louse.md.");
+    p.add("sharded-graph", 0,
+        "Build in graph-inside-shard IVF mode: K independent shard graph "
+        "indices + FP16 routing centroids (the PRIOR default, before the "
+        "scan path). Retained for the low-recall tier and back-compat with "
+        "existing build scripts. Prefer the default (no flag) for recall >= "
+        "0.94, or --merged-graph for K=1 merged-graph. See "
+        "docs/ivf_probe_design.md.");
     p.add<uint32_t>("partition-count", 0,
         "Partition count (K) override. 0 = auto (RAM-driven, plus the "
-        "shard-size heuristic when --ivf is set).",
+        "shard-size heuristic for the chosen build path).",
         false, 0);
 }
 
@@ -149,9 +159,15 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
         // (build-ram, ivf, partition-count are in add_common_flags now.)
     }
     if (mode == Mode::Autobuild) {
-        p.add<uint32_t>("ivf-n-probe", 0,
-            "IVF default n_probe (shards probed per query). 0 = auto "
-            "(max(1, K/4)). Only meaningful with --ivf.",
+        p.add<uint32_t>("sharded-graph-n-probe", 0,
+            "sharded-graph default n_probe (shards probed per query) for the "
+            "--sharded-graph path. 0 = auto (max(1, K/4)). Only "
+            "meaningful with --sharded-graph.",
+            false, 0);
+        p.add<uint32_t>("scan-n-probe", 0,
+            "IVF-scan default n_probe (shards probed per query) for the "
+            "default scan path. 0 = auto (max(1, K/4)). Ignored when "
+            "--merged-graph or --sharded-graph is set.",
             false, 0);
     }
 }
@@ -203,6 +219,26 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
             cfg.partition_count = p.get<uint32_t>("partition-count");
         }
     } catch (...) {}
+
+    // Build-path selection: --merged-graph, --sharded-graph, or default
+    // (IVF-list-scan).
+    //   --merged-graph  : merged-graph (K=1 or partition+merge). cfg.merged_graph=true.
+    //   --sharded-graph : graph-inside-shard (the PRIOR default). cfg.sharded_graph=true.
+    //   (neither)       : IVF-list-scan + 4-bit PQ FastScan (the new default).
+    // Both flags set is contradictory — the three paths are mutually exclusive.
+    // We check via p.exist() (registered in add_common_flags for all modes).
+    {
+        const bool want_graph = p.exist("merged-graph");
+        const bool want_ivf   = p.exist("sharded-graph");
+        if (want_graph && want_ivf) {
+            throw std::runtime_error(
+                "--merged-graph and --sharded-graph are mutually exclusive; "
+                "pick one build path (default = IVF-list-scan, --merged-graph "
+                "= merged-graph, --sharded-graph = graph-inside-shard)");
+        }
+        cfg.merged_graph = want_graph;
+        cfg.sharded_graph   = want_ivf;
+    }
     return cfg;
 }
 

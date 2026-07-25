@@ -31,6 +31,7 @@
 #include <limits>  // std::numeric_limits (used in argmin_scaled)
 #include <array>   // std::array (seg_min in quantize_lut_u8)
 #include <cstring> // std::memset (fastscan_many zero-init)
+#include <algorithm>  // std::min/std::max (quantize_lut_u4 clamp)
 
 namespace sextant {
 namespace simd {
@@ -1015,10 +1016,125 @@ inline void fastscan_block16(const uint8_t* code_block,
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// PQ-FastScan (4-bit): NEON `vqtbl1q_u8` kernel for 4-bit PQ codes.
+// ---------------------------------------------------------------------------
+//
+// Production path for IVF-list-scan (Option A). Replaces the 8-bit
+// `fastscan_many` (which was rejected for graph-search: too few codes/batch
+// and 256-byte LUT loads dominate). The 4-bit kernel's 16-byte LUT row fits
+// entirely in one NEON register, so one `vqtbl1q_u8` per nibble-half suffices
+// — no 4-bank split, no LUT-load amortisation games. Measured ~330 M codes/s
+// on Mac, flat across batch sizes 1-8192 blocks (3 KB LUT fits L1 trivially).
+//
+// Layout (load-bearing — DO NOT modify without re-validating recall):
+//   - `code_block`: `[m][16]` bytes, segment-major within the block.
+//     For segment s, byte k (0≤k<16) packs TWO vectors' s-th nibbles:
+//       low  nibble of byte k = vector (b*32 + k)        (the "lo" lanes)
+//       high nibble of byte k = vector (b*32 + 16 + k)   (the "hi" lanes)
+//     The final partial block is zero-padded (those lanes are masked out by
+//     `valid_mask`). NOTE: NOT (2k, 2k+1) — that would deinterleave the
+//     kernel's output order. This is the FAISS `perm0` permutation.
+//   - `lut4`: `[m][16]` uint8 (one row per segment; 16 entries = 2^4 centroids).
+//   - `out`: 32 uint32 distances. Lanes 0..15 = lo nibbles (vectors 0..15),
+//     lanes 16..31 = hi nibbles (vectors 16..31).
+//
+// LUT quantization (validated, see memory fastscan-spike-2026-07-25):
+//   - Per-segment min subtracted; one GLOBAL scale A = 15 / max_span.
+//   - NO clamp on A (the production temptation). The kernel accumulates into
+//     uint16 *internally* (safe: per-lane max = m×15, e.g. 2880 at m=192) and
+//     widens to uint32 only at extraction. Clamping A crushes precision on
+//     tight LUTs (typical A≈749 for normalized embeddings → near-every entry
+//     quantizes to 0 → recall 0.0006). DO NOT re-introduce a clamp.
+//   - Offset (sum of per-segment mins) is dropped — valid for argmin only.
+//     The scan distance is NOT a directly-interpretable L2; it ranks correctly
+//     within one query's LUT.
+
+/// Single-block 4-bit FastScan kernel — 32 codes/block.
+///
+/// Promoted verbatim from `scripts/spike_pq4_recall.cpp` (recall 0.9919 @ 1298
+/// QPS on arxiv100k). The production `pq4_scan_many` below wraps this for the
+/// multi-block scan path; this single-block form is the testable primitive and
+/// the per-block inner loop body.
+inline void pq4_block32(const uint8_t* code_block, const uint8_t* lut4,
+                        uint32_t m, uint32_t out[32]) {
+#if defined(SEXTANT_HAS_NEON)
+    uint16x8_t acc_lo_a = vdupq_n_u16(0);
+    uint16x8_t acc_lo_b = vdupq_n_u16(0);
+    uint16x8_t acc_hi_a = vdupq_n_u16(0);
+    uint16x8_t acc_hi_b = vdupq_n_u16(0);
+    const uint8x16_t mask4 = vdupq_n_u8(0x0F);
+    for (uint32_t s = 0; s < m; s++) {
+        const uint8x16_t lut_v = vld1q_u8(lut4 + s * 16);
+        const uint8x16_t c = vld1q_u8(code_block + s * 16);
+        const uint8x16_t clo = vandq_u8(c, mask4);
+        const uint8x16_t chi = vshrq_n_u8(c, 4);
+        const uint8x16_t rlo = vqtbl1q_u8(lut_v, clo);
+        const uint8x16_t rhi = vqtbl1q_u8(lut_v, chi);
+        // Internal u16 accumulation: per-lane max = m × 15 ≪ 65535 at any
+        // realistic m (≤256). u32 widening happens only at extraction below.
+        acc_lo_a = vaddq_u16(acc_lo_a, vmovl_u8(vget_low_u8(rlo)));
+        acc_lo_b = vaddq_u16(acc_lo_b, vmovl_u8(vget_high_u8(rlo)));
+        acc_hi_a = vaddq_u16(acc_hi_a, vmovl_u8(vget_low_u8(rhi)));
+        acc_hi_b = vaddq_u16(acc_hi_b, vmovl_u8(vget_high_u8(rhi)));
+    }
+    vst1q_u32(out +  0, vmovl_u16(vget_low_u16 (acc_lo_a)));
+    vst1q_u32(out +  4, vmovl_u16(vget_high_u16(acc_lo_a)));
+    vst1q_u32(out +  8, vmovl_u16(vget_low_u16 (acc_lo_b)));
+    vst1q_u32(out + 12, vmovl_u16(vget_high_u16(acc_lo_b)));
+    vst1q_u32(out + 16, vmovl_u16(vget_low_u16 (acc_hi_a)));
+    vst1q_u32(out + 20, vmovl_u16(vget_high_u16(acc_hi_a)));
+    vst1q_u32(out + 24, vmovl_u16(vget_low_u16 (acc_hi_b)));
+    vst1q_u32(out + 28, vmovl_u16(vget_high_u16(acc_hi_b)));
+#else
+    for (uint32_t j = 0; j < 16; j++) out[j] = 0;
+    for (uint32_t j = 0; j < 16; j++) out[16 + j] = 0;
+    for (uint32_t s = 0; s < m; s++) {
+        const uint8_t* codes = code_block + s * 16;
+        const uint8_t* row   = lut4 + s * 16;
+        for (uint32_t j = 0; j < 16; j++) {
+            out[j]      += row[codes[j] & 0x0F];
+            out[16 + j] += row[codes[j] >> 4];
+        }
+    }
+#endif
+}
+
+/// Multi-block 4-bit FastScan. Scans `n_blocks` blocks against one LUT, writing
+/// `n_blocks × 32` uint32 distances into `partial_sums`, then applies
+/// `valid_masks` to mask out padding lanes (invalid lanes → 0xFFFFFFFF).
+///
+/// `blocks`: `n_blocks × m × 16` bytes, segment-major within each block (the
+///   same layout as `pq4_block32`'s `code_block`, concatenated).
+/// `lut4`: `m × 16` uint8 LUT (one per query; reused across all blocks).
+/// `valid_masks`: `n_blocks` uint32 values. For block b, bit j (0≤j<32) set ⇒
+///   lane j is a real vector; cleared ⇒ padding. Lane j maps to vector
+///   `b*32 + j` (lo lanes 0..15, hi lanes 16..31 — matches `pq4_block32`).
+/// `partial_sums`: `n_blocks × 32` uint32, caller-allocated.
+///
+/// The 32-bit (not 16-bit) mask width lets a full block use 0xFFFFFFFF; the
+/// tail block sets only the real-vector bits.
+inline void pq4_scan_many(const uint8_t* blocks, uint32_t n_blocks,
+                          const uint8_t* lut4, uint32_t m,
+                          const uint32_t* valid_masks,
+                          uint32_t* partial_sums) {
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const uint8_t* blk = blocks + (size_t)b * m * 16;
+        uint32_t* out = partial_sums + (size_t)b * 32;
+        pq4_block32(blk, lut4, m, out);
+        // Mask out padding lanes in the tail block. 0xFFFFFFFF is larger than
+        // any real distance (max real = m × 15 ≤ 3840), so masked lanes never
+        // win argmin. Full blocks pass valid_mask = 0xFFFFFFFF (no-op).
+        const uint32_t mask = valid_masks[b];
+        for (uint32_t j = 0; j < 32; j++) {
+            if (!((mask >> j) & 1u)) {
+                out[j] = 0xFFFFFFFFu;
+            }
+        }
+    }
+}
+
 /// Quantize a float LUT (`[m][K]` row-major) to uint8 with a per-query-global
-/// `(A, B)` scale, the FAISS `NormTableScaler` approach. One scale across all
-/// m segments preserves cross-segment comparability for argmin; per-segment
-/// mins are summed into the offset B.
 ///
 /// Math (forward):
 ///   min_s     = min over c of lut_f32[s][c]               (per segment)
@@ -1091,6 +1207,63 @@ inline void quantize_lut_u8(const float* lut_f32,
 
     *scale_out  = A;
     *offset_out = B;
+}
+
+/// Quantize a float LUT (`[m][K]` row-major) to UINT4 values stored in a
+/// `uint8_t` array (each byte holds one 4-bit value in its low nibble; high
+/// nibble 0). Used by the 4-bit FastScan path's LUT builder.
+///
+/// This is the validated scheme from `scripts/spike_pq4_recall.cpp` (recall
+/// 0.9919 @ 1298 QPS). Critical differences from `quantize_lut_u8`:
+///   - K must be ≤ 16 (2^4). One scale across all segments (A = 15 / max_span).
+///   - **NO clamp on A.** The 4-bit kernel's internal u16 accumulators are
+///     safe up to per-lane m×15 ≪ 65535, and final extraction widens to u32
+///     (headroom to ~1.5M before overflow at m=192). Clamping A crushes
+///     precision on tight LUTs — this was the documented failure mode that
+///     dropped recall to 0.0006. DO NOT re-introduce a clamp here.
+///   - Per-segment min subtracted; offset (sum of mins) dropped (valid for
+///     argmin only). The scan distance is not directly comparable to the float
+///     LUT distance — it ranks correctly within one query.
+///
+/// Output: `lut4[s*K + c]` ∈ [0, 15] (stored in a uint8_t byte). `*scale_out`
+/// receives A (the caller needs it only for cross-LUT comparisons, which the
+/// scan path never does — all shards in one query share one LUT).
+inline void quantize_lut_u4(const float* lut_f32,
+                            uint32_t m, uint32_t K,
+                            uint8_t* lut4,
+                            float* scale_out) {
+    // Per-segment min, plus global max_span.
+    float max_span = 0.0f;
+    std::array<float, 256> seg_min{};
+    for (uint32_t s = 0; s < m; s++) {
+        const float* row = lut_f32 + s * K;
+        float mn = row[0];
+        for (uint32_t c = 1; c < K; c++) {
+            if (row[c] < mn) mn = row[c];
+        }
+        seg_min[s] = mn;
+        for (uint32_t c = 0; c < K; c++) {
+            const float span = row[c] - mn;
+            if (span > max_span) max_span = span;
+        }
+    }
+
+    // A = 15 / max_span, NO clamp (u32 accumulator has wide headroom).
+    const float A = (max_span > 0.0f) ? 15.0f / max_span : 0.0f;
+
+    for (uint32_t s = 0; s < m; s++) {
+        const float* src_row = lut_f32 + s * K;
+        uint8_t* dst_row = lut4 + s * K;
+        const float mn = seg_min[s];
+        for (uint32_t c = 0; c < K; c++) {
+            const int q4 = (int)((src_row[c] - mn) * A + 0.5f);
+            dst_row[c] = (uint8_t)std::max(0, std::min(15, q4));
+        }
+    }
+
+    // `scale_out` is optional — the scan path never needs the scale (all
+    // shards in one query share one LUT; argmin ranking is scale-invariant).
+    if (scale_out) *scale_out = A;
 }
 
 }  // namespace simd

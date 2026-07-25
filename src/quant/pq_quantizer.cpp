@@ -855,6 +855,22 @@ void PqQuantizer::build_fastscan_lut(const float* query,
     simd::quantize_lut_u8(lut_f32.data(), m_, K_, lut8, scale, offset);
 }
 
+void PqQuantizer::build_fastscan_lut4(const float* query,
+                                      uint8_t* lut4,
+                                      float* scale_out) const {
+    // 4-bit FastScan LUT (Option A scan path). The 4-bit kernel needs K=16
+    // entries per segment; misuse catches any other bits_ configuration.
+    if (bits_ != 4 || K_ != 16) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_fastscan_lut4: requires bits=4 (K=16); got bits=" +
+                        std::to_string(bits_) + " (K=" + std::to_string(K_) +
+                        "). Use build_fastscan_lut for 8-bit.");
+    }
+    std::vector<float> lut_f32(static_cast<size_t>(m_) * K_);
+    preprocess_query(query, lut_f32.data());
+    simd::quantize_lut_u4(lut_f32.data(), m_, K_, lut4, scale_out);
+}
+
 // ---------------------------------------------------------------------------
 // LUT distance
 // ---------------------------------------------------------------------------

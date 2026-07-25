@@ -49,7 +49,8 @@ int cmd_analyze(int argc, char* argv[]) {
     cfg.proximity_target = p.get<float>("proximity-target");
     cfg.recall_target    = p.get<float>("recall-target");
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
-    cfg.ivf_mode         = p.exist("ivf");
+    // (cfg.sharded_graph and cfg.merged_graph are set in build_config_from_parser
+    // from the --ivf / --graph flags, with mutual-exclusion validation.)
 
     sextant::Estimator estimator;
     const auto est = estimator.estimate_config(source, cfg);

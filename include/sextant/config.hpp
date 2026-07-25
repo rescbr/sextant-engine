@@ -120,7 +120,7 @@ struct BuildConfig {
     bool pq_opq = false;
 
     /// Partition count override. 0 = auto (resolved from build_ram_budget,
-    /// plus a recall-driven floor when `ivf_mode` is true). >0 forces exactly
+    /// plus a recall-driven floor when `sharded_graph` is true). >0 forces exactly
     /// this many partitions. Only meaningful for partitioned / IVF builds.
     uint32_t partition_count = 0;
 
@@ -129,7 +129,20 @@ struct BuildConfig {
     /// has enough shards for good routing even when RAM would allow K=1.
     /// See docs/ivf_probe_design.md "K selection". The recall floor is a
     /// lower bound — the RAM-driven K still wins when it's larger.
-    bool ivf_mode = false;
+    bool sharded_graph = false;
+
+    /// Use the merged-graph build path (Vamana per-shard) instead of the
+    /// default IVF-list-scan + 4-bit PQ FastScan path. Inverts the older
+    /// `--ivf` flag: IVF-scan is now the default for K≥1; `merged_graph=true`
+    /// restores the prior graph-inside-shard behavior (`build_ivf`) for
+    /// low-recall / high-QPS tier where graph traversal wins (recall < 0.88).
+    /// See ~/.local/state/maki/plans/sharing-eternal-louse.md.
+    bool merged_graph = false;
+
+    /// Number of subquantizers for the 4-bit FastScan codebook. 0 = auto
+    /// (dim/4 — 192 at dim=768, matching the validated spike). Only meaningful
+    /// for the IVF-scan path (merged_graph=false).
+    uint16_t pq4_m = 0;
 };
 
 /// Result of a build operation.
@@ -180,6 +193,15 @@ struct SearchConfig {
     /// (it always runs to completion regardless of this or the index value).
     /// IVF uses this to pass a higher patience than the merged default.
     uint32_t early_exit_patience = 0xFFFFFFFFu;  // kDeferToParams
+
+    /// IVF-list-scan rerank depth W (Option A). The scan path returns the
+    /// top-W candidates by 4-bit PQ distance; the database layer does exact
+    /// rerank + top-k outside sextant-engine. W replaces the `k ×
+    /// merge_oversample` shortlist the graph path uses — directly sets the
+    /// candidate-list size handed back to the caller. 0 = default (300, the
+    /// recall-0.99 point on arxiv-nomic per the hybrid-IVF spike). Ignored
+    /// for graph-mode indexes.
+    uint32_t fastscan_W = 0;
 };
 
 /// Adaptive parameters resolved from dataset/machine properties (Issue 37).
@@ -204,6 +226,15 @@ struct ResolvedParams {
     bool pq_anisotropy = false;  ///< PQ covariance-based anisotropic codebook training. Threaded into PqQuantizer::train.
     bool pq_opq = false;          ///< OPQ PCA rotation. Threaded into PqQuantizer::train.
     bool anisotropic_pq = false;  ///< Use AnisotropicPqQuantizer (ScaNN-style training).
+
+    /// Merged-graph build path (vs the default IVF-list-scan + 4-bit PQ
+    /// FastScan). Persisted so the search dispatcher can route correctly on
+    /// reopen. See BuildConfig::merged_graph.
+    bool merged_graph = false;
+
+    /// 4-bit PQ subquantizer count for the IVF-scan path. 0 = auto (dim/4).
+    /// Persisted; the searcher reads this to size its 4-bit LUT.
+    uint16_t pq4_m = 0;
 };
 
 /// Estimation diagnostics produced by `Engine::estimate_config` (and the

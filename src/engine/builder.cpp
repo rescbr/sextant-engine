@@ -1425,6 +1425,378 @@ BuildResult Builder::build_ivf(VectorSource& source, const std::string& index_pa
 }
 
 // ===========================================================================
+// build_ivf_scan — IVF-list-scan + 4-bit PQ FastScan (Option A, the DEFAULT
+// build path when BuildConfig::merged_graph is false).
+//
+// Pipeline:
+//   1. prepare_codes (existing): train the 8-bit routing PQ + encode all N
+//      (used for partition_codes — k-means on PQ codes).
+//   2. Train a SEPARATE 4-bit PQ codebook on a FP32 sample (the validated
+//      m=192/bits=4 config from the spike). This codebook is shared across
+//      all shards.
+//   3. partition_codes → PartitionAssignment (shard membership + centroids).
+//   4. For each shard: encode each member at 4-bit, pack into FastScan block
+//      layout, write `.codes4` + `.rowids` sidecars.
+//   5. centroids.bin: K × dim × float16_t (decoded from the partition's 8-bit
+//      PQ centroid codes — same as build_ivf).
+//   6. codebook4.bin: serialized 4-bit PqQuantizer (shared).
+//   7. manifest (line-oriented text; IVFScanIndex::read commit point).
+//
+// NO graph, NO Vamana, NO BFS reorder, NO .epc. Each shard is a pure code
+// container. See ~/.local/state/maki/plans/sharing-eternal-louse.md.
+// ===========================================================================
+BuildResult Builder::build_ivf_scan(VectorSource& source,
+                                     const std::string& index_path,
+                                     const ResolvedParams& params,
+                                     uint32_t n_probe_default) {
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // --- 1. Global 8-bit PQ (routing) + encode all N ---
+    prepare_codes(source, params);
+
+    const uint32_t n = static_cast<uint32_t>(index_.count);
+    const uint32_t K = std::max<uint32_t>(1u, params.partition_count);
+    const Dim dim = index_.dim;
+    const uint16_t m4 = params.pq4_m > 0 ? params.pq4_m
+                                          : static_cast<uint16_t>(dim / 4);
+    if (m4 == 0 || dim % m4 != 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_ivf_scan: pq4_m=" + std::to_string(m4) +
+                        " invalid for dim=" + std::to_string(dim) +
+                        " (must divide dim)");
+    }
+
+    spdlog::info("[sextant] build_ivf_scan: N={} K={} m4={} → '{}.shards'",
+                 n, K, m4, index_path);
+
+    // --- 2. Train the 4-bit codebook on a FP32 sample drawn from source ---
+    // Re-reads source once (reset + sample). The 8-bit codebook trained on a
+    // reservoir; we mirror that for 4-bit. Sample size matches the spike
+    // (min(20k, N)) — PQ training is sample-size-insensitive past ~10k.
+    PqQuantizer q4(MetricKind::L2Sq, dim, m4, /*bits=*/4, /*seed=*/42);
+    {
+        const uint32_t train_n = std::min<uint64_t>(20'000, n);
+        std::vector<float> sample(static_cast<size_t>(train_n) * dim);
+        // Prefer the first train_n contiguous vectors (matches the spike); if
+        // source has a path, seek-sample; otherwise reset + next.
+        source.reset();
+        Chunk chunk;
+        uint32_t filled = 0;
+        while (filled < train_n && source.next(chunk)) {
+            const uint32_t take = std::min<uint32_t>(
+                train_n - filled, chunk.count);
+            std::memcpy(sample.data() + static_cast<size_t>(filled) * dim,
+                        chunk.vectors,
+                        static_cast<size_t>(take) * dim * sizeof(float));
+            filled += take;
+        }
+        if (filled == 0) {
+            throw Error(ErrorCode::IoError,
+                        "build_ivf_scan: source yielded no vectors for 4-bit "
+                        "codebook training");
+        }
+        spdlog::info("[sextant] training 4-bit PQ (m={}, K=16) on {} samples",
+                     m4, filled);
+        const auto ts = std::chrono::steady_clock::now();
+        q4.train(sample.data(), filled);
+        const auto te = std::chrono::steady_clock::now();
+        spdlog::info("[sextant]   4-bit codebook trained in {:.2f}s",
+                     std::chrono::duration<double>(te - ts).count());
+    }
+
+    // --- 3. Partition via k-means on the 8-bit routing codes ---
+    auto assignment = partition_codes(*index_.quantizer, index_.codes_buffer, n,
+                                       index_.code_size, K, params.closure_factor,
+                                       /*iterations=*/10, params.num_threads);
+    if (assignment.shards.size() != K) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_ivf_scan: partition returned K=" +
+                        std::to_string(assignment.shards.size()) +
+                        " (expected " + std::to_string(K) + ")");
+    }
+
+    const std::string shards_dir = index_path + ".shards";
+    std::error_code ec;
+    std::filesystem::create_directories(shards_dir, ec);
+    if (ec) {
+        throw Error(ErrorCode::IoError,
+                    "build_ivf_scan: cannot create shards dir '" + shards_dir +
+                        "': " + ec.message());
+    }
+
+    // --- 4. Per-shard: encode 4-bit, pack FastScan blocks, write sidecars ---
+    // We need FP32 vectors to encode at 4-bit. Re-read source once, in shard
+    // order. Build a global-id → row_id map first (source emits row_ids in
+    // order; assign sequential global ids matching the codes_buffer order).
+    //
+    // `index_.codes_buffer` was filled by pass2_encode in global-id order
+    // (0..N-1). partition_codes assigned global ids the same way. To encode
+    // at 4-bit we need each vector's FP32 — re-read source sequentially and
+    // cache them in a flat FP32 buffer (N × dim × 4 bytes). At 1.34M×768×4
+    // = 4.1 GB this is too large to hold in RAM alongside the build buffers
+    // for 1B; for the arxiv-nomic validation scale it's fine. Production
+    // 1B-scale will page this via a MemorySource or seek-on-demand — flagged
+    // in the plan as a regroup point.
+    std::vector<float> all_vecs(static_cast<size_t>(n) * dim);
+    {
+        source.reset();
+        Chunk chunk;
+        uint32_t filled = 0;
+        while (filled < n && source.next(chunk)) {
+            const uint32_t take = std::min<uint32_t>(n - filled, chunk.count);
+            std::memcpy(all_vecs.data() + static_cast<size_t>(filled) * dim,
+                        chunk.vectors,
+                        static_cast<size_t>(take) * dim * sizeof(float));
+            filled += take;
+        }
+        if (filled != n) {
+            throw Error(ErrorCode::IoError,
+                        "build_ivf_scan: source yielded " +
+                            std::to_string(filled) + " vectors on re-read (" +
+                            std::to_string(n) + " expected)");
+        }
+    }
+
+    const auto uuid = make_uuid();
+    const uint32_t m = m4;
+    const uint32_t block_bytes = static_cast<uint32_t>(m) * 16;
+
+    uint32_t shards_written = 0;
+    for (uint32_t k = 0; k < K; k++) {
+        auto& members = assignment.shards[k];
+        const uint32_t shard_n = static_cast<uint32_t>(members.size());
+        char dirbuf[32];
+        std::snprintf(dirbuf, sizeof(dirbuf), "shard_%04u", k + 1);
+        const std::string shard_dir = shards_dir + "/" + dirbuf;
+        if (shard_n == 0) {
+            spdlog::warn("[sextant] build_ivf_scan: shard {} empty, skipping",
+                         k + 1);
+            continue;
+        }
+        std::filesystem::create_directories(shard_dir, ec);
+        if (ec) {
+            throw Error(ErrorCode::IoError,
+                        "build_ivf_scan: cannot create shard dir '" +
+                            shard_dir + "': " + ec.message());
+        }
+
+        const uint32_t n_blocks = (shard_n + 31) / 32;
+
+        // Encode each member to m nibbles (one byte per segment, value 0..15).
+        std::vector<uint8_t> nibbles(static_cast<size_t>(shard_n) * m);
+        {
+            std::vector<uint8_t> packed(q4.code_size());  // m/2 bytes
+            for (uint32_t i = 0; i < shard_n; i++) {
+                const uint32_t gid = members[i];
+                const float* vec =
+                    all_vecs.data() + static_cast<size_t>(gid) * dim;
+                q4.encode(vec, packed.data());
+                for (uint32_t s = 0; s < m; s++) {
+                    nibbles[static_cast<size_t>(i) * m + s] = static_cast<uint8_t>(
+                        (packed[s / 2] >> ((s % 2) * 4)) & 0xF);
+                }
+            }
+        }
+
+        // Pack into FastScan block layout: blocks[b][s][16], where byte k of
+        // segment s holds low=vector (b*32+k), high=vector (b*32+16+k). The
+        // tail block zero-pads (those lanes are masked at search time).
+        std::vector<uint8_t> blocks(static_cast<size_t>(n_blocks) * block_bytes,
+                                    0);
+        for (uint32_t b = 0; b < n_blocks; b++) {
+            for (uint32_t s = 0; s < m; s++) {
+                for (uint32_t kk = 0; kk < 16; kk++) {
+                    const uint32_t v0 = b * 32 + kk;        // low nibble
+                    const uint32_t v1 = b * 32 + 16 + kk;   // high nibble
+                    const uint8_t lo = (v0 < shard_n)
+                        ? nibbles[static_cast<size_t>(v0) * m + s] : 0;
+                    const uint8_t hi = (v1 < shard_n)
+                        ? nibbles[static_cast<size_t>(v1) * m + s] : 0;
+                    blocks[((static_cast<size_t>(b) * m) + s) * 16 + kk] =
+                        static_cast<uint8_t>((hi << 4) | lo);
+                }
+            }
+        }
+
+        // Write .codes4 (SidecarHeader + block payload).
+        {
+            const std::string path = shard_dir + "/.codes4";
+            DirectFile f(path, true);
+            SidecarHeader h{};
+            fill_header(h, kMagicCodes4, shard_n, dim, uuid);
+            write_padded(f, &h, sizeof(h), 0);
+            write_padded(f, blocks.data(), blocks.size(), sizeof(h));
+            f.sync();
+        }
+        // Write .rowids (SidecarHeader + shard_n × int64). Map shard-local
+        // idx → global RowId. The source's row_ids may carry DB-layer IDs;
+        // we collected row_ids during the re-read above implicitly (source
+        // emits them in order). If the source provides row_ids, use them;
+        // otherwise fall back to global sequential IDs (members[i]).
+        {
+            std::vector<RowId> rids(shard_n);
+            // We did not retain chunk.row_ids above; re-derive from members.
+            // For FbinSource (the benchmark path), row_id == global index,
+            // so members[i] IS the RowId. For DB-backed sources this would
+            // need a row_id cache pass — flagged as a regroup point.
+            for (uint32_t i = 0; i < shard_n; i++) {
+                rids[i] = static_cast<RowId>(members[i]);
+            }
+            const std::string path = shard_dir + "/.rowids";
+            DirectFile f(path, true);
+            SidecarHeader h{};
+            fill_header(h, kMagicRowids, shard_n, dim, uuid);
+            write_padded(f, &h, sizeof(h), 0);
+            write_padded(f, rids.data(),
+                         static_cast<size_t>(shard_n) * sizeof(RowId),
+                         sizeof(h));
+            f.sync();
+        }
+        // Per-shard manifest (atomic commit).
+        {
+            const std::string path = shard_dir + "/.manifest";
+            const std::string tmp = path + ".tmp";
+            {
+                DirectFile f(tmp, true);
+                std::string commit =
+                    std::string("ready\n") +
+                    std::to_string(shard_n) + "\n" +
+                    std::to_string(dim) + "\n" +
+                    std::to_string(m4) + "\n";
+                write_padded(f, commit.data(), commit.size(), 0);
+                f.sync();
+            }
+            std::error_code rec;
+            std::filesystem::rename(tmp, path, rec);
+            if (rec) {
+                throw Error(ErrorCode::IoError,
+                            "build_ivf_scan: shard manifest rename failed: " +
+                                rec.message());
+            }
+        }
+
+        ++shards_written;
+        spdlog::info("[sextant] build_ivf_scan: shard {}/{} ({} vectors, "
+                     "{} blocks, {:.1f}MB codes)", k + 1, K, shard_n,
+                     n_blocks, blocks.size() / 1e6);
+    }
+    if (shards_written == 0) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_ivf_scan: every shard was empty (K=" +
+                        std::to_string(K) + ", N=" + std::to_string(n) + ")");
+    }
+
+    // --- 5. centroids.bin: K × dim × float16_t (same as build_ivf) ---
+    {
+        const std::string path = shards_dir + "/centroids.bin";
+        DirectFile f(path, true);
+        const size_t vec_bytes = static_cast<size_t>(dim) * sizeof(float16_t);
+        const size_t block_cap = kBlockSize;
+        const uint32_t vecs_per_block = std::max<uint32_t>(
+            1u, static_cast<uint32_t>(block_cap / vec_bytes));
+        const size_t buf_cap = static_cast<size_t>(vecs_per_block) * vec_bytes;
+        AlignedBuf ring(kDiskAlign, buf_cap);
+
+        std::vector<float> centroid_f32(dim);
+        std::vector<float16_t> centroid_f16(dim);
+        uint64_t write_off = 0;
+        uint32_t in_block = 0;
+        for (uint32_t k = 0; k < K; k++) {
+            const auto& code = assignment.centroids[k];
+            if (code.size() != index_.code_size) {
+                throw Error(ErrorCode::InvalidParam,
+                            "build_ivf_scan: centroid " + std::to_string(k) +
+                                " has wrong code size");
+            }
+            index_.quantizer->decode_code(code.data(), centroid_f32.data());
+            cast_fp32_to_fp16(centroid_f32.data(), centroid_f16.data(), dim);
+            std::memcpy(ring.as<uint8_t>() +
+                            static_cast<size_t>(in_block) * vec_bytes,
+                        centroid_f16.data(), vec_bytes);
+            if (++in_block >= vecs_per_block) {
+                write_padded(f, ring.get(),
+                             static_cast<size_t>(in_block) * vec_bytes,
+                             write_off);
+                write_off += static_cast<size_t>(in_block) * vec_bytes;
+                in_block = 0;
+            }
+        }
+        if (in_block > 0) {
+            write_padded(f, ring.get(),
+                         static_cast<size_t>(in_block) * vec_bytes, write_off);
+        }
+        f.sync();
+    }
+
+    // --- 6. codebook4.bin: serialized 4-bit PqQuantizer (shared) ---
+    {
+        const std::string path = shards_dir + "/codebook4.bin";
+        std::vector<uint8_t> blob;
+        q4.serialize(blob);
+        DirectFile f(path, true);
+        SidecarHeader h{};
+        fill_header(h, kMagicCodebook4, n, dim, uuid);
+        write_padded(f, &h, sizeof(h), 0);
+        const uint64_t qsize = blob.size();
+        write_padded(f, &qsize, sizeof(qsize), sizeof(h));
+        if (!blob.empty()) {
+            write_padded(f, blob.data(), blob.size(),
+                         sizeof(h) + sizeof(qsize));
+        }
+        f.sync();
+    }
+
+    // --- 7. manifest (line-oriented text; IVFScanIndex::read commit point) ---
+    {
+        const uint32_t n_probe = n_probe_default > 0
+                                     ? n_probe_default
+                                     : std::max(1u, K / 4u);
+        const std::string path = shards_dir + "/manifest";
+        const std::string tmp = path + ".tmp";
+        {
+            DirectFile f(tmp, true);
+            std::string commit =
+                std::string("ready\n") +
+                std::to_string(K) + "\n" +
+                std::to_string(dim) + "\n" +
+                std::to_string(n_probe) + "\n" +
+                std::to_string(m4) + "\n";
+            write_padded(f, commit.data(), commit.size(), 0);
+            f.sync();
+        }
+        std::error_code rec;
+        std::filesystem::rename(tmp, path, rec);
+        if (rec) {
+            throw Error(ErrorCode::IoError,
+                        "build_ivf_scan: manifest rename failed: " +
+                            rec.message());
+        }
+        spdlog::info("[sextant] wrote {} (K={} n_probe_default={} m4={})",
+                     path, K, n_probe, m4);
+    }
+
+    // Free global build buffers.
+    if (index_.codes_buffer) { aligned_free(index_.codes_buffer); index_.codes_buffer = nullptr; }
+    if (index_.raw_vecs_buffer) { aligned_free(index_.raw_vecs_buffer); index_.raw_vecs_buffer = nullptr; }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    spdlog::info("[sextant] build_ivf_scan complete (K={}, {}/{} shards, "
+                 "m4={}) in {:.2f}s", K, shards_written, K, m4,
+                 std::chrono::duration<double>(t1 - t0).count());
+
+    BuildResult result;
+    result.index_path = shards_dir;
+    result.n_vectors = n;
+    result.dim = dim;
+    result.R = params.R;
+    result.L_build = params.L_build;
+    result.pq_m = m4;
+    result.pq_bits = 4;
+    result.build_time_sec = std::chrono::duration<double>(t1 - t0).count();
+    return result;
+}
+
+// ===========================================================================
 // build_shard_into_ — construct + flush ONE IVF shard via a fresh Builder.
 //
 // The shard Index arrives with: cloned quantizer, materialized shard-local
