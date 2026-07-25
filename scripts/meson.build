@@ -63,3 +63,10 @@ spike_margin_rerank = executable('spike_margin_rerank',
     include_directories: [engine_inc, third_party_inc, numkong_inc],
     install: false,
 )
+
+spike_graph_coarse_router = executable('spike_graph_coarse_router',
+    'spike_graph_coarse_router.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, third_party_inc, numkong_inc],
+    install: false,
+)
