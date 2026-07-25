@@ -35,3 +35,17 @@ spike_precision_cmp = executable('spike_precision_cmp',
     include_directories: [engine_inc, third_party_inc, numkong_inc],
     install: false,
 )
+
+spike_large_k = executable('spike_large_k',
+    'spike_large_k.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, third_party_inc, numkong_inc],
+    install: false,
+)
+
+bench_mem = executable('bench_mem',
+    'bench_mem.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, third_party_inc, numkong_inc],
+    install: false,
+)
