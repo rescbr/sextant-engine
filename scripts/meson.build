@@ -56,3 +56,10 @@ spike_colocated = executable('spike_colocated',
     include_directories: [engine_inc, third_party_inc, numkong_inc],
     install: false,
 )
+
+spike_margin_rerank = executable('spike_margin_rerank',
+    'spike_margin_rerank.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, third_party_inc, numkong_inc],
+    install: false,
+)
