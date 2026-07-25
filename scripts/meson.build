@@ -21,3 +21,17 @@ spike_pq4_recall = executable('spike_pq4_recall',
     include_directories: [engine_inc, third_party_inc, numkong_inc],
     install: false,
 )
+
+spike_hybrid_ivf = executable('spike_hybrid_ivf',
+    'spike_hybrid_ivf.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, third_party_inc, numkong_inc],
+    install: false,
+)
+
+spike_precision_cmp = executable('spike_precision_cmp',
+    'spike_precision_cmp.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, third_party_inc, numkong_inc],
+    install: false,
+)
