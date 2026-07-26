@@ -1593,8 +1593,22 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
     const uint32_t m = m4;
     const uint32_t block_bytes = static_cast<uint32_t>(m) * 16;
 
-    uint32_t shards_written = 0;
-    for (uint32_t k = 0; k < K; k++) {
+    // --- Per-shard encode + write (PARALLEL across K) ---
+    // Each shard is independent: its own member list, its own output
+    // directory, no shared mutable state. Work-steal over K (one shard per
+    // task). num_threads comes from resolve_params; clamped to K because
+    // there's no benefit to more workers than shards. Mirrors the
+    // partition_codes pool pattern (empty WorkerState — each task is
+    // self-contained, no reusable per-thread buffers worth caching).
+    const uint32_t encode_threads =
+        std::max(1u, std::min(params.num_threads, K));
+
+    struct ShardEncodeState {};
+    ctpl::thread_pool_tls<ShardEncodeState> encode_pool(encode_threads);
+
+    // Per-shard body. Returns 1 if the shard was written, 0 if it was
+    // empty-skipped. Captures only const inputs + the shards_dir path.
+    auto encode_shard = [&](uint32_t k) -> uint32_t {
         auto& members = assignment.shards[k];
         const uint32_t shard_n = static_cast<uint32_t>(members.size());
         char dirbuf[32];
@@ -1603,13 +1617,14 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         if (shard_n == 0) {
             spdlog::warn("[sextant] build_ivf_scan: shard {} empty, skipping",
                          k + 1);
-            continue;
+            return 0;
         }
-        std::filesystem::create_directories(shard_dir, ec);
-        if (ec) {
+        std::error_code mkrec;
+        std::filesystem::create_directories(shard_dir, mkrec);
+        if (mkrec) {
             throw Error(ErrorCode::IoError,
                         "build_ivf_scan: cannot create shard dir '" +
-                            shard_dir + "': " + ec.message());
+                            shard_dir + "': " + mkrec.message());
         }
 
         const uint32_t n_blocks = (shard_n + 31) / 32;
@@ -1707,12 +1722,37 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
             }
         }
 
-        ++shards_written;
         spdlog::info("[sextant] build_ivf_scan: shard {}/{} ({} vectors, "
                      "{} blocks, {:.1f}MB codes)", k + 1, K, shard_n,
                      n_blocks, blocks.size() / 1e6);
+        return 1;
+    };
+
+    // Work-steal over K: one shard per task. Atomic next_id drives the
+    // claim loop; the pool's own queue handles load balancing across the
+    // (intentionally oversubscribed) K shards. spdlog is thread-safe;
+    // DirectFile/PqQuantizer::encode are stateless on shared state (each
+    // task writes its own shard directory).
+    std::atomic<uint32_t> next_shard{0};
+    std::atomic<uint32_t> shards_written{0};
+    std::vector<std::future<void>> futs;
+    futs.reserve(encode_threads);
+    for (uint32_t t = 0; t < encode_threads; t++) {
+        futs.push_back(encode_pool.push(
+            [&encode_shard, K, &next_shard, &shards_written]
+            (size_t /*id*/, ShardEncodeState& /*w*/) {
+                while (true) {
+                    const uint32_t k = next_shard.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (k >= K) break;
+                    shards_written.fetch_add(
+                        encode_shard(k), std::memory_order_relaxed);
+                }
+            }));
     }
-    if (shards_written == 0) {
+    for (auto& f : futs) f.get();
+
+    if (shards_written.load(std::memory_order_relaxed) == 0) {
         throw Error(ErrorCode::InvalidParam,
                     "build_ivf_scan: every shard was empty (K=" +
                         std::to_string(K) + ", N=" + std::to_string(n) + ")");
@@ -1814,7 +1854,8 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
 
     const auto t1 = std::chrono::steady_clock::now();
     spdlog::info("[sextant] build_ivf_scan complete (K={}, {}/{} shards, "
-                 "m4={}) in {:.2f}s", K, shards_written, K, m4,
+                 "m4={}) in {:.2f}s", K,
+                 shards_written.load(std::memory_order_relaxed), K, m4,
                  std::chrono::duration<double>(t1 - t0).count());
 
     BuildResult result;
