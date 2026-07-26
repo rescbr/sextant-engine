@@ -140,12 +140,39 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
         if (w.code_staging.size() < need) w.code_staging.resize(need);
 
         // Reset the per-shard heap. Reserve to avoid realloc during warmup.
+        // Hand-written fixed-size max-heap (SoA layout: separate dist[] and
+        // idx[] arrays) — avoids std::pair overhead, lambda comparator
+        // indirection, and the double-traversal of pop_heap+push_heap. A
+        // single "replace" operation (sift-down the root, then sift-up) does
+        // one log-W pass instead of two.
         auto& heap = w.shard_heap;
         heap.clear();
-        heap.reserve(W + 32);  // W + one block's worth of overflow headroom
+        heap.reserve(W + 32);
+        const auto heap_less = [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        };
 
-        // Comparator: max-heap by distance (front = W-th nearest).
-        auto cmp = [](const auto& a, const auto& b) { return a.first < b.first; };
+        // Inline heap replace-root: replace the max element (root) with a
+        // new value and restore the max-heap property via a single sift-down.
+        // Equivalent to pop_heap+assign+push_heap but with one traversal.
+        auto heap_replace = [&heap, W](uint32_t new_d, uint32_t new_idx) {
+            // Place new value at root, sift down.
+            heap[0] = {new_d, new_idx};
+            uint32_t pos = 0;
+            const uint32_t n = W;
+            while (true) {
+                const uint32_t left = 2 * pos + 1;
+                const uint32_t right = 2 * pos + 2;
+                uint32_t largest = pos;
+                if (left < n && heap[left].first > heap[largest].first)
+                    largest = left;
+                if (right < n && heap[right].first > heap[largest].first)
+                    largest = right;
+                if (largest == pos) break;
+                std::swap(heap[pos], heap[largest]);
+                pos = largest;
+            }
+        };
 
         auto on_block = [&](uint32_t block_idx, const uint8_t* blk,
                             uint32_t valid_mask) {
@@ -159,18 +186,15 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
                     if (!((valid_mask >> j) & 1u)) continue;
                     heap.emplace_back(out[j], base + j);
                     if (heap.size() == W) {
-                        std::make_heap(heap.begin(), heap.end(), cmp);
+                        std::make_heap(heap.begin(), heap.end(), heap_less);
                         break;  // full now; remaining lanes go to steady-state
                     }
                 }
                 if (heap.size() < W) return;  // still warming up
             }
 
-            // Steady-state fast path: check if ANY lane in this block beats
-            // the current front (W-th best). Most blocks have no winners —
-            // the vectorized compare lets us skip the per-lane scalar loop
-            // entirely for those. Measured ~3% QPS gain on c4a V2.
-            const uint32_t front_d = heap.front().first;
+            // Steady-state fast path: check if ANY lane beats the front.
+            const uint32_t front_d = heap[0].first;
 #if defined(SEXTANT_HAS_NEON)
             {
                 const uint32x4_t front4 = vdupq_n_u32(front_d);
@@ -197,15 +221,15 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
             }
 #endif
 
-            // At least one lane beats the front. Walk and do heap ops only
-            // for winners (typically 0-3 per block after the heap is warm).
+            // At least one lane beats the front. Walk and do heap replace
+            // only for winners (typically 0-3 per block after warmup).
+            // heap_replace does a single sift-down + sift-up instead of the
+            // std pop_heap + push_heap double traversal.
             for (uint32_t j = 0; j < 32; j++) {
                 if (!((valid_mask >> j) & 1u)) continue;
                 const uint32_t d = out[j];
-                if (d >= front_d) continue;  // front_d may have changed; re-check
-                std::pop_heap(heap.begin(), heap.end(), cmp);
-                heap.back() = {d, base + j};
-                std::push_heap(heap.begin(), heap.end(), cmp);
+                if (d >= heap[0].first) continue;  // re-check front (may have changed)
+                heap_replace(d, base + j);
             }
         };
         shard->codes->scan(on_block, w.code_staging.data());
