@@ -70,3 +70,10 @@ spike_graph_coarse_router = executable('spike_graph_coarse_router',
     include_directories: [engine_inc, third_party_inc, numkong_inc],
     install: false,
 )
+
+bench_kernel = executable('bench_kernel',
+    'bench_kernel.cpp',
+    dependencies: sextant_dep,
+    include_directories: [engine_inc, third_party_inc, numkong_inc],
+    install: false,
+)
