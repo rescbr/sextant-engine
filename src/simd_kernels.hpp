@@ -612,8 +612,8 @@ inline void argmin_scaled(uint32_t n, uint32_t k, uint32_t k_simd,
                 float32x4_t vals = vsubq_f32(s, vmulq_f32(two, r));
                 uint32x4_t idx = vaddq_u32(vdupq_n_u32(base), lane_idx);
                 uint32x4_t mask = vcltq_f32(vals, best_val);
-                best_val = vbslq_f32(mask, vals, best_val);
-                best_idx = vbslq_f32(mask, idx, best_idx);
+                best_val = vbslq_f32(vreinterpretq_f32_u32(mask), vals, best_val);
+                best_idx = vbslq_u32(mask, idx, best_idx);
             }
             // Horizontal reduce of 4 lanes.
             float l0 = vgetq_lane_f32(best_val, 0);
