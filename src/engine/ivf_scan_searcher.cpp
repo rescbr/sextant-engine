@@ -117,10 +117,16 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
     }
     n_probe_eff = std::min(n_probe_eff, K);
 
-    // --- 3. Scan each probed shard SERIALY; maintain per-shard top-W heap ---
+    // --- 3. Scan each probed shard SERIALLY; maintain per-shard top-W heap ---
     // Max-heap of (dist, local_idx), size ≤ W. Smaller dist = nearer, so the
     // heap's front is the W-th nearest (the eviction candidate). When the heap
     // is full and a new dist is smaller than the front, pop the front and push.
+    //
+    // Profiling note: tried replacing this with flat-collect-all + post-sort
+    // (the spike's pattern) — it was ~15% SLOWER despite avoiding log-W heap
+    // ops, because flat-collect grows a per-shard buffer to ~22k pairs (vs the
+    // heap's fixed W=300), and the reallocation + 22k pair writes outweigh the
+    // heap-op savings. The heap's bounded memory is the right trade here.
     w.scored.clear();
     const uint32_t invalid = 0xFFFFFFFFu;
 
@@ -159,7 +165,7 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
                     if (heap.size() == W) {
                         std::make_heap(heap.begin(), heap.end(),
                                        [](const auto& a, const auto& b) {
-                                           return a.first < b.first;
+                                          return a.first < b.first;
                                        });
                     }
                 } else if (d < heap.front().first) {

@@ -50,7 +50,9 @@ struct IVFScanWorkerState {
     std::unordered_map<RowId, uint32_t> dedup;
     /// Per-shard top-W heap during scan (dist max-heap of size ≤ W; smaller
     /// distance = nearer). Reused across the n_probe shards of one query.
-    /// Stored as (dist, local_idx) pairs with the max at front.
+    /// Stored as (dist, local_idx) pairs with the max at front. Flat-collect
+    /// + post-sort was tried and measured slower (the per-shard buffer growth
+    /// to ~22k pairs outweighs the heap-op savings).
     std::vector<std::pair<uint32_t, uint32_t>> shard_heap;
     /// Staging buffer for CodeStream sequential pread. Owned per-worker so
     /// every probed shard reuses one allocation. Lazily sized on first use.
