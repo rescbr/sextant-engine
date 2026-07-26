@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <random>
@@ -151,14 +152,29 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
     };
 
     for (uint32_t iter = 0; iter < iterations; iter++) {
+        const auto iter_t0 = std::chrono::steady_clock::now();
         // --- Assignment pass (parallel): assign[i] = nearest centroid ---
         parallel_assign();
+        const auto assign_t1 = std::chrono::steady_clock::now();
 
         // --- Bucket assign[] into per-cluster lists (serial, cheap: O(n)) ---
         std::vector<std::vector<uint32_t>> clusters(K);
         for (uint32_t i = 0; i < n; i++) {
             clusters[assign[i]].push_back(i);
         }
+
+        spdlog::info("[sextant] partition: iter {}/{} assign={:.1f}s, "
+                     "cluster sizes min={} max={}",
+                     iter + 1, iterations,
+                     std::chrono::duration<double>(assign_t1 - iter_t0).count(),
+                     std::accumulate(clusters.begin(), clusters.end(), UINT32_MAX,
+                                     [](uint32_t a, const auto& b) {
+                                         return std::min(a, (uint32_t)b.size());
+                                     }),
+                     std::accumulate(clusters.begin(), clusters.end(), 0u,
+                                     [](uint32_t a, const auto& b) {
+                                         return std::max(a, (uint32_t)b.size());
+                                     }));
 
         // --- Update pass: medoid per cluster (parallel over K clusters) ---
         // Each cluster's medoid search is independent. K is small (16-512),
@@ -221,6 +237,10 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                 }));
         }
         for (auto& f : futs) f.get();
+        const auto update_t1 = std::chrono::steady_clock::now();
+        spdlog::info("[sextant] partition: iter {}/{} medoid_update={:.1f}s",
+                     iter + 1, iterations,
+                     std::chrono::duration<double>(update_t1 - assign_t1).count());
     }
 
     // --- Final assignment WITH closure_factor overlap (parallel) ---
