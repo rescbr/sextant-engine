@@ -88,7 +88,9 @@ nsync_dep = nsync_proj.get_variable('nsync_dep')
 # spdlog: from WrapDB (header-only mode). meson wrap install spdlog.
 spdlog_dep = dependency('spdlog')
 
-# NumKong: header-only, just add include path.
+# NumKong: header-only. Only used by scripts/bench_preprocess_query.cpp
+# (an old microbench). NOT used by the engine itself. Add the include path
+# only to scripts that actually need it.
 numkong_inc = include_directories('third_party/numkong/include')
 
 # CTPL and cmdline: committed headers, include path only.
@@ -128,7 +130,7 @@ engine_sources = [
 
 sextant_lib = static_library('sextant',
     engine_sources,
-    include_directories: [engine_inc, src_inc, numkong_inc, third_party_inc],
+    include_directories: [engine_inc, src_inc, third_party_inc],
     dependencies: [nsync_dep, spdlog_dep],
     install: false,
 )

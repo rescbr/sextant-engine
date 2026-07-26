@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <sys/mman.h>
 #include <utility>
 
 namespace sextant {
@@ -20,9 +21,8 @@ CodeStream::CodeStream(const std::string& path, uint32_t m)
     }
     block_bytes_ = m_ * 16;
 
-    // Read + validate the header.
     SidecarHeader h{};
-    engine_detail::read_exact(file_, &h, sizeof(h), /*offset=*/0);
+    engine_detail::read_exact(file_, &h, sizeof(h), 0);
     if (h.magic != kMagicCodes4) {
         throw Error(ErrorCode::CorruptIndex,
                     "CodeStream: magic mismatch on '" + path +
@@ -35,55 +35,80 @@ CodeStream::CodeStream(const std::string& path, uint32_t m)
     n_vectors_ = static_cast<uint32_t>(h.n_vectors);
     n_blocks_ = (n_vectors_ + 31) / 32;
 
-    // Chunk size: 4 × kBlockSize = 1 MB pre-read, divided by the per-block
-    // size. Clamped to at least 1 block (tiny shards) and at most n_blocks_.
-    constexpr uint32_t kTargetChunkBytes = 4 * kBlockSize;  // 1 MB
+    constexpr uint32_t kTargetChunkBytes = 4 * kBlockSize;
     chunk_blocks_ = std::max<uint32_t>(
         1u, kTargetChunkBytes / std::max<uint32_t>(1u, block_bytes_));
     chunk_blocks_ = std::min(chunk_blocks_, n_blocks_);
+
+    file_size_ = file_.size();
+    if (file_size_ > 0) {
+        void* p = ::mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE,
+                         file_.fd(), 0);
+        mapped_ = (p == MAP_FAILED) ? nullptr : static_cast<const uint8_t*>(p);
+    }
 }
 
-CodeStream::~CodeStream() = default;
+CodeStream::~CodeStream() {
+    if (mapped_) ::munmap((void*)mapped_, file_size_);
+}
 
-CodeStream::CodeStream(CodeStream&&) noexcept = default;
-CodeStream& CodeStream::operator=(CodeStream&&) noexcept = default;
+CodeStream::CodeStream(CodeStream&& other) noexcept
+    : file_(std::move(other.file_)), m_(other.m_),
+      block_bytes_(other.block_bytes_), n_blocks_(other.n_blocks_),
+      n_vectors_(other.n_vectors_), chunk_blocks_(other.chunk_blocks_),
+      mapped_(other.mapped_), file_size_(other.file_size_) {
+    other.mapped_ = nullptr;
+}
+
+CodeStream& CodeStream::operator=(CodeStream&& other) noexcept {
+    if (this != &other) {
+        if (mapped_) ::munmap((void*)mapped_, file_size_);
+        file_ = std::move(other.file_);
+        m_ = other.m_;
+        block_bytes_ = other.block_bytes_;
+        n_blocks_ = other.n_blocks_;
+        n_vectors_ = other.n_vectors_;
+        chunk_blocks_ = other.chunk_blocks_;
+        mapped_ = other.mapped_;
+        file_size_ = other.file_size_;
+        other.mapped_ = nullptr;
+    }
+    return *this;
+}
 
 bool CodeStream::scan(
     const std::function<void(uint32_t, const uint8_t*, uint32_t)>& on_block,
     uint8_t* staging) {
     if (n_blocks_ == 0) return true;
-
-    // The on-disk block ordering is the order `Builder::build_ivf_scan` wrote
-    // them: shard-local lane index 0..shard_n-1 in ascending order (block b's
-    // lane j → vector b*32+j). `valid_mask` for block b has bit j set iff
-    // b*32 + j < n_vectors_.
     const uint64_t data_off = sizeof(SidecarHeader);
 
-    // Buffered I/O: read in chunked batches matching the graph path's 1MB
-    // pre-read width. The OS page cache retains hot chunks across queries;
-    // cold chunks hit NVMe. `staging` may be unaligned (BufferedFile::pread
-    // handles any alignment via the page cache), but we keep the caller-owned
-    // staging pattern since it amortizes allocation across queries.
+    if (mapped_) {
+        const uint8_t* base_ptr = mapped_ + data_off;
+        for (uint32_t b = 0; b < n_blocks_; b++) {
+            const uint8_t* blk = base_ptr + (size_t)b * block_bytes_;
+            uint32_t mask = 0;
+            const uint32_t lane_base = b * 32;
+            const uint32_t lanes = std::min<uint32_t>(
+                32u, n_vectors_ - std::min(lane_base, n_vectors_));
+            for (uint32_t j = 0; j < lanes; j++) mask |= (1u << j);
+            on_block(b, blk, mask);
+        }
+        return true;
+    }
+
     uint32_t b = 0;
     while (b < n_blocks_) {
         const uint32_t blocks_this = std::min(chunk_blocks_, n_blocks_ - b);
-        const size_t bytes_this =
-            static_cast<size_t>(blocks_this) * block_bytes_;
-        const uint64_t off = data_off + static_cast<uint64_t>(b) * block_bytes_;
-
+        const size_t bytes_this = (size_t)blocks_this * block_bytes_;
+        const uint64_t off = data_off + (uint64_t)b * block_bytes_;
         engine_detail::read_exact(file_, staging, bytes_this, off);
-
         for (uint32_t i = 0; i < blocks_this; i++) {
-            const uint32_t gi = b + i;  // global block index
-            const uint8_t* blk =
-                staging + static_cast<size_t>(i) * block_bytes_;
-            // Compute the 32-bit valid_mask: bit j set iff gi*32 + j <
-            // n_vectors_. Full block → 0xFFFFFFFF; tail block → only the real
-            // bits.
+            const uint32_t gi = b + i;
+            const uint8_t* blk = staging + (size_t)i * block_bytes_;
             uint32_t mask = 0;
             const uint32_t base = gi * 32;
-            const uint32_t lanes =
-                std::min<uint32_t>(32u, n_vectors_ - std::min(base, n_vectors_));
+            const uint32_t lanes = std::min<uint32_t>(32u,
+                n_vectors_ - std::min(base, n_vectors_));
             for (uint32_t j = 0; j < lanes; j++) mask |= (1u << j);
             on_block(gi, blk, mask);
         }

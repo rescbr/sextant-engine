@@ -15,7 +15,7 @@ fvecs_to_fbin = executable('fvecs_to_fbin',
 sextant_bench = executable('sextant_bench',
     'benchmark.cpp',
     dependencies: sextant_dep,
-    include_directories: [engine_inc, third_party_inc, numkong_inc],
+    include_directories: [engine_inc, third_party_inc],
     install: false,
 )
 
@@ -29,6 +29,6 @@ pq_explore = executable('pq_explore',
 route_quality = executable('route_quality',
     'route_quality.cpp',
     dependencies: sextant_dep,
-    include_directories: [engine_inc, third_party_inc, numkong_inc],
+    include_directories: [engine_inc, third_party_inc],
     install: false,
 )
