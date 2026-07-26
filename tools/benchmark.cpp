@@ -581,37 +581,48 @@ int main(int argc, char* argv[]) {
          scfg.io_limit = io_limit;
          scfg.early_exit_patience = early_exit_req;
 
-        const auto t_start = Clock::now();
-        std::vector<std::future<std::vector<sextant::Candidate>>> futs;
-        futs.reserve(n_queries);
-        for (uint32_t qi = 0; qi < n_queries; qi++) {
-            const float* q = &queries[static_cast<size_t>(qi) * dim];
-            futs.push_back(searcher.search_one_async(q, scfg.k, scfg));
-        }
+         const auto t_start = Clock::now();
+         double recall_sum = 0.0;
+         uint64_t recall_hits = 0, recall_total = 0;
+         uint64_t prox_in = 0, prox_total = 0;
+         std::vector<double> prox_ratios;
+         std::vector<std::future<std::vector<sextant::Candidate>>> futs;
 
-        double recall_sum = 0.0;
-        uint64_t recall_hits = 0, recall_total = 0;
-        uint64_t prox_in = 0, prox_total = 0;
-        std::vector<double> prox_ratios;
-        for (uint32_t qi = 0; qi < n_queries; qi++) {
-            const auto q_start = Clock::now();
-            auto results = futs[qi].get();
-            const auto q_end = Clock::now();
-            const double per_q_us = US(q_end - q_start).count();
-            QueryMetrics m = process_results(rctx, queries, qi,
-                                             std::move(results), per_q_us);
-            latencies_us.push_back(m.latency_us);
-            recall_sum += m.recall_sum;
-            recall_hits += m.recall_hits;
-            recall_total += m.recall_total;
-            if (!m.prox_ratios.empty()) {
-                prox_ratios.insert(prox_ratios.end(),
-                                   m.prox_ratios.begin(),
-                                   m.prox_ratios.end());
-            }
-            prox_in += m.prox_in;
-            prox_total += m.prox_total;
-        }
+         futs.reserve(n_queries);
+
+         for (uint32_t qi = 0; qi < n_queries; qi++) {
+
+             const float* q = &queries[static_cast<size_t>(qi) * dim];
+
+             futs.push_back(searcher.search_one_async(q, scfg.k, scfg));
+
+         }
+
+         auto prev_q_end = Clock::now();
+
+         for (uint32_t qi = 0; qi < n_queries; qi++) {
+
+             auto results = futs[qi].get();
+
+             const auto q_end = Clock::now();
+
+             const double per_q_us = US(q_end - prev_q_end).count();
+
+             prev_q_end = q_end;
+             QueryMetrics m = process_results(rctx, queries, qi,
+                                              std::move(results), per_q_us);
+             latencies_us.push_back(m.latency_us);
+             recall_sum += m.recall_sum;
+             recall_hits += m.recall_hits;
+             recall_total += m.recall_total;
+             if (!m.prox_ratios.empty()) {
+                 prox_ratios.insert(prox_ratios.end(),
+                                    m.prox_ratios.begin(),
+                                    m.prox_ratios.end());
+             }
+             prox_in += m.prox_in;
+             prox_total += m.prox_total;
+         }
         const auto t_end = Clock::now();
         const double total_sec =
             std::chrono::duration<double>(t_end - t_start).count();
@@ -897,16 +908,28 @@ int main(int argc, char* argv[]) {
         std::cout << "[benchmark] starting timed search\n";
         const auto t_start = Clock::now();
         std::vector<std::future<std::vector<sextant::Candidate>>> futs;
+
         futs.reserve(n_queries);
+
         for (uint32_t qi = 0; qi < n_queries; qi++) {
+
             const float* q = &queries[static_cast<size_t>(qi) * dim];
+
             futs.push_back(ivf_searcher.search_one_async(q, scfg.k, scfg));
+
         }
+
+        auto prev_q_end = Clock::now();
+
         for (uint32_t qi = 0; qi < n_queries; qi++) {
-            const auto q_start = Clock::now();
+
             auto results = futs[qi].get();
+
             const auto q_end = Clock::now();
-            const double per_q_us = US(q_end - q_start).count();
+
+            const double per_q_us = US(q_end - prev_q_end).count();
+
+            prev_q_end = q_end;
             QueryMetrics m = process_results(rctx, queries, qi,
                                              std::move(results), per_q_us);
             latencies_us.push_back(m.latency_us);
@@ -1154,16 +1177,28 @@ int run_ivf_scan_benchmark(const std::string& index,
         std::cout << "[benchmark] starting timed search\n";
         const auto t_start = Clock::now();
         std::vector<std::future<std::vector<sextant::Candidate>>> futs;
+
         futs.reserve(n_queries);
+
         for (uint32_t qi = 0; qi < n_queries; qi++) {
+
             const float* q = &queries[static_cast<size_t>(qi) * dim];
+
             futs.push_back(ivf_searcher.search_one_async(q, scfg.k, scfg));
+
         }
+
+        auto prev_q_end = Clock::now();
+
         for (uint32_t qi = 0; qi < n_queries; qi++) {
-            const auto q_start = Clock::now();
+
             auto results = futs[qi].get();
+
             const auto q_end = Clock::now();
-            const double per_q_us = US(q_end - q_start).count();
+
+            const double per_q_us = US(q_end - prev_q_end).count();
+
+            prev_q_end = q_end;
             QueryMetrics m = process_results(rctx, queries, qi,
                                              std::move(results), per_q_us);
             latencies_us.push_back(m.latency_us);

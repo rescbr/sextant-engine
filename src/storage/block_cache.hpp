@@ -33,7 +33,7 @@
 
 namespace sextant {
 
-struct DirectFile;
+class DirectFile;
 class BlockCache;
 
 /// Which of the three W-TinyLFU lists an entry currently belongs to.

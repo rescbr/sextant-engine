@@ -46,9 +46,8 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
-#ifdef __linux__
-#include <sys/mman.h>  // madvise(MADV_HUGEPAGE) for TLB-friendly build buffers
-#endif
+#include <sys/mman.h>   // mmap for build_ivf_scan zero-copy source access
+#include <sys/stat.h>   // fstat for mmap
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -1527,26 +1526,56 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
     }
 
     // --- 4. Per-shard: encode 4-bit, pack FastScan blocks, write sidecars ---
-    // We need FP32 vectors to encode at 4-bit. Re-read source once, in shard
-    // order. Build a global-id → row_id map first (source emits row_ids in
-    // order; assign sequential global ids matching the codes_buffer order).
+    // Encode each member to 4-bit. The source vectors are needed for the
+    // 4-bit PQ encoding. Instead of materializing all N FP32 vectors in RAM
+    // (N × dim × 4 bytes = 4.1 GB at arxiv-nomic scale, 48 GB at 1B), we
+    // mmap the source .fbin file for zero-copy access. The mmap'd pointer
+    // replaces the all_vecs buffer — each member's vector is accessed
+    // on-demand via its global ID offset.
     //
-    // `index_.codes_buffer` was filled by pass2_encode in global-id order
-    // (0..N-1). partition_codes assigned global ids the same way. To encode
-    // at 4-bit we need each vector's FP32 — re-read source sequentially and
-    // cache them in a flat FP32 buffer (N × dim × 4 bytes). At 1.34M×768×4
-    // = 4.1 GB this is too large to hold in RAM alongside the build buffers
-    // for 1B; for the arxiv-nomic validation scale it's fine. Production
-    // 1B-scale will page this via a MemorySource or seek-on-demand — flagged
-    // in the plan as a regroup point.
-    std::vector<float> all_vecs(static_cast<size_t>(n) * dim);
-    {
+    // For sources that aren't file-backed (MemorySource), the source's own
+    // chunk API is used instead. The mmap path is a specialization for
+    // FbinSource (the common build/benchmark case).
+    const float* vecs_base = nullptr;
+    void* vecs_mmap = nullptr;
+    uint64_t vecs_mmap_size = 0;
+    // Try to get the source's file path for mmap. FbinSource returns its
+    // path via the virtual VectorSource::path(); other sources return "".
+    std::string source_path = source.path();
+    if (!source_path.empty()) {
+        int fd = ::open(source_path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            struct stat st;
+            if (::fstat(fd, &st) == 0 && st.st_size > 8) {
+                vecs_mmap_size = st.st_size;
+                vecs_mmap = ::mmap(nullptr, vecs_mmap_size, PROT_READ,
+                                   MAP_SHARED, fd, 0);
+                if (vecs_mmap != MAP_FAILED) {
+                    // Skip the 8-byte fbin header (n + dim).
+                    vecs_base = reinterpret_cast<const float*>(
+                        static_cast<char*>(vecs_mmap) + 8);
+                } else {
+                    vecs_mmap = nullptr;
+                }
+            }
+            ::close(fd);
+        }
+    }
+
+    // Fallback: if mmap failed (non-file source), materialize all vectors.
+    // This is the RAM-heavy path — only used by MemorySource or on mmap error.
+    std::vector<float> all_vecs_fallback;
+    if (!vecs_base) {
+        spdlog::warn("[sextant] build_ivf_scan: source not mmap-able; "
+                     "materializing all {} vectors in RAM", n);
+        all_vecs_fallback.resize(static_cast<size_t>(n) * dim);
         source.reset();
         Chunk chunk;
         uint32_t filled = 0;
         while (filled < n && source.next(chunk)) {
             const uint32_t take = std::min<uint32_t>(n - filled, chunk.count);
-            std::memcpy(all_vecs.data() + static_cast<size_t>(filled) * dim,
+            std::memcpy(all_vecs_fallback.data() +
+                            static_cast<size_t>(filled) * dim,
                         chunk.vectors,
                         static_cast<size_t>(take) * dim * sizeof(float));
             filled += take;
@@ -1554,9 +1583,10 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         if (filled != n) {
             throw Error(ErrorCode::IoError,
                         "build_ivf_scan: source yielded " +
-                            std::to_string(filled) + " vectors on re-read (" +
+                            std::to_string(filled) + " vectors (" +
                             std::to_string(n) + " expected)");
         }
+        vecs_base = all_vecs_fallback.data();
     }
 
     const auto uuid = make_uuid();
@@ -1591,7 +1621,7 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
             for (uint32_t i = 0; i < shard_n; i++) {
                 const uint32_t gid = members[i];
                 const float* vec =
-                    all_vecs.data() + static_cast<size_t>(gid) * dim;
+                    vecs_base + static_cast<size_t>(gid) * dim;
                 q4.encode(vec, packed.data());
                 for (uint32_t s = 0; s < m; s++) {
                     nibbles[static_cast<size_t>(i) * m + s] = static_cast<uint8_t>(
@@ -1777,7 +1807,8 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                      path, K, n_probe, m4);
     }
 
-    // Free global build buffers.
+    // Free global build buffers + mmap.
+    if (vecs_mmap) { ::munmap(vecs_mmap, vecs_mmap_size); }
     if (index_.codes_buffer) { aligned_free(index_.codes_buffer); index_.codes_buffer = nullptr; }
     if (index_.raw_vecs_buffer) { aligned_free(index_.raw_vecs_buffer); index_.raw_vecs_buffer = nullptr; }
 

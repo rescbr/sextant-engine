@@ -244,18 +244,16 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     // code_size = pq_m (for pq_bits=8, 1 byte per segment).
     {
         const bool is_scan = !overrides.merged_graph;
-        const uint32_t kKMax = is_scan ? 8192u : 512u;
+        const uint32_t kKMax = k_max_for_path(is_scan);
         const uint32_t code_sz = static_cast<uint32_t>(p.pq_m);
         const uint32_t node_sz =
             ((16u + static_cast<uint32_t>(p.R) * 4u + 7u) & ~7u);
         const uint64_t per_vec = code_sz + node_sz;
 
         if (overrides.partition_count > 0) {
-            // Explicit override — clamp to [1, K_max] and use verbatim.
             p.partition_count = std::min(overrides.partition_count, kKMax);
             spdlog::info("[sextant] K (partitions) = {} [override]", p.partition_count);
         } else {
-            // RAM-driven floor.
             uint32_t ram_driven_k = 1;
             uint64_t max_per_partition = 0;
             if (per_vec > 0 && p.build_ram_budget > 0) {
@@ -267,43 +265,9 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                 }
             }
 
-            // Recall-driven floor (any IVF build: scan OR graph-inside-shard).
-            uint32_t recall_driven_k = 1;
-            std::string recall_note;
-            if (overrides.sharded_graph || is_scan) {
-                if (is_scan) {
-                    // Scan path: target ~200k vectors/shard. Smaller shards =
-                    // less bytes streamed per probe. K_max=8192 (no per-shard
-                    // graph to build — shards are pure code containers).
-                    //
-                    // Floor is 64 (not 16): measurement on arxiv-nomic 1.34M
-                    // showed K=16 streams half the dataset per query (14 QPS)
-                    // while K=64 hits the recall-0.99 sweet spot at 38 QPS.
-                    // For very small N where even K=64 would give <1k/shard,
-                    // the formula naturally produces fewer (the max() only
-                    // lifts the floor when N is large enough to justify it).
-                    constexpr uint64_t kTargetShardSize = 200'000;
-                    recall_driven_k = static_cast<uint32_t>(
-                        (n_vectors + kTargetShardSize - 1) / kTargetShardSize);
-                    recall_driven_k =
-                        std::max<uint32_t>(recall_driven_k, 64u);
-                    recall_driven_k =
-                        std::min<uint32_t>(recall_driven_k, 8192u);
-                    recall_note = std::string(", scan_floor=") +
-                                  std::to_string(recall_driven_k);
-                } else {
-                    // Graph-inside-shard path: target ~64K/shard (standard
-                    // DiskANN/FAISS). The prior sqrt(N)/8 formula
-                    // over-partitioned badly at scale (K=144 at 1.34M).
-                    constexpr uint64_t kTargetShardSize = 65536;
-                    recall_driven_k = static_cast<uint32_t>(
-                        std::max<uint64_t>(2u,
-                            (n_vectors + kTargetShardSize - 1) / kTargetShardSize));
-                    recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
-                    recall_note = std::string(", graph_floor=") +
-                                  std::to_string(recall_driven_k);
-                }
-            }
+            const bool is_ivf = overrides.sharded_graph || is_scan;
+            const uint32_t recall_driven_k =
+                recall_driven_k_floor(n_vectors, is_scan, is_ivf);
 
             uint32_t k = std::max(ram_driven_k, recall_driven_k);
             k = std::min(k, kKMax);
@@ -317,10 +281,10 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                              p.build_ram_budget / 1e6);
             } else if (ram_driven_k >= recall_driven_k) {
                 spdlog::info("[sextant] K (partitions) = {} [flat RAM {:.1f}MB > "
-                             "budget {:.1f}MB → {} shards of ≤{} vectors each{}]",
+                             "budget {:.1f}MB → {} shards of ≤{} vectors each]",
                              p.partition_count, monolithic_ram / 1e6,
                              p.build_ram_budget / 1e6, p.partition_count,
-                             max_per_partition, recall_note);
+                             max_per_partition);
             } else {
                 spdlog::info("[sextant] K (partitions) = {} [recall-driven {} "
                              "floor={}; RAM budget {:.1f}MB would allow K={}]",

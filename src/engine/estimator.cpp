@@ -14,6 +14,7 @@
 #include "fbin_source.hpp"
 #include "memory_source.hpp"
 #include "probe.hpp"
+#include "resolve_params.hpp"
 #include "sextant/builder.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
@@ -856,7 +857,7 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
     // the graph paths (--graph or --ivf) target ~64k/shard with K_max=512.
     {
         const bool is_scan = !overrides.merged_graph && !overrides.sharded_graph;
-        const uint32_t kKMax = is_scan ? 8192u : 512u;
+        const uint32_t kKMax = k_max_for_path(is_scan);
         const uint32_t code_sz = static_cast<uint32_t>(p.pq_m);
         const uint32_t node_sz =
             ((16u + static_cast<uint32_t>(p.R) * 4u + 7u) & ~7u);
@@ -874,35 +875,9 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
                     if (ram_driven_k < 1) ram_driven_k = 1;
                 }
             }
-            uint32_t recall_driven_k = 1;
-            // Any IVF build (scan OR graph-inside-shard) gets a recall floor.
-            // The merged-graph path (--graph with no --ivf and scan off) is
-            // the only path that skips this floor — but is_scan captures that
-            // correctly (is_scan = !graph && !ivf).
-            if (overrides.sharded_graph || is_scan) {
-                if (is_scan) {
-                    // Scan path: target ~200k vectors/shard. Smaller shards = less
-                    // bytes streamed per probe. K_max=8192. Floor 64 (not 16):
-                    // K=16 was measured at 14 QPS on arxiv-nomic 1.34M (scans
-                    // half the dataset per query); K=64 hit the recall-0.99
-                    // sweet spot at 38 QPS. See resolve_params.cpp for detail.
-                    constexpr uint64_t kTargetShardSize = 200'000;
-                    recall_driven_k = static_cast<uint32_t>(
-                        (total_n + kTargetShardSize - 1) / kTargetShardSize);
-                    recall_driven_k =
-                        std::max<uint32_t>(recall_driven_k, 64u);
-                    recall_driven_k =
-                        std::min<uint32_t>(recall_driven_k, 8192u);
-                } else {
-                    // Graph-inside-shard (--ivf): target ~64K/shard (standard
-                    // DiskANN/FAISS). Prior sqrt(N)/8 over-partitioned.
-                    constexpr uint64_t kTargetShardSize = 65536;
-                    recall_driven_k = static_cast<uint32_t>(
-                        std::max<uint64_t>(2u,
-                            (total_n + kTargetShardSize - 1) / kTargetShardSize));
-                    recall_driven_k = std::min<uint32_t>(recall_driven_k, 256);
-                }
-            }
+            const bool is_ivf = overrides.sharded_graph || is_scan;
+            const uint32_t recall_driven_k =
+                recall_driven_k_floor(total_n, is_scan, is_ivf);
             p.partition_count = std::min(std::max(ram_driven_k, recall_driven_k),
                                           kKMax);
         }

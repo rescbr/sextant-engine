@@ -29,7 +29,7 @@
 
 namespace sextant {
 
-struct PqQuantizer;
+class PqQuantizer;
 struct ResolvedParams;  // defined in engine.hpp; only the factory needs the full type.
 
 /// Parameters for the Vamana graph.
