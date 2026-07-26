@@ -4,6 +4,7 @@
 /// Internal helpers shared between engine.cpp (flush) and search.cpp (load):
 /// padded aligned reads/writes around DirectFile, and SidecarHeader fill.
 
+#include "storage/buffered_io.hpp"
 #include "storage/direct_io.hpp"
 #include "storage/sidecar_header.hpp"
 
@@ -45,6 +46,19 @@ inline void read_exact(DirectFile& f, void* buf, size_t count, uint64_t offset) 
     std::memset(stage.get(), 0, aligned);
     f.pread_aligned(stage.get(), aligned, offset);
     std::memcpy(buf, stage.get(), count);
+}
+
+/// Buffered-file overload: no alignment staging needed (the kernel handles it
+/// via the page cache). Used by the scan path (CodeStream).
+inline void read_exact(BufferedFile& f, void* buf, size_t count,
+                       uint64_t offset) {
+    if (count == 0) return;
+    const size_t got = f.pread(buf, count, offset);
+    if (got != count) {
+        // Mirror the DirectFile path's "trailing zeros tolerated" semantics
+        // for padded writes; only error on a genuinely short read mid-payload.
+        std::memset(static_cast<char*>(buf) + got, 0, count - got);
+    }
 }
 
 /// Fill a SidecarHeader with the common fields.

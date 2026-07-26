@@ -13,7 +13,7 @@
 namespace sextant {
 
 CodeStream::CodeStream(const std::string& path, uint32_t m)
-    : file_(path, /*create=*/false), m_(m) {
+    : file_(path), m_(m) {
     if (m_ == 0) {
         throw Error(ErrorCode::InvalidParam,
                     "CodeStream: m (segments) must be > 0");
@@ -58,8 +58,12 @@ bool CodeStream::scan(
     // lane j → vector b*32+j). `valid_mask` for block b has bit j set iff
     // b*32 + j < n_vectors_.
     const uint64_t data_off = sizeof(SidecarHeader);
-    const size_t chunk_bytes = static_cast<size_t>(chunk_blocks_) * block_bytes_;
 
+    // Buffered I/O: read in chunked batches matching the graph path's 1MB
+    // pre-read width. The OS page cache retains hot chunks across queries;
+    // cold chunks hit NVMe. `staging` may be unaligned (BufferedFile::pread
+    // handles any alignment via the page cache), but we keep the caller-owned
+    // staging pattern since it amortizes allocation across queries.
     uint32_t b = 0;
     while (b < n_blocks_) {
         const uint32_t blocks_this = std::min(chunk_blocks_, n_blocks_ - b);
@@ -67,10 +71,6 @@ bool CodeStream::scan(
             static_cast<size_t>(blocks_this) * block_bytes_;
         const uint64_t off = data_off + static_cast<uint64_t>(b) * block_bytes_;
 
-        // pread_aligned requires count to be a multiple of kDiskAlign and the
-        // buffer to be kDiskAlign-aligned. `staging` is expected to be aligned
-        // (caller uses AlignedBuf). `bytes_this` is a multiple of block_bytes_
-        // = m*16; we pad up to kDiskAlign via read_exact's staging buffer.
         engine_detail::read_exact(file_, staging, bytes_this, off);
 
         for (uint32_t i = 0; i < blocks_this; i++) {

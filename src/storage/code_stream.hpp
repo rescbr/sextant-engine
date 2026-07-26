@@ -16,7 +16,7 @@
 /// the IVF scan worker state) and loaned to `scan()` so multiple shards in one
 /// query can reuse one allocation.
 
-#include "storage/direct_io.hpp"
+#include "storage/buffered_io.hpp"
 #include "storage/sidecar_header.hpp"
 
 #include <sextant/error.hpp>
@@ -31,13 +31,20 @@ namespace sextant {
 
 /// Read-only sequential stream over a `.codes4` sidecar.
 ///
+/// Uses BUFFERED I/O (BufferedFile, no O_DIRECT) so the OS page cache manages
+/// residency. The scan path's access pattern — sequential whole-shard streams
+/// with cross-query locality (queries routing to similar centroids re-probe
+/// the same shards) — is exactly what the page cache is designed for. Hot
+/// shards stay cached automatically; cold shards stream from NVMe. See
+/// buffered_io.hpp for the rationale vs DirectFile.
+///
 /// The file layout is `[SidecarHeader 64B][n_blocks × block_bytes]` where
 /// `block_bytes = m × 16` (one FastScan block). `n_blocks = ceil(n_vectors /
 /// 32)`. `CodeStream` validates the magic on open and exposes the shard's
 /// block count + block size; the caller drives the scan via `scan()`.
 class CodeStream {
 public:
-    /// Open `path` (a `.codes4` file) for direct sequential reads. Throws on
+    /// Open `path` (a `.codes4` file) for buffered sequential reads. Throws on
     /// open failure or magic mismatch. The file stays open for the lifetime of
     /// this object.
     CodeStream(const std::string& path, uint32_t m);
@@ -84,7 +91,7 @@ public:
     uint32_t chunk_blocks() const { return chunk_blocks_; }
 
 private:
-    DirectFile file_;
+    BufferedFile file_;
     uint32_t m_ = 0;
     uint32_t block_bytes_ = 0;     // m × 16
     uint32_t n_blocks_ = 0;

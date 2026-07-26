@@ -100,6 +100,7 @@ src_inc = include_directories('src')
 
 engine_sources = [
     'src/storage/direct_io.cpp',
+    'src/storage/buffered_io.cpp',
     'src/storage/block_allocator.cpp',
     'src/storage/block_buffer_pool.cpp',
     'src/storage/block_cache.cpp',
