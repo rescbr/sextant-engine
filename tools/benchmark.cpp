@@ -534,7 +534,7 @@ int main(int argc, char* argv[]) {
                 if (::fstat(fd, &st) == 0 && st.st_size > 8) {
                     base_mmap_size = st.st_size;
                     base_mmap = ::mmap(nullptr, base_mmap_size, PROT_READ,
-                                       MAP_PRIVATE, fd, 0);
+                                       MAP_SHARED, fd, 0);
                     if (base_mmap != MAP_FAILED) {
                         ::madvise(base_mmap, base_mmap_size, MADV_RANDOM);
                         // Skip the 8-byte fbin header (n + dim).
@@ -836,7 +836,7 @@ int main(int argc, char* argv[]) {
                 if (::fstat(fd, &st) == 0 && st.st_size > 8) {
                     base_mmap_size = st.st_size;
                     base_mmap = ::mmap(nullptr, base_mmap_size, PROT_READ,
-                                       MAP_PRIVATE, fd, 0);
+                                       MAP_SHARED, fd, 0);
                     if (base_mmap != MAP_FAILED) {
                         ::madvise(base_mmap, base_mmap_size, MADV_RANDOM);
                         base_all = reinterpret_cast<const float*>(
@@ -1110,7 +1110,7 @@ int run_ivf_scan_benchmark(const std::string& index,
                 if (::fstat(fd, &st) == 0 && st.st_size > 8) {
                     base_mmap_size = st.st_size;
                     base_mmap = ::mmap(nullptr, base_mmap_size, PROT_READ,
-                                       MAP_PRIVATE, fd, 0);
+                                       MAP_SHARED, fd, 0);
                     if (base_mmap != MAP_FAILED) {
                         ::madvise(base_mmap, base_mmap_size, MADV_RANDOM);
                         base_all = reinterpret_cast<const float*>(

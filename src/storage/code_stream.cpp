@@ -42,9 +42,19 @@ CodeStream::CodeStream(const std::string& path, uint32_t m)
 
     file_size_ = file_.size();
     if (file_size_ > 0) {
-        void* p = ::mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE,
+        // MAP_SHARED + PROT_READ: the lightest-weight read-only file mapping.
+        // No copy-on-write, no swap reservation (unlike MAP_PRIVATE which
+        // reserves swap for potential CoW copies that never happen under
+        // PROT_READ). The mapping is backed directly by the file's page cache.
+        void* p = ::mmap(nullptr, file_size_, PROT_READ, MAP_SHARED,
                          file_.fd(), 0);
         mapped_ = (p == MAP_FAILED) ? nullptr : static_cast<const uint8_t*>(p);
+        // No madvise: each shard is small (~2MB at K=64), fits in L2/L3.
+        // The default kernel policy (adaptive readahead) handles both the
+        // cold first-pass (sequential within a shard) and warm steady-state
+        // (resident pages). MADV_SEQUENTIAL was tried and caused page-cache
+        // thrashing when competing with the base-data mmap (4GB+); the
+        // default adaptive policy avoids that.
     }
 }
 
