@@ -1451,7 +1451,12 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
     const auto t0 = std::chrono::steady_clock::now();
 
     // --- 1. Global 8-bit PQ (routing) + encode all N ---
-    prepare_codes(source, params);
+    // prepare_routing_codes (not prepare_codes): the scan path mmaps the FP32
+    // source directly for 4-bit encoding, so it does NOT need the N × dim × 2
+    // FP16 raw_vecs_buffer (13.4 GB at 100M/768-dim) that prepare_codes
+    // materializes for graph builds. Skipping it unblocks 100M+ builds on a
+    // 30 GB VM.
+    prepare_routing_codes(source, params);
 
     const uint32_t n = static_cast<uint32_t>(index_.count);
     const uint32_t K = std::max<uint32_t>(1u, params.partition_count);
@@ -2763,38 +2768,55 @@ void Builder::flush() {
 }
 
 // =============================================================================
-// prepare_codes — pass1 (reservoir + PQ train) + pass2 (encode) only.
-// Leaves codes_buffer + raw_vecs_buffer populated for tools that want to
-// experiment with partitioning without a full merged-graph build.
+// prepare_routing_codes — pass1 (reservoir + PQ train) + pass2 (encode all N
+// into codes_buffer). NO raw_vecs_buffer allocation. The IVF-list-scan path
+// mmaps the FP32 source directly for 4-bit encoding; the 13.4 GB FP16 buffer
+// (N × dim × 2 at 100M/768-dim) is pure waste there and blocks large builds
+// on a 30 GB VM. Graph paths use prepare_codes (which calls this + adds FP16).
 // =============================================================================
-void Builder::prepare_codes(VectorSource& source, const ResolvedParams& params) {
+void Builder::prepare_routing_codes(VectorSource& source,
+                                     const ResolvedParams& params) {
     index_.count = source.count();
     index_.dim = source.dim();
     if (index_.count == 0) {
-        throw Error(ErrorCode::InvalidParam, "prepare_codes: source is empty");
+        throw Error(ErrorCode::InvalidParam, "prepare_routing_codes: source is empty");
     }
     if (index_.dim == 0) {
-        throw Error(ErrorCode::InvalidParam, "prepare_codes: source has dim=0");
+        throw Error(ErrorCode::InvalidParam, "prepare_routing_codes: source has dim=0");
     }
     // pass1 trains the quantizer and sets index_.code_size.
     pass1_sample_and_train(source, params);
     index_.node_size = VamanaCore::static_node_size(params.R, index_.code_size);
 
-    // Allocate flat codes + raw_vecs buffers (mirrors build_partitioned, but
-    // skips nodes_buffer — caller is not constructing a graph here).
+    // Allocate flat codes buffer (no nodes_buffer — caller is not constructing
+    // a graph; no raw_vecs_buffer — scan path mmaps FP32 source directly).
     const size_t codes_bytes = static_cast<size_t>(index_.count) * index_.code_size;
     AlignedBuf codes(kDiskAlign, codes_bytes);
     std::memset(codes.get(), 0, codes_bytes);
     index_.codes_buffer = codes.as<uint8_t>();
     codes.release();
+    spdlog::info("[sextant] prepare_routing_codes: allocated {:.1f}MB codes "
+                 "(no FP16 buffer — scan path mmaps source)",
+                 codes_bytes / 1e6);
+
+    pass2_encode(source, params);
+}
+
+// prepare_codes — prepare_routing_codes + load FP16 raw_vecs_buffer.
+// Leaves codes_buffer + raw_vecs_buffer populated for graph builds that need
+// FP16 for prune/construct (set_build_vecs). The scan path calls
+// prepare_routing_codes directly to skip the FP16 materialization.
+// =============================================================================
+void Builder::prepare_codes(VectorSource& source, const ResolvedParams& params) {
+    prepare_routing_codes(source, params);
 
     const size_t vecs_bytes =
         static_cast<size_t>(index_.count) * index_.dim * sizeof(float16_t);
     AlignedBuf vecs(kDiskAlign, vecs_bytes);
     index_.raw_vecs_buffer = vecs.as<float16_t>();
     vecs.release();
-    spdlog::info("[sextant] prepare_codes: allocated {:.1f}MB codes + {:.1f}MB FP16",
-                 codes_bytes / 1e6, vecs_bytes / 1e6);
+    spdlog::info("[sextant] prepare_codes: allocated {:.1f}MB FP16 raw_vecs_buffer",
+                 vecs_bytes / 1e6);
 
     // Load raw vectors as FP16 for the FP16 prune (same as build_partitioned).
     source.reset();
@@ -2814,8 +2836,6 @@ void Builder::prepare_codes(VectorSource& source, const ResolvedParams& params) 
         }
     }
     spdlog::info("[sextant] prepare_codes: loaded {} FP16 vectors", loaded);
-
-    pass2_encode(source, params);
 }
 
 }  // namespace sextant

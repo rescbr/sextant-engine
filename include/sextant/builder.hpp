@@ -93,6 +93,14 @@ public:
     /// step across all shards.
     void prepare_codes(VectorSource& source, const ResolvedParams& params);
 
+    /// Prepare routing codes only: pass1 (reservoir + PQ train) + pass2
+    /// (encode all N into codes_buffer). NO raw_vecs_buffer allocation —
+    /// the FP16 materialization (N × dim × 2 bytes = 13.4 GB at 100M/768-dim)
+    /// is graph-only. The IVF-list-scan path doesn't need it (it mmaps the
+    /// FP32 source directly for 4-bit encoding). Used by build_ivf_scan to
+    /// avoid the FP16 waste that blocks 100M+ builds on a 30 GB VM.
+    void prepare_routing_codes(VectorSource& source, const ResolvedParams& params);
+
     /// IVF-probe build: train the quantizer ONCE globally, encode all N
     /// vectors, partition into K shards, and flush each shard as a complete
     /// production Index under `<index_path>.shards/shard_NNNN/`. Also writes
