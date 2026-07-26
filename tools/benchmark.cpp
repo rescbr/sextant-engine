@@ -40,9 +40,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -154,7 +158,7 @@ struct RerankCtx {
     uint64_t n_base;            // base-data row count (bh.n)
     bool do_rerank;
     bool base_in_ram;
-    const std::vector<float>* base_all;   // base_in_ram payload
+    const float* base_all;           // base_in_ram payload (mmap'd or nullptr)
     const std::string* base_data;         // path for read_fbin_vector fallback
     const GroundTruth* gt;
     bool have_gt_dists;
@@ -193,7 +197,7 @@ QueryMetrics process_results(const RerankCtx& ctx,
             float d;
             if (ctx.base_in_ram) {
                 const float* bv =
-                    &(*ctx.base_all)[static_cast<size_t>(c.row_id) * ctx.dim];
+                    ctx.base_all + static_cast<size_t>(c.row_id) * ctx.dim;
                 d = rerank_dist(ctx.metric, q, bv, ctx.dim);
             } else {
                 read_fbin_vector(*ctx.base_data, ctx.dim,
@@ -220,7 +224,7 @@ QueryMetrics process_results(const RerankCtx& ctx,
                 static_cast<uint64_t>(rid) < ctx.n_base) {
                 if (ctx.base_in_ram) {
                     const float* bv =
-                        &(*ctx.base_all)[static_cast<size_t>(rid) * ctx.dim];
+                        ctx.base_all + static_cast<size_t>(rid) * ctx.dim;
                     d = rerank_dist(ctx.metric, q, bv, ctx.dim);
                 } else {
                     read_fbin_vector(*ctx.base_data, ctx.dim,
@@ -260,7 +264,7 @@ QueryMetrics process_results(const RerankCtx& ctx,
             float d_target;
             if (gt_kth_id < ctx.n_base) {
                 const float* bv_kth =
-                    &(*ctx.base_all)[static_cast<size_t>(gt_kth_id) * ctx.dim];
+                    ctx.base_all + static_cast<size_t>(gt_kth_id) * ctx.dim;
                 d_target = rerank_dist(ctx.metric, q, bv_kth, ctx.dim);
             } else {
                 d_target = gt.dists[static_cast<size_t>(qi) * gt.k +
@@ -516,28 +520,32 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Optionally mmap-style: read the whole base file for fast rerank.
-        std::vector<float> base_all;
+        // mmap the base file for zero-copy rerank. No size cap — the OS page
+        // cache manages residency. The 8-byte fbin header is skipped by
+        // offsetting the pointer.
+        const float* base_all = nullptr;
         bool base_in_ram = false;
+        void* base_mmap = nullptr;
+        uint64_t base_mmap_size = 0;
         {
-            std::ifstream bf(base_data, std::ios::binary | std::ios::ate);
-            if (bf) {
-                const std::streamoff sz = bf.tellg();
-                // Only load if it fits comfortably (cap at ~4GB).
-                if (sz > 8 &&
-                    static_cast<uint64_t>(sz) <= uint64_t{4} * 1024 * 1024 *
-                                                      1024) {
-                    base_all.resize(static_cast<size_t>(sz - 8) / sizeof(float));
-                    bf.seekg(8);
-                    bf.read(reinterpret_cast<char*>(base_all.data()),
-                            static_cast<std::streamsize>(base_all.size() *
-                                                         sizeof(float)));
-                    base_in_ram = bf.good();
-                    if (base_in_ram) {
-                        spdlog::info("benchmark: loaded {} base vectors into RAM",
-                                     bh.n);
-                    }
+            int fd = ::open(base_data.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                struct stat st;
+                if (::fstat(fd, &st) == 0 && st.st_size > 8) {
+                    base_mmap_size = st.st_size;
+                    base_mmap = ::mmap(nullptr, base_mmap_size, PROT_READ,
+                                       MAP_PRIVATE, fd, 0);
+                    if (base_mmap != MAP_FAILED) {
+                        ::madvise(base_mmap, base_mmap_size, MADV_RANDOM);
+                        // Skip the 8-byte fbin header (n + dim).
+                        base_all = reinterpret_cast<const float*>(
+                            static_cast<char*>(base_mmap) + 8);
+                        base_in_ram = true;
+                        spdlog::info("benchmark: mmap'd {} base vectors ({}MB)",
+                                     bh.n, base_mmap_size / (1024 * 1024));
+                    } else { base_mmap = nullptr; }
                 }
+                ::close(fd);
             }
         }
 
@@ -553,7 +561,7 @@ int main(int argc, char* argv[]) {
             idx->quantizer ? idx->quantizer->metric() : sextant::MetricKind::L2Sq;
         const RerankCtx rctx{
             dim, k, bh.n, do_rerank, base_in_ram,
-            base_in_ram ? &base_all : nullptr,
+            base_in_ram ? base_all : nullptr,
             &base_data, &gt, have_gt_dists, idx_metric
         };
 
@@ -816,27 +824,29 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Optionally read the whole base file for fast rerank.
-        std::vector<float> base_all;
+        // mmap the base file for zero-copy rerank.
+        const float* base_all = nullptr;
         bool base_in_ram = false;
+        void* base_mmap = nullptr;
+        uint64_t base_mmap_size = 0;
         {
-            std::ifstream bf(base_data, std::ios::binary | std::ios::ate);
-            if (bf) {
-                const std::streamoff sz = bf.tellg();
-                if (sz > 8 &&
-                    static_cast<uint64_t>(sz) <= uint64_t{4} * 1024 * 1024 *
-                                                      1024) {
-                    base_all.resize(static_cast<size_t>(sz - 8) / sizeof(float));
-                    bf.seekg(8);
-                    bf.read(reinterpret_cast<char*>(base_all.data()),
-                            static_cast<std::streamsize>(base_all.size() *
-                                                         sizeof(float)));
-                    base_in_ram = bf.good();
-                    if (base_in_ram) {
-                        spdlog::info("benchmark: loaded {} base vectors into RAM",
-                                     bh.n);
-                    }
+            int fd = ::open(base_data.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                struct stat st;
+                if (::fstat(fd, &st) == 0 && st.st_size > 8) {
+                    base_mmap_size = st.st_size;
+                    base_mmap = ::mmap(nullptr, base_mmap_size, PROT_READ,
+                                       MAP_PRIVATE, fd, 0);
+                    if (base_mmap != MAP_FAILED) {
+                        ::madvise(base_mmap, base_mmap_size, MADV_RANDOM);
+                        base_all = reinterpret_cast<const float*>(
+                            static_cast<char*>(base_mmap) + 8);
+                        base_in_ram = true;
+                        spdlog::info("benchmark: mmap'd {} base vectors ({}MB)",
+                                     bh.n, base_mmap_size / (1024 * 1024));
+                    } else { base_mmap = nullptr; }
                 }
+                ::close(fd);
             }
         }
 
@@ -852,7 +862,7 @@ int main(int argc, char* argv[]) {
         }
         const RerankCtx rctx{
             dim, k, bh.n, do_rerank, base_in_ram,
-            base_in_ram ? &base_all : nullptr,
+            base_in_ram ? base_all : nullptr,
             &base_data, &gt, have_gt_dists, ivf_metric
         };
 
@@ -1088,30 +1098,29 @@ int run_ivf_scan_benchmark(const std::string& index,
             }
         }
 
-        // Read the whole base file into RAM for exact rerank. The scan path
-        // returns candidates by 4-bit distance; without exact rerank the
-        // recall numbers are meaningless (4-bit ranking is too coarse). At
-        // arxiv-nomic 1.34M × 768 × 4 = 4.1 GB this fits a benchmark machine.
-        std::vector<float> base_all;
+        // mmap the base file for zero-copy rerank.
+        const float* base_all = nullptr;
         bool base_in_ram = false;
+        void* base_mmap = nullptr;
+        uint64_t base_mmap_size = 0;
         {
-            std::ifstream bf(base_data, std::ios::binary | std::ios::ate);
-            if (bf) {
-                const std::streamoff sz = bf.tellg();
-                if (sz > 8 &&
-                    static_cast<uint64_t>(sz) <= uint64_t{4} * 1024 * 1024 *
-                                                      1024) {
-                    base_all.resize(static_cast<size_t>(sz - 8) / sizeof(float));
-                    bf.seekg(8);
-                    bf.read(reinterpret_cast<char*>(base_all.data()),
-                            static_cast<std::streamsize>(base_all.size() *
-                                                         sizeof(float)));
-                    base_in_ram = bf.good();
-                    if (base_in_ram) {
-                        spdlog::info("benchmark: loaded {} base vectors into RAM",
-                                     bh.n);
-                    }
+            int fd = ::open(base_data.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                struct stat st;
+                if (::fstat(fd, &st) == 0 && st.st_size > 8) {
+                    base_mmap_size = st.st_size;
+                    base_mmap = ::mmap(nullptr, base_mmap_size, PROT_READ,
+                                       MAP_PRIVATE, fd, 0);
+                    if (base_mmap != MAP_FAILED) {
+                        ::madvise(base_mmap, base_mmap_size, MADV_RANDOM);
+                        base_all = reinterpret_cast<const float*>(
+                            static_cast<char*>(base_mmap) + 8);
+                        base_in_ram = true;
+                        spdlog::info("benchmark: mmap'd {} base vectors ({}MB)",
+                                     bh.n, base_mmap_size / (1024 * 1024));
+                    } else { base_mmap = nullptr; }
                 }
+                ::close(fd);
             }
         }
 
@@ -1121,7 +1130,7 @@ int run_ivf_scan_benchmark(const std::string& index,
                                : sextant::MetricKind::L2Sq;
         const RerankCtx rctx{
             dim, k, bh.n, /*do_rerank=*/true, base_in_ram,
-            base_in_ram ? &base_all : nullptr,
+            base_in_ram ? base_all : nullptr,
             &base_data, &gt, have_gt_dists, scan_metric
         };
 
