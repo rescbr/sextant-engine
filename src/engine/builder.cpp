@@ -1507,7 +1507,9 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
     // --- 3. Partition via k-means on the 8-bit routing codes ---
     auto assignment = partition_codes(*index_.quantizer, index_.codes_buffer, n,
                                        index_.code_size, K, params.closure_factor,
-                                       /*iterations=*/10, params.num_threads);
+                                       /*iterations=*/10, params.num_threads,
+                                       /*seed=*/0xC0DE1234ULL,
+                                       /*balance_factor=*/params.partition_balance_factor);
     if (assignment.shards.size() != K) {
         throw Error(ErrorCode::InvalidParam,
                     "build_ivf_scan: partition returned K=" +

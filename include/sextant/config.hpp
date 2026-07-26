@@ -143,6 +143,14 @@ struct BuildConfig {
     /// (dim/4 — 192 at dim=768, matching the validated spike). Only meaningful
     /// for the IVF-scan path (merged_graph=false).
     uint16_t pq4_m = 0;
+
+    /// Partition size-balance strength (SPANN-style λ, arXiv:2111.08566).
+    /// 0 = off (plain k-means + closure). >0 caps each shard's size at
+    /// (n/K)·(1 + 1/balance_factor), spilling excess vectors from oversized
+    /// closure clusters (primary membership always preserved). Bounds the
+    /// worst-case disk read per shard at paged-billion-scale. Default 0;
+    /// recommended 2-4 for production IVF-scan builds.
+    float partition_balance_factor = 0.0f;
 };
 
 /// Result of a build operation.
@@ -235,6 +243,10 @@ struct ResolvedParams {
     /// 4-bit PQ subquantizer count for the IVF-scan path. 0 = auto (dim/4).
     /// Persisted; the searcher reads this to size its 4-bit LUT.
     uint16_t pq4_m = 0;
+
+    /// Partition size-balance strength (SPANN λ). 0 = off. See
+    /// BuildConfig::partition_balance_factor.
+    float partition_balance_factor = 0.0f;
 };
 
 /// Estimation diagnostics produced by `Engine::estimate_config` (and the

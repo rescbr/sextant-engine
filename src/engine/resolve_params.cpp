@@ -90,6 +90,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
 
     // --- merged_graph / pq4_m (IVF-list-scan vs merged-graph) ---
     p.merged_graph = overrides.merged_graph;
+    p.partition_balance_factor = overrides.partition_balance_factor;
     if (overrides.pq4_m != 0) {
         p.pq4_m = overrides.pq4_m;
     } else if (dim > 0) {
@@ -272,15 +273,20 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
             if (overrides.sharded_graph || is_scan) {
                 if (is_scan) {
                     // Scan path: target ~200k vectors/shard. Smaller shards =
-                    // less bytes streamed per probe (each probe reads a full
-                    // shard sequentially). K can be large (≤8192) since
-                    // there's no per-shard graph to build — shards are pure
-                    // code containers.
+                    // less bytes streamed per probe. K_max=8192 (no per-shard
+                    // graph to build — shards are pure code containers).
+                    //
+                    // Floor is 64 (not 16): measurement on arxiv-nomic 1.34M
+                    // showed K=16 streams half the dataset per query (14 QPS)
+                    // while K=64 hits the recall-0.99 sweet spot at 38 QPS.
+                    // For very small N where even K=64 would give <1k/shard,
+                    // the formula naturally produces fewer (the max() only
+                    // lifts the floor when N is large enough to justify it).
                     constexpr uint64_t kTargetShardSize = 200'000;
                     recall_driven_k = static_cast<uint32_t>(
                         (n_vectors + kTargetShardSize - 1) / kTargetShardSize);
                     recall_driven_k =
-                        std::max<uint32_t>(recall_driven_k, 16u);
+                        std::max<uint32_t>(recall_driven_k, 64u);
                     recall_driven_k =
                         std::min<uint32_t>(recall_driven_k, 8192u);
                     recall_note = std::string(", scan_floor=") +

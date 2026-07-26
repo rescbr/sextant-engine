@@ -61,7 +61,7 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                                      uint32_t code_size, uint32_t K,
                                      float closure_factor,
                                      uint32_t iterations, uint32_t num_threads,
-                                     uint64_t seed) {
+                                     uint64_t seed, float balance_factor) {
     if (K == 0) {
         throw Error(ErrorCode::InvalidParam,
                     "partition_codes: K must be > 0");
@@ -228,10 +228,27 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
     // closure_factor × d_best. This produces ~15% replication (Issue 24).
     // Each code may land in multiple shards → per-thread local shard buffers,
     // concatenated at the end (avoids lock contention on shared vectors).
+    //
+    // When balance_factor > 0 (SPANN-style), per-shard size is capped at
+    // target_size × (1 + tolerance), where target = n/K and tolerance =
+    // 1/balance_factor. Vectors that would push a shard over its cap are
+    // dropped from THAT shard only (they keep their other closure
+    // assignments). This bounds max_shard, preventing the long-tail disk-read
+    // pathology at billion-scale paged search. See SPANN arXiv:2111.08566.
     PartitionAssignment pa;
     pa.shards.assign(K, {});
     pa.centroids = centroids;
     pa.closure_factor = closure_factor;
+
+    // Per-shard atomic size counters (only used when balance_factor > 0).
+    // The cap is soft: concurrent threads may push a few vectors past it
+    // before the counter updates propagate, but the overshoot is bounded
+    // (~num_threads vectors per shard) and irrelevant at scale.
+    const float cap_per_shard = (balance_factor > 0.0f && K > 0)
+        ? std::ceil(static_cast<float>(n) / K * (1.0f + 1.0f / balance_factor))
+        : std::numeric_limits<float>::max();
+    std::vector<std::atomic<uint32_t>> shard_sizes(K);
+    for (uint32_t k = 0; k < K; k++) shard_sizes[k].store(0, std::memory_order_relaxed);
 
     std::atomic<uint32_t> next_id{0};
     // Per-thread shard buffers. Each thread owns T ShardBufs (K each).
@@ -243,7 +260,7 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
     for (uint32_t t = 0; t < T; t++) {
         futs.push_back(pool.push(
             [&quantizer, &centroids, codes, n, code_size, K, closure_factor,
-             &local_shards, t, &next_id]
+             &local_shards, t, &next_id, &shard_sizes, cap_per_shard]
             (size_t /*id*/, PartWorkerState& /*w*/) {
                 std::vector<float> dists(K);
                 auto& my_shards = local_shards[t];
@@ -260,9 +277,23 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                                            code_size, dists.data(), &best_d);
                         const float threshold = closure_factor * best_d;
                         for (uint32_t k = 0; k < K; k++) {
-                            if (dists[k] <= threshold) {
-                                my_shards[k].push_back(i);
+                            if (dists[k] > threshold) continue;
+                            // Size cap (balance_factor). The PRIMARY cluster
+                            // (argmin dist) is always admitted even if over
+                            // cap — losing a vector from its nearest shard
+                            // would defeat the partition. Secondary closure
+                            // clusters respect the cap. This means the cap
+                            // bounds the closure-replication overhead but
+                            // never drops a vector's primary membership.
+                            if (cap_per_shard < std::numeric_limits<float>::max()) {
+                                const uint32_t cur = shard_sizes[k].load(
+                                    std::memory_order_relaxed);
+                                if (cur >= cap_per_shard && dists[k] > best_d) {
+                                    continue;  // over cap and not primary → skip
+                                }
                             }
+                            my_shards[k].push_back(i);
+                            shard_sizes[k].fetch_add(1, std::memory_order_relaxed);
                         }
                     }
                 }

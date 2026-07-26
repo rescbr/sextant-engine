@@ -881,14 +881,16 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
             // correctly (is_scan = !graph && !ivf).
             if (overrides.sharded_graph || is_scan) {
                 if (is_scan) {
-                    // Scan path: target ~200k vectors/shard. Smaller shards =
-                    // less bytes streamed per probe. K_max=8192 (no per-shard
-                    // graph to build — shards are pure code containers).
+                    // Scan path: target ~200k vectors/shard. Smaller shards = less
+                    // bytes streamed per probe. K_max=8192. Floor 64 (not 16):
+                    // K=16 was measured at 14 QPS on arxiv-nomic 1.34M (scans
+                    // half the dataset per query); K=64 hit the recall-0.99
+                    // sweet spot at 38 QPS. See resolve_params.cpp for detail.
                     constexpr uint64_t kTargetShardSize = 200'000;
                     recall_driven_k = static_cast<uint32_t>(
                         (total_n + kTargetShardSize - 1) / kTargetShardSize);
                     recall_driven_k =
-                        std::max<uint32_t>(recall_driven_k, 16u);
+                        std::max<uint32_t>(recall_driven_k, 64u);
                     recall_driven_k =
                         std::min<uint32_t>(recall_driven_k, 8192u);
                 } else {
@@ -911,6 +913,7 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
     // from the overrides; the estimator's mini-build path doesn't touch them.
     p.merged_graph = base.merged_graph;
     p.pq4_m = base.pq4_m;
+    p.partition_balance_factor = base.partition_balance_factor;
     p.pq_anisotropy = base.pq_anisotropy;
     p.pq_opq = base.pq_opq;
     p.anisotropic_pq = base.anisotropic_pq;

@@ -48,12 +48,21 @@ struct PartitionAssignment {
 ///                    embarrassingly parallel; the medoid pass parallelizes
 ///                    over the K clusters.
 /// @param seed        RNG seed for initial centroid selection.
+/// @param balance_factor  Size-balancing strength (0 = off; SPANN-style
+///                    λ-regularization). When >0, oversized clusters spill
+///                    excess vectors to their next-nearest centroid, bounding
+///                    shard-size variance. Caps max_shard at roughly
+///                    (1 + 1/balance_factor) × mean_size. Default 0 (off).
+///                    See SPANN (arXiv:2111.08566) §"Hierarchical Balanced
+///                    Clustering" — list-size balance bounds the worst-case
+///                    disk-read pathology at paged-billion-scale.
 PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                                      const uint8_t* codes, uint32_t n,
                                      uint32_t code_size, uint32_t K,
                                      float closure_factor,
                                      uint32_t iterations = 10,
                                      uint32_t num_threads = 0,
-                                     uint64_t seed = 0xC0DE1234ULL);
+                                     uint64_t seed = 0xC0DE1234ULL,
+                                     float balance_factor = 0.0f);
 
 }  // namespace sextant

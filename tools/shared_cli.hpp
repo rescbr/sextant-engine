@@ -125,6 +125,14 @@ inline void add_common_flags(cmdline::parser& p) {
         "Partition count (K) override. 0 = auto (RAM-driven, plus the "
         "shard-size heuristic for the chosen build path).",
         false, 0);
+    p.add<float>("partition-balance-factor", 0,
+        "Partition size-balance strength (SPANN-style λ, arXiv:2111.08566). "
+        "0 = off (plain k-means + closure). >0 caps each shard's size at "
+        "(N/K)·(1 + 1/λ), bounding the worst-case disk read per shard at "
+        "paged-billion-scale. Default 0; recommended 2-4 for IVF-scan builds. "
+        "Only the closure-replication overhead is capped; primary membership "
+        "is never dropped.",
+        false, 0.0f);
 }
 
 /// Add mode-specific extras. Call after add_common_flags.
@@ -217,6 +225,11 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     try {
         if (p.exist("partition-count")) {
             cfg.partition_count = p.get<uint32_t>("partition-count");
+        }
+    } catch (...) {}
+    try {
+        if (p.exist("partition-balance-factor")) {
+            cfg.partition_balance_factor = p.get<float>("partition-balance-factor");
         }
     } catch (...) {}
 
