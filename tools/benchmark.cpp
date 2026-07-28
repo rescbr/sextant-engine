@@ -63,15 +63,23 @@ using US = std::chrono::duration<double, std::micro>;
 using namespace sextant::fbin_io;  // FbinHeader, read_fbin_header, read_fbin_vector, l2sq_distance
 
 // ---------------------------------------------------------------------------
-// Ground-truth .gt reader: [uint32 n][uint32 k][n×k uint32 ids][n×k float dists].
-// We only need the IDs.
-// ---------------------------------------------------------------------------
+// Ground-truth .gt format:
+//   Legacy:  [uint32 n][uint32 k][n×k uint32 ids][n×k float dists]
+//   Current: [magic "GTMM" 4B][uint32 n][uint32 k][uint8 metric][n×k uint32 ids]
+//            [n×k float dists]
+// The magic is detected by peeking the first 4 bytes — old files start with
+// the n field (small), so "GTMM" (= 0x4D4D5447 LE = 1.3 billion) never collides
+// with a real query count. Current files carry the metric the GT was computed
+// under; the benchmark verifies it matches the build's --metric to prevent
+// silent recall artifacts (the Sphere-IP-vs-L2sq bug).
+inline constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
 
 struct GroundTruth {
     uint32_t n = 0;
     uint32_t k = 0;
+    sextant::MetricKind metric = sextant::MetricKind::L2Sq;  // default for legacy files
     std::vector<uint32_t> ids;    // n × k, row-major
-    std::vector<float> dists;     // n × k, row-major (L2sq, ascending per row)
+    std::vector<float> dists;     // n × k, row-major, ascending per row
 };
 
 GroundTruth read_ground_truth(const std::string& path) {
@@ -81,8 +89,28 @@ GroundTruth read_ground_truth(const std::string& path) {
                     "cannot open ground-truth '" + path + "'");
     }
     GroundTruth gt;
-    f.read(reinterpret_cast<char*>(&gt.n), sizeof(uint32_t));
-    f.read(reinterpret_cast<char*>(&gt.k), sizeof(uint32_t));
+
+    // Peek the first 4 bytes to detect the magic.
+    uint32_t maybe_magic = 0;
+    f.read(reinterpret_cast<char*>(&maybe_magic), sizeof(uint32_t));
+    if (!f) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "invalid ground-truth header in '" + path + "'");
+    }
+
+    if (maybe_magic == kGtMagic) {
+        // Current format: [magic][n][k][metric][ids][dists]
+        f.read(reinterpret_cast<char*>(&gt.n), sizeof(uint32_t));
+        f.read(reinterpret_cast<char*>(&gt.k), sizeof(uint32_t));
+        uint8_t metric_byte = 0;
+        f.read(reinterpret_cast<char*>(&metric_byte), sizeof(uint8_t));
+        gt.metric = static_cast<sextant::MetricKind>(metric_byte);
+    } else {
+        // Legacy format: the 4 bytes we just read were the n field.
+        gt.n = maybe_magic;
+        f.read(reinterpret_cast<char*>(&gt.k), sizeof(uint32_t));
+        gt.metric = sextant::MetricKind::L2Sq;  // legacy files assumed L2sq
+    }
     if (!f || gt.n == 0 || gt.k == 0) {
         throw Error(ErrorCode::CorruptIndex,
                     "invalid ground-truth header in '" + path + "'");
@@ -103,6 +131,37 @@ GroundTruth read_ground_truth(const std::string& path) {
         gt.dists.clear();
     }
     return gt;
+}
+
+/// Verify the GT's recorded metric matches what the index was built under.
+/// Hard-error on mismatch — this is the cheap check that would have caught
+/// the Sphere-IP-vs-L2sq ceiling immediately (we wasted ~5h of 8-bit
+/// experiments on that artifact before brute-forcing the GT).
+/// Returns 1 on mismatch (for run_*_benchmark's return-code convention),
+/// 0 on match. Legacy GT files (no metric tag) always match — we can't
+/// know what they were computed under, so we trust the user.
+int check_gt_metric(const GroundTruth& gt, sextant::MetricKind expected,
+                    const std::string& gt_path) {
+    if (gt.metric != expected) {
+        std::cerr << "benchmark: FATAL — ground-truth metric mismatch.\n"
+                  << "  GT '" << gt_path << "' was computed under "
+                  << (gt.metric == sextant::MetricKind::InnerProduct
+                          ? "inner product"
+                          : "squared Euclidean")
+                  << ", but the index/search metric is "
+                  << (expected == sextant::MetricKind::InnerProduct
+                          ? "inner product"
+                          : "squared Euclidean")
+                  << ".\n  Recall numbers will be WRONG — rebuild with "
+                     "--metric "
+                  << (gt.metric == sextant::MetricKind::InnerProduct
+                          ? "ip"
+                          : "l2sq")
+                  << " to match the GT.\n  (Override with "
+                     "--i-know-the-metric-is-right if you've verified.)\n";
+        return 1;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +620,7 @@ int main(int argc, char* argv[]) {
         // IVF paths route results through process_results via this struct.
         const sextant::MetricKind idx_metric =
             idx->quantizer ? idx->quantizer->metric() : sextant::MetricKind::L2Sq;
+        if (int c = check_gt_metric(gt, idx_metric, gt_path)) return c;
         const RerankCtx rctx{
             dim, k, bh.n, do_rerank, base_in_ram,
             base_in_ram ? base_all : nullptr,
@@ -873,6 +933,7 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
+        if (int c = check_gt_metric(gt, ivf_metric, gt_path)) return c;
         const RerankCtx rctx{
             dim, k, bh.n, do_rerank, base_in_ram,
             base_in_ram ? base_all : nullptr,
@@ -1153,6 +1214,7 @@ int run_ivf_scan_benchmark(const std::string& index,
         const sextant::MetricKind scan_metric =
             ivf_idx->quantizer ? ivf_idx->quantizer->metric()
                                : sextant::MetricKind::L2Sq;
+        if (int c = check_gt_metric(gt, scan_metric, gt_path)) return c;
         const RerankCtx rctx{
             dim, k, bh.n, /*do_rerank=*/true, base_in_ram,
             base_in_ram ? base_all : nullptr,
