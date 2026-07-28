@@ -144,6 +144,14 @@ struct BuildConfig {
     /// for the IVF-scan path (merged_graph=false).
     uint16_t pq4_m = 0;
 
+    /// Bits per segment for the IVF-scan codebook. 4 (default, FastScan
+    /// nibble-packed) or 8 (byte-per-code, Quicker-ADC shuffle kernel).
+    /// 8-bit lifts the recall ceiling on high-LID datasets (e.g. Sphere
+    /// LID 20.8 caps at ~0.57 with 4-bit; 8-bit breaks the ceiling) at
+    /// 2× index size and ~½ scan throughput. The codebook is shared across
+    /// shards; the routing PQ is unaffected (always 8-bit).
+    uint8_t scan_pq_bits = 4;
+
     /// Partition size-balance strength (SPANN-style λ, arXiv:2111.08566).
     /// 0 = off (plain k-means + closure). >0 caps each shard's size at
     /// (n/K)·(1 + 1/balance_factor), spilling excess vectors from oversized
@@ -243,6 +251,11 @@ struct ResolvedParams {
     /// 4-bit PQ subquantizer count for the IVF-scan path. 0 = auto (dim/4).
     /// Persisted; the searcher reads this to size its 4-bit LUT.
     uint16_t pq4_m = 0;
+
+    /// Bits per segment for the IVF-scan codebook (4 or 8). Persisted; the
+    /// searcher reads this to pick the FastScan kernel. See
+    /// BuildConfig::scan_pq_bits.
+    uint8_t scan_pq_bits = 4;
 
     /// Partition size-balance strength (SPANN λ). 0 = off. See
     /// BuildConfig::partition_balance_factor.

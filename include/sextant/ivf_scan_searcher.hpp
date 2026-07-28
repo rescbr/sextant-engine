@@ -42,7 +42,8 @@ struct IVFScanIndex;
 struct IVFScanWorkerState {
     std::vector<float16_t> query_fp16;                  // dim (routing)
     std::vector<std::pair<float, uint32_t>> cent_dists;  // K (dist, shard_idx)
-    std::vector<uint8_t> lut4;                           // m × 16 bytes
+    std::vector<uint8_t> lut4;                           // m × 16 bytes (4-bit)
+    std::vector<uint8_t> lut8;                           // m × 256 bytes (8-bit)
     /// Per-query top-W accumulator: (4-bit distance, RowId). Reused across
     /// queries (clear() preserves capacity).
     std::vector<std::pair<uint32_t, RowId>> scored;

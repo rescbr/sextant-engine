@@ -1245,15 +1245,17 @@ inline void quantize_lut_u8(const float* lut_f32,
         }
     }
 
-    // A = 255 / max_span, clamped so m × 255 × A < 65535 (u16 accumulator
-    // headroom). At m=96 the clamp threshold is 65535/(96*255) ≈ 2.678; for
-    // spans < ~95 the natural A (255/95 ≈ 2.68) is already at the edge, so
-    // the clamp is load-bearing for very tight LUTs. When max_span is 0
-    // (degenerate LUT, e.g. untrained), A=0 → all zeros.
+    // A = 255 / max_span, clamped so the m × 255 × A accumulator fits the
+    // kernel's u32 accumulators (fastscan_block16 widens u8→u16→u32 per
+    // segment, summing m terms of ≤ 255 × A each). u32 headroom is ample
+    // (4.29e9 / (m*255) ≈ 88k at m=192); the historical u16 cap (65535/(m*255)
+    // ≈ 1.34 at m=192) was for an older u16-accumulator kernel and crushed
+    // 8-bit LUTs to all-zero (their per-segment spans are ~100× smaller than
+    // 4-bit's). When max_span is 0 (degenerate LUT, e.g. untrained), A=0.
     float A = 0.0f;
     if (max_span > 0.0f) {
         A = 255.0f / max_span;
-        const float A_cap = 65535.0f / (float(m) * 255.0f);
+        const float A_cap = 4294967295.0f / (float(m) * 255.0f);
         if (A > A_cap) A = A_cap;
     }
 

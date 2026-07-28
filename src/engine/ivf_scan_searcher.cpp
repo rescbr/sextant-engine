@@ -27,15 +27,17 @@ namespace sextant {
 struct IVFScanSearcher::PoolImpl {
     ctpl::thread_pool_tls<IVFScanWorkerState> pool;
 
-    PoolImpl(uint32_t n_threads, Dim dim, uint32_t K, uint32_t lut_bytes)
+    PoolImpl(uint32_t n_threads, Dim dim, uint32_t K,
+             uint32_t lut4_bytes, uint32_t lut8_bytes)
         : pool(n_threads,
-               [dim, K, lut_bytes](size_t /*id*/,
-                                    std::shared_ptr<IVFScanWorkerState>& w) {
+               [dim, K, lut4_bytes, lut8_bytes](size_t /*id*/,
+                                     std::shared_ptr<IVFScanWorkerState>& w) {
                    w = std::make_shared<IVFScanWorkerState>();
                    w->query_fp16.resize(dim);
                    w->cent_dists.reserve(K);
                    w->scored.reserve(512);
-                   w->lut4.resize(lut_bytes > 0 ? lut_bytes : 1);
+                   w->lut4.resize(lut4_bytes > 0 ? lut4_bytes : 1);
+                   w->lut8.resize(lut8_bytes > 0 ? lut8_bytes : 1);
                    w->dedup.reserve(512);
                }) {}
 };
@@ -51,10 +53,12 @@ IVFScanSearcher::IVFScanSearcher(IVFScanIndex& index, uint32_t num_threads)
         throw Error(ErrorCode::CorruptIndex,
                     "IVFScanSearcher: index has no 4-bit quantizer");
     }
-    const uint32_t lut_bytes =
-        static_cast<uint32_t>(index_.m4) * 16;  // m4 × 16 (K=16 at bits=4)
+    const uint32_t lut4_bytes =
+        static_cast<uint32_t>(index_.m4) * 16;      // m4 × 16 (4-bit: K=16)
+    const uint32_t lut8_bytes =
+        static_cast<uint32_t>(index_.m4) * 256;     // m4 × 256 (8-bit: K=256)
     pool_ = std::make_unique<PoolImpl>(num_threads_, index_.dim, index_.K,
-                                        lut_bytes);
+                                        lut4_bytes, lut8_bytes);
 }
 
 IVFScanSearcher::~IVFScanSearcher() = default;
@@ -80,14 +84,23 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
     uint32_t n_probe = config.n_probe > 0 ? config.n_probe : index_.n_probe_default;
     n_probe = std::max(1u, std::min(n_probe, K));
 
-    // --- 1. Build 4-bit LUT once + cast query → FP16 ---
-    // The LUT (m × 16 = ~3 KB at m=192) stays hot in L1 across all probed
-    // shards and all of their blocks — the per-query constant working set.
-    index_.quantizer->build_fastscan_lut4(query, w.lut4.data(),
-                                          /*scale_out=*/nullptr);
+    // --- 1. Build FastScan LUT once + cast query → FP16 ---
+    // The LUT stays hot in L1 across all probed shards and all of their
+    // blocks — the per-query constant working set. Pick builder + buffer
+    // by scan_pq_bits.
+    const bool scan_8bit = (index_.scan_pq_bits == 8);
+    if (scan_8bit) {
+        float scale, offset;  // unused for argmin within one LUT
+        index_.quantizer->build_fastscan_lut(query, w.lut8.data(),
+                                             &scale, &offset);
+    } else {
+        index_.quantizer->build_fastscan_lut4(query, w.lut4.data(),
+                                              /*scale_out=*/nullptr);
+    }
     cast_fp32_to_fp16(query, w.query_fp16.data(), index_.dim);
     const MetricKind metric = index_.quantizer->metric();
     const uint32_t m = index_.m4;
+    const uint32_t codes_per_block = scan_8bit ? 16 : 32;
 
     // --- 2. Route: FP16 L2sq/IP to each centroid, pick n_probe nearest ---
     // (Plus the multi-probe extension from IVFSearcher — variable per query.)
@@ -176,6 +189,57 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
 
         auto on_block = [&](uint32_t block_idx, const uint8_t* blk,
                             uint32_t valid_mask) {
+            if (scan_8bit) {
+                // 8-bit path: 16 codes/block. fastscan_block16 writes
+                // 0xFFFFFFFF to invalid lanes itself (sentinel auto-loses
+                // any comparison), so no external mask walk is needed.
+                uint32_t out[16];
+                simd::fastscan_block16(blk, w.lut8.data(), m,
+                                       static_cast<uint16_t>(valid_mask), out);
+                const uint32_t base = block_idx * 16;
+
+                if (heap.size() < W) {
+                    for (uint32_t j = 0; j < 16; j++) {
+                        if (out[j] == 0xFFFFFFFFu) continue;
+                        heap.emplace_back(out[j], base + j);
+                        if (heap.size() == W) {
+                            std::make_heap(heap.begin(), heap.end(), heap_less);
+                            break;
+                        }
+                    }
+                    if (heap.size() < W) return;
+                }
+                const uint32_t front_d = heap[0].first;
+                // Front-compare: any of the 16 lanes beat the front?
+    #if defined(SEXTANT_HAS_NEON)
+                {
+                    const uint32x4_t front4 = vdupq_n_u32(front_d);
+                    const uint32x4_t* o = reinterpret_cast<const uint32x4_t*>(out);
+                    uint32x4_t any = vcltq_u32(o[0], front4);
+                    any = vorrq_u32(any, vcltq_u32(o[1], front4));
+                    any = vorrq_u32(any, vcltq_u32(o[2], front4));
+                    any = vorrq_u32(any, vcltq_u32(o[3], front4));
+                    const uint64x2_t a64 = vreinterpretq_u64_u32(any);
+                    if (vgetq_lane_u64(a64, 0) == 0 && vgetq_lane_u64(a64, 1) == 0)
+                        return;
+                }
+    #else
+                {
+                    uint32_t block_min = 0xFFFFFFFFu;
+                    for (uint32_t j = 0; j < 16; j++)
+                        if (out[j] < block_min) block_min = out[j];
+                    if (block_min >= front_d) return;
+                }
+    #endif
+                for (uint32_t j = 0; j < 16; j++) {
+                    const uint32_t d = out[j];
+                    if (d >= heap[0].first) continue;
+                    heap_replace(d, base + j);
+                }
+                return;
+            }
+
+            // 4-bit path: 32 codes/block, mask applied by caller.
             uint32_t out[32];
             simd::pq4_block32(blk, w.lut4.data(), m, out);
             const uint32_t base = block_idx * 32;

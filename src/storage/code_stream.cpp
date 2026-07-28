@@ -13,27 +13,31 @@
 
 namespace sextant {
 
-CodeStream::CodeStream(const std::string& path, uint32_t m)
+CodeStream::CodeStream(const std::string& path, uint32_t m, uint8_t scan_pq_bits)
     : file_(path), m_(m) {
     if (m_ == 0) {
         throw Error(ErrorCode::InvalidParam,
                     "CodeStream: m (segments) must be > 0");
     }
     block_bytes_ = m_ * 16;
+    codes_per_block_ = (scan_pq_bits == 8) ? 16 : 32;
 
     SidecarHeader h{};
     engine_detail::read_exact(file_, &h, sizeof(h), 0);
-    if (h.magic != kMagicCodes4) {
+    const uint64_t expected_magic =
+        (scan_pq_bits == 8) ? kMagicCodes8 : kMagicCodes4;
+    if (h.magic != expected_magic) {
         throw Error(ErrorCode::CorruptIndex,
                     "CodeStream: magic mismatch on '" + path +
-                        "' (expected kMagicCodes4)");
+                        "' (expected scan_pq_bits=" +
+                        std::to_string(scan_pq_bits) + ")");
     }
     if (h.dim == 0 || h.n_vectors == 0) {
         throw Error(ErrorCode::CorruptIndex,
                     "CodeStream: empty/corrupt header on '" + path + "'");
     }
     n_vectors_ = static_cast<uint32_t>(h.n_vectors);
-    n_blocks_ = (n_vectors_ + 31) / 32;
+    n_blocks_ = (n_vectors_ + codes_per_block_ - 1) / codes_per_block_;
 
     constexpr uint32_t kTargetChunkBytes = 4 * kBlockSize;
     chunk_blocks_ = std::max<uint32_t>(
@@ -65,7 +69,8 @@ CodeStream::~CodeStream() {
 CodeStream::CodeStream(CodeStream&& other) noexcept
     : file_(std::move(other.file_)), m_(other.m_),
       block_bytes_(other.block_bytes_), n_blocks_(other.n_blocks_),
-      n_vectors_(other.n_vectors_), chunk_blocks_(other.chunk_blocks_),
+      n_vectors_(other.n_vectors_), codes_per_block_(other.codes_per_block_),
+      chunk_blocks_(other.chunk_blocks_),
       mapped_(other.mapped_), file_size_(other.file_size_) {
     other.mapped_ = nullptr;
 }
@@ -78,6 +83,7 @@ CodeStream& CodeStream::operator=(CodeStream&& other) noexcept {
         block_bytes_ = other.block_bytes_;
         n_blocks_ = other.n_blocks_;
         n_vectors_ = other.n_vectors_;
+        codes_per_block_ = other.codes_per_block_;
         chunk_blocks_ = other.chunk_blocks_;
         mapped_ = other.mapped_;
         file_size_ = other.file_size_;
@@ -91,15 +97,16 @@ bool CodeStream::scan(
     uint8_t* staging) {
     if (n_blocks_ == 0) return true;
     const uint64_t data_off = sizeof(SidecarHeader);
+    const uint32_t cpb = codes_per_block_;  // 32 (4-bit) or 16 (8-bit)
 
     if (mapped_) {
         const uint8_t* base_ptr = mapped_ + data_off;
         for (uint32_t b = 0; b < n_blocks_; b++) {
             const uint8_t* blk = base_ptr + (size_t)b * block_bytes_;
             uint32_t mask = 0;
-            const uint32_t lane_base = b * 32;
+            const uint32_t lane_base = b * cpb;
             const uint32_t lanes = std::min<uint32_t>(
-                32u, n_vectors_ - std::min(lane_base, n_vectors_));
+                cpb, n_vectors_ - std::min(lane_base, n_vectors_));
             for (uint32_t j = 0; j < lanes; j++) mask |= (1u << j);
             on_block(b, blk, mask);
         }
@@ -116,8 +123,8 @@ bool CodeStream::scan(
             const uint32_t gi = b + i;
             const uint8_t* blk = staging + (size_t)i * block_bytes_;
             uint32_t mask = 0;
-            const uint32_t base = gi * 32;
-            const uint32_t lanes = std::min<uint32_t>(32u,
+            const uint32_t base = gi * cpb;
+            const uint32_t lanes = std::min<uint32_t>(cpb,
                 n_vectors_ - std::min(base, n_vectors_));
             for (uint32_t j = 0; j < lanes; j++) mask |= (1u << j);
             on_block(gi, blk, mask);

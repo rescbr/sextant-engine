@@ -27,9 +27,12 @@ namespace {
 ///   <dim>
 ///   <n_probe_default>
 ///   <m4>
+///   <scan_pq_bits>   (optional; defaults to 4 if absent — pre-8-bit indexes)
 /// Returns false if the file is missing or malformed.
 bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
-                        uint32_t& n_probe_default, uint16_t& m4) {
+                        uint32_t& n_probe_default, uint16_t& m4,
+                        uint8_t& scan_pq_bits) {
+    scan_pq_bits = 4;  // default for older indexes that don't carry the field
     std::ifstream f(path);
     if (!f) return false;
     std::string tok;
@@ -50,19 +53,29 @@ bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
     if (!read_line(dim)) return false;
     if (!read_line(n_probe_default)) return false;
     if (!read_line(m4)) return false;
+    // Optional 6th line — old indexes stop here and keep the default of 4.
+    uint16_t bits_raw = 4;
+    if (read_line(bits_raw)) {
+        scan_pq_bits = (bits_raw == 8) ? 8 : 4;
+    }
     return true;
 }
 
-/// Read the shared 4-bit codebook (a serialized PqQuantizer blob prefixed by a
-/// SidecarHeader). Reconstructs the quantizer in-place.
+/// Read the shared scan codebook (a serialized PqQuantizer blob prefixed by a
+/// SidecarHeader). Reconstructs the quantizer in-place. The sidecar magic
+/// (kMagicCodebook4 vs kMagicCodebook8) selects the bits.
 void read_codebook(const std::string& path, std::unique_ptr<PqQuantizer>& out,
-                   Dim dim, uint16_t m4) {
+                   Dim dim, uint16_t m4, uint8_t scan_pq_bits) {
     DirectFile f(path, /*create=*/false);
     SidecarHeader h{};
     engine_detail::read_exact(f, &h, sizeof(h), 0);
-    if (h.magic != kMagicCodebook4) {
+    const uint64_t expected_magic =
+        (scan_pq_bits == 8) ? kMagicCodebook8 : kMagicCodebook4;
+    if (h.magic != expected_magic) {
         throw Error(ErrorCode::CorruptIndex,
-                    "IVFScanIndex: codebook magic mismatch on '" + path + "'");
+                    "IVFScanIndex: codebook magic mismatch on '" + path +
+                        "' (expected scan_pq_bits=" +
+                        std::to_string(scan_pq_bits) + ")");
     }
     // The blob layout after the header: [u64 qsize][quantizer bytes].
     uint64_t qsize = 0;
@@ -72,9 +85,10 @@ void read_codebook(const std::string& path, std::unique_ptr<PqQuantizer>& out,
         engine_detail::read_exact(f, blob.data(), blob.size(),
                                   sizeof(SidecarHeader) + sizeof(qsize));
     }
-    // Construct with the index's recorded dim/m4 (sanity vs the serialized
-    // state); deserialize overwrites the placeholder training state.
-    out = std::make_unique<PqQuantizer>(MetricKind::L2Sq, dim, m4, /*bits=*/4);
+    // Construct with the index's recorded dim/m4/bits (sanity vs the
+    // serialized state); deserialize overwrites the placeholder training state.
+    out = std::make_unique<PqQuantizer>(MetricKind::L2Sq, dim, m4,
+                                        /*bits=*/scan_pq_bits);
     out->deserialize(blob.data(), blob.size());
 }
 
@@ -106,7 +120,9 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     uint32_t K = 0, n_probe_default = 1;
     Dim dim = 0;
     uint16_t m4 = 0;
-    if (!read_scan_manifest(manifest_path, K, dim, n_probe_default, m4)) {
+    uint8_t scan_pq_bits = 4;
+    if (!read_scan_manifest(manifest_path, K, dim, n_probe_default, m4,
+                            scan_pq_bits)) {
         throw Error(ErrorCode::CorruptIndex,
                     "IVFScanIndex: cannot read manifest '" + manifest_path + "'");
     }
@@ -118,6 +134,7 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     idx->dim = dim;
     idx->n_probe_default = n_probe_default > 0 ? n_probe_default : 1;
     idx->m4 = m4;
+    idx->scan_pq_bits = scan_pq_bits;
 
     // Load centroids (raw FP16, same layout as IVFIndex).
     {
@@ -137,27 +154,34 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
         }
     }
 
-    // Load the shared 4-bit codebook.
-    read_codebook(shards_dir + "/codebook4.bin", idx->quantizer, dim, m4);
+    // Load the shared scan codebook (4-bit or 8-bit per scan_pq_bits).
+    {
+        const std::string path = shards_dir +
+            ((scan_pq_bits == 8) ? "/codebook8.bin" : "/codebook4.bin");
+        read_codebook(path, idx->quantizer, dim, m4, scan_pq_bits);
+    }
 
     // Open per-shard CodeStreams + load rowids.
     idx->shards.resize(K);
+    const std::string codes_suffix =
+        (scan_pq_bits == 8) ? "/.codes8" : "/.codes4";
     for (uint32_t k = 0; k < K; k++) {
         char dirbuf[32];
         std::snprintf(dirbuf, sizeof(dirbuf), "shard_%04u", k + 1);
         const std::string shard_dir = shards_dir + "/" + dirbuf;
-        const std::string codes4_path = shard_dir + "/.codes4";
+        const std::string codes_path = shard_dir + codes_suffix;
         const std::string rowids_path = shard_dir + "/.rowids";
 
         std::error_code ec;
-        if (!std::filesystem::exists(codes4_path, ec)) {
+        if (!std::filesystem::exists(codes_path, ec)) {
             // Empty shard — skip (no entry created; router sees K but null).
-            spdlog::debug("[sextant] IVFScanIndex: shard {} has no .codes4 (empty)",
-                          k + 1);
+            spdlog::debug("[sextant] IVFScanIndex: shard {} has no {} (empty)",
+                          k + 1, codes_suffix);
             continue;
         }
         auto shard = std::make_unique<ScanShard>();
-        shard->codes = std::make_unique<CodeStream>(codes4_path, m4);
+        shard->codes = std::make_unique<CodeStream>(codes_path, m4,
+                                                     scan_pq_bits);
         read_rowids(rowids_path, shard->row_ids);
         shard->count = static_cast<uint32_t>(shard->row_ids.size());
         if (shard->count != shard->codes->n_vectors()) {

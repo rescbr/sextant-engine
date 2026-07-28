@@ -21,8 +21,10 @@ inline constexpr uint64_t kMagicEpc     = 0x43504543'484d5649ULL;  // "IVMHCEPC"
 // under `<prefix>.shards/shard_NNNN/` and the shared codebook lives once at
 // `<prefix>.shards/codebook4.bin`. See ~/.local/state/maki/plans/sharing-eternal-louse.md.
 inline constexpr uint64_t kMagicCodes4   = 0x344f444f'484d5643ULL;  // "CVMHCODO4" tail — 4-bit FastScan-packed codes
+inline constexpr uint64_t kMagicCodes8   = 0x384f444f'484d5643ULL;  // "CVMHCODO8" tail — 8-bit FastScan (byte-per-code) codes
 inline constexpr uint64_t kMagicRowids   = 0x53444957'4f52454dULL;  // "MEROWIDS" — shard-local idx → RowId
 inline constexpr uint64_t kMagicCodebook4 = 0x344b4f42'444f4f43ULL; // "COOKBOC4" tail — shared 4-bit PQ codebook
+inline constexpr uint64_t kMagicCodebook8 = 0x384b4f42'444f4f43ULL; // "COOKBOC8" tail — shared 8-bit PQ codebook
 
 inline constexpr uint32_t kFormatVersion = 1;
 

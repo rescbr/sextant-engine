@@ -1477,7 +1477,14 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
     // Re-reads source once (reset + sample). The 8-bit codebook trained on a
     // reservoir; we mirror that for 4-bit. Sample size matches the spike
     // (min(20k, N)) — PQ training is sample-size-insensitive past ~10k.
-    PqQuantizer q4(MetricKind::L2Sq, dim, m4, /*bits=*/4, /*seed=*/42);
+    const uint8_t scan_bits = params.scan_pq_bits;
+    if (scan_bits != 4 && scan_bits != 8) {
+        throw Error(ErrorCode::InvalidParam,
+                    "build_ivf_scan: scan_pq_bits must be 4 or 8 (got " +
+                        std::to_string(scan_bits) + ")");
+    }
+    PqQuantizer qscan(MetricKind::L2Sq, dim, m4, /*bits=*/scan_bits,
+                      /*seed=*/42);
     {
         const uint32_t train_n = std::min<uint64_t>(20'000, n);
         std::vector<float> sample(static_cast<size_t>(train_n) * dim);
@@ -1502,7 +1509,7 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         spdlog::info("[sextant] training 4-bit PQ (m={}, K=16) on {} samples",
                      m4, filled);
         const auto ts = std::chrono::steady_clock::now();
-        q4.train(sample.data(), filled);
+        qscan.train(sample.data(), filled);
         const auto te = std::chrono::steady_clock::now();
         spdlog::info("[sextant]   4-bit codebook trained in {:.2f}s",
                      std::chrono::duration<double>(te - ts).count());
@@ -1632,50 +1639,71 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                             shard_dir + "': " + mkrec.message());
         }
 
-        const uint32_t n_blocks = (shard_n + 31) / 32;
+        // codes_per_block: 32 for 4-bit (2 vectors packed per byte via low/high
+        // nibbles), 16 for 8-bit (one byte per code, no packing).
+        const uint32_t codes_per_block = (scan_bits == 4) ? 32 : 16;
+        const uint32_t n_blocks = (shard_n + codes_per_block - 1) / codes_per_block;
 
-        // Encode each member to m nibbles (one byte per segment, value 0..15).
-        std::vector<uint8_t> nibbles(static_cast<size_t>(shard_n) * m);
+        // Encode each member to m segment-codes (one byte per segment).
+        // For 4-bit the byte value is 0..15 (one nibble); for 8-bit it's 0..255.
+        std::vector<uint8_t> seg_codes(static_cast<size_t>(shard_n) * m);
         {
-            std::vector<uint8_t> packed(q4.code_size());  // m/2 bytes
+            std::vector<uint8_t> packed(qscan.code_size());
             for (uint32_t i = 0; i < shard_n; i++) {
                 const uint32_t gid = members[i];
                 const float* vec =
                     vecs_base + static_cast<size_t>(gid) * dim;
-                q4.encode(vec, packed.data());
+                qscan.encode(vec, packed.data());
                 for (uint32_t s = 0; s < m; s++) {
-                    nibbles[static_cast<size_t>(i) * m + s] = static_cast<uint8_t>(
-                        (packed[s / 2] >> ((s % 2) * 4)) & 0xF);
+                    if (scan_bits == 4) {
+                        seg_codes[static_cast<size_t>(i) * m + s] =
+                            static_cast<uint8_t>(
+                                (packed[s / 2] >> ((s % 2) * 4)) & 0xF);
+                    } else {
+                        seg_codes[static_cast<size_t>(i) * m + s] = packed[s];
+                    }
                 }
             }
         }
 
-        // Pack into FastScan block layout: blocks[b][s][16], where byte k of
-        // segment s holds low=vector (b*32+k), high=vector (b*32+16+k). The
-        // tail block zero-pads (those lanes are masked at search time).
+        // Pack into FastScan block layout: blocks[b][s][16], segment-major.
+        // Tail block zero-pads (padding lanes are masked at search time).
+        //   4-bit: byte k of segment s packs low=vec(b*32+k), high=vec(b*32+16+k).
+        //   8-bit: byte k of segment s is vec(b*16+k) directly (no packing).
         std::vector<uint8_t> blocks(static_cast<size_t>(n_blocks) * block_bytes,
                                     0);
         for (uint32_t b = 0; b < n_blocks; b++) {
             for (uint32_t s = 0; s < m; s++) {
                 for (uint32_t kk = 0; kk < 16; kk++) {
-                    const uint32_t v0 = b * 32 + kk;        // low nibble
-                    const uint32_t v1 = b * 32 + 16 + kk;   // high nibble
-                    const uint8_t lo = (v0 < shard_n)
-                        ? nibbles[static_cast<size_t>(v0) * m + s] : 0;
-                    const uint8_t hi = (v1 < shard_n)
-                        ? nibbles[static_cast<size_t>(v1) * m + s] : 0;
-                    blocks[((static_cast<size_t>(b) * m) + s) * 16 + kk] =
-                        static_cast<uint8_t>((hi << 4) | lo);
+                    if (scan_bits == 4) {
+                        const uint32_t v0 = b * 32 + kk;        // low nibble
+                        const uint32_t v1 = b * 32 + 16 + kk;   // high nibble
+                        const uint8_t lo = (v0 < shard_n)
+                            ? seg_codes[static_cast<size_t>(v0) * m + s] : 0;
+                        const uint8_t hi = (v1 < shard_n)
+                            ? seg_codes[static_cast<size_t>(v1) * m + s] : 0;
+                        blocks[((static_cast<size_t>(b) * m) + s) * 16 + kk] =
+                            static_cast<uint8_t>((hi << 4) | lo);
+                    } else {
+                        const uint32_t v = b * 16 + kk;
+                        blocks[((static_cast<size_t>(b) * m) + s) * 16 + kk] =
+                            (v < shard_n)
+                                ? seg_codes[static_cast<size_t>(v) * m + s]
+                                : 0;
+                    }
                 }
             }
         }
 
-        // Write .codes4 (SidecarHeader + block payload).
+        // Write .codes{4,8} (SidecarHeader + block payload). The magic tells
+        // the searcher which kernel + LUT builder to use.
         {
-            const std::string path = shard_dir + "/.codes4";
+            const uint64_t magic = (scan_bits == 4) ? kMagicCodes4 : kMagicCodes8;
+            const std::string path =
+                shard_dir + ((scan_bits == 4) ? "/.codes4" : "/.codes8");
             DirectFile f(path, true);
             SidecarHeader h{};
-            fill_header(h, kMagicCodes4, shard_n, dim, uuid);
+            fill_header(h, magic, shard_n, dim, uuid);
             write_padded(f, &h, sizeof(h), 0);
             write_padded(f, blocks.data(), blocks.size(), sizeof(h));
             f.sync();
@@ -1805,14 +1833,17 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         f.sync();
     }
 
-    // --- 6. codebook4.bin: serialized 4-bit PqQuantizer (shared) ---
+    // --- 6. codebook{4,8}.bin: serialized scan PqQuantizer (shared) ---
     {
-        const std::string path = shards_dir + "/codebook4.bin";
+        const uint64_t magic =
+            (scan_bits == 4) ? kMagicCodebook4 : kMagicCodebook8;
+        const std::string path = shards_dir +
+            ((scan_bits == 4) ? "/codebook4.bin" : "/codebook8.bin");
         std::vector<uint8_t> blob;
-        q4.serialize(blob);
+        qscan.serialize(blob);
         DirectFile f(path, true);
         SidecarHeader h{};
-        fill_header(h, kMagicCodebook4, n, dim, uuid);
+        fill_header(h, magic, n, dim, uuid);
         write_padded(f, &h, sizeof(h), 0);
         const uint64_t qsize = blob.size();
         write_padded(f, &qsize, sizeof(qsize), sizeof(h));
@@ -1837,7 +1868,8 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                 std::to_string(K) + "\n" +
                 std::to_string(dim) + "\n" +
                 std::to_string(n_probe) + "\n" +
-                std::to_string(m4) + "\n";
+                std::to_string(m4) + "\n" +
+                std::to_string(static_cast<unsigned>(scan_bits)) + "\n";
             write_padded(f, commit.data(), commit.size(), 0);
             f.sync();
         }

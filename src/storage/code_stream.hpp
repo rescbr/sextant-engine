@@ -29,7 +29,7 @@ namespace sextant {
 
 class CodeStream {
 public:
-    CodeStream(const std::string& path, uint32_t m);
+    CodeStream(const std::string& path, uint32_t m, uint8_t scan_pq_bits = 4);
     ~CodeStream();
 
     CodeStream(const CodeStream&) = delete;
@@ -53,6 +53,7 @@ private:
     uint32_t block_bytes_ = 0;
     uint32_t n_blocks_ = 0;
     uint32_t n_vectors_ = 0;
+    uint32_t codes_per_block_ = 32;  // 32 (4-bit) or 16 (8-bit)
     uint32_t chunk_blocks_ = 1;
     const uint8_t* mapped_ = nullptr;  // mmap'd payload; nullptr if mmap failed
     uint64_t file_size_ = 0;

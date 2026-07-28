@@ -91,6 +91,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     // --- merged_graph / pq4_m (IVF-list-scan vs merged-graph) ---
     p.merged_graph = overrides.merged_graph;
     p.partition_balance_factor = overrides.partition_balance_factor;
+    p.scan_pq_bits = (overrides.scan_pq_bits == 8) ? 8 : 4;  // sanitize: 4 or 8 only
     if (overrides.pq4_m != 0) {
         p.pq4_m = overrides.pq4_m;
     } else if (dim > 0) {

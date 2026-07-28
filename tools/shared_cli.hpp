@@ -58,6 +58,11 @@ inline void add_common_flags(cmdline::parser& p) {
         false, 0);
     p.add<std::string>("pq-bits", 0,
         "PQ bits per segment: 4, 8, or auto.", false, "auto");
+    p.add<uint16_t>("scan-pq-bits", 0,
+        "IVF-scan codebook bits per segment: 4 (default, FastScan nibble) "
+        "or 8 (byte-per-code, ~½ throughput but breaks the recall ceiling "
+        "on high-LID datasets). The routing PQ is unaffected (always 8-bit).",
+        false, 4);
     p.add<float>("pq-max-distortion", 0,
         "Max PQ distortion (median |1 - pq_dist/true_dist|) for auto (m,bits) "
         "selection. 0 = default (0.05).",
@@ -194,6 +199,11 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
         else if (b == "4")                cfg.pq_bits = 4;
         else if (b == "8")                cfg.pq_bits = 8;
         else throw std::runtime_error("--pq-bits must be 4, 8, or auto");
+    }
+    {
+        const uint16_t sb = p.get<uint16_t>("scan-pq-bits");
+        if (sb == 4 || sb == 8) cfg.scan_pq_bits = static_cast<uint8_t>(sb);
+        else throw std::runtime_error("--scan-pq-bits must be 4 or 8");
     }
     cfg.pq_max_distortion = p.get<float>("pq-max-distortion");
     cfg.pq_anisotropy = (p.get<float>("pq-anisotropy") > 0.0f);

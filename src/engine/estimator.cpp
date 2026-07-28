@@ -889,6 +889,7 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
     p.merged_graph = base.merged_graph;
     p.pq4_m = base.pq4_m;
     p.partition_balance_factor = base.partition_balance_factor;
+    p.scan_pq_bits = base.scan_pq_bits;
     p.pq_anisotropy = base.pq_anisotropy;
     p.pq_opq = base.pq_opq;
     p.anisotropic_pq = base.anisotropic_pq;

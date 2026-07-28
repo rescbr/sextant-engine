@@ -438,7 +438,9 @@ int main(int argc, char* argv[]) {
     // absent.
     if (std::filesystem::is_directory(index + ".shards")) {
         const bool is_scan = std::filesystem::exists(
-            index + ".shards/codebook4.bin");
+                                 index + ".shards/codebook4.bin") ||
+                             std::filesystem::exists(
+                                 index + ".shards/codebook8.bin");
         if (is_scan) {
             return run_ivf_scan_benchmark(
                 index, query_path, base_data, gt_path,
