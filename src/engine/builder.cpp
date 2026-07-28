@@ -1483,7 +1483,7 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                     "build_ivf_scan: scan_pq_bits must be 4 or 8 (got " +
                         std::to_string(scan_bits) + ")");
     }
-    PqQuantizer qscan(MetricKind::L2Sq, dim, m4, /*bits=*/scan_bits,
+    PqQuantizer qscan(params.metric, dim, m4, /*bits=*/scan_bits,
                       /*seed=*/42);
     {
         const uint32_t train_n = std::min<uint64_t>(20'000, n);
