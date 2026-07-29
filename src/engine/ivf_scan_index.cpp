@@ -2,6 +2,7 @@
 
 #include "engine/sidecar_io.hpp"
 #include "quant/pq_quantizer.hpp"
+#include "quant/product_residual_quantizer.hpp"
 #include "storage/code_stream.hpp"
 #include "storage/sidecar_header.hpp"
 
@@ -27,12 +28,17 @@ namespace {
 ///   <dim>
 ///   <n_probe_default>
 ///   <m4>
-///   <scan_pq_bits>   (optional; defaults to 4 if absent — pre-8-bit indexes)
+///   <scan_pq_bits>     (optional; defaults to 4 if absent — pre-8-bit indexes)
+///   <quantizer_type>   (optional; defaults to "pq" — pre-PRQ indexes)
+///   <prq_nsplits>      (optional; defaults to 0 — only meaningful for "prq")
 /// Returns false if the file is missing or malformed.
 bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
                         uint32_t& n_probe_default, uint16_t& m4,
-                        uint8_t& scan_pq_bits) {
-    scan_pq_bits = 4;  // default for older indexes that don't carry the field
+                        uint8_t& scan_pq_bits, std::string& quantizer_type,
+                        uint32_t& prq_nsplits) {
+    scan_pq_bits = 4;       // default for older indexes that don't carry the field
+    quantizer_type = "pq";  // default for older indexes (pre-PRQ)
+    prq_nsplits = 0;        // default for older indexes / non-PRQ quantizers
     std::ifstream f(path);
     if (!f) return false;
     std::string tok;
@@ -57,25 +63,37 @@ bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
     uint16_t bits_raw = 4;
     if (read_line(bits_raw)) {
         scan_pq_bits = (bits_raw == 8) ? 8 : 4;
+        // Optional 7th line — quantizer_type (pre-PRQ indexes stop at line 6).
+        std::string qtype_raw;
+        if (read_line(qtype_raw) && !qtype_raw.empty()) {
+            quantizer_type = qtype_raw;
+            // Optional 8th line — PRQ nsplits.
+            read_line(prq_nsplits);
+        }
     }
     return true;
 }
 
 /// Read the shared scan codebook (a serialized PqQuantizer blob prefixed by a
-/// SidecarHeader). Reconstructs the quantizer in-place. The sidecar magic
-/// (kMagicCodebook4 vs kMagicCodebook8) selects the bits.
+/// SidecarHeader). Reconstructs the quantizer in-place. Dispatches on
+/// `quantizer_type`: "prq" reconstructs a ProductResidualQuantizer (and accepts
+/// the kMagicCodebookPRQ4 magic); otherwise a plain PqQuantizer. The sidecar
+/// magic (kMagicCodebook4 vs kMagicCodebook8 vs kMagicCodebookPRQ4) selects the
+/// quantizer/bits variant on disk.
 void read_codebook(const std::string& path, std::unique_ptr<PqQuantizer>& out,
-                   Dim dim, uint16_t m4, uint8_t scan_pq_bits) {
+                   Dim dim, uint16_t m4, uint8_t scan_pq_bits,
+                   const std::string& quantizer_type, uint32_t prq_nsplits) {
     DirectFile f(path, /*create=*/false);
     SidecarHeader h{};
     engine_detail::read_exact(f, &h, sizeof(h), 0);
     const uint64_t expected_magic =
-        (scan_pq_bits == 8) ? kMagicCodebook8 : kMagicCodebook4;
+        (quantizer_type == "prq") ? kMagicCodebookPRQ4
+        : ((scan_pq_bits == 8) ? kMagicCodebook8 : kMagicCodebook4);
     if (h.magic != expected_magic) {
         throw Error(ErrorCode::CorruptIndex,
                     "IVFScanIndex: codebook magic mismatch on '" + path +
-                        "' (expected scan_pq_bits=" +
-                        std::to_string(scan_pq_bits) + ")");
+                        "' (quantizer_type=" + quantizer_type +
+                        ", scan_pq_bits=" + std::to_string(scan_pq_bits) + ")");
     }
     // The blob layout after the header: [u64 qsize][quantizer bytes].
     uint64_t qsize = 0;
@@ -87,8 +105,14 @@ void read_codebook(const std::string& path, std::unique_ptr<PqQuantizer>& out,
     }
     // Construct with the index's recorded dim/m4/bits (sanity vs the
     // serialized state); deserialize overwrites the placeholder training state.
-    out = std::make_unique<PqQuantizer>(MetricKind::L2Sq, dim, m4,
-                                        /*bits=*/scan_pq_bits);
+    if (quantizer_type == "prq") {
+        out = std::make_unique<ProductResidualQuantizer>(
+            MetricKind::L2Sq, dim, m4, /*bits=*/scan_pq_bits, prq_nsplits,
+            /*beam_size=*/1);
+    } else {
+        out = std::make_unique<PqQuantizer>(MetricKind::L2Sq, dim, m4,
+                                            /*bits=*/scan_pq_bits);
+    }
     out->deserialize(blob.data(), blob.size());
 }
 
@@ -121,8 +145,10 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     Dim dim = 0;
     uint16_t m4 = 0;
     uint8_t scan_pq_bits = 4;
+    std::string quantizer_type = "pq";
+    uint32_t prq_nsplits = 0;
     if (!read_scan_manifest(manifest_path, K, dim, n_probe_default, m4,
-                            scan_pq_bits)) {
+                            scan_pq_bits, quantizer_type, prq_nsplits)) {
         throw Error(ErrorCode::CorruptIndex,
                     "IVFScanIndex: cannot read manifest '" + manifest_path + "'");
     }
@@ -135,6 +161,8 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     idx->n_probe_default = n_probe_default > 0 ? n_probe_default : 1;
     idx->m4 = m4;
     idx->scan_pq_bits = scan_pq_bits;
+    idx->quantizer_type = quantizer_type;
+    idx->prq_nsplits = prq_nsplits;
 
     // Load centroids (raw FP16, same layout as IVFIndex).
     {
@@ -154,11 +182,13 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
         }
     }
 
-    // Load the shared scan codebook (4-bit or 8-bit per scan_pq_bits).
+    // Load the shared scan codebook (4-bit or 8-bit per scan_pq_bits;
+    // PRQ always writes codebook4.bin with kMagicCodebookPRQ4).
     {
         const std::string path = shards_dir +
             ((scan_pq_bits == 8) ? "/codebook8.bin" : "/codebook4.bin");
-        read_codebook(path, idx->quantizer, dim, m4, scan_pq_bits);
+        read_codebook(path, idx->quantizer, dim, m4, scan_pq_bits,
+                      quantizer_type, prq_nsplits);
     }
 
     // Open per-shard CodeStreams + load rowids.
@@ -194,8 +224,8 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     }
 
     spdlog::info("[sextant] IVFScanIndex: opened '{}' (K={}, dim={}, m4={}, "
-                 "n_probe_default={})", shards_dir, K, dim, m4,
-                 idx->n_probe_default);
+                 "n_probe_default={}, quantizer={})",
+                 shards_dir, K, dim, m4, idx->n_probe_default, quantizer_type);
     return idx;
 }
 

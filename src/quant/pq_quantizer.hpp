@@ -89,7 +89,9 @@ public:
     bool has_rotation() const { return has_rotation_; }
 
     /// Encode a single vector into `code_out` (must be code_size() bytes).
-    void encode(const float* vec, uint8_t* code_out) const;
+    /// Virtual so ProductResidualQuantizer can override with greedy beam-search
+    /// residual encoding; the PQ path stays monomorphic when held by value.
+    virtual void encode(const float* vec, uint8_t* code_out) const;
 
     /// Build the symmetric cross-distance table (code-to-code).
     /// Called after train(). Stored internally.
@@ -97,14 +99,16 @@ public:
 
     /// Preprocess a query vector into a LUT for PQ distance estimation.
     /// `out` must hold lut_size() floats. Uses the configured `metric_`.
-    void preprocess_query(const float* query, float* out) const;
+    /// Virtual: ProductResidualQuantizer builds a structurally different LUT
+    /// (multiple codebook levels share one query sub-vector per split).
+    virtual void preprocess_query(const float* query, float* out) const;
 
     /// Preprocess a query into a LUT under an explicit metric, regardless of the
     /// configured `metric_`. Used by `Estimator::estimate_config` to measure
     /// IP-ADC vs L2sq-ADC ranking agreement (the metric-recommendation signal):
     /// builds both LUTs on the same query and compares top-k overlap.
     /// L2sq: out[s*K+c] = ||q_sub - c||².  IP: out[s*K+c] = -<q_sub, c>.
-    void preprocess_query_as(MetricKind metric, const float* query, float* out) const;
+    virtual void preprocess_query_as(MetricKind metric, const float* query, float* out) const;
 
     /// Build the uint8-quantized FastScan LUT for a query. Same per-segment
     /// distances as `preprocess_query` (under the configured metric_), but
@@ -192,13 +196,17 @@ public:
     /// inverse (transpose) rotation is applied so the result is in the
     /// original input space. Used to reverse-map partition centroids (PQ
     /// codes) back to vector space for IVF routing.
-    void decode_code(const uint8_t* code, float* out) const;
+    /// Virtual: ProductResidualQuantizer decodes by summing M_sub centroids
+    /// per sub-space (additive residual reconstruction).
+    virtual void decode_code(const uint8_t* code, float* out) const;
 
     /// Serialize the quantizer state (codebook + params).
-    void serialize(std::vector<uint8_t>& out) const;
+    /// Virtual: ProductResidualQuantizer uses a distinct (magic-byte-tagged)
+    /// format to distinguish its additive codebook layout from PQ.
+    virtual void serialize(std::vector<uint8_t>& out) const;
 
     /// Deserialize from a buffer. Replaces current state.
-    void deserialize(const uint8_t* in, size_t size);
+    virtual void deserialize(const uint8_t* in, size_t size);
 
 protected:
     // Members accessible to AnisotropicPqQuantizer (the subclass overriding

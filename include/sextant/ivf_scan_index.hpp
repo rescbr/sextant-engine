@@ -63,6 +63,12 @@ struct IVFScanIndex {
     uint16_t m4 = 0;  ///< Scan PQ subquantizer count (matches the codebook).
     uint8_t scan_pq_bits = 4;  ///< 4 (FastScan nibble) or 8 (byte-per-code).
 
+    /// Quantizer type ("pq" / "anisotropic-pq" / "prq"). Read from the manifest;
+    /// selects which PqQuantizer subclass reconstructs the codebook.
+    std::string quantizer_type = "pq";
+    /// PRQ nsplits (sub-space count), read from the manifest. 0 = not PRQ.
+    uint32_t prq_nsplits = 0;
+
     /// Shared 4-bit codebook for all shards. Trained once at build time.
     std::unique_ptr<PqQuantizer> quantizer;
 

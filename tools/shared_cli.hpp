@@ -85,15 +85,22 @@ inline void add_common_flags(cmdline::parser& p) {
         "(the value is ignored); covariance determines the rotation.",
         false, 0.0f);
     p.add<std::string>("quantizer", 0,
-        "Quantizer type: 'pq' (default, standard k-means) or 'anisotropic-pq' "
-        "(ScaNN-style anisotropic Lloyd's training; search path identical). "
-        "See docs/plans/metric_per_tier_plan.md Phase 2.",
+        "Quantizer type for the IVF-scan codebook: 'pq' (default, standard "
+        "k-means), 'anisotropic-pq' (ScaNN-style anisotropic Lloyd's training; "
+        "search path identical), or 'prq' (Product Residual Quantization — "
+        "additive-residual variant of PQ; multiple segments per sub-space sum "
+        "into the distance). See docs/plans/metric_per_tier_plan.md Phase 2-3.",
         false, "pq");
     p.add<float>("anisotropy-threshold", 0,
         "ScaNN anisotropic threshold T for anisotropic-pq training (default "
         "0.2 → η ≈ 4.125). Higher T weights parallel quantization error more. "
         "Only meaningful with --quantizer anisotropic-pq. See ScaNN paper §3.",
         false, 0.2f);
+    p.add<uint32_t>("prq-nsplits", 0,
+        "PRQ nsplits (sub-space count) for --quantizer prq. 0 = auto (dim/32, "
+        "i.e. sub_dim=32 per sub-space). Must divide both dim and m4. Only "
+        "meaningful with --quantizer prq.",
+        false, 0);
     p.add<uint32_t>("threads", 0,
         "Threads for build/mini-builds (0 = hardware_concurrency).",
         false, 0);
@@ -208,7 +215,9 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     cfg.pq_max_distortion = p.get<float>("pq-max-distortion");
     cfg.pq_anisotropy = (p.get<float>("pq-anisotropy") > 0.0f);
     cfg.pq_opq = (p.get<float>("pq-opq") > 0.0f);
-    cfg.anisotropic_pq = (p.get<std::string>("quantizer") == "anisotropic-pq");
+    cfg.quantizer_type = p.get<std::string>("quantizer");
+    cfg.anisotropic_pq = (cfg.quantizer_type == "anisotropic-pq");
+    if (p.exist("prq-nsplits")) cfg.prq_nsplits = p.get<uint32_t>("prq-nsplits");
     cfg.num_threads       = p.get<uint32_t>("threads");
     {
         const std::string m = p.get<std::string>("metric");

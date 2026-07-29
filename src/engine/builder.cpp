@@ -27,6 +27,7 @@
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "quant/anisotropic_pq_quantizer.hpp"
+#include "quant/product_residual_quantizer.hpp"
 #include "storage/direct_io.hpp"
 #include "storage/memgraph.hpp"      // complete type for Index's unique_ptr<MemGraph>
 #include "storage/sidecar_header.hpp"
@@ -1483,8 +1484,49 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                     "build_ivf_scan: scan_pq_bits must be 4 or 8 (got " +
                         std::to_string(scan_bits) + ")");
     }
-    PqQuantizer qscan(params.metric, dim, m4, /*bits=*/scan_bits,
-                      /*seed=*/42);
+    // Construct the scan codebook. Dispatch on params.quantizer_type:
+    //   "prq"            → ProductResidualQuantizer (additive-residual PQ;
+    //                       4-bit only for now — FastScan nibble path).
+    //   "anisotropic-pq" → AnisotropicPqQuantizer (ScaNN score-aware loss:
+    //                       penalize parallel quantization error ~4× more than
+    //                       orthogonal). Same code format, same FastScan kernel.
+    //   "pq" (default)   → PqQuantizer (standard k-means).
+    std::unique_ptr<PqQuantizer> qscan_owner;
+    if (params.quantizer_type == "prq") {
+        if (scan_bits != 4) {
+            throw Error(ErrorCode::InvalidParam,
+                        "build_ivf_scan: PRQ currently supports only 4-bit "
+                        "FastScan (scan_pq_bits=4); got scan_pq_bits=" +
+                            std::to_string(static_cast<unsigned>(scan_bits)));
+        }
+        // PRQ: nsplits defaults to dim/32 (sub_dim=32 per the plan).
+        const uint32_t nsplits = (params.prq_nsplits > 0)
+            ? params.prq_nsplits
+            : static_cast<uint32_t>(dim) / 32;
+        if (nsplits == 0 || dim % nsplits != 0) {
+            throw Error(ErrorCode::InvalidParam,
+                        "build_ivf_scan: PRQ dim=" + std::to_string(dim) +
+                            " not divisible by nsplits=" +
+                            std::to_string(nsplits));
+        }
+        if (m4 % nsplits != 0) {
+            throw Error(ErrorCode::InvalidParam,
+                        "build_ivf_scan: PRQ m4=" + std::to_string(m4) +
+                            " not divisible by nsplits=" +
+                            std::to_string(nsplits));
+        }
+        qscan_owner = std::make_unique<ProductResidualQuantizer>(
+            params.metric, dim, m4, scan_bits, nsplits,
+            /*beam_size=*/1, /*seed=*/42);
+    } else if (params.quantizer_type == "anisotropic-pq") {
+        qscan_owner = std::make_unique<AnisotropicPqQuantizer>(
+            params.metric, dim, m4, scan_bits,
+            /*threshold=*/0.2f, /*seed=*/42);
+    } else {
+        qscan_owner = std::make_unique<PqQuantizer>(
+            params.metric, dim, m4, scan_bits, /*seed=*/42);
+    }
+    PqQuantizer& qscan = *qscan_owner;
     {
         const uint32_t train_n = std::min<uint64_t>(20'000, n);
         std::vector<float> sample(static_cast<size_t>(train_n) * dim);
@@ -1506,7 +1548,10 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                         "build_ivf_scan: source yielded no vectors for 4-bit "
                         "codebook training");
         }
-        spdlog::info("[sextant] training 4-bit PQ (m={}, K=16) on {} samples",
+        spdlog::info("[sextant] training {} (m={}, K=16) on {} samples",
+                     params.quantizer_type == "prq" ? "PRQ"
+                     : (params.quantizer_type == "anisotropic-pq" ? "4-bit anisotropic-PQ"
+                                                                  : "4-bit PQ"),
                      m4, filled);
         const auto ts = std::chrono::steady_clock::now();
         qscan.train(sample.data(), filled);
@@ -1835,8 +1880,9 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
 
     // --- 6. codebook{4,8}.bin: serialized scan PqQuantizer (shared) ---
     {
-        const uint64_t magic =
-            (scan_bits == 4) ? kMagicCodebook4 : kMagicCodebook8;
+        const uint64_t magic = (params.quantizer_type == "prq")
+            ? kMagicCodebookPRQ4
+            : ((scan_bits == 4) ? kMagicCodebook4 : kMagicCodebook8);
         const std::string path = shards_dir +
             ((scan_bits == 4) ? "/codebook4.bin" : "/codebook8.bin");
         std::vector<uint8_t> blob;
@@ -1863,13 +1909,22 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         const std::string tmp = path + ".tmp";
         {
             DirectFile f(tmp, true);
+            // Quantizer type (7th line) + PRQ nsplits (8th line) are APPEND-ONLY
+            // optional fields; old manifests stop at line 6 and the reader
+            // defaults them to "pq" / 0.
+            const uint32_t manifest_nsplits =
+                (params.quantizer_type == "prq")
+                    ? static_cast<ProductResidualQuantizer&>(qscan).nsplits()
+                    : 0;
             std::string commit =
                 std::string("ready\n") +
                 std::to_string(K) + "\n" +
                 std::to_string(dim) + "\n" +
                 std::to_string(n_probe) + "\n" +
                 std::to_string(m4) + "\n" +
-                std::to_string(static_cast<unsigned>(scan_bits)) + "\n";
+                std::to_string(static_cast<unsigned>(scan_bits)) + "\n" +
+                params.quantizer_type + "\n" +
+                std::to_string(manifest_nsplits) + "\n";
             write_padded(f, commit.data(), commit.size(), 0);
             f.sync();
         }

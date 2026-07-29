@@ -110,6 +110,7 @@ engine_sources = [
     'src/storage/memgraph.cpp',
     'src/quant/pq_quantizer.cpp',
     'src/quant/anisotropic_pq_quantizer.cpp',
+    'src/quant/product_residual_quantizer.cpp',
     'src/algo/vamana_core.cpp',
     'src/engine/resolve_params.cpp',
     'src/engine/index.cpp',

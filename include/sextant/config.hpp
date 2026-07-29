@@ -112,6 +112,18 @@ struct BuildConfig {
     /// See docs/plans/metric_per_tier_plan.md Phase 2.
     bool anisotropic_pq = false;
 
+    /// Quantizer type for the IVF-scan codebook: "pq" (default, standard
+    /// k-means), "anisotropic-pq" (ScaNN-style), or "prq" (Product Residual
+    /// Quantization — additive-residual variant of PQ; see
+    /// quant/product_residual_quantizer.hpp). Drives the 3-way dispatch in
+    /// build_ivf_scan. "anisotropic-pq" sets anisotropic_pq=true for back-compat.
+    std::string quantizer_type = "pq";
+
+    /// PRQ nsplits (number of contiguous sub-spaces) for the IVF-scan codebook.
+    /// 0 = auto (dim/32 → sub_dim=32 per the plan). Only meaningful with
+    /// quantizer_type="prq". Must divide both `dim` and `m4`.
+    uint32_t prq_nsplits = 0;
+
     /// OPQ (PCA rotation). When true, a d×d PCA rotation is learned from the
     /// training-sample covariance and applied to vectors before PQ encoding
     /// and to queries before LUT construction, so PQ splits align with the
@@ -242,6 +254,13 @@ struct ResolvedParams {
     bool pq_anisotropy = false;  ///< PQ covariance-based anisotropic codebook training. Threaded into PqQuantizer::train.
     bool pq_opq = false;          ///< OPQ PCA rotation. Threaded into PqQuantizer::train.
     bool anisotropic_pq = false;  ///< Use AnisotropicPqQuantizer (ScaNN-style training).
+
+    /// Quantizer type for the IVF-scan codebook ("pq" / "anisotropic-pq" / "prq").
+    /// Persisted to the scan manifest; read back to reconstruct the right
+    /// quantizer subclass at index-open.
+    std::string quantizer_type = "pq";
+    /// PRQ nsplits (sub-space count). 0 = auto (dim/32). Persisted to the manifest.
+    uint32_t prq_nsplits = 0;
 
     /// Merged-graph build path (vs the default IVF-list-scan + 4-bit PQ
     /// FastScan). Persisted so the search dispatcher can route correctly on

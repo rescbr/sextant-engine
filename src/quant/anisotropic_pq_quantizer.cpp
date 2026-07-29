@@ -239,7 +239,14 @@ void AnisotropicPqQuantizer::train(const float* samples, uint64_t n) {
     // structure as the base train). The assignment + update use ScaNN's
     // anisotropic objective.
     const float T = threshold_;
-    const float eta = (T > 0.0f) ? (T * T) / (1.0f - T * T) : 1.0f;
+    // ScaNN's eta (Theorem 3.4): the weighting function w(t) = I(t >= T)
+    // yields, under the paper's statistical assumptions, an anisotropic loss
+    // where parallel error is weighted eta times more than orthogonal:
+    //   eta = 1/T² - 1
+    // At T=0.2 (ScaNN default): eta = 24 (parallel penalized 24× more).
+    // The earlier code had T²/(1-T²) = 0.04, which INVERTED the weighting
+    // (penalized orthogonal 24× more than parallel — backwards).
+    const float eta = (T > 0.0f && T < 1.0f) ? (1.0f / (T * T) - 1.0f) : 1.0f;
     if (eta <= 1.0f) return;  // T=0 → η=1 → standard k-means, nothing to do.
 
     // Handle OPQ rotation: if active, the training data is rotated. We need
