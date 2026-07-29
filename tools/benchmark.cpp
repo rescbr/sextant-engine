@@ -391,7 +391,8 @@ int run_ivf_scan_benchmark(const std::string& index,
                            uint64_t cache_size_req,
                            uint32_t n_probe_req,
                            uint32_t early_exit_req,
-                           float multiprobe_ratio_req);
+                           float multiprobe_ratio_req,
+                           uint32_t fastscan_w_req);
 
 int main(int argc, char* argv[]) {
     sextant::init_logging();
@@ -406,6 +407,13 @@ int main(int argc, char* argv[]) {
         "Search-time beam width (L in Vamana literature). Higher = more accurate, slower.",
         false, 200);
     p.add<uint32_t>("rerank", 0, "Rerank factor (0/1 = no rerank)", false, 10);
+    p.add<uint32_t>("fastscan-w", 0,
+        "FastScan candidate window W (per-shard top-W shortlist before "
+        "merge). Default 300. Increase to bypass PQ-distance merge issues "
+        "(e.g. testing per-shard codebooks where cross-shard distances "
+        "aren't comparable). At W >> shard_n the merge becomes irrelevant "
+        "and FP32 rerank dominates.",
+        false, 0);
     p.add<uint32_t>("io-limit", 0, "Search I/O budget (0 = unlimited)", false, 0);
     p.add<uint32_t>("limit", 0, "Max queries to run (0 = all)", false, 0);
     p.add<uint32_t>("threads", 0, "Search threads (0 = hardware_concurrency)",
@@ -486,6 +494,7 @@ int main(int argc, char* argv[]) {
     const uint32_t n_probe_req = p.get<uint32_t>("n-probe");
     const uint32_t early_exit_req = p.get<uint32_t>("early-exit-patience");
     const float multiprobe_ratio_req = p.get<float>("multiprobe-ratio");
+    const uint32_t fastscan_w_req = p.get<uint32_t>("fastscan-w");
 
     // IVF dispatch: if `<index>.shards/` is a directory, this is an IVF
     // index. Two IVF flavors share the `.shards/` layout:
@@ -505,7 +514,8 @@ int main(int argc, char* argv[]) {
                 index, query_path, base_data, gt_path,
                 k, L, rerank, io_limit, limit,
                 n_threads_hint, cache_size_req,
-                n_probe_req, early_exit_req, multiprobe_ratio_req);
+                n_probe_req, early_exit_req, multiprobe_ratio_req,
+                fastscan_w_req);
         }
         return run_ivf_benchmark(index, query_path, base_data, gt_path,
                                  k, L, rerank, io_limit, limit,
@@ -1111,7 +1121,8 @@ int run_ivf_scan_benchmark(const std::string& index,
                            uint64_t cache_size_req,
                            uint32_t n_probe_req,
                            uint32_t early_exit_req,
-                           float multiprobe_ratio_req) {
+                           float multiprobe_ratio_req,
+                           uint32_t fastscan_w_req) {
     (void)L;             // scan path has no beam width
     (void)io_limit;      // scan reads the whole shard — no node visit cap
     (void)cache_size_req;// scan bypasses the BlockCache (sequential stream)
@@ -1228,7 +1239,9 @@ int run_ivf_scan_benchmark(const std::string& index,
         scfg.k = k;
         scfg.n_probe = n_probe_req;  // 0 → index default
         scfg.multiprobe_ratio = multiprobe_ratio_req;
-        // fastscan_W defaults to 300 inside the searcher when 0.
+        // fastscan_W: 0 (default) → auto-derived from shard size in the
+        // searcher. Override with --fastscan-w for manual tuning.
+        scfg.fastscan_W = fastscan_w_req;
 
         std::vector<double> latencies_us;
         latencies_us.reserve(n_queries);

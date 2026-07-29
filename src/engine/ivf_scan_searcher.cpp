@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -71,13 +72,13 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
     const float* query, uint32_t k, const SearchConfig& config,
     IVFScanWorkerState& w) {
     const uint32_t K = index_.K;
-    // W is the rerank shortlist handed to the DB layer. config.fastscan_W
-    // (default 300 per the spike's recall-0.99 point) replaces the graph
-    // path's k × merge_oversample shortlist.
+    // W (rerank shortlist). Default 300 (validated on arxiv100k for recall
+    // 0.99 at k=10). The --fastscan-w flag overrides for manual tuning.
+    // TODO: auto-derive from shard size + distortion (W ∝ S^0.15, not √S
+    // as first modeled — the sqrt scaling over-shrinks at small shards).
+    // Needs a 3rd calibration point before shipping the formula.
     uint32_t W = config.fastscan_W > 0 ? config.fastscan_W : 300u;
     if (W == 0) W = 1;
-    // `k` is informational for the DB layer; we still size W to be ≥ k so the
-    // caller has at least k candidates to rerank.
     W = std::max(W, k);
     (void)k;
 
@@ -307,12 +308,17 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
         }
     }
 
-    // --- 4. Merge per-shard top-W via hash dedup (keep min distance), ---
-    // --- then partial_sort the global top-W by 4-bit distance.         ---
+    // --- 4. Dedup by RowId (keep first occurrence, not min distance). ---
+    // Under a shared codebook, a replicated vector gets IDENTICAL PQ distance
+    // in every shard it appears in (same code, same LUT). So keep-first and
+    // keep-min are equivalent. Under per-shard codebooks, PQ distances live
+    // in different scales per shard — comparing them (keep-min) is wrong.
+    // Keep-first avoids the cross-shard comparison; FP32 rerank handles
+    // final ranking. Zero regression for shared codebooks; strictly correct
+    // for per-shard.
     w.dedup.clear();
     for (const auto& [d, rid] : w.scored) {
-        auto [it, inserted] = w.dedup.try_emplace(rid, d);
-        if (!inserted && d < it->second) it->second = d;
+        w.dedup.try_emplace(rid, d);  // keeps first; ignores subsequent
     }
     w.scored.clear();
     w.scored.reserve(w.dedup.size());
