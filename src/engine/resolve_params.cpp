@@ -152,6 +152,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     // meaningful with "prq" (0 = auto → dim/32 in the builder).
     p.quantizer_type = overrides.quantizer_type;
     p.prq_nsplits = overrides.prq_nsplits;
+    p.prq_beam_size = overrides.prq_beam_size;
     if (p.quantizer_type != "pq") {
         spdlog::info("[sextant] quantizer_type = '{}' [override]{}",
                      p.quantizer_type,

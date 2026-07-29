@@ -291,25 +291,115 @@ void ProductResidualQuantizer::train(const float* samples, uint64_t n) {
 void ProductResidualQuantizer::encode(const float* vec,
                                       uint8_t* code_out) const {
     std::memset(code_out, 0, code_size());
-    std::vector<float> residual(sub_dim_prq_);
-    for (uint32_t s = 0; s < nsplits_; s++) {
-        const float* sub = vec + static_cast<size_t>(s) * sub_dim_prq_;
-        std::memcpy(residual.data(), sub, sub_dim_prq_ * sizeof(float));
-        for (uint32_t lev = 0; lev < M_sub_; lev++) {
-            const float* book = level_book_(s, lev);
-            const uint32_t cid = nearest_centroid_l2(
-                book, residual.data(), K_, sub_dim_prq_, nullptr);
-            const uint32_t global_seg = s * M_sub_ + lev;
-            write_code(code_out, bits_, global_seg, cid);
-            const float* cen = book + cid * sub_dim_prq_;
-            for (uint32_t d = 0; d < sub_dim_prq_; d++) {
-                residual[d] -= cen[d];
+
+    if (beam_size_ <= 1) {
+        std::vector<float> residual(sub_dim_prq_);
+        for (uint32_t s = 0; s < nsplits_; s++) {
+            const float* sub = vec + static_cast<size_t>(s) * sub_dim_prq_;
+            std::memcpy(residual.data(), sub, sub_dim_prq_ * sizeof(float));
+            for (uint32_t lev = 0; lev < M_sub_; lev++) {
+                const float* book = level_book_(s, lev);
+                const uint32_t cid = nearest_centroid_l2(
+                    book, residual.data(), K_, sub_dim_prq_, nullptr);
+                const uint32_t global_seg = s * M_sub_ + lev;
+                write_code(code_out, bits_, global_seg, cid);
+                const float* cen = book + cid * sub_dim_prq_;
+                for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                    residual[d] -= cen[d];
+                }
             }
         }
+        return;
     }
-    // TODO(beam): beam_size > 1. At each level keep `beam_size` hypotheses,
-    // expand each by all K centroids, score by resulting residual norm, prune
-    // to the best beam_size. Greedy (beam=1) above is the common default.
+
+    // Beam search encoding. For each split, maintain `beam_size_` hypotheses
+    // (residual + partial codes + residual norm). At each level, expand each
+    // hypothesis by all K centroids, compute the resulting residual norm, and
+    // keep the best `beam_size_` candidates. This escapes the greedy local
+    // minima that limit beam=1 quality.
+    const uint32_t B = beam_size_;
+
+    struct Hypothesis {
+        std::vector<float> residual;
+        std::vector<uint32_t> codes;
+        float res_norm_sq;
+    };
+
+    struct Candidate {
+        uint32_t hyp_idx;
+        uint32_t cid;
+        float new_res_norm_sq;
+    };
+
+    for (uint32_t s = 0; s < nsplits_; s++) {
+        const float* sub = vec + static_cast<size_t>(s) * sub_dim_prq_;
+
+        std::vector<Hypothesis> beam;
+        beam.reserve(B);
+        {
+            Hypothesis h0;
+            h0.residual.assign(sub, sub + sub_dim_prq_);
+            h0.codes.reserve(M_sub_);
+            h0.res_norm_sq = simd::dot_f32(h0.residual.data(),
+                                           h0.residual.data(), sub_dim_prq_);
+            beam.push_back(std::move(h0));
+        }
+
+        for (uint32_t lev = 0; lev < M_sub_; lev++) {
+            const float* book = level_book_(s, lev);
+            const uint32_t cur_beam = static_cast<uint32_t>(beam.size());
+
+            std::vector<Candidate> cands;
+            cands.reserve(static_cast<size_t>(cur_beam) * K_);
+            std::vector<float> new_res(sub_dim_prq_);
+
+            for (uint32_t bi = 0; bi < cur_beam; bi++) {
+                const float* res = beam[bi].residual.data();
+                for (uint32_t c = 0; c < K_; c++) {
+                    const float* cen = book + c * sub_dim_prq_;
+                    for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                        new_res[d] = res[d] - cen[d];
+                    }
+                    const float nrn = simd::dot_f32(new_res.data(),
+                                                    new_res.data(),
+                                                    sub_dim_prq_);
+                    cands.push_back({bi, c, nrn});
+                }
+            }
+
+            std::partial_sort(cands.begin(),
+                              cands.begin() + std::min(B, static_cast<uint32_t>(cands.size())),
+                              cands.end(),
+                              [](const Candidate& a, const Candidate& b) {
+                                  return a.new_res_norm_sq < b.new_res_norm_sq;
+                              });
+
+            const uint32_t n_keep = std::min(B, static_cast<uint32_t>(cands.size()));
+            std::vector<Hypothesis> new_beam;
+            new_beam.reserve(n_keep);
+            for (uint32_t ki = 0; ki < n_keep; ki++) {
+                const auto& cand = cands[ki];
+                Hypothesis h;
+                h.codes = beam[cand.hyp_idx].codes;
+                h.codes.push_back(cand.cid);
+                const float* res = beam[cand.hyp_idx].residual.data();
+                const float* cen = book + cand.cid * sub_dim_prq_;
+                h.residual.resize(sub_dim_prq_);
+                for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                    h.residual[d] = res[d] - cen[d];
+                }
+                h.res_norm_sq = cand.new_res_norm_sq;
+                new_beam.push_back(std::move(h));
+            }
+            beam = std::move(new_beam);
+        }
+
+        const auto& best = beam[0];
+        for (uint32_t lev = 0; lev < M_sub_; lev++) {
+            const uint32_t global_seg = s * M_sub_ + lev;
+            write_code(code_out, bits_, global_seg, best.codes[lev]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -124,6 +124,11 @@ struct BuildConfig {
     /// quantizer_type="prq". Must divide both `dim` and `m4`.
     uint32_t prq_nsplits = 0;
 
+    /// PRQ beam size for encoding (1 = greedy, >1 = beam search).
+    /// Higher = better quality, slower encode. Only meaningful with
+    /// quantizer_type="prq".
+    uint32_t prq_beam_size = 1;
+
     /// OPQ (PCA rotation). When true, a d×d PCA rotation is learned from the
     /// training-sample covariance and applied to vectors before PQ encoding
     /// and to queries before LUT construction, so PQ splits align with the
@@ -261,6 +266,7 @@ struct ResolvedParams {
     std::string quantizer_type = "pq";
     /// PRQ nsplits (sub-space count). 0 = auto (dim/32). Persisted to the manifest.
     uint32_t prq_nsplits = 0;
+    uint32_t prq_beam_size = 1;
 
     /// Merged-graph build path (vs the default IVF-list-scan + 4-bit PQ
     /// FastScan). Persisted so the search dispatcher can route correctly on

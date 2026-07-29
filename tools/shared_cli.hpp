@@ -101,6 +101,11 @@ inline void add_common_flags(cmdline::parser& p) {
         "i.e. sub_dim=32 per sub-space). Must divide both dim and m4. Only "
         "meaningful with --quantizer prq.",
         false, 0);
+    p.add<uint32_t>("prq-beam-size", 0,
+        "PRQ beam size for encoding (1 = greedy, >1 = beam search). "
+        "Higher = better recall, slower build. Only meaningful with "
+        "--quantizer prq. Default: 1.",
+        false, 1);
     p.add<uint32_t>("threads", 0,
         "Threads for build/mini-builds (0 = hardware_concurrency).",
         false, 0);
@@ -218,6 +223,7 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     cfg.quantizer_type = p.get<std::string>("quantizer");
     cfg.anisotropic_pq = (cfg.quantizer_type == "anisotropic-pq");
     if (p.exist("prq-nsplits")) cfg.prq_nsplits = p.get<uint32_t>("prq-nsplits");
+    if (p.exist("prq-beam-size")) cfg.prq_beam_size = p.get<uint32_t>("prq-beam-size");
     cfg.num_threads       = p.get<uint32_t>("threads");
     {
         const std::string m = p.get<std::string>("metric");
