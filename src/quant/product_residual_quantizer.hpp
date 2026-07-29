@@ -3,6 +3,20 @@
 /// @file product_residual_quantizer.hpp
 /// Product Residual Quantization (PRQ) — additive-residual variant of PQ.
 ///
+/// **References:**
+/// - Additive Quantization (AQ): Babenko, Slesarev, Chigorin, Lempitsky,
+///   "Neural Codes for Image Retrieval," ECCV 2014. Introduced representing
+///   x ≈ Σ_m c_m[code_m] as a sum of full-dimensional codewords.
+/// - Residual Quantizer encoding: Martínez, Zholbussirov, Martínez,
+///   "LSQ++: Lower running time and higher recall in multi-codebook
+///   quantization," ECCV 2016. Greedy residual beam search with
+///   progressive-dim k-means codebook training.
+/// - Product decomposition + FastScan integration: FAISS
+///   `IndexIVFProductResidualQuantizerFastScan` (Douze, Guzhva, Deng, Johnson,
+///   Sivic, Jégou). Splits the vector into nsplits sub-spaces, runs RQ
+///   per sub-space, packs 4-bit codes into the same FastScan block layout
+///   as IVFPQFastScan.
+///
 /// PRQ splits the vector into `nsplits` contiguous sub-spaces of dimension
 /// `sub_dim = dim / nsplits`. Within each sub-space, a Residual Quantizer
 /// encodes the residual after the previous levels: level 0 quantizes the raw
