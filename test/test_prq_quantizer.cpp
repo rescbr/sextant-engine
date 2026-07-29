@@ -474,5 +474,47 @@ TEST(ProductResidualQuantizer, IcmEncodeRoundTrip) {
     }
 }
 
+TEST(ProductResidualQuantizer, LsqTrainingReducesError) {
+    const uint32_t dim = 64;
+    const uint16_t m = 16;
+    const uint32_t nsplits = 8;
+    const uint64_t n = 1000;
+
+    auto data = make_clustered_data(n, dim, 50, 42);
+
+    // k-means only (no LSQ).
+    ProductResidualQuantizer q_kmeans(
+        MetricKind::InnerProduct, dim, m, 4, nsplits, 1, 99,
+        "icm", 4, 4, 4, /*lsq_train_iters=*/0);
+    q_kmeans.train(data.data(), n);
+
+    // LSQ with 10 alternating iterations.
+    ProductResidualQuantizer q_lsq(
+        MetricKind::InnerProduct, dim, m, 4, nsplits, 1, 99,
+        "icm", 4, 4, 4, /*lsq_train_iters=*/10);
+    q_lsq.train(data.data(), n);
+
+    double total_err_kmeans = 0, total_err_lsq = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const float* vec = data.data() + i * dim;
+        std::vector<uint8_t> code_k(q_kmeans.code_size(), 0);
+        std::vector<uint8_t> code_l(q_lsq.code_size(), 0);
+        q_kmeans.encode(vec, code_k.data());
+        q_lsq.encode(vec, code_l.data());
+
+        std::vector<float> recon_k(dim, 0), recon_l(dim, 0);
+        q_kmeans.decode_code(code_k.data(), recon_k.data());
+        q_lsq.decode_code(code_l.data(), recon_l.data());
+
+        for (uint32_t d = 0; d < dim; d++) {
+            const double dk = double(vec[d]) - double(recon_k[d]);
+            const double dl = double(vec[d]) - double(recon_l[d]);
+            total_err_kmeans += dk * dk;
+            total_err_lsq += dl * dl;
+        }
+    }
+    EXPECT_LT(total_err_lsq, total_err_kmeans);
+}
+
 }  // namespace
 }  // namespace sextant

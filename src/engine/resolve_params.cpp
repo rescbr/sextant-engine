@@ -157,6 +157,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     p.prq_icm_iters = overrides.prq_icm_iters;
     p.prq_ils_iters = overrides.prq_ils_iters;
     p.prq_ils_perturb = overrides.prq_ils_perturb;
+    p.prq_lsq_train_iters = overrides.prq_lsq_train_iters;
     if (p.quantizer_type != "pq") {
         spdlog::info("[sextant] quantizer_type = '{}' [override]{}",
                      p.quantizer_type,

@@ -80,7 +80,8 @@ public:
                              std::string encode_mode = "greedy",
                              uint32_t icm_iters = 4,
                              uint32_t ils_iters = 4,
-                             uint32_t ils_perturb = 4);
+                             uint32_t ils_perturb = 4,
+                             uint32_t lsq_train_iters = 0);
 
     void train(const float* samples, uint64_t n) override;
     void encode(const float* vec, uint8_t* code_out) const override;
@@ -114,10 +115,21 @@ private:
     uint32_t ils_iters_ = 4;   ///< ILS cycles (perturb + ICM + accept)
     uint32_t ils_perturb_ = 4; ///< codes to perturb per ILS cycle
 
+    /// LSQ training iterations (alternating codebook update + ICM re-encode).
+    /// 0 = use progressive k-means only (no LSQ refinement).
+    uint32_t lsq_train_iters_ = 0;
+
     /// On-the-fly ICM+ILS encoding (no precomputed tables).
     /// See docs/quantization_findings.md §PRQ and the plan at
     /// ~/.local/state/maki/plans/amazing-striking-toad.md.
     void encode_icm_(const float* vec, uint8_t* code_out) const;
+
+    /// LSQ codebook update: solve (BᵀB + ρI) Cᵀ = XBᵀ for one sub-space.
+    /// `codes` is [n][M_sub], `samples` is [n][sub_dim]. Updates `books`
+    /// in-place. Uses Gaussian elimination with partial pivoting (system is
+    /// tiny: M_sub·K × M_sub·K, at most 128×128).
+    void update_codebooks_lsq_(const float* samples, uint64_t n,
+                               const uint32_t* codes, float* books) const;
 
     /// Additive codebooks: [nsplits][M_sub][K][sub_dim_prq].
     std::vector<float> rq_codebooks_;

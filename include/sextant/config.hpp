@@ -142,6 +142,10 @@ struct BuildConfig {
     /// PRQ ILS perturbation count (codes to randomize per cycle). Default 4.
     uint32_t prq_ils_perturb = 4;
 
+    /// LSQ training iterations (alternating codebook update + ICM re-encode).
+    /// 0 = progressive k-means only (default). ~25 for full LSQ training.
+    uint32_t prq_lsq_train_iters = 0;
+
     /// OPQ (PCA rotation). When true, a d×d PCA rotation is learned from the
     /// training-sample covariance and applied to vectors before PQ encoding
     /// and to queries before LUT construction, so PQ splits align with the
@@ -284,6 +288,7 @@ struct ResolvedParams {
     uint32_t prq_icm_iters = 4;
     uint32_t prq_ils_iters = 4;
     uint32_t prq_ils_perturb = 4;
+    uint32_t prq_lsq_train_iters = 0;
 
     /// Merged-graph build path (vs the default IVF-list-scan + 4-bit PQ
     /// FastScan). Persisted so the search dispatcher can route correctly on

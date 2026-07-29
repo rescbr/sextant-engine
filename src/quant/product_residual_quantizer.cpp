@@ -11,10 +11,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <random>
+#include <spdlog/spdlog.h>
 #include <thread>
 #include <vector>
 
@@ -164,7 +166,8 @@ ProductResidualQuantizer::ProductResidualQuantizer(
     MetricKind metric, Dim dim, uint16_t m, uint8_t bits, uint32_t nsplits,
     uint32_t beam_size, uint64_t seed,
     std::string encode_mode, uint32_t icm_iters,
-    uint32_t ils_iters, uint32_t ils_perturb)
+    uint32_t ils_iters, uint32_t ils_perturb,
+    uint32_t lsq_train_iters)
     : PqQuantizer(metric, dim, m, bits, seed),
       nsplits_(nsplits == 0 ? 1 : nsplits),
       M_sub_(nsplits == 0 ? 0 : m / nsplits),
@@ -173,7 +176,8 @@ ProductResidualQuantizer::ProductResidualQuantizer(
       encode_mode_(std::move(encode_mode)),
       icm_iters_(icm_iters),
       ils_iters_(ils_iters),
-      ils_perturb_(ils_perturb) {
+      ils_perturb_(ils_perturb),
+      lsq_train_iters_(lsq_train_iters) {
     if (nsplits == 0) {
         throw Error(ErrorCode::InvalidParam, "PRQ: nsplits must be > 0");
     }
@@ -288,6 +292,232 @@ void ProductResidualQuantizer::train(const float* samples, uint64_t n) {
     // (m_ == nsplits*M_sub); the per-segment sub-dimension differs but each
     // base segment's block is only read by code that uses the PRQ overrides.
     // We leave codebook_ zero-filled — PRQ never reads it on the scan path.
+
+    // --- LSQ alternating refinement (optional) ---
+    // If lsq_train_iters_ > 0, alternate: re-encode all training vectors
+    // with ICM → update codebooks via regularized least-squares. This
+    // jointly optimizes codebooks AND assignments (the k-means init only
+    // optimized codebooks greedily on residuals).
+    if (lsq_train_iters_ > 0) {
+        spdlog::info("[sextant] PRQ LSQ training: {} alternating iterations",
+                     lsq_train_iters_);
+        const auto tlsq = std::chrono::steady_clock::now();
+
+        // Per-sub-space codes buffer: [n][M_sub].
+        std::vector<std::vector<uint32_t>> all_codes(
+            nsplits_, std::vector<uint32_t>(n * M_sub_));
+
+        // Gather sub-vectors once (reusable across iterations).
+        std::vector<std::vector<float>> sub_vecs_all(nsplits_);
+        for (uint32_t s = 0; s < nsplits_; s++) {
+            sub_vecs_all[s].resize(n * sub_dim_prq_);
+            const float* src = samples + static_cast<size_t>(s) * sub_dim_prq_;
+            for (uint64_t i = 0; i < n; i++) {
+                std::memcpy(sub_vecs_all[s].data() + i * sub_dim_prq_,
+                            src + i * dim_, sub_dim_prq_ * sizeof(float));
+            }
+        }
+
+        for (uint32_t iter = 0; iter < lsq_train_iters_; iter++) {
+            // --- Encode all vectors with current codebooks (ICM) ---
+            #pragma omp parallel for schedule(dynamic)
+            for (uint32_t s = 0; s < nsplits_; s++) {
+                const float* sub = sub_vecs_all[s].data();
+                uint32_t* codes = all_codes[s].data();
+                float* books = rq_codebooks_.data() +
+                               static_cast<size_t>(s) * M_sub_ * K_ *
+                                   sub_dim_prq_;
+
+                // ICM encode each vector for this sub-space.
+                std::vector<float> reconstruction(sub_dim_prq_);
+                std::vector<float> residual(sub_dim_prq_);
+                for (uint64_t i = 0; i < n; i++) {
+                    const float* x = sub + i * sub_dim_prq_;
+                    // Greedy init.
+                    std::memcpy(residual.data(), x,
+                                sub_dim_prq_ * sizeof(float));
+                    std::memset(reconstruction.data(), 0,
+                                sub_dim_prq_ * sizeof(float));
+                    for (uint32_t lev = 0; lev < M_sub_; lev++) {
+                        const float* book = books + lev * K_ * sub_dim_prq_;
+                        const uint32_t cid = nearest_centroid_l2(
+                            book, residual.data(), K_, sub_dim_prq_, nullptr);
+                        codes[i * M_sub_ + lev] = cid;
+                        const float* cen = book + cid * sub_dim_prq_;
+                        for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                            residual[d] -= cen[d];
+                            reconstruction[d] += cen[d];
+                        }
+                    }
+                    // ICM sweeps.
+                    for (uint32_t it = 0; it < icm_iters_; it++) {
+                        for (uint32_t lev = 0; lev < M_sub_; lev++) {
+                            const float* book = books + lev * K_ * sub_dim_prq_;
+                            const uint32_t old = codes[i * M_sub_ + lev];
+                            const float* old_cen = book + old * sub_dim_prq_;
+                            for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                                residual[d] = x[d] - reconstruction[d] + old_cen[d];
+                            }
+                            const uint32_t cid = nearest_centroid_l2(
+                                book, residual.data(), K_, sub_dim_prq_, nullptr);
+                            if (cid != old) {
+                                const float* new_cen = book + cid * sub_dim_prq_;
+                                codes[i * M_sub_ + lev] = cid;
+                                for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                                    reconstruction[d] += new_cen[d] - old_cen[d];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- Update codebooks via regularized least-squares ---
+            #pragma omp parallel for schedule(dynamic)
+            for (uint32_t s = 0; s < nsplits_; s++) {
+                update_codebooks_lsq_(sub_vecs_all[s].data(), n,
+                                      all_codes[s].data(),
+                                      rq_codebooks_.data() +
+                                          static_cast<size_t>(s) * M_sub_ *
+                                              K_ * sub_dim_prq_);
+            }
+
+            // Recompute centroid norms.
+            for (uint32_t s = 0; s < nsplits_; s++) {
+                for (uint32_t lev = 0; lev < M_sub_; lev++) {
+                    const float* book = level_book_(s, lev);
+                    float* out = rq_centroid_sqnorms_.data() +
+                                 (static_cast<size_t>(s) * M_sub_ + lev) * K_;
+                    for (uint32_t c = 0; c < K_; c++) {
+                        out[c] = simd::dot_f32(book + c * sub_dim_prq_,
+                                               book + c * sub_dim_prq_,
+                                               sub_dim_prq_);
+                    }
+                }
+            }
+        }
+        const auto tlsq_end = std::chrono::steady_clock::now();
+        spdlog::info("[sextant] PRQ LSQ training complete in {:.2f}s",
+                     std::chrono::duration<double>(tlsq_end - tlsq).count());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LSQ codebook update: solve (BᵀB + ρI) Cᵀ = XBᵀ via Gaussian elimination.
+//
+// B is the [n][M_sub] code matrix (one-hot). BᵀB is [M_sub·K][M_sub·K]:
+//   diagonal blocks (i,i): count of vectors assigned to each centroid in book i
+//   off-diagonal (i,j): co-occurrence count of centroid_a in book i and
+//     centroid_b in book j for the same vector.
+// XBᵀ is [M_sub·K][sub_dim]: sum of sub-vectors assigned to each centroid.
+//
+// The system is tiny (at most 128×128 at M_sub=8, K=16). Solved with
+// Gaussian elimination with partial pivoting in double precision.
+// ---------------------------------------------------------------------------
+
+void ProductResidualQuantizer::update_codebooks_lsq_(
+    const float* samples, uint64_t n,
+    const uint32_t* codes, float* books) const {
+
+    const uint32_t mk = M_sub_ * K_;
+    const float rho = 1e-4f;
+
+    // Build A = BᵀB + ρI  (mk × mk) and b = XBᵀ (mk × sub_dim) in double.
+    std::vector<double> A(size_t(mk) * mk, 0.0);
+    std::vector<double> b(size_t(mk) * sub_dim_prq_, 0.0);
+
+    // Accumulate A and b from the one-hot structure.
+    for (uint64_t i = 0; i < n; i++) {
+        const float* x = samples + i * sub_dim_prq_;
+        for (uint32_t li = 0; li < M_sub_; li++) {
+            const uint32_t ci = codes[i * M_sub_ + li];
+            const uint32_t row_i = li * K_ + ci;
+            // b[row_i] += x
+            for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                b[size_t(row_i) * sub_dim_prq_ + d] += x[d];
+            }
+            // A[row_i][row_j] for all assigned codebooks j (including i).
+            for (uint32_t lj = 0; lj < M_sub_; lj++) {
+                const uint32_t cj = codes[i * M_sub_ + lj];
+                const uint32_t row_j = lj * K_ + cj;
+                A[size_t(row_i) * mk + row_j] += 1.0;
+            }
+        }
+    }
+
+    // Regularize.
+    for (uint32_t i = 0; i < mk; i++) {
+        A[size_t(i) * mk + i] += rho;
+    }
+
+    // Solve A·Cᵀ = b via Gaussian elimination with partial pivoting.
+    // A is mk×mk, b is mk×sub_dim_prq. Result overwrites b.
+    for (uint32_t col = 0; col < mk; col++) {
+        // Find pivot.
+        uint32_t pivot = col;
+        double max_val = std::abs(A[size_t(col) * mk + col]);
+        for (uint32_t row = col + 1; row < mk; row++) {
+            const double val = std::abs(A[size_t(row) * mk + col]);
+            if (val > max_val) { max_val = val; pivot = row; }
+        }
+        if (max_val < 1e-12) continue; // singular column, skip
+
+        // Swap rows in A and b.
+        if (pivot != col) {
+            for (uint32_t j = 0; j < mk; j++)
+                std::swap(A[size_t(col) * mk + j], A[size_t(pivot) * mk + j]);
+            for (uint32_t d = 0; d < sub_dim_prq_; d++)
+                std::swap(b[size_t(col) * sub_dim_prq_ + d],
+                          b[size_t(pivot) * sub_dim_prq_ + d]);
+        }
+
+        // Eliminate.
+        const double pivot_val = A[size_t(col) * mk + col];
+        for (uint32_t row = col + 1; row < mk; row++) {
+            const double factor = A[size_t(row) * mk + col] / pivot_val;
+            if (factor == 0.0) continue;
+            for (uint32_t j = col; j < mk; j++) {
+                A[size_t(row) * mk + j] -= factor * A[size_t(col) * mk + j];
+            }
+            for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                b[size_t(row) * sub_dim_prq_ + d] -=
+                    factor * b[size_t(col) * sub_dim_prq_ + d];
+            }
+        }
+    }
+
+    // Back-substitution.
+    std::vector<double> solution(size_t(mk) * sub_dim_prq_);
+    for (int32_t row = mk - 1; row >= 0; row--) {
+        const double diag = A[size_t(row) * mk + row];
+        if (std::abs(diag) < 1e-12) {
+            // Singular — keep old codebook values for this row.
+            for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                solution[size_t(row) * sub_dim_prq_ + d] = 0.0;
+            }
+            continue;
+        }
+        for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+            double val = b[size_t(row) * sub_dim_prq_ + d];
+            for (uint32_t j = row + 1; j < mk; j++) {
+                val -= A[size_t(row) * mk + j] *
+                       solution[size_t(j) * sub_dim_prq_ + d];
+            }
+            solution[size_t(row) * sub_dim_prq_ + d] = val / diag;
+        }
+    }
+
+    // Write back to codebooks: C[lev][cid][d] = solution[lev*K + cid][d].
+    for (uint32_t lev = 0; lev < M_sub_; lev++) {
+        for (uint32_t c = 0; c < K_; c++) {
+            const uint32_t row = lev * K_ + c;
+            float* dst = books + (size_t(lev) * K_ + c) * sub_dim_prq_;
+            for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                dst[d] = static_cast<float>(
+                    solution[size_t(row) * sub_dim_prq_ + d]);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

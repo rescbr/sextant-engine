@@ -123,6 +123,11 @@ inline void add_common_flags(cmdline::parser& p) {
         "PRQ ILS perturbation count: codes to randomize per cycle (default 4). "
         "Only meaningful with --prq-encode-mode icm.",
         false, 4);
+    p.add<uint32_t>("prq-lsq-train-iters", 0,
+        "PRQ LSQ training iterations: alternating codebook update + ICM "
+        "re-encode (default 0 = k-means only). ~10-25 for full LSQ training. "
+        "Only meaningful with --quantizer prq.",
+        false, 0);
     p.add<uint32_t>("threads", 0,
         "Threads for build/mini-builds (0 = hardware_concurrency).",
         false, 0);
@@ -245,6 +250,7 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     if (p.exist("prq-icm-iters")) cfg.prq_icm_iters = p.get<uint32_t>("prq-icm-iters");
     if (p.exist("prq-ils-iters")) cfg.prq_ils_iters = p.get<uint32_t>("prq-ils-iters");
     if (p.exist("prq-ils-perturb")) cfg.prq_ils_perturb = p.get<uint32_t>("prq-ils-perturb");
+    if (p.exist("prq-lsq-train-iters")) cfg.prq_lsq_train_iters = p.get<uint32_t>("prq-lsq-train-iters");
     cfg.num_threads       = p.get<uint32_t>("threads");
     {
         const std::string m = p.get<std::string>("metric");
