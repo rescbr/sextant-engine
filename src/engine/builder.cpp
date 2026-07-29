@@ -1517,7 +1517,9 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         }
         qscan_owner = std::make_unique<ProductResidualQuantizer>(
             params.metric, dim, m4, scan_bits, nsplits,
-            params.prq_beam_size, /*seed=*/42);
+            params.prq_beam_size, /*seed=*/42,
+            params.prq_encode_mode, params.prq_icm_iters,
+            params.prq_ils_iters, params.prq_ils_perturb);
     } else if (params.quantizer_type == "anisotropic-pq") {
         qscan_owner = std::make_unique<AnisotropicPqQuantizer>(
             params.metric, dim, m4, scan_bits,

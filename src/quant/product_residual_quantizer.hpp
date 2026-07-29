@@ -55,6 +55,7 @@
 
 #include "pq_quantizer.hpp"
 #include <sextant/types.hpp>
+#include <string>
 #include <vector>
 #include <cstdint>
 
@@ -67,12 +68,19 @@ public:
     /// `bits` must be 4 (4-bit FastScan scan path; K=16).
     /// `nsplits` is the number of contiguous sub-spaces; must divide both
     ///   `dim` and `m` evenly.
-    /// `beam_size` controls the greedy encode search width (1 = pure greedy;
-    ///   >1 reserved for future beam-search encoding — currently behaves as 1).
+    /// `beam_size` controls the greedy/beam encode search width (1 = pure
+    ///   greedy; >1 = beam search). Ignored when encode_mode = "icm".
+    /// `encode_mode` selects the encoding strategy: "greedy" (sequential
+    ///   residual, fast), "beam" (beam search, moderate), or "icm"
+    ///   (ICM+ILS coordinate descent, best quality, still L1/L2-resident).
     ProductResidualQuantizer(MetricKind metric, Dim dim, uint16_t m,
                              uint8_t bits, uint32_t nsplits,
                              uint32_t beam_size = 1,
-                             uint64_t seed = 0xC0DE1234ULL);
+                             uint64_t seed = 0xC0DE1234ULL,
+                             std::string encode_mode = "greedy",
+                             uint32_t icm_iters = 4,
+                             uint32_t ils_iters = 4,
+                             uint32_t ils_perturb = 4);
 
     void train(const float* samples, uint64_t n) override;
     void encode(const float* vec, uint8_t* code_out) const override;
@@ -86,6 +94,7 @@ public:
     uint32_t nsplits() const { return nsplits_; }
     uint32_t m_sub() const { return M_sub_; }
     uint32_t rq_sub_dim() const { return sub_dim_prq_; }
+    const std::string& encode_mode() const { return encode_mode_; }
 
     /// PRQ codebook layout: [nsplits][M_sub][K][sub_dim_prq] row-major.
     /// For split s, level l, centroid c: ((s * M_sub + l) * K + c) * sub_dim_prq.
@@ -99,6 +108,16 @@ private:
     uint32_t M_sub_;       ///< levels per split = m / nsplits.
     uint32_t sub_dim_prq_; ///< per-split sub-vector dimension = dim / nsplits.
     uint32_t beam_size_;
+
+    std::string encode_mode_ = "greedy"; ///< "greedy", "beam", or "icm"
+    uint32_t icm_iters_ = 4;   ///< ICM sweeps per ILS cycle
+    uint32_t ils_iters_ = 4;   ///< ILS cycles (perturb + ICM + accept)
+    uint32_t ils_perturb_ = 4; ///< codes to perturb per ILS cycle
+
+    /// On-the-fly ICM+ILS encoding (no precomputed tables).
+    /// See docs/quantization_findings.md §PRQ and the plan at
+    /// ~/.local/state/maki/plans/amazing-striking-toad.md.
+    void encode_icm_(const float* vec, uint8_t* code_out) const;
 
     /// Additive codebooks: [nsplits][M_sub][K][sub_dim_prq].
     std::vector<float> rq_codebooks_;

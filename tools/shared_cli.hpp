@@ -106,6 +106,23 @@ inline void add_common_flags(cmdline::parser& p) {
         "Higher = better recall, slower build. Only meaningful with "
         "--quantizer prq. Default: 1.",
         false, 1);
+    p.add<std::string>("prq-encode-mode", 0,
+        "PRQ encoding strategy: 'greedy' (default, sequential residual), "
+        "'beam' (beam search), or 'icm' (ICM+ILS coordinate descent — best "
+        "quality, on-the-fly compute). Only meaningful with --quantizer prq.",
+        false, "greedy");
+    p.add<uint32_t>("prq-icm-iters", 0,
+        "PRQ ICM sweeps per ILS cycle (default 4). Only meaningful with "
+        "--prq-encode-mode icm.",
+        false, 4);
+    p.add<uint32_t>("prq-ils-iters", 0,
+        "PRQ ILS cycles: perturb + ICM + accept (default 4). Only meaningful "
+        "with --prq-encode-mode icm.",
+        false, 4);
+    p.add<uint32_t>("prq-ils-perturb", 0,
+        "PRQ ILS perturbation count: codes to randomize per cycle (default 4). "
+        "Only meaningful with --prq-encode-mode icm.",
+        false, 4);
     p.add<uint32_t>("threads", 0,
         "Threads for build/mini-builds (0 = hardware_concurrency).",
         false, 0);
@@ -224,6 +241,10 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     cfg.anisotropic_pq = (cfg.quantizer_type == "anisotropic-pq");
     if (p.exist("prq-nsplits")) cfg.prq_nsplits = p.get<uint32_t>("prq-nsplits");
     if (p.exist("prq-beam-size")) cfg.prq_beam_size = p.get<uint32_t>("prq-beam-size");
+    if (p.exist("prq-encode-mode")) cfg.prq_encode_mode = p.get<std::string>("prq-encode-mode");
+    if (p.exist("prq-icm-iters")) cfg.prq_icm_iters = p.get<uint32_t>("prq-icm-iters");
+    if (p.exist("prq-ils-iters")) cfg.prq_ils_iters = p.get<uint32_t>("prq-ils-iters");
+    if (p.exist("prq-ils-perturb")) cfg.prq_ils_perturb = p.get<uint32_t>("prq-ils-perturb");
     cfg.num_threads       = p.get<uint32_t>("threads");
     {
         const std::string m = p.get<std::string>("metric");

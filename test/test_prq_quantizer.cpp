@@ -408,5 +408,71 @@ TEST(ProductResidualQuantizer, FourSplitsFourLevels) {
     EXPECT_LT(sqerr, 1000.0);
 }
 
+// ---------------------------------------------------------------------------
+// ICM encoding: produces ≤ reconstruction error than greedy
+// ---------------------------------------------------------------------------
+
+TEST(ProductResidualQuantizer, IcmErrorLessOrEqualGreedy) {
+    const uint32_t dim = 64;
+    const uint16_t m = 16;
+    const uint32_t nsplits = 8;
+    const uint64_t n = 2000;
+
+    auto data = make_clustered_data(n, dim, 50, 42);
+
+    ProductResidualQuantizer q_greedy(
+        MetricKind::InnerProduct, dim, m, 4, nsplits, 1, 99);
+    q_greedy.train(data.data(), n);
+
+    ProductResidualQuantizer q_icm(
+        MetricKind::InnerProduct, dim, m, 4, nsplits, 1, 99,
+        "icm", 4, 8, 4);
+    q_icm.train(data.data(), n);
+
+    // ICM and greedy share the same codebooks (same seed) — only encoding differs.
+    double total_err_greedy = 0, total_err_icm = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const float* vec = data.data() + i * dim;
+        std::vector<uint8_t> code_g(q_greedy.code_size(), 0);
+        std::vector<uint8_t> code_i(q_icm.code_size(), 0);
+        q_greedy.encode(vec, code_g.data());
+        q_icm.encode(vec, code_i.data());
+
+        std::vector<float> recon_g(dim, 0), recon_i(dim, 0);
+        q_greedy.decode_code(code_g.data(), recon_g.data());
+        q_icm.decode_code(code_i.data(), recon_i.data());
+
+        for (uint32_t d = 0; d < dim; d++) {
+            const double dg = double(vec[d]) - double(recon_g[d]);
+            const double di = double(vec[d]) - double(recon_i[d]);
+            total_err_greedy += dg * dg;
+            total_err_icm += di * di;
+        }
+    }
+    EXPECT_LE(total_err_icm, total_err_greedy * 1.001);
+}
+
+TEST(ProductResidualQuantizer, IcmEncodeRoundTrip) {
+    const uint32_t dim = 128;
+    const uint16_t m = 32;
+    const uint32_t nsplits = 16;
+
+    auto data = make_clustered_data(500, dim, 30, 7);
+
+    ProductResidualQuantizer q(
+        MetricKind::InnerProduct, dim, m, 4, nsplits, 1, 7,
+        "icm", 4, 4, 4);
+    q.train(data.data(), 500);
+
+    std::vector<uint8_t> code(q.code_size(), 0);
+    q.encode(data.data(), code.data());
+    std::vector<float> recon(dim, 0);
+    q.decode_code(code.data(), recon.data());
+
+    for (uint32_t d = 0; d < dim; d++) {
+        EXPECT_TRUE(std::isfinite(recon[d]));
+    }
+}
+
 }  // namespace
 }  // namespace sextant

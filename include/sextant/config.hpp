@@ -129,6 +129,19 @@ struct BuildConfig {
     /// quantizer_type="prq".
     uint32_t prq_beam_size = 1;
 
+    /// PRQ encoding mode: "greedy" (default), "beam", or "icm".
+    /// ICM uses on-the-fly coordinate descent + ILS perturbation.
+    std::string prq_encode_mode = "greedy";
+
+    /// PRQ ICM iterations (sweeps per ILS cycle). Default 4.
+    uint32_t prq_icm_iters = 4;
+
+    /// PRQ ILS iterations (perturb + ICM + accept cycles). Default 4.
+    uint32_t prq_ils_iters = 4;
+
+    /// PRQ ILS perturbation count (codes to randomize per cycle). Default 4.
+    uint32_t prq_ils_perturb = 4;
+
     /// OPQ (PCA rotation). When true, a d×d PCA rotation is learned from the
     /// training-sample covariance and applied to vectors before PQ encoding
     /// and to queries before LUT construction, so PQ splits align with the
@@ -267,6 +280,10 @@ struct ResolvedParams {
     /// PRQ nsplits (sub-space count). 0 = auto (dim/32). Persisted to the manifest.
     uint32_t prq_nsplits = 0;
     uint32_t prq_beam_size = 1;
+    std::string prq_encode_mode = "greedy";
+    uint32_t prq_icm_iters = 4;
+    uint32_t prq_ils_iters = 4;
+    uint32_t prq_ils_perturb = 4;
 
     /// Merged-graph build path (vs the default IVF-list-scan + 4-bit PQ
     /// FastScan). Persisted so the search dispatcher can route correctly on

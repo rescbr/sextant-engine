@@ -162,12 +162,18 @@ inline uint32_t nearest_centroid_l2(const float* book, const float* sub,
 
 ProductResidualQuantizer::ProductResidualQuantizer(
     MetricKind metric, Dim dim, uint16_t m, uint8_t bits, uint32_t nsplits,
-    uint32_t beam_size, uint64_t seed)
+    uint32_t beam_size, uint64_t seed,
+    std::string encode_mode, uint32_t icm_iters,
+    uint32_t ils_iters, uint32_t ils_perturb)
     : PqQuantizer(metric, dim, m, bits, seed),
       nsplits_(nsplits == 0 ? 1 : nsplits),
       M_sub_(nsplits == 0 ? 0 : m / nsplits),
       sub_dim_prq_(nsplits == 0 ? dim : dim / nsplits),
-      beam_size_(beam_size) {
+      beam_size_(beam_size),
+      encode_mode_(std::move(encode_mode)),
+      icm_iters_(icm_iters),
+      ils_iters_(ils_iters),
+      ils_perturb_(ils_perturb) {
     if (nsplits == 0) {
         throw Error(ErrorCode::InvalidParam, "PRQ: nsplits must be > 0");
     }
@@ -292,6 +298,11 @@ void ProductResidualQuantizer::encode(const float* vec,
                                       uint8_t* code_out) const {
     std::memset(code_out, 0, code_size());
 
+    if (encode_mode_ == "icm") {
+        encode_icm_(vec, code_out);
+        return;
+    }
+
     if (beam_size_ <= 1) {
         std::vector<float> residual(sub_dim_prq_);
         for (uint32_t s = 0; s < nsplits_; s++) {
@@ -398,6 +409,131 @@ void ProductResidualQuantizer::encode(const float* vec,
         for (uint32_t lev = 0; lev < M_sub_; lev++) {
             const uint32_t global_seg = s * M_sub_ + lev;
             write_code(code_out, bits_, global_seg, best.codes[lev]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ICM+ILS encoding (on-the-fly, no precomputed tables).
+//
+// ICM coordinate descent: for each codebook j, fix all others, find the
+// centroid that minimizes the residual. The residual is computed on-the-fly
+// from a running reconstruction vector maintained incrementally.
+//
+// ILS: perturb npert random codebook assignments, re-run ICM, accept
+// per-sub-space only if total reconstruction error decreased.
+//
+// All per-vector state (reconstruction, codes) fits in L1/L2. Codebooks
+// (16 KB per sub-space at K=16, sub_dim=32) stay L1-resident across the
+// batch. No tables — compute is cheaper than RAM.
+// ---------------------------------------------------------------------------
+
+void ProductResidualQuantizer::encode_icm_(const float* vec,
+                                            uint8_t* code_out) const {
+    std::vector<float> reconstruction(sub_dim_prq_);
+    std::vector<float> residual(sub_dim_prq_);
+    std::vector<uint32_t> codes(M_sub_);
+    std::vector<uint32_t> best_codes(M_sub_);
+    std::mt19937 rng(seed_ ^ std::hash<const float*>{}(vec));
+
+    float best_err = std::numeric_limits<float>::max();
+
+    for (uint32_t s = 0; s < nsplits_; s++) {
+        const float* sub = vec + static_cast<size_t>(s) * sub_dim_prq_;
+
+        // --- Greedy init ---
+        std::memcpy(residual.data(), sub, sub_dim_prq_ * sizeof(float));
+        std::memset(reconstruction.data(), 0, sub_dim_prq_ * sizeof(float));
+        for (uint32_t lev = 0; lev < M_sub_; lev++) {
+            const float* book = level_book_(s, lev);
+            const uint32_t cid = nearest_centroid_l2(
+                book, residual.data(), K_, sub_dim_prq_, nullptr);
+            codes[lev] = cid;
+            const float* cen = book + cid * sub_dim_prq_;
+            for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                residual[d] -= cen[d];
+                reconstruction[d] += cen[d];
+            }
+        }
+
+        float current_err = simd::dot_f32(residual.data(), residual.data(),
+                                           sub_dim_prq_);
+        best_err = current_err;
+        best_codes = codes;
+
+        // --- ILS loop ---
+        for (uint32_t ils = 0; ils < ils_iters_; ils++) {
+            // Perturb: replace npert random codebook assignments.
+            if (ils > 0 && ils_perturb_ > 0 && M_sub_ > 1) {
+                const uint32_t npert = std::min(ils_perturb_, M_sub_);
+                for (uint32_t p = 0; p < npert; p++) {
+                    const uint32_t lev = rng() % M_sub_;
+                    const uint32_t old_cid = codes[lev];
+                    const float* book = level_book_(s, lev);
+                    const float* old_cen = book + old_cid * sub_dim_prq_;
+                    const uint32_t new_cid = rng() % K_;
+                    const float* new_cen = book + new_cid * sub_dim_prq_;
+                    codes[lev] = new_cid;
+                    for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                        reconstruction[d] += new_cen[d] - old_cen[d];
+                    }
+                }
+            }
+
+            // ICM sweeps.
+            for (uint32_t iter = 0; iter < icm_iters_; iter++) {
+                for (uint32_t lev = 0; lev < M_sub_; lev++) {
+                    const float* book = level_book_(s, lev);
+                    const uint32_t old_cid = codes[lev];
+                    const float* old_cen = book + old_cid * sub_dim_prq_;
+
+                    // residual = x_sub - reconstruction + old_cen
+                    // (remove this codebook's contribution)
+                    for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                        residual[d] = sub[d] - reconstruction[d] + old_cen[d];
+                    }
+
+                    const uint32_t new_cid = nearest_centroid_l2(
+                        book, residual.data(), K_, sub_dim_prq_, nullptr);
+                    if (new_cid != old_cid) {
+                        const float* new_cen = book + new_cid * sub_dim_prq_;
+                        codes[lev] = new_cid;
+                        for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                            reconstruction[d] += new_cen[d] - old_cen[d];
+                        }
+                    }
+                }
+            }
+
+            // Compute total error for this sub-space.
+            for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                residual[d] = sub[d] - reconstruction[d];
+            }
+            const float err = simd::dot_f32(residual.data(), residual.data(),
+                                             sub_dim_prq_);
+
+            if (err < best_err) {
+                best_err = err;
+                best_codes = codes;
+            } else {
+                // Revert to best: rebuild reconstruction from best_codes.
+                codes = best_codes;
+                std::memset(reconstruction.data(), 0,
+                            sub_dim_prq_ * sizeof(float));
+                for (uint32_t lev = 0; lev < M_sub_; lev++) {
+                    const float* cen = level_book_(s, lev) +
+                                       codes[lev] * sub_dim_prq_;
+                    for (uint32_t d = 0; d < sub_dim_prq_; d++) {
+                        reconstruction[d] += cen[d];
+                    }
+                }
+            }
+        }
+
+        // Write best codes for this sub-space.
+        for (uint32_t lev = 0; lev < M_sub_; lev++) {
+            const uint32_t global_seg = s * M_sub_ + lev;
+            write_code(code_out, bits_, global_seg, best_codes[lev]);
         }
     }
 }
