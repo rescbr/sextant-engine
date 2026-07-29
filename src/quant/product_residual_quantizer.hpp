@@ -20,6 +20,24 @@
 /// path. Overrides train/encode/preprocess_query/decode_code/serialize/
 /// deserialize; the FastScan LUT build and the scan kernels are inherited
 /// unchanged (they consume the m×K LUT + packed codes agnostically).
+///
+/// ## Empirical findings (Sphere IP, LID 20.8, 10M × 768, K=256)
+///
+/// PRQ breaks the 4-bit PQ recall ceiling, with the gain scaling monotonically
+/// with nsplits (more splits = fewer residual levels per sub-space = less
+/// cascading greedy encoding error):
+///
+///   nsplits=192 (M_sub=1) → degenerates to standard PQ (no additive structure)
+///   nsplits=96  (M_sub=2) → recall 0.927 (greedy) / 0.936 (beam=5)
+///   nsplits=48  (M_sub=4) → recall 0.919
+///   nsplits=24  (M_sub=8) → recall 0.907
+///   nsplits=12  (M_sub=16) → recall 0.877 (WORSE than PQ — too many levels)
+///   PQ baseline              → recall 0.897
+///
+/// Recommended default: nsplits=96 (auto when sub_dim=8), beam_size=5.
+/// At matched QPS (~290, np=64), PRQ s96 b1 delivers 0.905 vs PQ's 0.875.
+/// The 8-bit PQ ceiling (0.999) remains unreachable at 4-bit; PRQ closes
+/// ~43% of the gap. See docs/quantization_findings.md §PRQ for full analysis.
 
 #include "pq_quantizer.hpp"
 #include <sextant/types.hpp>
