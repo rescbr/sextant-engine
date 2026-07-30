@@ -868,7 +868,7 @@ void PqQuantizer::build_fastscan_lut4(const float* query,
     }
     std::vector<float> lut_f32(static_cast<size_t>(m_) * K_);
     preprocess_query(query, lut_f32.data());
-    simd::quantize_lut_u4(lut_f32.data(), m_, K_, lut4, scale_out);
+    simd::quantize_lut_u8(lut_f32.data(), m_, K_, lut4, scale_out);
 }
 
 // ---------------------------------------------------------------------------

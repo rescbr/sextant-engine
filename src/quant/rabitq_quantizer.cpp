@@ -199,7 +199,7 @@ void RaBitQQuantizer::build_fastscan_lut4_with_centroid(
     float* scale_out) const {
     std::vector<float> lut_f32(static_cast<size_t>(m_) * 16);
     preprocess_query_with_centroid(query, centroid, lut_f32.data());
-    simd::quantize_lut_u4(lut_f32.data(), m_, 16, lut4, scale_out);
+    simd::quantize_lut_u8(lut_f32.data(), m_, 16, lut4, scale_out);
     // Capture the per-segment-minimum sum and scale so finalize_distance can
     // dequantize the raw FastScan result back to the true float sign-dot.
     // quantize_lut_u4 uses A = 15/max_span and stores (val - seg_min)*A.
@@ -260,7 +260,7 @@ void RaBitQQuantizer::build_lut4_with_state(
 
     // Quantize to uint4 and capture dequant params
     float scale;
-    simd::quantize_lut_u4(lut_f32.data(), m_, 16, lut4, &scale);
+    simd::quantize_lut_u8(lut_f32.data(), m_, 16, lut4, &scale);
     qs.lut_scale = scale;
 
     float seg_min_sum = 0.0f;

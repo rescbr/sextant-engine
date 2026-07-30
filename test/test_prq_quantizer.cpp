@@ -321,7 +321,7 @@ TEST(ProductResidualQuantizer, BuildFastScanLut4Shape) {
 
     EXPECT_GT(scale, 0.0f);
     for (uint8_t v : lut4) {
-        EXPECT_LE(v, 15) << "4-bit value out of range";
+        EXPECT_LE(v, 255) << "LUT value out of range";
     }
 }
 

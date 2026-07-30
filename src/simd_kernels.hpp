@@ -1339,5 +1339,49 @@ inline void quantize_lut_u4(const float* lut_f32,
     if (scale_out) *scale_out = A;
 }
 
+/// Quantize a float LUT to uint8 for the pq4_block32 kernel. The kernel uses
+/// vqtbl1q_u8 (byte-indexed table lookup), so LUT entries are already 8 bits
+/// wide in hardware — the u4 variant artificially clamps to 4 bits. Using the
+/// full 0-255 range gives 16× finer distance resolution at zero speed cost
+/// (same kernel, same code layout, same uint16 accumulation path).
+///
+/// Accumulation headroom: M segments × max 255 per segment. At M=192:
+/// 192 × 255 = 48,960 < 65,535 (uint16 max). Safe.
+///
+/// Output: `lut8[s*K + c]` ∈ [0, 255]. `*scale_out` receives A.
+inline void quantize_lut_u8(const float* lut_f32,
+                            uint32_t m, uint32_t K,
+                            uint8_t* lut8,
+                            float* scale_out) {
+    float max_span = 0.0f;
+    std::array<float, 256> seg_min{};
+    for (uint32_t s = 0; s < m; s++) {
+        const float* row = lut_f32 + s * K;
+        float mn = row[0];
+        for (uint32_t c = 1; c < K; c++) {
+            if (row[c] < mn) mn = row[c];
+        }
+        seg_min[s] = mn;
+        for (uint32_t c = 0; c < K; c++) {
+            const float span = row[c] - mn;
+            if (span > max_span) max_span = span;
+        }
+    }
+
+    const float A = (max_span > 0.0f) ? 255.0f / max_span : 0.0f;
+
+    for (uint32_t s = 0; s < m; s++) {
+        const float* src_row = lut_f32 + s * K;
+        uint8_t* dst_row = lut8 + s * K;
+        const float mn = seg_min[s];
+        for (uint32_t c = 0; c < K; c++) {
+            const int q8 = (int)((src_row[c] - mn) * A + 0.5f);
+            dst_row[c] = (uint8_t)std::max(0, std::min(255, q8));
+        }
+    }
+
+    if (scale_out) *scale_out = A;
+}
+
 }  // namespace simd
 }  // namespace sextant
