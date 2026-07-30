@@ -53,9 +53,28 @@ public:
     float finalize_distance_ip(float raw_scan_result, const float* factors) const;
 
     /// Per-vector distance error bound for selective rerank (Phase 3). Derived
+    /// Per-query state for RaBitQ distance finalization. Stored per-thread
+    /// (in IVFScanWorkerState) to avoid races on the shared quantizer.
+    struct QueryState {
+        float qr_to_c_l2sqr = 0;
+        float c34 = 0;
+        float lut_scale = 1;
+        float seg_min_sum = 0;
+    };
+
+    /// Build LUT and populate query state. Thread-safe: writes only to `qs`.
+    void build_lut4_with_state(const float* query, const float* centroid,
+                               uint8_t* lut4, QueryState& qs) const;
+
+    /// Dequantize + finalize using per-thread query state. Thread-safe.
+    float dequant_and_finalize(uint32_t raw_uint4, const float* factors,
+                               const QueryState& qs) const;
+
+    /// Error bound using per-thread query state.
+    float error_bound(const float* factors, const QueryState& qs) const;
+
     /// from the stored factors (dp_multiplier, or_minus_c_l2sqr) so it can be
-    /// computed at search time without the original vector. Requires the
-    /// per-shard LUT to have been built (sets qr_to_c_l2sqr_).
+    /// computed at search time without the original vector.
     float get_error_bound(const float* factors) const;
 
     void decode_code(const uint8_t* code, float* out) const override;
@@ -78,6 +97,7 @@ public:
 private:
     uint32_t padded_dim_;
     float padded_dim_sqrt_;
+    float dim_sqrt_;
     uint32_t sign_code_bytes_;
     std::vector<float> signs_;
 

@@ -60,6 +60,7 @@ RaBitQQuantizer::RaBitQQuantizer(MetricKind metric, Dim dim, uint64_t seed)
     while (p < dim) p <<= 1;
     padded_dim_ = p;
     padded_dim_sqrt_ = std::sqrt(static_cast<float>(p));
+    dim_sqrt_ = std::sqrt(static_cast<float>(dim_));
     sign_code_bytes_ = (m_ * bits_ + 7) / 8;
     generate_signs_();
 }
@@ -136,7 +137,7 @@ void RaBitQQuantizer::encode_with_centroid(const float* vec,
         write_code(code_out, bits_, group, code);
     }
     const float dp_multiplier =
-        (dp_oO > 0.0f) ? std::sqrt(norm_l2sqr) * padded_dim_sqrt_ / dp_oO : 0.0f;
+        (dp_oO > 0.0f) ? std::sqrt(norm_l2sqr) * dim_sqrt_ / dp_oO : 0.0f;
     const float or_minus_c_l2sqr =
         (metric_ == MetricKind::InnerProduct) ? (norm_l2sqr - or_l2sqr)
                                               : norm_l2sqr;
@@ -173,15 +174,15 @@ void RaBitQQuantizer::preprocess_query_with_centroid(
     }
     const float span = v_max - v_min;
     const float delta = span / static_cast<float>(kQueryMaxCode);
-    c1_ = 2.0f * delta / padded_dim_sqrt_;
-    c2_ = 2.0f * v_min / padded_dim_sqrt_;
+    c1_ = 2.0f * delta / dim_sqrt_;
+    c2_ = 2.0f * v_min / dim_sqrt_;
     std::vector<float> qq(dim_);
     float sum_qq = 0.0f;
     for (uint32_t i = 0; i < dim_; i++) {
         qq[i] = (span > 0.0f) ? std::round((rotated_q[i] - v_min) / delta) : 0.0f;
         sum_qq += qq[i];
     }
-    c34_ = (delta * sum_qq + static_cast<float>(dim_) * v_min) / padded_dim_sqrt_;
+    c34_ = (delta * sum_qq + static_cast<float>(dim_) * v_min) / dim_sqrt_;
 
     for (uint32_t m = 0; m < m_; m++) {
         const uint32_t ds = m * 4;
@@ -215,6 +216,95 @@ void RaBitQQuantizer::build_fastscan_lut4_with_centroid(
     lut_scale_ = scale_out ? *scale_out : 1.0f;
 }
 
+void RaBitQQuantizer::build_lut4_with_state(
+    const float* query, const float* centroid,
+    uint8_t* lut4, QueryState& qs) const {
+    // Compute residual
+    std::vector<float> rq(dim_);
+    for (uint32_t i = 0; i < dim_; i++) rq[i] = query[i] - centroid[i];
+    qs.qr_to_c_l2sqr = simd::dot_f32(rq.data(), rq.data(), dim_);
+
+    // Rotate
+    std::vector<float> rotated_q(padded_dim_, 0.0f);
+    rotate(rq.data(), rotated_q.data());
+
+    // Scalar quantize query
+    float v_min = rotated_q[0], v_max = rotated_q[0];
+    for (uint32_t i = 0; i < dim_; i++) {
+        if (rotated_q[i] < v_min) v_min = rotated_q[i];
+        if (rotated_q[i] > v_max) v_max = rotated_q[i];
+    }
+    const float span = v_max - v_min;
+    const float delta = span / static_cast<float>(kQueryMaxCode);
+    const float c1 = 2.0f * delta / dim_sqrt_;
+    const float c2 = 2.0f * v_min / dim_sqrt_;
+    std::vector<float> qq(dim_);
+    float sum_qq = 0.0f;
+    for (uint32_t i = 0; i < dim_; i++) {
+        qq[i] = (span > 0.0f) ? std::round((rotated_q[i] - v_min) / delta) : 0.0f;
+        sum_qq += qq[i];
+    }
+    qs.c34 = (delta * sum_qq + static_cast<float>(dim_) * v_min) / dim_sqrt_;
+
+    // Build float LUT
+    std::vector<float> lut_f32(static_cast<size_t>(m_) * 16);
+    for (uint32_t m = 0; m < m_; m++) {
+        const uint32_t ds = m * 4;
+        const float v0 = c1 * qq[ds] + c2;
+        const float v1 = c1 * qq[ds+1] + c2;
+        const float v2 = c1 * qq[ds+2] + c2;
+        const float v3 = c1 * qq[ds+3] + c2;
+        write_subset_sum_lut(lut_f32.data() + m * 16, 0.0f, v0, v1, v2, v3);
+    }
+
+    // Quantize to uint4 and capture dequant params
+    float scale;
+    simd::quantize_lut_u4(lut_f32.data(), m_, 16, lut4, &scale);
+    qs.lut_scale = scale;
+
+    float seg_min_sum = 0.0f;
+    for (uint32_t s = 0; s < m_; s++) {
+        const float* row = lut_f32.data() + s * 16;
+        float mn = row[0];
+        for (uint32_t c = 1; c < 16; c++) if (row[c] < mn) mn = row[c];
+        seg_min_sum += mn;
+    }
+    qs.seg_min_sum = seg_min_sum;
+}
+
+float RaBitQQuantizer::dequant_and_finalize(uint32_t raw_uint4,
+                                            const float* factors,
+                                            const QueryState& qs) const {
+    const float dp_multiplier = factors[0];
+    const float or_minus_c_l2sqr = factors[1];
+    // Dequantize: raw = Σ (val_s - seg_min_s) * A → Σ val_s = raw/A + seg_min_sum
+    const float dequant = (qs.lut_scale > 0.0f)
+        ? static_cast<float>(raw_uint4) / qs.lut_scale + qs.seg_min_sum
+        : static_cast<float>(raw_uint4);
+    // final_dot = dequant - c34 (matches FAISS: c1*dot_qo + c2*sum_q - c34)
+    const float final_dot = dequant - qs.c34;
+    const float est_ip = dp_multiplier * final_dot;
+    return or_minus_c_l2sqr + qs.qr_to_c_l2sqr - 2.0f * est_ip;
+}
+
+float RaBitQQuantizer::error_bound(const float* factors,
+                                   const QueryState& qs) const {
+    const float norm_l2sqr = std::fmax(factors[1], 0.0f);
+    const float dp_multiplier = factors[0];
+    if (dp_multiplier <= 0.0f || norm_l2sqr <= 0.0f) return 0.0f;
+    const float norm_l2 = std::sqrt(norm_l2sqr);
+    const float dp_oO = norm_l2 * dim_sqrt_ / dp_multiplier;
+    const float ip_resi_xucb = 0.5f * dp_oO;
+    const float ratio_sq =
+        (norm_l2sqr * kXuCbNormSqr * static_cast<float>(dim_)) /
+        (ip_resi_xucb * ip_resi_xucb);
+    if (ratio_sq <= 1.0f || dim_ <= 1) return 0.0f;
+    const float tmp_error = norm_l2 * kConstEpsilon *
+        std::sqrt((ratio_sq - 1.0f) / static_cast<float>(dim_ - 1));
+    const float g_error = std::sqrt(qs.qr_to_c_l2sqr);
+    return tmp_error * g_error;
+}
+
 float RaBitQQuantizer::get_query_factor(const std::string& name) const {
     if (name == "qr_to_c_l2sqr") return qr_to_c_l2sqr_;
     if (name == "c1") return c1_;
@@ -227,20 +317,19 @@ float RaBitQQuantizer::finalize_distance(float raw_scan_result,
                                          const float* factors) const {
     const float dp_multiplier = factors[0];
     const float or_minus_c_l2sqr = factors[1];
-    // The FastScan subset-sum LUT accumulates v_j only over coordinates where
-    // the database sign is negative (bit set), i.e. raw = Σ_neg v_j. The
-    // signed sign-dot is Σ sign(o)*q = Σ_pos v - Σ_neg v = T - 2*raw, where
-    // T = Σ_all v = 2*c34_ (c34_ stores T/2). Hence signed_dot = 2*(c34_-raw).
-    const float signed_dot = 2.0f * (c34_ - raw_scan_result);
-    const float est_ip = dp_multiplier * signed_dot;
+    // raw_scan_result = c1*dot_qo + c2*sum_q (accumulated over positive-sign
+    // dims by the subset-sum LUT). final_dot = raw - c34, matching FAISS:
+    // final_dot = query_fac.c1 * dot_qo + query_fac.c2 * sum_q - query_fac.c34
+    const float final_dot = raw_scan_result - c34_;
+    const float est_ip = dp_multiplier * final_dot;
     return or_minus_c_l2sqr + qr_to_c_l2sqr_ - 2.0f * est_ip;
 }
 
 float RaBitQQuantizer::finalize_distance_ip(float raw_scan_result,
                                             const float* factors) const {
     const float dp_multiplier = factors[0];
-    const float signed_dot = 2.0f * (c34_ - raw_scan_result);
-    return dp_multiplier * signed_dot;
+    const float final_dot = raw_scan_result - c34_;
+    return dp_multiplier * final_dot;
 }
 
 float RaBitQQuantizer::get_error_bound(const float* factors) const {
@@ -260,7 +349,7 @@ float RaBitQQuantizer::get_error_bound(const float* factors) const {
         return 0.0f;
     }
     const float norm_l2 = std::sqrt(norm_l2sqr);
-    const float dp_oO = norm_l2 * padded_dim_sqrt_ / dp_multiplier;
+    const float dp_oO = norm_l2 * dim_sqrt_ / dp_multiplier;
     const float ip_resi_xucb = 0.5f * dp_oO;
     const float ratio_sq =
         (norm_l2sqr * kXuCbNormSqr * static_cast<float>(dim_)) /
@@ -311,6 +400,7 @@ void RaBitQQuantizer::deserialize(const uint8_t* in, size_t size) {
     while (p < dim_) p <<= 1;
     padded_dim_ = p;
     padded_dim_sqrt_ = std::sqrt(static_cast<float>(p));
+    dim_sqrt_ = std::sqrt(static_cast<float>(dim_));
     sign_code_bytes_ = (m_ * bits_ + 7) / 8;
     generate_signs_();
 }

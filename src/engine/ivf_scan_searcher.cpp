@@ -448,9 +448,9 @@ std::vector<Candidate> IVFScanSearcher::search_body_rabitq_(
 
         // Rebuild the FastScan LUT for THIS shard (encodes query-centroid).
         // Sets rabitq's per-sharch c34_ / qr_to_c_l2sqr_ used by finalize.
-        float scale;  // unused: RaBitQ finalization is scale-invariant
-        rabitq.build_fastscan_lut4_with_centroid(query, w.centroid_f32.data(),
-                                                 w.lut4.data(), &scale);
+        // RaBitQ LUT build populates w.rabitq_qs (thread-local query factors).
+        rabitq.build_lut4_with_state(query, w.centroid_f32.data(),
+                                     w.lut4.data(), w.rabitq_qs);
 
         const size_t need = code_stream_staging_bytes(*shard->codes);
         if (w.code_staging.size() < need) w.code_staging.resize(need);
@@ -500,9 +500,8 @@ std::vector<Candidate> IVFScanSearcher::search_body_rabitq_(
                                    static_cast<size_t>(local_idx) * 2;
                 // Dequantize the uint4 FastScan result to the true float
                 // sign-dot, then finalize into a real L2sq estimate.
-                const float sign_dot =
-                    rabitq.dequantize_scan_result(static_cast<float>(out[j]));
-                const float est = rabitq.finalize_distance(sign_dot, fac);
+                const float est = rabitq.dequant_and_finalize(out[j], fac,
+                                                                w.rabitq_qs);
 
                 if (heap.size() < W) {
                     heap.emplace_back(est, local_idx);
@@ -516,7 +515,7 @@ std::vector<Candidate> IVFScanSearcher::search_body_rabitq_(
                 // This is the selective-rerank criterion — borderline
                 // candidates with large uncertainty survive the cut.
                 if (est >= heap[0].first) {
-                    const float err = rabitq.get_error_bound(fac);
+                    const float err = rabitq.error_bound(fac, w.rabitq_qs);
                     if (est - err >= heap[0].first) continue;
                 }
                 heap_replace(est, local_idx);

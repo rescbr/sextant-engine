@@ -25,6 +25,7 @@
 #include "sextant/config.hpp"
 #include "sextant/ivf_scan_index.hpp"
 #include "sextant/types.hpp"
+#include "quant/rabitq_quantizer.hpp"
 
 #include <cstdint>
 #include <future>
@@ -64,6 +65,8 @@ struct IVFScanWorkerState {
     /// FP32 centroid scratch (dim) reused per probed shard (RaBitQ only). The
     /// index stores FP16 centroids; RaBitQ needs FP32 for the rotation.
     std::vector<float> centroid_f32;
+    /// RaBitQ per-query state (thread-local to avoid races on shared quantizer).
+    RaBitQQuantizer::QueryState rabitq_qs;
     /// Staging buffer for CodeStream sequential pread. Owned per-worker so
     /// every probed shard reuses one allocation. Lazily sized on first use.
     std::vector<uint8_t> code_staging;
