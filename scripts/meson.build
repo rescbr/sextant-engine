@@ -68,6 +68,12 @@ spike_pq_bounds = executable('spike_pq_bounds',
     install: false,
 )
 
+spike_panorama_rerank = executable('spike_panorama_rerank',
+    'spike_panorama_rerank.cpp',
+    dependencies: sextant_dep,
+    install: false,
+)
+
 bench_kernel = executable('bench_kernel',
     'bench_kernel.cpp',
     dependencies: sextant_dep,
