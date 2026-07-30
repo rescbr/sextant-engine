@@ -132,7 +132,7 @@ void RaBitQQuantizer::encode_with_centroid(const float* vec,
     for (uint32_t group = 0; group < m_; group++) {
         uint32_t code = 0;
         for (uint32_t b = 0; b < 4; b++) {
-            if (rotated[group * 4 + b] < 0.0f) code |= (1u << b);
+            if (rotated[group * 4 + b] > 0.0f) code |= (1u << b);
         }
         write_code(code_out, bits_, group, code);
     }
