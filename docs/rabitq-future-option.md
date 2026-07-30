@@ -1,11 +1,12 @@
 # Option E: RaBitQ as the quantizer — investigated and rejected (2026-07-30)
 
-> **Status: REJECTED for high-LID data.** FAISS multi-dataset spike shows
-> RaBitQ's advantage is dataset-dependent. At matched storage, PQ4 beats
-> RaBitQ on SIFT1M (LID ~10) and Sphere (LID ~21). RaBitQ beats PQ4
-> only on MSMARCO (LID ~14.6) and only at 2× storage (96B vs 48B).
-> Implementation exists (6 commits) but is parked. The 8-bit LUT
-> improvement to PQ4/PRQ is a strictly better path for our target data.
+> **Status: NUANCED.** RaBitQ's advantage is real but operates through a
+> different mechanism than raw scan recall. With rerank (the paper's setup),
+> RaBitQ at 16B matches PQ4 at 32B on SIFT1M — same end-to-end recall at
+> half the storage. Without rerank, PQ4 has better raw scan recall. The
+> advantage comes from RaBitQ's unbiased distance estimation producing
+> better shortlists, not from better per-vector distance accuracy. On
+> high-LID data (Sphere, LID 20.8), the advantage disappears.
 > RaBitQ's advantages are NOT portable to PQ without becoming RaBitQ.
 
 ## Why this is on the table
