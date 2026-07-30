@@ -137,7 +137,7 @@ void RaBitQQuantizer::encode_with_centroid(const float* vec,
         write_code(code_out, bits_, group, code);
     }
     const float dp_multiplier =
-        (dp_oO > 0.0f) ? std::sqrt(norm_l2sqr) * dim_sqrt_ / dp_oO : 0.0f;
+        (dp_oO > 0.0f) ? norm_l2sqr * dim_sqrt_ / dp_oO : 0.0f;
     const float or_minus_c_l2sqr =
         (metric_ == MetricKind::InnerProduct) ? (norm_l2sqr - or_l2sqr)
                                               : norm_l2sqr;
@@ -223,6 +223,7 @@ void RaBitQQuantizer::build_lut4_with_state(
     std::vector<float> rq(dim_);
     for (uint32_t i = 0; i < dim_; i++) rq[i] = query[i] - centroid[i];
     qs.qr_to_c_l2sqr = simd::dot_f32(rq.data(), rq.data(), dim_);
+    qs.qr_norm_l2sqr = simd::dot_f32(query, query, dim_);
 
     // Rotate
     std::vector<float> rotated_q(padded_dim_, 0.0f);
@@ -284,7 +285,14 @@ float RaBitQQuantizer::dequant_and_finalize(uint32_t raw_uint4,
     // final_dot = dequant - c34 (matches FAISS: c1*dot_qo + c2*sum_q - c34)
     const float final_dot = dequant - qs.c34;
     const float est_ip = dp_multiplier * final_dot;
-    return or_minus_c_l2sqr + qs.qr_to_c_l2sqr - 2.0f * est_ip;
+    // pre_dist estimates ‖o-q‖² = ‖o-c‖² + ‖q-c‖² - 2·dp_mul·final_dot
+    const float pre_dist = or_minus_c_l2sqr + qs.qr_to_c_l2sqr - 2.0f * est_ip;
+    if (metric_ == MetricKind::InnerProduct) {
+        // FAISS: IP_dist = -0.5 * (pre_dist - ‖q‖²)
+        // We want: smaller return = larger <q,o> = better
+        return -0.5f * (pre_dist - qs.qr_norm_l2sqr);
+    }
+    return std::max(0.0f, pre_dist);
 }
 
 float RaBitQQuantizer::error_bound(const float* factors,
@@ -293,7 +301,7 @@ float RaBitQQuantizer::error_bound(const float* factors,
     const float dp_multiplier = factors[0];
     if (dp_multiplier <= 0.0f || norm_l2sqr <= 0.0f) return 0.0f;
     const float norm_l2 = std::sqrt(norm_l2sqr);
-    const float dp_oO = norm_l2 * dim_sqrt_ / dp_multiplier;
+    const float dp_oO = norm_l2sqr * dim_sqrt_ / dp_multiplier;
     const float ip_resi_xucb = 0.5f * dp_oO;
     const float ratio_sq =
         (norm_l2sqr * kXuCbNormSqr * static_cast<float>(dim_)) /
@@ -349,7 +357,7 @@ float RaBitQQuantizer::get_error_bound(const float* factors) const {
         return 0.0f;
     }
     const float norm_l2 = std::sqrt(norm_l2sqr);
-    const float dp_oO = norm_l2 * dim_sqrt_ / dp_multiplier;
+    const float dp_oO = norm_l2sqr * dim_sqrt_ / dp_multiplier;
     const float ip_resi_xucb = 0.5f * dp_oO;
     const float ratio_sq =
         (norm_l2sqr * kXuCbNormSqr * static_cast<float>(dim_)) /

@@ -56,7 +56,8 @@ public:
     /// Per-query state for RaBitQ distance finalization. Stored per-thread
     /// (in IVFScanWorkerState) to avoid races on the shared quantizer.
     struct QueryState {
-        float qr_to_c_l2sqr = 0;
+        float qr_to_c_l2sqr = 0;   // ‖q-c‖²
+        float qr_norm_l2sqr = 0;   // ‖q‖² (for IP metric)
         float c34 = 0;
         float lut_scale = 1;
         float seg_min_sum = 0;
