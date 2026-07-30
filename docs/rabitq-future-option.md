@@ -1,8 +1,11 @@
-# Option E: RaBitQ as the quantizer — future option (deferred 2026-07-25)
+# Option E: RaBitQ as the quantizer — investigated and rejected (2026-07-30)
 
-> Status: deferred. Option A (4-bit PQ + top-W rerank) is the validated
-> production path; Option E is documented for later revisit. Grounded in
-> the E1/E1.6/B negative spikes of this session, which established that
+> **Status: REJECTED for high-LID data.** FAISS spike confirms RaBitQ
+> underperforms PQ4 on Sphere (LID 20.8): 0.357 vs 0.521 recall at 2×
+> the storage and 3.6× lower QPS. The paper's advantage (beats PQ at
+> 2× bits) does not transfer to high-LID, high-norm embeddings.
+> Implementation exists (6 commits) but is parked. May revisit for
+> low-LID datasets (SIFT, MSMARCO at LID ~14).
 > RaBitQ's advantages are NOT portable to PQ without becoming RaBitQ.
 
 ## Why this is on the table
@@ -197,3 +200,53 @@ contradicts both the RaBitQ paper and the GPU-IVF-RaBitQ paper.** The
 correction is in `memory/colocated-spike-2026-07-25.md` (§"CORRECTION
 on RaBitQ vs PQ recall"). The docs file should be updated when Option E
 is revisited.
+
+---
+
+## FAISS spike results (2026-07-30) — REJECTED for high-LID data
+
+A controlled FAISS experiment on Sphere (100k subset, IP, LID 20.8)
+confirms RaBitQ underperforms on our target data:
+
+| Config | Storage | np=64 recall | np=64 QPS |
+|--------|---------|-------------|-----------|
+| FAISS RaBitQ 1-bit | 96 B | 0.357 | 8,093 |
+| FAISS PQ4 | 48 B | 0.521 | 28,829 |
+| Sextant PRQ s96 b5 + 8b LUT | 48 B | **0.945** | 79 |
+
+(QPS from FAISS Python on 100k cache-resident; not comparable to c4a
+10M scale, but ratios are informative.)
+
+### Why RaBitQ fails on high-LID data
+
+1. **1 bit/dim is too coarse for LID 20.8.** The O(1/√D) error bound
+   (~3.6% at D=768) is theoretically bounded, but the constant factor
+   is too large for the tight neighbor distributions in high-LID data.
+   Neighbors and non-neighbors have similar sign-dot products after
+   rotation — the discriminative power is insufficient.
+
+2. **2× storage penalty.** RaBitQ at D bits (96B for D=768) should be
+   compared to PQ at 2D bits (96B = PQ8). But even against PQ4 at 48B
+   (half the storage), RaBitQ has *lower* recall. The sign hash wastes
+   capacity that PQ's learned codebooks use more efficiently.
+
+3. **No transfer from paper benchmarks.** RaBitQ's claims are validated
+   on SIFT1M/GIST1M (LID ~10-12). At LID 20.8, the advantage inverts.
+
+### When RaBitQ might still be useful
+
+- **Low-LID datasets** (SIFT, MSMARCO at LID ~14): the paper's advantage
+  may hold. Worth testing if we add low-LID datasets to the benchmark.
+- **Selective rerank architecture**: RaBitQ's error-bound-based adaptive
+  rerank (vs our fixed W=300) is architecturally superior and could be
+  ported to PQ/PRQ if we had per-vector error bounds.
+- **Graph + FastScan (SymphonyQG-style)**: RaBitQ is a prerequisite for
+  the no-rerank-via-normalization trick. But we're on IVF-scan, not graph.
+
+### Implementation status
+
+6 commits (encode, IVF integration, search path, selective rerank,
+thread-safe query state). Distance estimation has a magnitude bug
+(est_ip ≈ 0.35 when true ≈ 40) — multiple fixes applied but core issue
+remains. Parked: fixing it won't change the conclusion (RaBitQ < PQ4
+on Sphere even in FAISS's correct implementation).
