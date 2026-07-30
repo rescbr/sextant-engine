@@ -1,11 +1,11 @@
 # Option E: RaBitQ as the quantizer — investigated and rejected (2026-07-30)
 
-> **Status: REJECTED for high-LID data.** FAISS spike confirms RaBitQ
-> underperforms PQ4 on Sphere (LID 20.8): 0.357 vs 0.521 recall at 2×
-> the storage and 3.6× lower QPS. The paper's advantage (beats PQ at
-> 2× bits) does not transfer to high-LID, high-norm embeddings.
-> Implementation exists (6 commits) but is parked. May revisit for
-> low-LID datasets (SIFT, MSMARCO at LID ~14).
+> **Status: REJECTED for high-LID data.** FAISS multi-dataset spike shows
+> RaBitQ's advantage is dataset-dependent. At matched storage, PQ4 beats
+> RaBitQ on SIFT1M (LID ~10) and Sphere (LID ~21). RaBitQ beats PQ4
+> only on MSMARCO (LID ~14.6) and only at 2× storage (96B vs 48B).
+> Implementation exists (6 commits) but is parked. The 8-bit LUT
+> improvement to PQ4/PRQ is a strictly better path for our target data.
 > RaBitQ's advantages are NOT portable to PQ without becoming RaBitQ.
 
 ## Why this is on the table
