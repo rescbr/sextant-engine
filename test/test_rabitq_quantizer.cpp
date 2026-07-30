@@ -177,7 +177,8 @@ TEST(RaBitQQuantizer, DistanceEstimationL2) {
                 raw += lut[s * 16 + cid];
             }
             const float est = q.finalize_distance(
-                raw, codes[i].data(), centroid.data());
+                raw, reinterpret_cast<const float*>(
+                    codes[i].data() + q.factors_offset()));
             const float true_d =
                 simd::l2sq_f32(query, data.data() + i * dim, dim);
             total_abs_err += std::fabs(est - true_d);
@@ -216,6 +217,77 @@ TEST(RaBitQQuantizer, DeserializeRejectsBadMagic) {
     RaBitQQuantizer q(MetricKind::L2Sq, 16);
     std::vector<uint8_t> blob = {0x00, 0x00, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     EXPECT_THROW(q.deserialize(blob.data(), blob.size()), Error);
+}
+
+// FastScan-path recall: verify the uint4-quantized LUT + finalize_distance
+// recovers true NNs as well as the float-LUT path (guards the dequantization
+// that maps the quantized scan result back to the float sign-dot).
+TEST(RaBitQQuantizer, FastScanUint4Recall) {
+    const uint32_t dim = 64;
+    const uint32_t n = 500;
+    const uint32_t k = 10;
+    RaBitQQuantizer q(MetricKind::L2Sq, dim, 42);
+    auto data = make_random_vectors(n, dim, 9);
+    // RaBitQ assumes (near-)unit-norm vectors: the 1-bit sign quantization and
+    // the dp_multiplier normalization are derived for normalized data. Normalize
+    // each vector so the estimator is well-conditioned.
+    for (uint32_t i = 0; i < n; i++) {
+        float* v = data.data() + i * dim;
+        float nrm = 0.0f;
+        for (uint32_t d = 0; d < dim; d++) nrm += v[d] * v[d];
+        nrm = std::sqrt(nrm);
+        if (nrm > 0) for (uint32_t d = 0; d < dim; d++) v[d] /= nrm;
+    }
+    // Centroid = mean.
+    std::vector<float> centroid(dim, 0.0f);
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t d = 0; d < dim; d++)
+            centroid[d] += data[i * dim + d];
+    for (auto& v : centroid) v /= n;
+    std::vector<std::vector<float>> facs(n, std::vector<float>(2));
+    std::vector<std::vector<uint8_t>> codes(n);
+    for (uint32_t i = 0; i < n; i++) {
+        codes[i].resize(q.full_code_size());
+        q.encode_with_centroid(data.data() + i * dim, centroid.data(),
+                               codes[i].data());
+        std::memcpy(facs[i].data(), codes[i].data() + q.factors_offset(), 8);
+    }
+    const float* query = data.data();  // data[0] is the query
+    std::vector<uint8_t> lut4(q.m() * 16);
+    float scale;
+    q.build_fastscan_lut4_with_centroid(query, centroid.data(), lut4.data(),
+                                        &scale);
+    // True top-k (exclude self at idx 0).
+    std::vector<std::pair<float, uint32_t>> tru;
+    for (uint32_t i = 1; i < n; i++)
+        tru.push_back({simd::l2sq_f32(query, data.data() + i * dim, dim), i});
+    std::sort(tru.begin(), tru.end());
+    std::vector<uint32_t> truth_topk;
+    for (uint32_t i = 0; i < k; i++) truth_topk.push_back(tru[i].second);
+    // Estimated distances via the uint4 LUT + finalize.
+    std::vector<std::pair<float, uint32_t>> est;
+    for (uint32_t i = 1; i < n; i++) {
+        float raw = 0.0f;
+        for (uint32_t s = 0; s < q.m(); s++) {
+            const uint32_t byte_off = s / 2;
+            const uint8_t shift = static_cast<uint8_t>((s % 2) * 4);
+            const uint32_t cid =
+                (static_cast<uint32_t>(codes[i][byte_off]) >> shift) & 0x0Fu;
+            raw += lut4[s * 16 + cid];
+        }
+        est.push_back({q.finalize_distance(raw, facs[i].data()), i});
+    }
+    std::sort(est.begin(), est.end());
+    // Top-50 shortlist coverage of the true top-10.
+    std::vector<uint32_t> top50;
+    for (uint32_t i = 0; i < 50 && i < est.size(); i++)
+        top50.push_back(est[i].second);
+    uint32_t hits = 0;
+    for (uint32_t t : truth_topk)
+        if (std::find(top50.begin(), top50.end(), t) != top50.end()) hits++;
+    EXPECT_GT(hits, 5u)
+        << "uint4 FastScan shortlist missed too many true NNs (hits=" << hits
+        << ", scale=" << scale << ")";
 }
 
 }  // namespace

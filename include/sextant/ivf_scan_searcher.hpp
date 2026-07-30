@@ -47,6 +47,8 @@ struct IVFScanWorkerState {
     /// Per-query top-W accumulator: (4-bit distance, RowId). Reused across
     /// queries (clear() preserves capacity).
     std::vector<std::pair<uint32_t, RowId>> scored;
+    /// RaBitQ float-distance accumulator: (finalized dist, RowId).
+    std::vector<std::pair<float, RowId>> scored_f;
     /// Hash dedup of merged candidates: RowId → min 4-bit distance.
     std::unordered_map<RowId, uint32_t> dedup;
     /// Per-shard top-W heap during scan (dist max-heap of size ≤ W; smaller
@@ -55,6 +57,13 @@ struct IVFScanWorkerState {
     /// + post-sort was tried and measured slower (the per-shard buffer growth
     /// to ~22k pairs outweighs the heap-op savings).
     std::vector<std::pair<uint32_t, uint32_t>> shard_heap;
+    /// RaBitQ float-distance heap: (finalized dist, local_idx). RaBitQ's scan
+    /// output is an intermediate that must be finalized per-vector (different
+    /// dp_multiplier per code), so the heap carries real float distances.
+    std::vector<std::pair<float, uint32_t>> shard_heap_f;
+    /// FP32 centroid scratch (dim) reused per probed shard (RaBitQ only). The
+    /// index stores FP16 centroids; RaBitQ needs FP32 for the rotation.
+    std::vector<float> centroid_f32;
     /// Staging buffer for CodeStream sequential pread. Owned per-worker so
     /// every probed shard reuses one allocation. Lazily sized on first use.
     std::vector<uint8_t> code_staging;
@@ -97,6 +106,15 @@ private:
     std::vector<Candidate> search_body_(const float* query, uint32_t k,
                                           const SearchConfig& config,
                                           IVFScanWorkerState& w);
+
+    /// RaBitQ-specific search path. Differs from the PQ path in two ways:
+    /// (1) the FastScan LUT is rebuilt per shard (it encodes `query-centroid`,
+    /// and each shard has a different centroid), and (2) the raw scan result
+    /// is finalized per-vector into a real L2sq distance using the per-vector
+    /// factors, with selective FP32 rerank driven by per-vector error bounds.
+    std::vector<Candidate> search_body_rabitq_(
+        const float* query, uint32_t k, const SearchConfig& config,
+        IVFScanWorkerState& w);
 };
 
 }  // namespace sextant

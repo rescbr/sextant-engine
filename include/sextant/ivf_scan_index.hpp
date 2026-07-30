@@ -47,6 +47,10 @@ struct ScanShard {
     /// shard-local index (0..shard_n-1) → global RowId. Length = shard_n.
     /// Loaded once at index-open (the .rowids sidecar is small: 8 B/vec).
     std::vector<RowId> row_ids;
+    /// RaBitQ per-vector factors (dp_multiplier, or_minus_c_l2sqr), row-major,
+    /// length = shard_n × 2. Empty for non-RaBitQ indexes. Loaded from the
+    /// `.factors` sidecar; used during the heap walk to finalize distances.
+    std::vector<float> factors;
     /// Shard-local vector count (= row_ids.size()).
     uint32_t count = 0;
 };

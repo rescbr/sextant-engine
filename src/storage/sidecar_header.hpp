@@ -26,6 +26,7 @@ inline constexpr uint64_t kMagicRowids   = 0x53444957'4f52454dULL;  // "MEROWIDS
 inline constexpr uint64_t kMagicCodebook4 = 0x344b4f42'444f4f43ULL; // "COOKBOC4" tail — shared 4-bit PQ codebook
 inline constexpr uint64_t kMagicCodebook8 = 0x384b4f42'444f4f43ULL; // "COOKBOC8" tail — shared 8-bit PQ codebook
 inline constexpr uint64_t kMagicCodebookPRQ4 = 0x34515250'4f4f43ULL; // "PRQCOO4" — PRQ 4-bit codebook
+inline constexpr uint64_t kMagicFactors  = 0x4f544346'52415441ULL;  // "ATARFCFO" — RaBitQ per-vector factors (2 × float)
 
 inline constexpr uint32_t kFormatVersion = 1;
 

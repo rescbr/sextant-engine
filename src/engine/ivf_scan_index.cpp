@@ -3,6 +3,7 @@
 #include "engine/sidecar_io.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "quant/product_residual_quantizer.hpp"
+#include "quant/rabitq_quantizer.hpp"
 #include "storage/code_stream.hpp"
 #include "storage/sidecar_header.hpp"
 
@@ -109,6 +110,10 @@ void read_codebook(const std::string& path, std::unique_ptr<PqQuantizer>& out,
         out = std::make_unique<ProductResidualQuantizer>(
             MetricKind::L2Sq, dim, m4, /*bits=*/scan_pq_bits, prq_nsplits,
             /*beam_size=*/1);
+    } else if (quantizer_type == "rabitq") {
+        // RaBitQ reconstructs its own code_size/rotation from the serialized
+        // blob (seed + dim); m4/bits are derived (m4 = dim/4, bits = 4).
+        out = std::make_unique<RaBitQQuantizer>(MetricKind::L2Sq, dim);
     } else {
         out = std::make_unique<PqQuantizer>(MetricKind::L2Sq, dim, m4,
                                             /*bits=*/scan_pq_bits);
@@ -123,13 +128,31 @@ void read_rowids(const std::string& path, std::vector<RowId>& out) {
     engine_detail::read_exact(f, &h, sizeof(h), 0);
     if (h.magic != kMagicRowids) {
         throw Error(ErrorCode::CorruptIndex,
-                    "IVFScanIndex: rowids magic mismatch on '" + path + "'");
+                     "IVFScanIndex: rowids magic mismatch on '" + path + "'");
     }
     const uint32_t n = static_cast<uint32_t>(h.n_vectors);
     out.resize(n);
     if (n > 0) {
         engine_detail::read_exact(f, out.data(),
                                   static_cast<size_t>(n) * sizeof(RowId),
+                                  sizeof(SidecarHeader));
+    }
+}
+
+/// Read a shard's `.factors` sidecar (RaBitQ) into `out`: n × 2 floats
+/// (dp_multiplier, or_minus_c_l2sqr), row-major, indexed by shard-local ID.
+void read_factors(const std::string& path, std::vector<float>& out) {
+    DirectFile f(path, /*create=*/false);
+    SidecarHeader h{};
+    engine_detail::read_exact(f, &h, sizeof(h), 0);
+    if (h.magic != kMagicFactors) {
+        throw Error(ErrorCode::CorruptIndex,
+                     "IVFScanIndex: factors magic mismatch on '" + path + "'");
+    }
+    const uint32_t n = static_cast<uint32_t>(h.n_vectors);
+    out.resize(static_cast<size_t>(n) * 2);
+    if (n > 0) {
+        engine_detail::read_exact(f, out.data(), out.size() * sizeof(float),
                                   sizeof(SidecarHeader));
     }
 }
@@ -219,6 +242,12 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
                          "codes n_vectors ({}) — using the smaller",
                          k + 1, shard->count, shard->codes->n_vectors());
             shard->count = std::min(shard->count, shard->codes->n_vectors());
+        }
+        // RaBitQ-only: load the per-vector factors sidecar used to finalize
+        // scan distances during the heap walk.
+        if (quantizer_type == "rabitq") {
+            const std::string factors_path = shard_dir + "/.factors";
+            read_factors(factors_path, shard->factors);
         }
         idx->shards[k] = std::move(shard);
     }

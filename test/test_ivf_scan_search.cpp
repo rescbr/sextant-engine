@@ -366,5 +366,122 @@ TEST(IvfScanSearch, ResultsSortedAscendingByDistanceToken) {
     remove_shards_dir(idx);
 }
 
+// ---------------------------------------------------------------------------
+// RaBitQ end-to-end: build with quantizer_type="rabitq", verify the .factors
+// sidecar is written + loaded per shard, and that search returns candidates
+// (finalized L2sq estimates) with recall recovery after FP32 rerank.
+// ---------------------------------------------------------------------------
+
+TEST(IvfScanSearch, RaBitQBuildLoadSearch) {
+    constexpr uint32_t n = 2000;
+    constexpr uint32_t dim = 64;   // RaBitQ: m = dim/4 = 16 segments
+    constexpr uint32_t K = 4;
+    constexpr uint32_t k = 10;
+    constexpr uint32_t W = 200;
+    auto data = make_clustered(n, dim, /*clusters=*/10, /*seed=*/7);
+    // RaBitQ assumes (near-)unit-norm vectors: the 1-bit sign quantization and
+    // the dp_multiplier normalization are derived for normalized data. Normalize
+    // each vector so the estimator is well-conditioned.
+    for (uint32_t i = 0; i < n; i++) {
+        float* v = data.data() + static_cast<size_t>(i) * dim;
+        float nrm = 0.0f;
+        for (uint32_t d = 0; d < dim; d++) nrm += v[d] * v[d];
+        nrm = std::sqrt(nrm);
+        if (nrm > 0) for (uint32_t d = 0; d < dim; d++) v[d] /= nrm;
+    }
+    const std::string fbin = write_fbin("ivf_scan_rabitq.fbin", data, n, dim);
+    const std::string idx =
+        (std::filesystem::temp_directory_path() / "ivf_scan_rabitq_idx").string();
+    remove_shards_dir(idx);
+
+    FbinSource source(fbin);
+    BuildConfig cfg;
+    cfg.quantizer_type = "rabitq";
+    cfg.pq_m = dim / 4;
+    cfg.partition_count = K;
+    Index index;
+    Builder(index).build_ivf_scan(source, idx, cfg);
+
+    auto ivf = IVFScanIndex::read(idx + ".shards");
+    ASSERT_NE(ivf, nullptr);
+    EXPECT_EQ(ivf->quantizer_type, "rabitq");
+    EXPECT_EQ(ivf->m4, dim / 4);
+    ASSERT_NE(ivf->quantizer, nullptr);
+
+    // Every non-null shard must have loaded its factors (2 floats/vector).
+    for (uint32_t s = 0; s < K; s++) {
+        auto& shard = ivf->shards[s];
+        if (!shard) continue;
+        EXPECT_EQ(shard->factors.size(),
+                  static_cast<size_t>(shard->count) * 2)
+            << "shard " << s << " factors not loaded";
+    }
+
+    IVFScanSearcher searcher(*ivf, 1);
+    SearchConfig scfg;
+    scfg.k = k;
+    scfg.n_probe = K;          // probe all shards
+    scfg.fastscan_W = W;
+
+    uint64_t total_hits = 0;
+    uint64_t total_possible = 0;
+    const uint32_t n_query = 40;
+    for (uint32_t qi = 0; qi < n_query; qi++) {
+        const float* q = data.data() + static_cast<size_t>(qi) * dim;
+        auto results = searcher.search(q, k, scfg);
+        EXPECT_GE(results.size(), 1u);
+        EXPECT_LE(results.size(), W);
+
+        // Results must be sorted ascending by the finalized estimate.
+        for (size_t i = 1; i < results.size(); i++) {
+            EXPECT_LE(results[i - 1].dist, results[i].dist);
+        }
+
+        // FP32 rerank (DB-layer job) over the shortlist, take top-k.
+        auto truth_pairs = brute_topk(data, n, dim, q, k);
+        std::vector<RowId> truth_ids;
+        truth_ids.reserve(truth_pairs.size());
+        for (const auto& [d, rid] : truth_pairs) truth_ids.push_back(rid);
+
+        std::vector<std::pair<float, RowId>> scored;
+        scored.reserve(results.size());
+        for (const auto& c : results) {
+            if (c.row_id < 0 || static_cast<uint64_t>(c.row_id) >= n) continue;
+            const float* v = data.data() + static_cast<size_t>(c.row_id) * dim;
+            float d = 0.0f;
+            for (uint32_t dd = 0; dd < dim; dd++) {
+                const float diff = v[dd] - q[dd];
+                d += diff * diff;
+            }
+            scored.emplace_back(d, c.row_id);
+        }
+        const uint32_t kk =
+            std::min<uint32_t>(k, static_cast<uint32_t>(scored.size()));
+        if (kk > 0) {
+            std::nth_element(scored.begin(), scored.begin() + kk, scored.end(),
+                             [](const auto& a, const auto& b) {
+                                 return a.first < b.first;
+                             });
+        }
+        std::vector<RowId> found_reranked;
+        found_reranked.reserve(kk);
+        for (uint32_t i = 0; i < kk; i++)
+            found_reranked.push_back(scored[i].second);
+
+        total_hits += recall_hits(found_reranked, truth_ids, k);
+        total_possible += k;
+    }
+    const double recall = static_cast<double>(total_hits) /
+                          static_cast<double>(total_possible);
+    // RaBitQ's finalized L2sq estimates order the shortlist well on normalized
+    // data (the regime RaBitQ is designed for). After the DB-layer FP32 rerank
+    // of the W-shortlist, recall lands ~0.85 on this synthetic clustered data.
+    // The threshold guards against broken finalization / factor indexing /
+    // per-shard LUT rebuild (which collapse coverage to <0.3).
+    EXPECT_GT(recall, 0.6) << "RaBitQ recall=" << recall << " too low";
+
+    remove_shards_dir(idx);
+}
+
 }  // namespace
 }  // namespace sextant

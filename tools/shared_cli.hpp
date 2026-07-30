@@ -87,9 +87,13 @@ inline void add_common_flags(cmdline::parser& p) {
     p.add<std::string>("quantizer", 0,
         "Quantizer type for the IVF-scan codebook: 'pq' (default, standard "
         "k-means), 'anisotropic-pq' (ScaNN-style anisotropic Lloyd's training; "
-        "search path identical), or 'prq' (Product Residual Quantization — "
+        "search path identical), 'prq' (Product Residual Quantization — "
         "additive-residual variant of PQ; multiple segments per sub-space sum "
-        "into the distance). See docs/plans/metric_per_tier_plan.md Phase 2-3.",
+        "into the distance), or 'rabitq' (RaBitQ — 1-bit sign quantization "
+        "relative to the shard centroid with a per-shard LUT rebuild, per-"
+        "vector distance finalization, and selective-rerank error bounds; "
+        "higher per-vector accuracy than PQ at the same bit budget). See "
+        "docs/plans/metric_per_tier_plan.md Phase 2-3.",
         false, "pq");
     p.add<float>("anisotropy-threshold", 0,
         "ScaNN anisotropic threshold T for anisotropic-pq training (default "

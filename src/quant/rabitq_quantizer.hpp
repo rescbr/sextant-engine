@@ -35,12 +35,28 @@ public:
                                            uint8_t* lut4,
                                            float* scale_out) const;
 
-    float finalize_distance(float raw_scan_result, const uint8_t* code,
-                            const float* centroid) const;
-    float finalize_distance_ip(float raw_scan_result, const uint8_t* code,
-                               const float* centroid) const;
+    /// Map a raw uint4 FastScan scan result back to the true float sign-dot.
+    /// Requires build_fastscan_lut4_with_centroid to have been called for the
+    /// current shard (sets lut_scale_ and seg_min_sum_).
+    float dequantize_scan_result(float raw_scan_result) const {
+        return (lut_scale_ > 0.0f)
+                   ? raw_scan_result / lut_scale_ + seg_min_sum_
+                   : raw_scan_result;
+    }
 
-    float get_error_bound(const uint8_t* code, const float* centroid) const;
+    /// Finalize a raw FastScan result into an estimated L2sq distance. The
+    /// `factors` pointer addresses the 2 per-vector floats stored in the
+    /// `.factors` sidecar: factors[0] = dp_multiplier, factors[1] =
+    /// or_minus_c_l2sqr. Requires build_fastscan_lut4_with_centroid to have
+    /// been called for this shard (sets c34_ and qr_to_c_l2sqr_).
+    float finalize_distance(float raw_scan_result, const float* factors) const;
+    float finalize_distance_ip(float raw_scan_result, const float* factors) const;
+
+    /// Per-vector distance error bound for selective rerank (Phase 3). Derived
+    /// from the stored factors (dp_multiplier, or_minus_c_l2sqr) so it can be
+    /// computed at search time without the original vector. Requires the
+    /// per-shard LUT to have been built (sets qr_to_c_l2sqr_).
+    float get_error_bound(const float* factors) const;
 
     void decode_code(const uint8_t* code, float* out) const override;
 
@@ -69,6 +85,12 @@ private:
     mutable float c1_ = 0.0f;
     mutable float c2_ = 0.0f;
     mutable float c34_ = 0.0f;
+    // FastScan dequantization params, set by build_fastscan_lut4_with_centroid.
+    // The uint4 kernel stores (lut - seg_min) * A and sums over segments, so
+    // the raw scan result is A*(sign_dot - seg_min_sum). dequantize_scan_result
+    // divides by lut_scale_ and adds seg_min_sum_ to recover the true sign-dot.
+    mutable float lut_scale_ = 1.0f;
+    mutable float seg_min_sum_ = 0.0f;
 
     void generate_signs_();
 };

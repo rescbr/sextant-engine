@@ -28,6 +28,7 @@
 #include "quant/pq_quantizer.hpp"
 #include "quant/anisotropic_pq_quantizer.hpp"
 #include "quant/product_residual_quantizer.hpp"
+#include "quant/rabitq_quantizer.hpp"
 #include "storage/direct_io.hpp"
 #include "storage/memgraph.hpp"      // complete type for Index's unique_ptr<MemGraph>
 #include "storage/sidecar_header.hpp"
@@ -1525,6 +1526,17 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         qscan_owner = std::make_unique<AnisotropicPqQuantizer>(
             params.metric, dim, m4, scan_bits,
             /*threshold=*/0.2f, /*seed=*/42);
+    } else if (params.quantizer_type == "rabitq") {
+        if (scan_bits != 4) {
+            throw Error(ErrorCode::InvalidParam,
+                        "build_ivf_scan: RaBitQ currently supports only 4-bit "
+                        "FastScan (scan_pq_bits=4); got scan_pq_bits=" +
+                            std::to_string(static_cast<unsigned>(scan_bits)));
+        }
+        // RaBitQ: per-vector 1-bit sign codes (nibble-packed, same FastScan
+        // layout as PQ4) + 2 per-vector factors stored in a sidecar. m4 is
+        // forced to dim/4 inside the constructor regardless of the passed m4.
+        qscan_owner = std::make_unique<RaBitQQuantizer>(params.metric, dim, 42);
     } else {
         qscan_owner = std::make_unique<PqQuantizer>(
             params.metric, dim, m4, scan_bits, /*seed=*/42);
@@ -1554,7 +1566,8 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         spdlog::info("[sextant] training {} (m={}, K=16) on {} samples",
                      params.quantizer_type == "prq" ? "PRQ"
                      : (params.quantizer_type == "anisotropic-pq" ? "4-bit anisotropic-PQ"
-                                                                  : "4-bit PQ"),
+                      : (params.quantizer_type == "rabitq" ? "RaBitQ"
+                                                           : "4-bit PQ")),
                      m4, filled);
         const auto ts = std::chrono::steady_clock::now();
         qscan.train(sample.data(), filled);
@@ -1695,13 +1708,50 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         // Encode each member to m segment-codes (one byte per segment).
         // For 4-bit the byte value is 0..15 (one nibble); for 8-bit it's 0..255.
         std::vector<uint8_t> seg_codes(static_cast<size_t>(shard_n) * m);
+        // RaBitQ-only: per-vector factors (dp_multiplier, or_minus_c_l2sqr),
+        // 2 floats each, written to the `.factors` sidecar below.
+        std::vector<float> factors;
+        const bool is_rabitq = (params.quantizer_type == "rabitq");
         {
-            std::vector<uint8_t> packed(qscan.code_size());
+            // RaBitQ encodes relative to the shard centroid: its full code is
+            // sign bytes (code_size()) + 2 factor floats (factors_offset()).
+            // PQ/PRQ/anisotropic encode absolute vectors: code_size() only.
+            const uint32_t packed_size =
+                is_rabitq ? static_cast<RaBitQQuantizer&>(qscan).full_code_size()
+                          : qscan.code_size();
+            std::vector<uint8_t> packed(packed_size);
+            // Decode the shard centroid to FP32 once (RaBitQ needs it). The
+            // centroid is a PQ code of the 8-bit routing quantizer.
+            std::vector<float> centroid_f32;
+            if (is_rabitq) {
+                centroid_f32.resize(dim);
+                const auto& centroid_code = assignment.centroids[k];
+                if (centroid_code.size() != index_.code_size) {
+                    throw Error(ErrorCode::InvalidParam,
+                                "build_ivf_scan: shard " +
+                                    std::to_string(k + 1) +
+                                    " centroid code size mismatch");
+                }
+                index_.quantizer->decode_code(centroid_code.data(),
+                                              centroid_f32.data());
+                factors.resize(static_cast<size_t>(shard_n) * 2);
+            }
+            const uint32_t factors_off =
+                is_rabitq ? static_cast<RaBitQQuantizer&>(qscan).factors_offset()
+                          : 0;
             for (uint32_t i = 0; i < shard_n; i++) {
                 const uint32_t gid = members[i];
                 const float* vec =
                     vecs_base + static_cast<size_t>(gid) * dim;
-                qscan.encode(vec, packed.data());
+                if (is_rabitq) {
+                    static_cast<RaBitQQuantizer&>(qscan).encode_with_centroid(
+                        vec, centroid_f32.data(), packed.data());
+                    // Stash the 2 factor floats (dp_multiplier, or_minus_c_l2sqr).
+                    std::memcpy(&factors[static_cast<size_t>(i) * 2],
+                                packed.data() + factors_off, 2 * sizeof(float));
+                } else {
+                    qscan.encode(vec, packed.data());
+                }
                 for (uint32_t s = 0; s < m; s++) {
                     if (scan_bits == 4) {
                         seg_codes[static_cast<size_t>(i) * m + s] =
@@ -1777,6 +1827,19 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
             write_padded(f, &h, sizeof(h), 0);
             write_padded(f, rids.data(),
                          static_cast<size_t>(shard_n) * sizeof(RowId),
+                         sizeof(h));
+            f.sync();
+        }
+        // RaBitQ-only: write `.factors` (SidecarHeader + shard_n × 2 floats).
+        // The two factors (dp_multiplier, or_minus_c_l2sqr) are read back at
+        // index-open into shard->factors and used to finalize scan distances.
+        if (is_rabitq) {
+            const std::string path = shard_dir + "/.factors";
+            DirectFile f(path, true);
+            SidecarHeader h{};
+            fill_header(h, kMagicFactors, shard_n, dim, uuid);
+            write_padded(f, &h, sizeof(h), 0);
+            write_padded(f, factors.data(), factors.size() * sizeof(float),
                          sizeof(h));
             f.sync();
         }

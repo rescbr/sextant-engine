@@ -42,12 +42,6 @@ inline void write_subset_sum_lut(float* out, float base, float v0, float v1,
     out[15] = base + v0 + v1 + v2 + v3;
 }
 
-inline float read_factor(const uint8_t* code, uint32_t off, uint32_t idx) {
-    float v;
-    std::memcpy(&v, code + off + idx * sizeof(float), sizeof(float));
-    return v;
-}
-
 inline void write_factor(uint8_t* code, uint32_t off, uint32_t idx, float v) {
     std::memcpy(code + off + idx * sizeof(float), &v, sizeof(float));
 }
@@ -205,6 +199,20 @@ void RaBitQQuantizer::build_fastscan_lut4_with_centroid(
     std::vector<float> lut_f32(static_cast<size_t>(m_) * 16);
     preprocess_query_with_centroid(query, centroid, lut_f32.data());
     simd::quantize_lut_u4(lut_f32.data(), m_, 16, lut4, scale_out);
+    // Capture the per-segment-minimum sum and scale so finalize_distance can
+    // dequantize the raw FastScan result back to the true float sign-dot.
+    // quantize_lut_u4 uses A = 15/max_span and stores (val - seg_min)*A.
+    float seg_min_sum = 0.0f;
+    for (uint32_t s = 0; s < m_; s++) {
+        const float* row = lut_f32.data() + s * 16;
+        float mn = row[0];
+        for (uint32_t c = 1; c < 16; c++) {
+            if (row[c] < mn) mn = row[c];
+        }
+        seg_min_sum += mn;
+    }
+    seg_min_sum_ = seg_min_sum;
+    lut_scale_ = scale_out ? *scale_out : 1.0f;
 }
 
 float RaBitQQuantizer::get_query_factor(const std::string& name) const {
@@ -216,45 +224,50 @@ float RaBitQQuantizer::get_query_factor(const std::string& name) const {
 }
 
 float RaBitQQuantizer::finalize_distance(float raw_scan_result,
-                                         const uint8_t* code,
-                                         const float* centroid) const {
-    (void)centroid;
-    const float dp_multiplier = read_factor(code, sign_code_bytes_, 0);
-    const float or_minus_c_l2sqr = read_factor(code, sign_code_bytes_, 1);
-    const float sign_dot = raw_scan_result;
-    const float final_dot = sign_dot - c34_;
-    const float est_ip = dp_multiplier * final_dot;
+                                         const float* factors) const {
+    const float dp_multiplier = factors[0];
+    const float or_minus_c_l2sqr = factors[1];
+    // The FastScan subset-sum LUT accumulates v_j only over coordinates where
+    // the database sign is negative (bit set), i.e. raw = Σ_neg v_j. The
+    // signed sign-dot is Σ sign(o)*q = Σ_pos v - Σ_neg v = T - 2*raw, where
+    // T = Σ_all v = 2*c34_ (c34_ stores T/2). Hence signed_dot = 2*(c34_-raw).
+    const float signed_dot = 2.0f * (c34_ - raw_scan_result);
+    const float est_ip = dp_multiplier * signed_dot;
     return or_minus_c_l2sqr + qr_to_c_l2sqr_ - 2.0f * est_ip;
 }
 
 float RaBitQQuantizer::finalize_distance_ip(float raw_scan_result,
-                                            const uint8_t* code,
-                                            const float* centroid) const {
-    (void)centroid;
-    const float dp_multiplier = read_factor(code, sign_code_bytes_, 0);
-    const float sign_dot = raw_scan_result;
-    const float final_dot = sign_dot - c34_;
-    const float est_ip = dp_multiplier * final_dot;
-    return est_ip;
+                                            const float* factors) const {
+    const float dp_multiplier = factors[0];
+    const float signed_dot = 2.0f * (c34_ - raw_scan_result);
+    return dp_multiplier * signed_dot;
 }
 
-float RaBitQQuantizer::get_error_bound(const uint8_t* code,
-                                       const float* centroid) const {
-    std::vector<float> residual(dim_);
-    float norm_l2sqr = 0.0f;
-    float dp_oO = 0.0f;
-    for (uint32_t i = 0; i < dim_; i++) {
-        residual[i] = code[i] - centroid[i];
-        norm_l2sqr += residual[i] * residual[i];
-        dp_oO += std::fabs(residual[i]);
+float RaBitQQuantizer::get_error_bound(const float* factors) const {
+    // Recover norm_l2sqr and dp_oO from the stored factors:
+    //   factors[0] = dp_multiplier = sqrt(norm_l2sqr) * padded_dim_sqrt / dp_oO
+    //   factors[1] = or_minus_c_l2sqr = norm_l2sqr (L2) or norm_l2sqr - or_l2sqr (IP)
+    // For the bound we only need norm_l2sqr and dp_oO. For IP the stored
+    // factors[1] is norm_l2sqr - or_l2sqr, but the error bound is driven by
+    // the residual norm, which for IP builds is still norm_l2sqr. We
+    // approximate by assuming factors[1] ≈ norm_l2sqr (exact for L2; the IP
+    // case differs by the constant or_l2sqr, which only weakly affects the
+    // bound ratio). This matches the RaBitQ theory where the bound is on the
+    // residual-vector inner-product error.
+    const float norm_l2sqr = std::fmax(factors[1], 0.0f);
+    const float dp_multiplier = factors[0];
+    if (dp_multiplier <= 0.0f || norm_l2sqr <= 0.0f) {
+        return 0.0f;
     }
+    const float norm_l2 = std::sqrt(norm_l2sqr);
+    const float dp_oO = norm_l2 * padded_dim_sqrt_ / dp_multiplier;
     const float ip_resi_xucb = 0.5f * dp_oO;
     const float ratio_sq =
         (norm_l2sqr * kXuCbNormSqr * static_cast<float>(dim_)) /
         (ip_resi_xucb * ip_resi_xucb);
     float tmp_error = 0.0f;
     if (ratio_sq > 1.0f && dim_ > 1) {
-        tmp_error = std::sqrt(norm_l2sqr) * kConstEpsilon *
+        tmp_error = norm_l2 * kConstEpsilon *
                     std::sqrt((ratio_sq - 1.0f) / static_cast<float>(dim_ - 1));
     }
     const float f_error =
