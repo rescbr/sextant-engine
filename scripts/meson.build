@@ -62,6 +62,12 @@ spike_graph_coarse_router = executable('spike_graph_coarse_router',
     install: false,
 )
 
+spike_pq_bounds = executable('spike_pq_bounds',
+    'spike_pq_bounds.cpp',
+    dependencies: sextant_dep,
+    install: false,
+)
+
 bench_kernel = executable('bench_kernel',
     'bench_kernel.cpp',
     dependencies: sextant_dep,
