@@ -101,8 +101,8 @@ inline void add_common_flags(cmdline::parser& p) {
         "Only meaningful with --quantizer anisotropic-pq. See ScaNN paper §3.",
         false, 0.2f);
     p.add<uint32_t>("prq-nsplits", 0,
-        "PRQ nsplits (sub-space count) for --quantizer prq. 0 = auto (dim/32, "
-        "i.e. sub_dim=32 per sub-space). Must divide both dim and m4. Only "
+        "PRQ nsplits (sub-space count) for --quantizer prq. 0 = auto (dim/8, "
+        "i.e. sub_dim=8 per sub-space). Must divide both dim and m4. Only "
         "meaningful with --quantizer prq.",
         false, 0);
     p.add<uint32_t>("prq-beam-size", 0,
@@ -172,18 +172,18 @@ inline void add_common_flags(cmdline::parser& p) {
         "Partition size-balance strength (SPANN-style λ, arXiv:2111.08566). "
         "0 = off (plain k-means + closure). >0 caps each shard's size at "
         "(N/K)·(1 + 1/λ), bounding the worst-case disk read per shard at "
-        "paged-billion-scale. Default 0; recommended 2-4 for IVF-scan builds. "
+        "paged-billion-scale. Default 4 (zero search-time cost, reduces skew). "
         "Only the closure-replication overhead is capped; primary membership "
         "is never dropped.",
-        false, 0.0f);
+        false, 4.0f);
     p.add<float>("closure-epsilon", 0,
         "Absolute margin for SPANN-style boundary posting (arXiv:2111.08566). "
         "When >0, vectors within d_best + epsilon of a centroid are replicated "
         "to that shard. Structurally K-robust: as K grows, epsilon covers an "
         "increasing fraction of the cell radius. -1 = auto (0.2 × mean NN "
-        "distance). 0 = use ratio-based closure (closure_factor × d_best). "
-        "See docs/closure_factor_derivation.md.",
-        false, 0.0f);
+        "distance, default). 0 = use ratio-based closure (closure_factor × d_best, "
+        "K-fragile, deprecated). See docs/closure_factor_derivation.md.",
+        false, -1.0f);
     p.add<float>("closure-f-target", 0,
         "Target fraction of non-replicated vectors for closure_factor auto-"
         "computation. Default 0.15 (85% replicated). Higher = more replication "

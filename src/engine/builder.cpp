@@ -1399,9 +1399,12 @@ BuildResult Builder::build_ivf(VectorSource& source, const std::string& index_pa
     // --- 5. manifest (line-oriented text; IVFIndex::read commit point) ---
     // Written LAST via temp + rename so its presence signals a complete build.
     {
+        // np ∝ √K: the single best-validated scaling law (3 datasets, LID
+        // 13-21, recall 0.55-0.99). K/4 over-probes at K>16.
         const uint32_t n_probe = n_probe_default > 0
                                      ? n_probe_default
-                                     : std::max(1u, K / 4u);
+                                     : std::max(1u, static_cast<uint32_t>(
+                                           2.0f * std::sqrt(float(K))));
         const std::string path = shards_dir + "/manifest";
         const std::string tmp = path + ".tmp";
         {
@@ -1523,10 +1526,12 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                         "FastScan (scan_pq_bits=4); got scan_pq_bits=" +
                             std::to_string(static_cast<unsigned>(scan_bits)));
         }
-        // PRQ: nsplits defaults to dim/32 (sub_dim=32 per the plan).
+        // PRQ: nsplits defaults to dim/8 (sub_dim=8, M_sub=2 at m4=192).
+        // Measured best: nsplits=96 at dim=768 (sub_dim=8). The old default
+        // of dim/32 gave sub_dim=32 (M_sub=4) — strictly worse recall.
         const uint32_t nsplits = (params.prq_nsplits > 0)
             ? params.prq_nsplits
-            : static_cast<uint32_t>(dim) / 32;
+            : static_cast<uint32_t>(dim) / 8;
         if (nsplits == 0 || dim % nsplits != 0) {
             throw Error(ErrorCode::InvalidParam,
                         "build_ivf_scan: PRQ dim=" + std::to_string(dim) +
@@ -2281,9 +2286,12 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
 
     // --- 7. manifest (line-oriented text; IVFScanIndex::read commit point) ---
     {
+        // np ∝ √K: the single best-validated scaling law (3 datasets, LID
+        // 13-21, recall 0.55-0.99). K/4 over-probes at K>16.
         const uint32_t n_probe = n_probe_default > 0
                                      ? n_probe_default
-                                     : std::max(1u, K / 4u);
+                                     : std::max(1u, static_cast<uint32_t>(
+                                           2.0f * std::sqrt(float(K))));
         const std::string path = shards_dir + "/manifest";
         const std::string tmp = path + ".tmp";
         {

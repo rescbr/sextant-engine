@@ -149,7 +149,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     // --- quantizer_type / prq_nsplits (PRQ — Product Residual Quantization) ---
     // Pure pass-through. quantizer_type drives the 3-way dispatch in
     // build_ivf_scan ("pq" / "anisotropic-pq" / "prq"); prq_nsplits is only
-    // meaningful with "prq" (0 = auto → dim/32 in the builder).
+    // meaningful with "prq" (0 = auto → dim/8 in the builder).
     p.quantizer_type = overrides.quantizer_type;
     p.prq_nsplits = overrides.prq_nsplits;
     p.prq_beam_size = overrides.prq_beam_size;
@@ -164,7 +164,7 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                      p.quantizer_type == "prq"
                          ? (p.prq_nsplits > 0
                                 ? " (prq_nsplits=" + std::to_string(p.prq_nsplits) + ")"
-                                : " (prq_nsplits=auto → dim/32)")
+                                 : " (prq_nsplits=auto → dim/8)")
                          : "");
     }
 

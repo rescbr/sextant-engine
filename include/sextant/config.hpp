@@ -190,13 +190,14 @@ struct BuildConfig {
     /// 0 = off (plain k-means + closure). >0 caps each shard's size at
     /// (n/K)·(1 + 1/balance_factor), spilling excess vectors from oversized
     /// closure clusters (primary membership always preserved). Bounds the
-    /// worst-case disk read per shard at paged-billion-scale. Default 0;
-    /// recommended 2-4 for production IVF-scan builds.
-    float partition_balance_factor = 0.0f;
+    /// worst-case disk read per shard at paged-billion-scale. Default 4
+    /// (SPANN λ balancing — zero search-time cost, reduces shard skew).
+    float partition_balance_factor = 4.0f;
 
-    /// Absolute margin for SPANN-style boundary posting. 0 = ratio-based.
-    /// -1 = auto (0.2 × mean NN distance). See docs/closure_factor_derivation.md.
-    float closure_epsilon = 0.0f;
+    /// Absolute margin for SPANN-style boundary posting. -1 = auto
+    /// (0.2 × mean NN distance). 0 = ratio-based (K-fragile, deprecated).
+    /// See docs/closure_factor_derivation.md.
+    float closure_epsilon = -1.0f;
 
     /// Sub-shard threshold: max vectors per sub-shard before splitting.
     /// 0 = no sub-sharding (flat shards). >0 = split shards exceeding this
