@@ -151,21 +151,13 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
     w.scored.clear();
     const uint32_t invalid = 0xFFFFFFFFu;
 
-    for (uint32_t p = 0; p < n_probe_eff; p++) {
-        const uint32_t c = w.cent_dists[p].second;
-        auto& shard = index_.shards[c];
-        if (!shard || !shard->codes) continue;
-
-        // Size the staging buffer to one chunk (loaned to CodeStream::scan).
-        const size_t need = code_stream_staging_bytes(*shard->codes);
+    // Helper: scan one code stream (flat shard or sub-shard) and merge
+    // results into the global w.scored accumulator. Uses a local heap.
+    auto scan_one = [&](CodeStream& codes, const std::vector<RowId>& row_ids,
+                        const float16_t* query_fp16) {
+        const size_t need = code_stream_staging_bytes(codes);
         if (w.code_staging.size() < need) w.code_staging.resize(need);
 
-        // Reset the per-shard heap. Reserve to avoid realloc during warmup.
-        // Hand-written fixed-size max-heap (SoA layout: separate dist[] and
-        // idx[] arrays) — avoids std::pair overhead, lambda comparator
-        // indirection, and the double-traversal of pop_heap+push_heap. A
-        // single "replace" operation (sift-down the root, then sift-up) does
-        // one log-W pass instead of two.
         auto& heap = w.shard_heap;
         heap.clear();
         heap.reserve(W + 32);
@@ -173,11 +165,7 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
             return a.first < b.first;
         };
 
-        // Inline heap replace-root: replace the max element (root) with a
-        // new value and restore the max-heap property via a single sift-down.
-        // Equivalent to pop_heap+assign+push_heap but with one traversal.
         auto heap_replace = [&heap, W](uint32_t new_d, uint32_t new_idx) {
-            // Place new value at root, sift down.
             heap[0] = {new_d, new_idx};
             uint32_t pos = 0;
             const uint32_t n = W;
@@ -198,14 +186,10 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
         auto on_block = [&](uint32_t block_idx, const uint8_t* blk,
                             uint32_t valid_mask) {
             if (scan_8bit) {
-                // 8-bit path: 16 codes/block. fastscan_block16 writes
-                // 0xFFFFFFFF to invalid lanes itself (sentinel auto-loses
-                // any comparison), so no external mask walk is needed.
                 uint32_t out[16];
                 simd::fastscan_block16(blk, w.lut8.data(), m,
                                        static_cast<uint16_t>(valid_mask), out);
                 const uint32_t base = block_idx * 16;
-
                 if (heap.size() < W) {
                     for (uint32_t j = 0; j < 16; j++) {
                         if (out[j] == 0xFFFFFFFFu) continue;
@@ -218,8 +202,7 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
                     if (heap.size() < W) return;
                 }
                 const uint32_t front_d = heap[0].first;
-                // Front-compare: any of the 16 lanes beat the front?
-    #if defined(SEXTANT_HAS_NEON)
+#if defined(SEXTANT_HAS_NEON)
                 {
                     const uint32x4_t front4 = vdupq_n_u32(front_d);
                     const uint32x4_t* o = reinterpret_cast<const uint32x4_t*>(out);
@@ -231,41 +214,38 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
                     if (vgetq_lane_u64(a64, 0) == 0 && vgetq_lane_u64(a64, 1) == 0)
                         return;
                 }
-    #else
+#else
                 {
                     uint32_t block_min = 0xFFFFFFFFu;
                     for (uint32_t j = 0; j < 16; j++)
                         if (out[j] < block_min) block_min = out[j];
                     if (block_min >= front_d) return;
                 }
-    #endif
+#endif
                 for (uint32_t j = 0; j < 16; j++) {
                     const uint32_t d = out[j];
-                    if (d >= heap[0].first) continue;
+                    if (d == 0xFFFFFFFFu || d >= heap[0].first) continue;
                     heap_replace(d, base + j);
                 }
                 return;
             }
 
-            // 4-bit path: 32 codes/block, mask applied by caller.
             uint32_t out[32];
             simd::pq4_block32(blk, w.lut4.data(), m, out);
             const uint32_t base = block_idx * 32;
 
-            // Warmup phase: heap not yet full. Emplace all valid lanes.
             if (heap.size() < W) {
                 for (uint32_t j = 0; j < 32; j++) {
                     if (!((valid_mask >> j) & 1u)) continue;
                     heap.emplace_back(out[j], base + j);
                     if (heap.size() == W) {
                         std::make_heap(heap.begin(), heap.end(), heap_less);
-                        break;  // full now; remaining lanes go to steady-state
+                        break;
                     }
                 }
-                if (heap.size() < W) return;  // still warming up
+                if (heap.size() < W) return;
             }
 
-            // Steady-state fast path: check if ANY lane beats the front.
             const uint32_t front_d = heap[0].first;
 #if defined(SEXTANT_HAS_NEON)
             {
@@ -281,7 +261,7 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
                 any = vorrq_u32(any, vcltq_u32(o[7], front4));
                 const uint64x2_t a64 = vreinterpretq_u64_u32(any);
                 if (vgetq_lane_u64(a64, 0) == 0 && vgetq_lane_u64(a64, 1) == 0)
-                    return;  // no winner in this block → skip
+                    return;
             }
 #else
             {
@@ -293,25 +273,63 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
             }
 #endif
 
-            // At least one lane beats the front. Walk and do heap replace
-            // only for winners (typically 0-3 per block after warmup).
-            // heap_replace does a single sift-down + sift-up instead of the
-            // std pop_heap + push_heap double traversal.
             for (uint32_t j = 0; j < 32; j++) {
                 if (!((valid_mask >> j) & 1u)) continue;
                 const uint32_t d = out[j];
-                if (d >= heap[0].first) continue;  // re-check front (may have changed)
+                if (d >= heap[0].first) continue;
                 heap_replace(d, base + j);
             }
         };
-        shard->codes->scan(on_block, w.code_staging.data());
+        codes.scan(on_block, w.code_staging.data());
 
-        // Heap now holds the shard's top-W (or all of it if shard_n < W).
-        // Map local_idx → RowId and append to the global accumulator.
         for (const auto& [d, local_idx] : heap) {
-            if (local_idx < shard->row_ids.size()) {
-                w.scored.emplace_back(d, shard->row_ids[local_idx]);
+            if (local_idx < row_ids.size()) {
+                w.scored.emplace_back(d, row_ids[local_idx]);
             }
+        }
+    };
+
+    for (uint32_t p = 0; p < n_probe_eff; p++) {
+        const uint32_t c = w.cent_dists[p].second;
+        auto& shard = index_.shards[c];
+        if (!shard) continue;
+
+        if (shard->has_sub_shards) {
+            // --- Two-level routing: pick top sub-shards ---
+            const uint32_t n_sub =
+                static_cast<uint32_t>(shard->sub_shards.size());
+            const uint32_t sub_np = std::min(index_.sub_shard_n_probe, n_sub);
+
+            if (sub_np >= n_sub) {
+                // Scan all sub-shards (no sub-routing needed).
+                for (auto& ss : shard->sub_shards) {
+                    if (ss.codes)
+                        scan_one(*ss.codes, ss.row_ids, w.query_fp16.data());
+                }
+            } else {
+                // Route to top-N sub-shards by FP16 distance.
+                std::vector<std::pair<float, uint32_t>> sub_dists;
+                sub_dists.reserve(n_sub);
+                for (uint32_t s = 0; s < n_sub; s++) {
+                    const float16_t* sub_cent =
+                        index_.sub_centroids.data() +
+                        shard->sub_centroid_offsets[s];
+                    const float d = simd::dist_f16(metric, w.query_fp16.data(),
+                                                   sub_cent, index_.dim);
+                    sub_dists.push_back({d, s});
+                }
+                std::partial_sort(sub_dists.begin(),
+                                  sub_dists.begin() + sub_np,
+                                  sub_dists.end());
+                for (uint32_t s = 0; s < sub_np; s++) {
+                    auto& ss = shard->sub_shards[sub_dists[s].second];
+                    if (ss.codes)
+                        scan_one(*ss.codes, ss.row_ids, w.query_fp16.data());
+                }
+            }
+        } else if (shard->codes) {
+            // --- Flat shard (existing path) ---
+            scan_one(*shard->codes, shard->row_ids, w.query_fp16.data());
         }
     }
 

@@ -36,10 +36,12 @@ namespace {
 bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
                         uint32_t& n_probe_default, uint16_t& m4,
                         uint8_t& scan_pq_bits, std::string& quantizer_type,
-                        uint32_t& prq_nsplits) {
+                        uint32_t& prq_nsplits,
+                        uint32_t& sub_shard_n_probe) {
     scan_pq_bits = 4;       // default for older indexes that don't carry the field
     quantizer_type = "pq";  // default for older indexes (pre-PRQ)
     prq_nsplits = 0;        // default for older indexes / non-PRQ quantizers
+    sub_shard_n_probe = 1;  // default: no sub-shard routing (scan all)
     std::ifstream f(path);
     if (!f) return false;
     std::string tok;
@@ -70,6 +72,8 @@ bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
             quantizer_type = qtype_raw;
             // Optional 8th line — PRQ nsplits.
             read_line(prq_nsplits);
+            // Optional 9th line — sub_shard_n_probe.
+            read_line(sub_shard_n_probe);
         }
     }
     return true;
@@ -171,7 +175,8 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     std::string quantizer_type = "pq";
     uint32_t prq_nsplits = 0;
     if (!read_scan_manifest(manifest_path, K, dim, n_probe_default, m4,
-                            scan_pq_bits, quantizer_type, prq_nsplits)) {
+                            scan_pq_bits, quantizer_type, prq_nsplits,
+                            idx->sub_shard_n_probe)) {
         throw Error(ErrorCode::CorruptIndex,
                     "IVFScanIndex: cannot read manifest '" + manifest_path + "'");
     }
@@ -218,14 +223,79 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     idx->shards.resize(K);
     const std::string codes_suffix =
         (scan_pq_bits == 8) ? "/.codes8" : "/.codes4";
+
+    // Load sub-shard centroids if present (raw FP16, same as centroids.bin).
+    {
+        const std::string path = shards_dir + "/subcentroids.bin";
+        std::ifstream f(path, std::ios::binary);
+        if (f) {
+            f.seekg(0, std::ios::end);
+            const auto sz = f.tellg();
+            f.seekg(0);
+            if (sz > 0) {
+                idx->sub_centroids.resize(sz / sizeof(float16_t));
+                f.read(reinterpret_cast<char*>(idx->sub_centroids.data()), sz);
+            }
+        }
+    }
+
     for (uint32_t k = 0; k < K; k++) {
         char dirbuf[32];
         std::snprintf(dirbuf, sizeof(dirbuf), "shard_%04u", k + 1);
         const std::string shard_dir = shards_dir + "/" + dirbuf;
+
+        // Check for sub-shard layout: shard_NNNN/sub_0000/ directory.
+        char subdir_buf[32];
+        std::snprintf(subdir_buf, sizeof(subdir_buf), "sub_%04u", 0);
+        const std::string sub0_dir = shard_dir + "/" + subdir_buf;
+        const std::string sub0_codes = sub0_dir + codes_suffix;
+
+        std::error_code ec;
+        if (std::filesystem::exists(sub0_codes, ec)) {
+            // --- Sub-shard layout ---
+            auto shard = std::make_unique<ScanShard>();
+            shard->has_sub_shards = true;
+            for (uint32_t s = 0; ; s++) {
+                char sbuf[32];
+                std::snprintf(sbuf, sizeof(sbuf), "sub_%04u", s);
+                const std::string sd = shard_dir + "/" + sbuf;
+                const std::string cp = sd + codes_suffix;
+                if (!std::filesystem::exists(cp, ec)) break;
+
+                ScanSubShard ss;
+                ss.codes = std::make_unique<CodeStream>(cp, m4, scan_pq_bits);
+                read_rowids(sd + "/.rowids", ss.row_ids);
+                ss.count = static_cast<uint32_t>(ss.row_ids.size());
+                if (ss.count != ss.codes->n_vectors()) {
+                    ss.count = std::min(ss.count, ss.codes->n_vectors());
+                }
+                shard->count += ss.count;
+                shard->sub_shards.push_back(std::move(ss));
+            }
+            // Read sub-centroid offsets from shard.manifest.
+            const std::string shard_manifest = shard_dir + "/shard.manifest";
+            std::ifstream smf(shard_manifest);
+            if (smf) {
+                std::string tok;
+                std::getline(smf, tok); // "ready"
+                uint32_t n_subs = 0;
+                std::getline(smf, tok);
+                std::istringstream(tok) >> n_subs;
+                for (uint32_t s = 0; s < n_subs; s++) {
+                    uint32_t off = 0;
+                    std::getline(smf, tok);
+                    std::istringstream(tok) >> off;
+                    shard->sub_centroid_offsets.push_back(off);
+                }
+            }
+            idx->shards[k] = std::move(shard);
+            continue;
+        }
+
+        // --- Flat shard layout (existing path) ---
         const std::string codes_path = shard_dir + codes_suffix;
         const std::string rowids_path = shard_dir + "/.rowids";
 
-        std::error_code ec;
         if (!std::filesystem::exists(codes_path, ec)) {
             // Empty shard — skip (no entry created; router sees K but null).
             spdlog::debug("[sextant] IVFScanIndex: shard {} has no {} (empty)",

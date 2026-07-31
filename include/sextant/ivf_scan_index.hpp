@@ -40,6 +40,15 @@ namespace sextant {
 
 class CodeStream;
 
+/// One sub-shard's scan-side data. Identical to ScanShard's fields but
+/// without the sub-shard vector (no recursion). When a shard has no
+/// sub-shards, its data lives directly in ScanShard (flat mode).
+struct ScanSubShard {
+    std::unique_ptr<CodeStream> codes;
+    std::vector<RowId> row_ids;
+    uint32_t count = 0;
+};
+
 /// One shard's scan-side data: a codes stream + the shard-local→RowId map.
 struct ScanShard {
     /// Sequential pread streamer over `.codes4`.
@@ -53,6 +62,15 @@ struct ScanShard {
     std::vector<float> factors;
     /// Shard-local vector count (= row_ids.size()).
     uint32_t count = 0;
+
+    // --- Sub-shard support (Phase 1) ---
+    // When has_sub_shards=true, the flat codes/row_ids above are empty and
+    // data lives in sub_shards. When false, the flat fields are used as today.
+    std::vector<ScanSubShard> sub_shards;
+    /// Offset of each sub-shard's FP16 centroid into IVFScanIndex::sub_centroids
+    /// (in float16_t elements, not bytes). Empty when !has_sub_shards.
+    std::vector<uint32_t> sub_centroid_offsets;
+    bool has_sub_shards = false;
 };
 
 /// Owning container for an IVF-scan index: K ScanShards + shared 4-bit
@@ -78,6 +96,15 @@ struct IVFScanIndex {
 
     /// Per-shard scan data. Null entries = empty shard (skipped at build).
     std::vector<std::unique_ptr<ScanShard>> shards;
+
+    // --- Sub-shard support (Phase 1) ---
+    /// Sub-shard centroids (FP16, same layout as `centroids`). Concatenated
+    /// for all sub-shards across all shards. Indexed by
+    /// ScanShard::sub_centroid_offsets. Empty when no shards have sub-shards.
+    std::vector<float16_t> sub_centroids;
+    /// How many sub-shards to probe per coarse shard during search.
+    /// 0 or 1 = scan all sub-shards (= flat scan). >1 = two-level routing.
+    uint32_t sub_shard_n_probe = 1;
 
     std::string path;
 

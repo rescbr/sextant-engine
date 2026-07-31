@@ -1672,6 +1672,14 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
     const auto uuid = make_uuid();
     const uint32_t m = m4;
     const uint32_t block_bytes = static_cast<uint32_t>(m) * 16;
+    const std::string codes_filename =
+        (scan_bits == 4) ? "/.codes4" : "/.codes8";
+    const uint32_t codes_per_block = (scan_bits == 4) ? 32 : 16;
+
+    // Shared accumulator for sub-shard centroids (FP16). Written by parallel
+    // encode_shard tasks under sub_centroids_mutex.
+    std::vector<float16_t> sub_centroids_accum;
+    std::mutex sub_centroids_mutex;
 
     // --- Per-shard encode + write (PARALLEL across K) ---
     // Each shard is independent: its own member list, its own output
@@ -1699,17 +1707,218 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                          k + 1);
             return 0;
         }
-        std::error_code mkrec;
-        std::filesystem::create_directories(shard_dir, mkrec);
-        if (mkrec) {
-            throw Error(ErrorCode::IoError,
-                        "build_ivf_scan: cannot create shard dir '" +
-                            shard_dir + "': " + mkrec.message());
+
+        // --- Sub-shard decision ---
+        // If the shard exceeds the threshold, split into S sub-shards via
+        // local k-means on the scan codes. Otherwise, write flat (existing path).
+        const bool do_sub_shard =
+            params.sub_shard_threshold > 0 &&
+            shard_n > params.sub_shard_threshold;
+
+        if (!do_sub_shard) {
+            std::error_code mkrec;
+            std::filesystem::create_directories(shard_dir, mkrec);
+            if (mkrec) {
+                throw Error(ErrorCode::IoError,
+                            "build_ivf_scan: cannot create shard dir '" +
+                                shard_dir + "': " + mkrec.message());
+            }
+            // Flat: encode all members to shard_dir (existing code path).
+            // Fall through to the flat encode below.
+        } else {
+            // --- Sub-shard: local k-means(S) on scan codes ---
+            const uint32_t target_sub_size = params.sub_shard_threshold;
+            const uint32_t S = std::max(2u, (shard_n + target_sub_size - 1) /
+                                             target_sub_size);
+            spdlog::info("[sextant] build_ivf_scan: shard {} has {} vectors "
+                         "(> threshold {}), splitting into {} sub-shards",
+                         k + 1, shard_n, target_sub_size, S);
+
+            // Encode all members to scan codes first.
+            std::vector<uint8_t> seg_codes(static_cast<size_t>(shard_n) * m);
+            {
+                std::vector<uint8_t> packed(qscan.code_size());
+                for (uint32_t i = 0; i < shard_n; i++) {
+                    const float* vec = vecs_base +
+                        static_cast<size_t>(members[i]) * dim;
+                    qscan.encode(vec, packed.data());
+                    for (uint32_t s = 0; s < m; s++) {
+                        seg_codes[static_cast<size_t>(i) * m + s] =
+                            (scan_bits == 4)
+                                ? static_cast<uint8_t>(
+                                      (packed[s / 2] >> ((s % 2) * 4)) & 0xF)
+                                : packed[s];
+                    }
+                }
+            }
+
+            // Local k-means(S) on the scan codes using the scan quantizer's
+            // cross-distance table (if available; fallback to code_distance).
+            const uint32_t code_sz = qscan.code_size();
+            // Pack seg_codes into code_size bytes for partition_codes.
+            std::vector<uint8_t> flat_codes(
+                static_cast<size_t>(shard_n) * code_sz, 0);
+            for (uint32_t i = 0; i < shard_n; i++) {
+                for (uint32_t s = 0; s < m; s++) {
+                    uint8_t val = seg_codes[static_cast<size_t>(i) * m + s];
+                    if (scan_bits == 4) {
+                        if (s % 2 == 0)
+                            flat_codes[static_cast<size_t>(i) * code_sz + s / 2] = val;
+                        else
+                            flat_codes[static_cast<size_t>(i) * code_sz + s / 2] |= (val << 4);
+                    } else {
+                        flat_codes[static_cast<size_t>(i) * code_sz + s] = val;
+                    }
+                }
+            }
+
+            auto sub_assignment = partition_codes(
+                qscan, flat_codes.data(), shard_n, code_sz, S,
+                /*closure=*/1.0f, /*iters=*/5, encode_threads,
+                /*seed=*/0xC0DE1234ULL + k,
+                /*balance_factor=*/0.0f,
+                /*closure_epsilon=*/0.0f);
+
+            // Decode sub-centroids to FP16 for routing.
+            std::vector<float16_t> sub_cents(S * dim);
+            for (uint32_t s = 0; s < S; s++) {
+                float centroid_f32[768];
+                qscan.decode_code(sub_assignment.centroids[s].data(),
+                                  centroid_f32);
+                cast_fp32_to_fp16(centroid_f32, &sub_cents[size_t(s) * dim],
+                                  dim);
+            }
+
+            // Write each sub-shard. Accumulate centroid offsets for shard.manifest.
+            std::vector<uint32_t> sub_offsets;
+            {
+                std::lock_guard<std::mutex> lk(sub_centroids_mutex);
+                for (uint32_t s = 0; s < S; s++) {
+                    sub_offsets.push_back(
+                        static_cast<uint32_t>(sub_centroids_accum.size()));
+                    sub_centroids_accum.insert(sub_centroids_accum.end(),
+                                               &sub_cents[size_t(s) * dim],
+                                               &sub_cents[size_t(s) * dim] + dim);
+                }
+            }
+
+            // Write sub-shard directories + files.
+            std::error_code mkrec;
+            std::filesystem::create_directories(shard_dir, mkrec);
+            for (uint32_t s = 0; s < S; s++) {
+                char sbuf[32];
+                std::snprintf(sbuf, sizeof(sbuf), "sub_%04u", s);
+                const std::string sub_dir = shard_dir + "/" + sbuf;
+                std::filesystem::create_directories(sub_dir, mkrec);
+
+                auto& sub_members = sub_assignment.shards[s];
+                const uint32_t sub_n =
+                    static_cast<uint32_t>(sub_members.size());
+                if (sub_n == 0) continue;
+
+                // Re-encode sub_members to this sub-shard's seg_codes.
+                const uint32_t n_blocks =
+                    (sub_n + codes_per_block - 1) / codes_per_block;
+                std::vector<uint8_t> sub_seg(static_cast<size_t>(sub_n) * m);
+                std::vector<uint8_t> packed(qscan.code_size());
+                for (uint32_t i = 0; i < sub_n; i++) {
+                    // sub_members[i] is an index into flat_codes (shard-local).
+                    const uint32_t local_idx = sub_members[i];
+                    const float* vec = vecs_base +
+                        static_cast<size_t>(members[local_idx]) * dim;
+                    qscan.encode(vec, packed.data());
+                    for (uint32_t ss = 0; ss < m; ss++) {
+                        sub_seg[static_cast<size_t>(i) * m + ss] =
+                            (scan_bits == 4)
+                                ? static_cast<uint8_t>(
+                                      (packed[ss / 2] >> ((ss % 2) * 4)) & 0xF)
+                                : packed[ss];
+                    }
+                }
+                // Pack FastScan blocks.
+                std::vector<uint8_t> sub_blocks(
+                    static_cast<size_t>(n_blocks) * block_bytes, 0);
+                for (uint32_t b = 0; b < n_blocks; b++) {
+                    for (uint32_t ss = 0; ss < m; ss++) {
+                        for (uint32_t kk = 0; kk < 16; kk++) {
+                            if (scan_bits == 4) {
+                                const uint32_t v0 = b * 32 + kk;
+                                const uint32_t v1 = b * 32 + 16 + kk;
+                                const uint8_t lo = (v0 < sub_n)
+                                    ? sub_seg[static_cast<size_t>(v0) * m + ss] : 0;
+                                const uint8_t hi = (v1 < sub_n)
+                                    ? sub_seg[static_cast<size_t>(v1) * m + ss] : 0;
+                                sub_blocks[((static_cast<size_t>(b) * m) + ss) * 16 + kk] =
+                                    static_cast<uint8_t>((hi << 4) | lo);
+                            } else {
+                                const uint32_t v = b * 16 + kk;
+                                sub_blocks[((static_cast<size_t>(b) * m) + ss) * 16 + kk] =
+                                    (v < sub_n) ? sub_seg[static_cast<size_t>(v) * m + ss] : 0;
+                            }
+                        }
+                    }
+                }
+                // Write .codes{4,8}.
+                {
+                    const uint64_t magic =
+                        (scan_bits == 4) ? kMagicCodes4 : kMagicCodes8;
+                    DirectFile f(sub_dir + codes_filename, true);
+                    SidecarHeader h{};
+                    fill_header(h, magic, sub_n, dim, uuid);
+                    write_padded(f, &h, sizeof(h), 0);
+                    write_padded(f, sub_blocks.data(), sub_blocks.size(),
+                                 sizeof(h));
+                    f.sync();
+                }
+                // Write .rowids (map to GLOBAL RowId via members[]).
+                {
+                    std::vector<RowId> rids(sub_n);
+                    for (uint32_t i = 0; i < sub_n; i++)
+                        rids[i] = static_cast<RowId>(members[sub_members[i]]);
+                    DirectFile f(sub_dir + "/.rowids", true);
+                    SidecarHeader h{};
+                    fill_header(h, kMagicRowids, sub_n, dim, uuid);
+                    write_padded(f, &h, sizeof(h), 0);
+                    write_padded(f, rids.data(),
+                                 static_cast<size_t>(sub_n) * sizeof(RowId),
+                                 sizeof(h));
+                    f.sync();
+                }
+                // Per-sub-shard manifest.
+                {
+                    const std::string mpath = sub_dir + "/.manifest";
+                    const std::string tmp = mpath + ".tmp";
+                    DirectFile f(tmp, true);
+                    std::string commit = std::string("ready\n") +
+                        std::to_string(sub_n) + "\n" +
+                        std::to_string(dim) + "\n" +
+                        std::to_string(m4) + "\n";
+                    write_padded(f, commit.data(), commit.size(), 0);
+                    f.sync();
+                    std::error_code rec;
+                    std::filesystem::rename(tmp, mpath, rec);
+                }
+                spdlog::info("[sextant] build_ivf_scan: shard {}/{} sub {}/{} "
+                             "({} vectors)", k + 1, K, s, S, sub_n);
+            }
+
+            // Write shard.manifest (sub-centroid offsets).
+            {
+                const std::string mpath = shard_dir + "/shard.manifest";
+                const std::string tmp = mpath + ".tmp";
+                DirectFile f(tmp, true);
+                std::string commit = "ready\n" + std::to_string(S) + "\n";
+                for (uint32_t s = 0; s < S; s++)
+                    commit += std::to_string(sub_offsets[s]) + "\n";
+                write_padded(f, commit.data(), commit.size(), 0);
+                f.sync();
+                std::error_code rec;
+                std::filesystem::rename(tmp, mpath, rec);
+            }
+            return 1;
         }
 
-        // codes_per_block: 32 for 4-bit (2 vectors packed per byte via low/high
-        // nibbles), 16 for 8-bit (one byte per code, no packing).
-        const uint32_t codes_per_block = (scan_bits == 4) ? 32 : 16;
+        // --- Flat shard path (existing code, unchanged) ---
         const uint32_t n_blocks = (shard_n + codes_per_block - 1) / codes_per_block;
 
         // Encode each member to m segment-codes (one byte per segment).
@@ -1951,6 +2160,19 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         f.sync();
     }
 
+    // --- 5b. subcentroids.bin: Σ sub-shards × dim × float16_t ---
+    // Written only if any shards were sub-sharded (sub_centroids_accum non-empty).
+    if (!sub_centroids_accum.empty()) {
+        const std::string path = shards_dir + "/subcentroids.bin";
+        DirectFile f(path, true);
+        write_padded(f, sub_centroids_accum.data(),
+                     sub_centroids_accum.size() * sizeof(float16_t), 0);
+        f.sync();
+        spdlog::info("[sextant] wrote {} ({} sub-centroids, {}KB)",
+                     path, sub_centroids_accum.size() / dim,
+                     sub_centroids_accum.size() * sizeof(float16_t) / 1024);
+    }
+
     // --- 6. codebook{4,8}.bin: serialized scan PqQuantizer (shared) ---
     {
         const uint64_t magic = (params.quantizer_type == "prq")
@@ -1997,7 +2219,8 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                 std::to_string(m4) + "\n" +
                 std::to_string(static_cast<unsigned>(scan_bits)) + "\n" +
                 params.quantizer_type + "\n" +
-                std::to_string(manifest_nsplits) + "\n";
+                std::to_string(manifest_nsplits) + "\n" +
+                std::to_string(params.sub_shard_n_probe) + "\n";
             write_padded(f, commit.data(), commit.size(), 0);
             f.sync();
         }

@@ -197,6 +197,14 @@ struct BuildConfig {
     /// Absolute margin for SPANN-style boundary posting. 0 = ratio-based.
     /// -1 = auto (0.2 × mean NN distance). See docs/closure_factor_derivation.md.
     float closure_epsilon = 0.0f;
+
+    /// Sub-shard threshold: max vectors per sub-shard before splitting.
+    /// 0 = no sub-sharding (flat shards). >0 = split shards exceeding this
+    /// into sub-shards via local k-means. See docs/sub_shard_design.md.
+    uint32_t sub_shard_threshold = 0;
+    /// How many sub-shards to probe per coarse shard at search time.
+    /// 0 or 1 = scan all sub-shards (flat). >1 = two-level routing.
+    uint32_t sub_shard_n_probe = 1;
 };
 
 /// Result of a build operation.
@@ -274,6 +282,8 @@ struct ResolvedParams {
     uint32_t partition_count = 1; ///< Partition count (>1 → partitioned build)
     float closure_factor = 1.033f;  ///< Shard overlap radius ratio
     float closure_epsilon = 0.0f;  ///< Absolute margin for SPANN-style boundary posting. 0 = ratio-based.
+    uint32_t sub_shard_threshold = 0;  ///< Max vectors per sub-shard (0 = off).
+    uint32_t sub_shard_n_probe = 1;    ///< Sub-shards to probe per shard (0/1 = scan all).
     uint16_t n_entry_points = 16;   ///< K-means centroid count for entry-point selection
     uint16_t n_search_entry_points = 4;  ///< Multi-start: top-M entry points per query
     float target_recall = 0.0f;     ///< Recall target the index was built for (0 = unspecified). Drives search early-exit.

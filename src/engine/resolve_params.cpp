@@ -249,6 +249,9 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     if (overrides.closure_epsilon != 0.0f) {
         p.closure_epsilon = overrides.closure_epsilon;
     }
+    // Sub-shard settings (pass through from build config).
+    p.sub_shard_threshold = overrides.sub_shard_threshold;
+    p.sub_shard_n_probe = overrides.sub_shard_n_probe;
 
     // --- n_entry_points / n_search_entry_points / target_recall ---
     p.n_entry_points = overrides.n_entry_points > 0 ? overrides.n_entry_points : 16;

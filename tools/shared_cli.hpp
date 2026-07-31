@@ -190,6 +190,17 @@ inline void add_common_flags(cmdline::parser& p) {
         "= better boundary recall, more storage. Only affects ratio-based "
         "closure (when closure-epsilon=0).",
         false, 0.0f);
+    p.add<uint32_t>("sub-shard-threshold", 0,
+        "Max vectors per sub-shard before splitting. 0 = no sub-sharding. "
+        ">0 = shards exceeding this are split into sub-shards via local "
+        "k-means, enabling two-level routing (fewer codes scanned per query). "
+        "See docs/sub_shard_design.md.",
+        false, 0);
+    p.add<uint32_t>("sub-shard-n-probe", 0,
+        "Number of sub-shards to probe per coarse shard during search. "
+        "0 or 1 = scan all sub-shards (flat). >1 = two-level routing "
+        "(scan only the nearest sub-shards). Default 1.",
+        false, 1);
 }
 
 /// Add mode-specific extras. Call after add_common_flags.
@@ -310,6 +321,16 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     try {
         if (p.exist("closure-f-target")) {
             cfg.closure_f_target = p.get<float>("closure-f-target");
+        }
+    } catch (...) {}
+    try {
+        if (p.exist("sub-shard-threshold")) {
+            cfg.sub_shard_threshold = p.get<uint32_t>("sub-shard-threshold");
+        }
+    } catch (...) {}
+    try {
+        if (p.exist("sub-shard-n-probe")) {
+            cfg.sub_shard_n_probe = p.get<uint32_t>("sub-shard-n-probe");
         }
     } catch (...) {}
 
