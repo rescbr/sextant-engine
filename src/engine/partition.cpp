@@ -98,36 +98,22 @@ inline uint32_t assign_nearest_centroid(
     float best_d = q.code_distance(code, centroids[prev_assign].data());
     uint32_t best_k = prev_assign;
 
-    // Process remaining centroids in groups of 4 using SIMD batch4.
+    // Process all centroids in groups of 4 using SIMD batch4.
+    // Centroids are padded to a multiple of 4, so no scalar tail.
     // The vector code is the anchor; 4 centroid codes are the candidates.
     // code_distance_batch4 uses SVE2 gather-load (4 independent load streams).
     float out[4];
     for (uint32_t kg = 0; kg < K; kg += 4) {
-        const uint32_t remaining = K - kg;
-
-        if (remaining >= 4) {
-            // Full group of 4 — skip prev_assign if it's in this group.
-            // For simplicity, evaluate all 4 and check bounds after.
-            q.code_distance_batch4(code,
-                centroids[kg].data(),
-                centroids[kg + 1].data(),
-                centroids[kg + 2].data(),
-                centroids[kg + 3].data(),
-                out);
-            for (uint32_t j = 0; j < 4; j++) {
-                if (out[j] < best_d) {
-                    best_d = out[j];
-                    best_k = kg + j;
-                }
-            }
-        } else {
-            // Tail: 1-3 remaining centroids, use scalar.
-            for (uint32_t j = 0; j < remaining; j++) {
-                const float d = q.code_distance(code, centroids[kg + j].data());
-                if (d < best_d) {
-                    best_d = d;
-                    best_k = kg + j;
-                }
+        q.code_distance_batch4(code,
+            centroids[kg].data(),
+            centroids[kg + 1].data(),
+            centroids[kg + 2].data(),
+            centroids[kg + 3].data(),
+            out);
+        for (uint32_t j = 0; j < 4; j++) {
+            if (kg + j < K && out[j] < best_d) {
+                best_d = out[j];
+                best_k = kg + j;
             }
         }
     }
@@ -160,7 +146,11 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
 
     // --- Initialize centroids: distinct random codes (k-means++-ish via
     //     random distinct picks; k-means refinement handles quality). ---
-    std::vector<std::vector<uint8_t>> centroids(K,
+    // Pad to a multiple of 4 so the batch4 loop has no scalar tail.
+    // The padded centroids are duplicates of the last real centroid;
+    // they'll never win the argmin (distance ≥ best_d by construction).
+    const uint32_t K_padded = (K + 3) & ~3u;
+    std::vector<std::vector<uint8_t>> centroids(K_padded,
         std::vector<uint8_t>(code_size, 0));
     {
         std::vector<uint32_t> picks;
@@ -176,6 +166,10 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
             std::memcpy(centroids[k].data(),
                         codes + static_cast<size_t>(picks[k]) * code_size,
                         code_size);
+        }
+        // Pad: duplicate the last real centroid into the padding slots.
+        for (uint32_t k = K; k < K_padded; k++) {
+            std::memcpy(centroids[k].data(), centroids[K - 1].data(), code_size);
         }
     }
 
