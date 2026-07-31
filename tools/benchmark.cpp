@@ -552,9 +552,9 @@ int main(int argc, char* argv[]) {
     p.add<float>("adaptive-probe-gap", 0,
         "Adaptive probe early-exit: stop scanning when the next shard's centroid "
         "is significantly farther than the current (ratio > gap). 0 = disabled. "
-        "Recommended: 1.5 (stop when next centroid is 50% farther). Lets easy "
+        "Default 1.5 (stop when next centroid is 50% farther). Lets easy "
         "queries stop early; hard queries keep probing.",
-        false, 0.0f);
+        false, 1.5f);
     p.add<uint32_t>("scan-code-budget", 0,
         "Maximum total codes (vectors) to scan across all probed shards. "
         "0 = unlimited. Shards scanned in centroid-distance order until budget "

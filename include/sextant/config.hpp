@@ -275,8 +275,9 @@ struct SearchConfig {
     /// If cent_dist[p+1] / cent_dist[p] > adaptive_probe_gap, stop scanning.
     /// This lets easy queries (tight neighborhood) stop early while hard queries
     /// (spread neighborhood) keep probing. 0 = disabled (scan all n_probe).
-    /// Recommended: 1.5 (stop when the next centroid is 50% farther).
-    float adaptive_probe_gap = 0.0f;
+    /// Default 1.5 (stop when the next centroid is 50% farther). Set to 0
+    /// to disable.
+    float adaptive_probe_gap = 1.5f;
 
     /// Scan code budget (D): maximum total codes (vectors) to scan across all
     /// probed shards. 0 = unlimited (scan all n_probe shards). When set, shards
