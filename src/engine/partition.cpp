@@ -417,7 +417,7 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
              &local_shards, t, &next_id, &shard_sizes, cap_per_shard, &primary,
              use_absolute, effective_epsilon]
             (size_t /*id*/, PartWorkerState& /*w*/) {
-                std::vector<float> dists(K);
+                std::vector<float> dists(centroids.size());  // K_padded, not K
                 auto& my_shards = local_shards[t];
                 while (true) {
                     const uint32_t lo = next_id.fetch_add(kChunk,
