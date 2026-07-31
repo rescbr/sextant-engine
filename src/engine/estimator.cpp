@@ -900,6 +900,9 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
     p.num_threads = base.num_threads;
     p.build_ram_budget = base.build_ram_budget;
     p.pq_max_distortion = base.pq_max_distortion;
+    p.closure_epsilon = base.closure_epsilon;
+    p.sub_shard_threshold = base.sub_shard_threshold;
+    p.sub_shard_n_probe = base.sub_shard_n_probe;
 
     spdlog::info("[sextant] estimate_config: final → R={} alpha={:.1f} "
                  "pq_m={} pq_bits={} L_build={} K={}",
