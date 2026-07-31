@@ -214,11 +214,16 @@ When a sub-shard drops below T_min:
 - Extend manifest format
 - Test: build K=1024 with sub_shard_threshold=5000, measure recall/QPS
 
-### Phase 2: Live split/merge
+### Phase 2: Adaptive sub-shard count
+- Auto-tune S (number of sub-shards) per shard based on shard size
+  (fat shards get S=8, small shards stay flat S=1)
+- Auto-tune sub_shard_n_probe based on recall target
+- This is the primary value for skewed datasets: Sphere has shard sizes
+  ranging from 248 to 58k. Fixed-threshold sub-sharding helps the fat
+  shards; adaptive S ensures small shards aren't over-partitioned.
+
+### Phase 3: Live split/merge
 - Implement split/merge API
 - Wire to insert/delete paths
 - Test: insert batches, verify splits happen and recall is maintained
-
-### Phase 3: Adaptive sub-shard count
-- Auto-tune S (number of sub-shards) based on shard size
-- Auto-tune sub_shard_n_probe based on recall target
+- Most complex (atomic manifest updates, concurrent access) — last.
