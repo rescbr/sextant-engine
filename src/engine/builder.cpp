@@ -1782,9 +1782,13 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
             // when sub_np < S. Use ratio-based closure (1.05) — the absolute
             // margin is harder to calibrate for the scan quantizer's distance
             // scale (4-bit PQ code distances are in different units than FP16).
+            // Sub-shard k-means: run serially (num_threads=1). This runs inside
+            // the encode_pool worker — spawning another pool would create nested
+            // pools (8×8=64 threads on 8 cores → oversubscription). The sub-shard
+            // data is small enough (~shard_n codes) that serial k-means is fast.
             auto sub_assignment = partition_codes(
                 qscan, flat_codes.data(), shard_n, code_sz, S,
-                /*closure=*/1.05f, /*iters=*/5, encode_threads,
+                /*closure=*/1.05f, /*iters=*/5, /*num_threads=*/1,
                 /*seed=*/0xC0DE1234ULL + k,
                 /*balance_factor=*/0.0f,
                 /*closure_epsilon=*/0.0f);
