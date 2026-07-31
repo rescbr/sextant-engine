@@ -207,7 +207,13 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
                  overrides.build_ram_budget != 0 ? "override" : "auto");
 
     // --- closure_factor (Issue 24: ~15% replication) ---
-    // c = (1 - f_target)^{-1/d_eff}, clamped to [1.0, 1.2].
+    // Base: c = (1 - f_target)^{-1/d_eff}, clamped to [1.0, 1.2].
+    // Defensive K-scaling: c(K) = c_base × (K/K₀)^{1/(d_eff(d_eff-1))}.
+    // The leading-order theory says c is K-independent (the shell count
+    // μ(c) = c^{d_eff}−1 is K-free). But higher-order effects (covering
+    // radius shrinks slightly faster than NN distance) introduce weak
+    // K-dependence. The defensive formula grows c slowly with K as
+    // insurance. See docs/closure_factor_derivation.md.
     {
         const float f_target = overrides.closure_f_target > 0.0f
                                    ? overrides.closure_f_target
@@ -217,15 +223,31 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
         const float d_eff = overrides.closure_d_eff > 0.0f
                                 ? overrides.closure_d_eff
                                 : 5.0f;
-        float c = std::pow(1.0f - f_target, -1.0f / d_eff);
+        float c_base = std::pow(1.0f - f_target, -1.0f / d_eff);
+        // Defensive K-scaling (exponent ~0.05 at d_eff=5).
+        // K₀=1024 is the calibration point where c_base was validated.
+        const float k_ref = 1024.0f;
+        const float k_actual = static_cast<float>(
+            overrides.partition_count > 0 ? overrides.partition_count
+                                          : p.partition_count);
+        if (k_actual > k_ref && d_eff > 1.0f) {
+            const float alpha = 1.0f / (d_eff * (d_eff - 1.0f));
+            c_base *= std::pow(k_actual / k_ref, alpha);
+        }
+        float c = c_base;
         if (c < 1.0f) c = 1.0f;
-        if (c > 1.2f) c = 1.2f;
+        if (c > 1.3f) c = 1.3f;  // clamp: allow up to 30% ratio for fine K
         p.closure_factor = c;
         spdlog::info("[sextant] closure_factor = {:.4f} [{}] (f_target={:.2f}, "
-                     "d_eff={:.2f})", p.closure_factor,
-                     overrides.closure_f_target > 0.0f || overrides.closure_d_eff > 0.0f
-                         ? "override" : "auto",
-                      f_target, d_eff);
+                      "d_eff={:.2f}, K={})", p.closure_factor,
+                      overrides.closure_f_target > 0.0f || overrides.closure_d_eff > 0.0f
+                          ? "override" : "auto",
+                       f_target, d_eff, static_cast<uint32_t>(k_actual));
+    }
+
+    // Propagate closure_epsilon override (0 = ratio-based, -1 = auto, >0 = explicit).
+    if (overrides.closure_epsilon != 0.0f) {
+        p.closure_epsilon = overrides.closure_epsilon;
     }
 
     // --- n_entry_points / n_search_entry_points / target_recall ---

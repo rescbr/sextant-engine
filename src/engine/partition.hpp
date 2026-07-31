@@ -32,6 +32,11 @@ struct PartitionAssignment {
 
     /// The closure_factor used for overlap assignment.
     float closure_factor = 1.0f;
+
+    /// Absolute margin (SPANN-style) used for overlap assignment. When >0,
+    /// vectors within d_best + closure_epsilon of a centroid are replicated.
+    /// 0 = use ratio-based (closure_factor × d_best) instead.
+    float closure_epsilon = 0.0f;
 };
 
 /// Run k-means on PQ codes and assign vectors to shards with closure overlap.
@@ -56,6 +61,12 @@ struct PartitionAssignment {
 ///                    See SPANN (arXiv:2111.08566) §"Hierarchical Balanced
 ///                    Clustering" — list-size balance bounds the worst-case
 ///                    disk-read pathology at paged-billion-scale.
+/// @param closure_epsilon  Absolute margin for SPANN-style boundary posting.
+///                    When >0, vectors within d_best + closure_epsilon of a
+///                    centroid are replicated. This is structurally K-robust:
+///                    as K grows and cells shrink, epsilon covers an increasing
+///                    fraction of the cell radius. 0 = use ratio-based closure
+///                    (closure_factor × d_best). See docs/closure_factor_derivation.md §6.
 PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                                      const uint8_t* codes, uint32_t n,
                                      uint32_t code_size, uint32_t K,
@@ -63,6 +74,7 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                                      uint32_t iterations = 10,
                                      uint32_t num_threads = 0,
                                      uint64_t seed = 0xC0DE1234ULL,
-                                     float balance_factor = 0.0f);
+                                     float balance_factor = 0.0f,
+                                     float closure_epsilon = 0.0f);
 
 }  // namespace sextant

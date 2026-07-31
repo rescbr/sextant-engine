@@ -193,6 +193,10 @@ struct BuildConfig {
     /// worst-case disk read per shard at paged-billion-scale. Default 0;
     /// recommended 2-4 for production IVF-scan builds.
     float partition_balance_factor = 0.0f;
+
+    /// Absolute margin for SPANN-style boundary posting. 0 = ratio-based.
+    /// -1 = auto (0.2 × mean NN distance). See docs/closure_factor_derivation.md.
+    float closure_epsilon = 0.0f;
 };
 
 /// Result of a build operation.
@@ -269,6 +273,7 @@ struct ResolvedParams {
     uint32_t num_threads = 0;
     uint32_t partition_count = 1; ///< Partition count (>1 → partitioned build)
     float closure_factor = 1.033f;  ///< Shard overlap radius ratio
+    float closure_epsilon = 0.0f;  ///< Absolute margin for SPANN-style boundary posting. 0 = ratio-based.
     uint16_t n_entry_points = 16;   ///< K-means centroid count for entry-point selection
     uint16_t n_search_entry_points = 4;  ///< Multi-start: top-M entry points per query
     float target_recall = 0.0f;     ///< Recall target the index was built for (0 = unspecified). Drives search early-exit.

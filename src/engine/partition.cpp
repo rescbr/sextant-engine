@@ -128,7 +128,8 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                                      uint32_t code_size, uint32_t K,
                                      float closure_factor,
                                      uint32_t iterations, uint32_t num_threads,
-                                     uint64_t seed, float balance_factor) {
+                                     uint64_t seed, float balance_factor,
+                                     float closure_epsilon) {
     if (K == 0) {
         throw Error(ErrorCode::InvalidParam,
                     "partition_codes: K must be > 0");
@@ -334,7 +335,37 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                      std::chrono::duration<double>(update_t1 - assign_t1).count());
     }
 
-    // --- Final assignment WITH closure_factor overlap (parallel) ---
+    // --- Auto-compute closure_epsilon from data if requested ---
+    // Sentinel: closure_epsilon < 0 means "auto-compute from mean NN distance."
+    // The absolute margin is set to a fraction of the mean nearest-centroid
+    // distance, making it K-adaptive (cell radius shrinks with K, so epsilon
+    // tracks it). See docs/closure_factor_derivation.md §6.
+    float effective_epsilon = closure_epsilon;
+    if (closure_epsilon < 0.0f) {
+        // Sample-based estimate of mean NN distance from the last assignment.
+        // Use the assign[] array: for each vector, the distance to its assigned
+        // centroid is ~the NN distance. We sample to avoid a full O(N×K) pass.
+        constexpr uint32_t kSampleSize = 4096;
+        const uint32_t step = std::max(1u, n / kSampleSize);
+        double sum_nn = 0.0;
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < n; i += step) {
+            const uint8_t* code =
+                codes + static_cast<size_t>(i) * code_size;
+            const uint8_t* cent = centroids[assign[i]].data();
+            sum_nn += quantizer.code_distance(code, cent);
+            count++;
+        }
+        const float mean_nn = count > 0 ? float(sum_nn / count) : 0.0f;
+        // epsilon = 20% of mean NN distance. This targets ~10-15% replication
+        // (vectors within d_best + 0.2×mean_nn of a secondary centroid).
+        effective_epsilon = 0.2f * mean_nn;
+        spdlog::info("[sextant] partition: closure_epsilon = {:.4f} (auto, "
+                     "mean_nn={:.4f}, sample={})", effective_epsilon, mean_nn,
+                     count);
+    }
+
+    // --- Final assignment WITH closure overlap (parallel) ---
     // Each vector joins its nearest centroid AND any centroid within
     // closure_factor × d_best. This produces ~15% replication (Issue 24).
     // Each code may land in multiple shards → per-thread local shard buffers,
@@ -350,6 +381,13 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
     pa.shards.assign(K, {});
     pa.centroids = centroids;
     pa.closure_factor = closure_factor;
+    pa.closure_epsilon = closure_epsilon;
+
+    // If closure_epsilon > 0, we need the mean nearest-centroid distance to
+    // set the absolute margin adaptively when closure_epsilon is a flag
+    // (sentinel -1.0 means "auto-compute from data"). For now, closure_epsilon
+    // is either 0 (use ratio) or a positive value (use absolute).
+    const bool use_absolute = effective_epsilon > 0.0f;
 
     // Per-shard atomic size counters (only used when balance_factor > 0).
     // The cap is soft: concurrent threads may push a few vectors past it
@@ -376,7 +414,8 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
     for (uint32_t t = 0; t < T; t++) {
         futs.push_back(pool.push(
             [&quantizer, &centroids, codes, n, code_size, K, closure_factor,
-             &local_shards, t, &next_id, &shard_sizes, cap_per_shard, &primary]
+             &local_shards, t, &next_id, &shard_sizes, cap_per_shard, &primary,
+             use_absolute, effective_epsilon]
             (size_t /*id*/, PartWorkerState& /*w*/) {
                 std::vector<float> dists(K);
                 auto& my_shards = local_shards[t];
@@ -397,7 +436,12 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
                             if (dists[k] < dists[prim_k]) prim_k = k;
                         }
                         primary[i] = prim_k;
-                        const float threshold = closure_factor * best_d;
+                        // Closure threshold: absolute margin (SPANN-style) or
+                        // ratio (legacy). Absolute is structurally K-robust.
+                        // See docs/closure_factor_derivation.md §6.
+                        const float threshold = use_absolute
+                            ? (best_d + effective_epsilon)
+                            : (closure_factor * best_d);
                         for (uint32_t k = 0; k < K; k++) {
                             if (dists[k] > threshold) continue;
                             // Size cap (balance_factor). The PRIMARY cluster

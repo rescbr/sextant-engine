@@ -176,6 +176,20 @@ inline void add_common_flags(cmdline::parser& p) {
         "Only the closure-replication overhead is capped; primary membership "
         "is never dropped.",
         false, 0.0f);
+    p.add<float>("closure-epsilon", 0,
+        "Absolute margin for SPANN-style boundary posting (arXiv:2111.08566). "
+        "When >0, vectors within d_best + epsilon of a centroid are replicated "
+        "to that shard. Structurally K-robust: as K grows, epsilon covers an "
+        "increasing fraction of the cell radius. -1 = auto (0.2 × mean NN "
+        "distance). 0 = use ratio-based closure (closure_factor × d_best). "
+        "See docs/closure_factor_derivation.md.",
+        false, 0.0f);
+    p.add<float>("closure-f-target", 0,
+        "Target fraction of non-replicated vectors for closure_factor auto-"
+        "computation. Default 0.15 (85% replicated). Higher = more replication "
+        "= better boundary recall, more storage. Only affects ratio-based "
+        "closure (when closure-epsilon=0).",
+        false, 0.0f);
 }
 
 /// Add mode-specific extras. Call after add_common_flags.
@@ -286,6 +300,16 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     try {
         if (p.exist("partition-balance-factor")) {
             cfg.partition_balance_factor = p.get<float>("partition-balance-factor");
+        }
+    } catch (...) {}
+    try {
+        if (p.exist("closure-epsilon")) {
+            cfg.closure_epsilon = p.get<float>("closure-epsilon");
+        }
+    } catch (...) {}
+    try {
+        if (p.exist("closure-f-target")) {
+            cfg.closure_f_target = p.get<float>("closure-f-target");
         }
     } catch (...) {}
 
