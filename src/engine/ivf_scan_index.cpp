@@ -29,19 +29,16 @@ namespace {
 ///   <dim>
 ///   <n_probe_default>
 ///   <m4>
-///   <scan_pq_bits>     (optional; defaults to 4 if absent — pre-8-bit indexes)
-///   <quantizer_type>   (optional; defaults to "pq" — pre-PRQ indexes)
-///   <prq_nsplits>      (optional; defaults to 0 — only meaningful for "prq")
-/// Returns false if the file is missing or malformed.
+///   <scan_pq_bits>
+///   <quantizer_type>
+///   <prq_nsplits>
+///   <sub_shard_probe_pct>
+/// Returns false if the file is missing or malformed (all fields required).
 bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
                         uint32_t& n_probe_default, uint16_t& m4,
                         uint8_t& scan_pq_bits, std::string& quantizer_type,
                         uint32_t& prq_nsplits,
-                        uint32_t& sub_shard_n_probe) {
-    scan_pq_bits = 4;       // default for older indexes that don't carry the field
-    quantizer_type = "pq";  // default for older indexes (pre-PRQ)
-    prq_nsplits = 0;        // default for older indexes / non-PRQ quantizers
-    sub_shard_n_probe = 1;  // default: no sub-shard routing (scan all)
+                        uint32_t& sub_shard_probe_pct) {
     std::ifstream f(path);
     if (!f) return false;
     std::string tok;
@@ -62,20 +59,12 @@ bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
     if (!read_line(dim)) return false;
     if (!read_line(n_probe_default)) return false;
     if (!read_line(m4)) return false;
-    // Optional 6th line — old indexes stop here and keep the default of 4.
     uint16_t bits_raw = 4;
-    if (read_line(bits_raw)) {
-        scan_pq_bits = (bits_raw == 8) ? 8 : 4;
-        // Optional 7th line — quantizer_type (pre-PRQ indexes stop at line 6).
-        std::string qtype_raw;
-        if (read_line(qtype_raw) && !qtype_raw.empty()) {
-            quantizer_type = qtype_raw;
-            // Optional 8th line — PRQ nsplits.
-            read_line(prq_nsplits);
-            // Optional 9th line — sub_shard_n_probe.
-            read_line(sub_shard_n_probe);
-        }
-    }
+    if (!read_line(bits_raw)) return false;
+    scan_pq_bits = (bits_raw == 8) ? 8 : 4;
+    if (!read_line(quantizer_type)) return false;
+    if (!read_line(prq_nsplits)) return false;
+    if (!read_line(sub_shard_probe_pct)) return false;
     return true;
 }
 
@@ -176,7 +165,7 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     uint32_t prq_nsplits = 0;
     if (!read_scan_manifest(manifest_path, K, dim, n_probe_default, m4,
                             scan_pq_bits, quantizer_type, prq_nsplits,
-                            idx->sub_shard_n_probe)) {
+                            idx->sub_shard_probe_pct)) {
         throw Error(ErrorCode::CorruptIndex,
                     "IVFScanIndex: cannot read manifest '" + manifest_path + "'");
     }

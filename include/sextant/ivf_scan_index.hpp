@@ -102,9 +102,12 @@ struct IVFScanIndex {
     /// for all sub-shards across all shards. Indexed by
     /// ScanShard::sub_centroid_offsets. Empty when no shards have sub-shards.
     std::vector<float16_t> sub_centroids;
-    /// How many sub-shards to probe per coarse shard during search.
-    /// 0 or 1 = scan all sub-shards (= flat scan). >1 = two-level routing.
-    uint32_t sub_shard_n_probe = 1;
+    /// Sub-shard probe percentage (0-100). At search time, each shard's
+    /// actual sub_np = max(1, ceil(n_sub * pct / 100)). 100 = scan all
+    /// sub-shards (= flat scan). 50 = probe half (two-level routing).
+    /// Set from the manifest; overridden by SearchConfig::sub_shard_n_probe_override
+    /// when that is >0 (treated as a fixed count, not a percentage).
+    uint32_t sub_shard_probe_pct = 50;
 
     std::string path;
 

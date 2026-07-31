@@ -212,7 +212,8 @@ Builder::PqSelection Builder::probe_pq_config(const float* sample, uint64_t n,
 }
 
 void Builder::pass1_sample_and_train(VectorSource& source,
-                                    const ResolvedParams& params) {
+                                    const ResolvedParams& params,
+                                    bool compute_entry_points) {
     spdlog::info("[sextant] pass 1: reservoir sample (target {} vectors)",
                  kSampleTarget);
 
@@ -380,78 +381,94 @@ void Builder::pass1_sample_and_train(VectorSource& source,
     }
     spdlog::info("[sextant] pass 1: training PQ (m={}, bits={}{}) on {} samples",
                  pq_m, pq_bits, aniso_note, actual_sample);
+    index_.quantizer->set_num_threads(params.num_threads);
     index_.quantizer->train(reservoir.data(), actual_sample);
     spdlog::info("[sextant] pass 1: PQ trained (code_size={})", index_.code_size);
 
     // Compute global k-means centroids for entry-point selection (EP-2).
-    // Run on the FP32 reservoir (precise; the reservoir is alive here and
-    // destroyed when this function returns). Centroids are stored in FP32
-    // and snapped to nearest data vectors at flush time (snap_entry_points_).
-    if (actual_sample >= params.n_entry_points) {
+    // Only needed for graph builds (snap_entry_points_ consumes these at
+    // flush time). The scan path skips this entirely — it never writes
+    // graph sidecars (.epc, .ball, entry points in .meta).
+    if (compute_entry_points && actual_sample >= params.n_entry_points) {
         const uint32_t k = std::min<uint32_t>(params.n_entry_points,
                                               static_cast<uint32_t>(actual_sample));
-        entry_centroids_.resize(static_cast<size_t>(k) * index_.dim);
-        // Adapt k-means++ + Lloyd from pq_quantizer.cpp (generic algorithm).
-        // Inline implementation to avoid cross-module linkage issues.
+        const Dim dim = index_.dim;
+        entry_centroids_.resize(static_cast<size_t>(k) * dim);
+        const uint32_t n_threads = std::max(1u, std::min(params.num_threads,
+            static_cast<uint32_t>(actual_sample)));
+
+        // k-means++ seeding (sequential centroid selection, parallel dist).
         std::mt19937_64 rng(0xC0DE1234ULL);
-        // k-means++ seeding.
-        {
-            entry_centroids_.assign(static_cast<size_t>(k) * index_.dim, 0.0f);
-            std::memcpy(entry_centroids_.data(), reservoir.data(),
-                        static_cast<size_t>(index_.dim) * sizeof(float));
-            std::vector<float> min_d2(actual_sample,
-                                      std::numeric_limits<float>::max());
-            for (uint32_t c = 1; c < k; c++) {
-                const float* prev = entry_centroids_.data() + static_cast<size_t>(c - 1) * index_.dim;
-                for (uint64_t i = 0; i < actual_sample; i++) {
-                    double d = 0.0;
-                    const float* v = reservoir.data() + static_cast<size_t>(i) * index_.dim;
-                    for (uint32_t dd = 0; dd < index_.dim; dd++) {
-                        const double diff = double(v[dd]) - double(prev[dd]);
-                        d += diff * diff;
-                    }
-                    if (float(d) < min_d2[i]) min_d2[i] = float(d);
+        entry_centroids_.assign(static_cast<size_t>(k) * dim, 0.0f);
+        std::memcpy(entry_centroids_.data(), reservoir.data(),
+                    static_cast<size_t>(dim) * sizeof(float));
+        std::vector<float> min_d2(actual_sample,
+                                  std::numeric_limits<float>::max());
+        for (uint32_t c = 1; c < k; c++) {
+            const float* prev = entry_centroids_.data() +
+                                 static_cast<size_t>(c - 1) * dim;
+            // Parallel: update min_d2[i] with dist(reservoir[i], prev).
+            std::atomic<uint64_t> next_i{0};
+            auto dist_worker = [&]() {
+                uint64_t i;
+                while ((i = next_i.fetch_add(1, std::memory_order_relaxed))
+                       < actual_sample) {
+                    const float d = simd::l2sq_f32(
+                        reservoir.data() + i * dim, prev, dim);
+                    if (d < min_d2[i]) min_d2[i] = d;
                 }
-                std::discrete_distribution<uint64_t> dist(min_d2.begin(), min_d2.end());
-                const uint64_t picked = dist(rng);
-                std::memcpy(entry_centroids_.data() + static_cast<size_t>(c) * index_.dim,
-                            reservoir.data() + static_cast<size_t>(picked) * index_.dim,
-                            static_cast<size_t>(index_.dim) * sizeof(float));
-            }
+            };
+            std::vector<std::thread> pool;
+            for (uint32_t t = 0; t < n_threads; t++) pool.emplace_back(dist_worker);
+            for (auto& th : pool) th.join();
+
+            std::discrete_distribution<uint64_t> dist(min_d2.begin(), min_d2.end());
+            const uint64_t picked = dist(rng);
+            std::memcpy(entry_centroids_.data() + static_cast<size_t>(c) * dim,
+                        reservoir.data() + static_cast<size_t>(picked) * dim,
+                        static_cast<size_t>(dim) * sizeof(float));
         }
-        // Lloyd iterations (10).
+
+        // Lloyd iterations (10). Assign is parallel; update is serial but
+        // cheap (k × dim accumulators).
         std::vector<uint32_t> assign(actual_sample, 0);
         for (uint32_t iter = 0; iter < 10; iter++) {
-            // Assign.
-            for (uint64_t i = 0; i < actual_sample; i++) {
-                const float* v = reservoir.data() + static_cast<size_t>(i) * index_.dim;
-                float best = std::numeric_limits<float>::infinity();
-                uint32_t best_c = 0;
-                for (uint32_t c = 0; c < k; c++) {
-                    const float* cen = entry_centroids_.data() + static_cast<size_t>(c) * index_.dim;
-                    double d = 0.0;
-                    for (uint32_t dd = 0; dd < index_.dim; dd++) {
-                        const double diff = double(v[dd]) - double(cen[dd]);
-                        d += diff * diff;
+            // Parallel assign.
+            std::atomic<uint64_t> next_i{0};
+            auto assign_worker = [&]() {
+                uint64_t i;
+                while ((i = next_i.fetch_add(1, std::memory_order_relaxed))
+                       < actual_sample) {
+                    const float* v = reservoir.data() + i * dim;
+                    float best = std::numeric_limits<float>::infinity();
+                    uint32_t best_c = 0;
+                    for (uint32_t c = 0; c < k; c++) {
+                        const float d = simd::l2sq_f32(
+                            v, entry_centroids_.data() +
+                               static_cast<size_t>(c) * dim, dim);
+                        if (d < best) { best = d; best_c = c; }
                     }
-                    if (float(d) < best) { best = float(d); best_c = c; }
+                    assign[i] = best_c;
                 }
-                assign[i] = best_c;
-            }
-            // Update.
-            std::vector<double> sum(static_cast<size_t>(k) * index_.dim, 0.0);
+            };
+            std::vector<std::thread> pool;
+            for (uint32_t t = 0; t < n_threads; t++) pool.emplace_back(assign_worker);
+            for (auto& th : pool) th.join();
+
+            // Serial update (k is small, ~16).
+            std::vector<double> sum(static_cast<size_t>(k) * dim, 0.0);
             std::vector<uint64_t> cnt(k, 0);
             for (uint64_t i = 0; i < actual_sample; i++) {
-                const float* v = reservoir.data() + static_cast<size_t>(i) * index_.dim;
-                double* s = sum.data() + static_cast<size_t>(assign[i]) * index_.dim;
-                for (uint32_t dd = 0; dd < index_.dim; dd++) s[dd] += double(v[dd]);
+                const float* v = reservoir.data() + static_cast<size_t>(i) * dim;
+                double* s = sum.data() + static_cast<size_t>(assign[i]) * dim;
+                for (uint32_t dd = 0; dd < dim; dd++) s[dd] += double(v[dd]);
                 cnt[assign[i]]++;
             }
             for (uint32_t c = 0; c < k; c++) {
-                float* cen = entry_centroids_.data() + static_cast<size_t>(c) * index_.dim;
+                float* cen = entry_centroids_.data() + static_cast<size_t>(c) * dim;
                 if (cnt[c] > 0) {
-                    const double* s = sum.data() + static_cast<size_t>(c) * index_.dim;
-                    for (uint32_t dd = 0; dd < index_.dim; dd++)
+                    const double* s = sum.data() + static_cast<size_t>(c) * dim;
+                    for (uint32_t dd = 0; dd < dim; dd++)
                         cen[dd] = float(s[dd] / double(cnt[c]));
                 }
             }
@@ -1576,6 +1593,7 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                                                            : "4-bit PQ")),
                      m4, filled);
         const auto ts = std::chrono::steady_clock::now();
+        qscan.set_num_threads(params.num_threads);
         qscan.train(sample.data(), filled);
         const auto te = std::chrono::steady_clock::now();
         spdlog::info("[sextant]   4-bit codebook trained in {:.2f}s",
@@ -1676,6 +1694,58 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         (scan_bits == 4) ? "/.codes4" : "/.codes8";
     const uint32_t codes_per_block = (scan_bits == 4) ? 32 : 16;
 
+    // --- Adaptive sub-shard threshold ---
+    // When sub_shard_threshold == 0 (auto), compute a target sub-shard size
+    // from the shard size distribution. The goal: average shards get ~4
+    // sub-shards, fat shards get more, small shards stay flat (S=1).
+    //
+    // Heuristic: target = max(floor, mean_shard_size / 4). The floor
+    // (2048) prevents over-splitting on datasets with naturally small
+    // shards. At billion scale (mean_shard ~ 1M), this gives target=250k
+    // → ~4 sub-shards per average shard, ~20+ for fat ones.
+    //
+    // Also auto-compute sub_shard_n_probe: probe_fraction = 50% of
+    // sub-shards per shard. This is stored as a ratio in the manifest;
+    // the search path computes actual sub_np = max(1, ceil(S * fraction))
+    // per shard at query time.
+    uint32_t effective_threshold = params.sub_shard_threshold;
+    float sub_probe_fraction = 0.0f;
+    if (effective_threshold == 0) {
+        // Compute mean shard size (non-empty shards only).
+        uint64_t total_members = 0;
+        uint32_t non_empty = 0;
+        uint32_t max_shard = 0;
+        for (const auto& sh : assignment.shards) {
+            if (!sh.empty()) {
+                total_members += sh.size();
+                non_empty++;
+                max_shard = std::max(max_shard,
+                    static_cast<uint32_t>(sh.size()));
+            }
+        }
+        if (non_empty > 0 && total_members > 0) {
+            const uint32_t mean_shard =
+                static_cast<uint32_t>(total_members / non_empty);
+            constexpr uint32_t kSubSizeFloor = 2048;
+            effective_threshold = std::max(kSubSizeFloor, mean_shard / 4);
+            // Only enable if at least one shard exceeds 2× the threshold
+            // (otherwise sub-sharding adds overhead with no benefit).
+            if (max_shard < 2 * effective_threshold) {
+                effective_threshold = 0;  // disable
+            }
+            sub_probe_fraction = 0.5f;  // probe 50% of sub-shards
+            spdlog::info("[sextant] build_ivf_scan: auto sub-shard threshold "
+                         "= {} (mean_shard={}, max_shard={}, probe_frac={:.2f})",
+                         effective_threshold, mean_shard, max_shard,
+                         sub_probe_fraction);
+        }
+    } else {
+        // Manual threshold: probe all sub-shards unless sub_np was set.
+        // sub_probe_fraction=1.0 means "scan all" (backward compatible).
+        sub_probe_fraction =
+            (params.sub_shard_n_probe > 1) ? 1.0f : 1.0f;
+    }
+
     // Shared accumulator for sub-shard centroids (FP16). Written by parallel
     // encode_shard tasks under sub_centroids_mutex.
     std::vector<float16_t> sub_centroids_accum;
@@ -1709,15 +1779,15 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         }
 
         // --- Adaptive sub-shard decision ---
-        // S = ceil(shard_n / target_sub_size), clamped to [1, S_max].
-        // Shards that fit within target_sub_size stay flat (S=1).
-        // No upper cap — at billion scale, a shard may have millions of vectors
-        // and need many sub-shards. Routing overhead (sub-centroid FP16 dists)
-        // is only 2.1% of cycles (profiled), so more sub-shards = net win.
+        // S = ceil(shard_n / effective_threshold). Shards that fit within
+        // the threshold stay flat (S=1). No upper cap — at billion scale,
+        // a shard may have millions of vectors and need many sub-shards.
+        // Routing overhead (sub-centroid FP16 dists) is only 2.1% of cycles
+        // (profiled), so more sub-shards = net win.
         uint32_t S = 1;
-        if (params.sub_shard_threshold > 0) {
-            S = (shard_n + params.sub_shard_threshold - 1) /
-                params.sub_shard_threshold;
+        if (effective_threshold > 0) {
+            S = (shard_n + effective_threshold - 1) /
+                effective_threshold;
             // Clamp to 1 (no split for small shards). S=0 would be a bug.
             S = std::max(1u, S);
         }
@@ -1736,8 +1806,8 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         } else {
             // --- Sub-shard: local k-means(S) on scan codes ---
             spdlog::info("[sextant] build_ivf_scan: shard {} has {} vectors "
-                         "(target_sub_size={}), splitting into {} sub-shards",
-                         k + 1, shard_n, params.sub_shard_threshold, S);
+                         "(threshold={}), splitting into {} sub-shards",
+                         k + 1, shard_n, effective_threshold, S);
 
             // Encode all members to scan codes first.
             std::vector<uint8_t> seg_codes(static_cast<size_t>(shard_n) * m);
@@ -2218,13 +2288,14 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         const std::string tmp = path + ".tmp";
         {
             DirectFile f(tmp, true);
-            // Quantizer type (7th line) + PRQ nsplits (8th line) are APPEND-ONLY
-            // optional fields; old manifests stop at line 6 and the reader
-            // defaults them to "pq" / 0.
             const uint32_t manifest_nsplits =
                 (params.quantizer_type == "prq")
                     ? static_cast<ProductResidualQuantizer&>(qscan).nsplits()
                     : 0;
+            // sub_probe_pct: integer percentage (0-100). At search time,
+            // sub_np = max(1, ceil(n_sub * pct / 100)) per shard.
+            const uint32_t sub_probe_pct = static_cast<uint32_t>(
+                sub_probe_fraction * 100.0f + 0.5f);
             std::string commit =
                 std::string("ready\n") +
                 std::to_string(K) + "\n" +
@@ -2234,7 +2305,7 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                 std::to_string(static_cast<unsigned>(scan_bits)) + "\n" +
                 params.quantizer_type + "\n" +
                 std::to_string(manifest_nsplits) + "\n" +
-                std::to_string(params.sub_shard_n_probe) + "\n";
+                std::to_string(sub_probe_pct) + "\n";
             write_padded(f, commit.data(), commit.size(), 0);
             f.sync();
         }
@@ -3182,7 +3253,9 @@ void Builder::prepare_routing_codes(VectorSource& source,
         throw Error(ErrorCode::InvalidParam, "prepare_routing_codes: source has dim=0");
     }
     // pass1 trains the quantizer and sets index_.code_size.
-    pass1_sample_and_train(source, params);
+    // compute_entry_points=false: the scan path never builds a graph, so
+    // the ~14s serial entry-point k-means is dead work here.
+    pass1_sample_and_train(source, params, /*compute_entry_points=*/false);
     index_.node_size = VamanaCore::static_node_size(params.R, index_.code_size);
 
     // Allocate flat codes buffer (no nodes_buffer — caller is not constructing

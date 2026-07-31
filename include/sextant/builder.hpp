@@ -166,7 +166,8 @@ private:
     std::vector<float> entry_centroids_;
 
     // --- Build pipeline ---
-    void pass1_sample_and_train(VectorSource& source, const ResolvedParams& params);
+    void pass1_sample_and_train(VectorSource& source, const ResolvedParams& params,
+                                bool compute_entry_points = true);
     void pass2_encode(VectorSource& source, const ResolvedParams& params);
     void parallel_construct(const ResolvedParams& params);
 

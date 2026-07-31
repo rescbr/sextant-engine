@@ -579,7 +579,9 @@ void PqQuantizer::train(const float* samples, uint64_t n) {
         rotated.resize(size_t(n) * dim);
         // rotated[i][r] = Σ_c R[r*dim + c] · samples[i][c]  (one dot per row).
         // Parallelized across vectors (each is dim independent simd::dot_f32 calls).
-        const uint32_t hw_rot = std::max(1u, std::thread::hardware_concurrency());
+        const uint32_t hw_rot = num_threads_ > 0
+            ? num_threads_
+            : std::max(1u, std::thread::hardware_concurrency());
         const uint32_t n_threads_rot = std::min(hw_rot, static_cast<uint32_t>(n));
         std::atomic<uint64_t> next{0};
         auto worker = [&]() {
@@ -600,7 +602,9 @@ void PqQuantizer::train(const float* samples, uint64_t n) {
 
     // Each segment's k-means++ is fully independent (disjoint codebook
     // region, disjoint sub_buffer). Parallelize across segments.
-    const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t hw = num_threads_ > 0
+        ? num_threads_
+        : std::max(1u, std::thread::hardware_concurrency());
     const uint32_t n_threads = std::min(hw, static_cast<uint32_t>(m_));
 
     std::atomic<uint32_t> next_seg{0};
@@ -688,20 +692,35 @@ void PqQuantizer::build_cross_distance_table() {
     // with IP cross-distances drops IP search recall 15pp (0.76→0.61 on
     // arxiv100k) because IP code-to-code distances have higher variance.
     // The L2sq PQ-construct produces a graph robust to both search metrics.
-    for (uint32_t s = 0; s < m_; s++) {
-        const float* book = codebook_.data() + size_t(s) * K_ * sub_dim_;
-        float* table = cross_distance_table_.data() + size_t(s) * K_ * K_;
-        for (uint32_t a = 0; a < K_; a++) {
-            const float* ca = book + a * sub_dim_;
-            table[a * K_ + a] = 0.0f;  // L2 diagonal is always 0
-            for (uint32_t b = a + 1; b < K_; b++) {
-                const float* cb = book + b * sub_dim_;
-                const float d = simd::l2sq_f32(ca, cb, sub_dim_);
-                table[a * K_ + b] = d;
-                table[b * K_ + a] = d;  // symmetric
+    //
+    // Each subspace's table is independent — parallelize across m_.
+    const uint32_t hw = num_threads_ > 0
+        ? num_threads_
+        : std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t n_threads = std::min(hw, static_cast<uint32_t>(m_));
+
+    std::atomic<uint32_t> next_seg{0};
+    auto worker = [&]() {
+        uint32_t s;
+        while ((s = next_seg.fetch_add(1, std::memory_order_relaxed)) < m_) {
+            const float* book = codebook_.data() + size_t(s) * K_ * sub_dim_;
+            float* table = cross_distance_table_.data() + size_t(s) * K_ * K_;
+            for (uint32_t a = 0; a < K_; a++) {
+                const float* ca = book + a * sub_dim_;
+                table[a * K_ + a] = 0.0f;  // L2 diagonal is always 0
+                for (uint32_t b = a + 1; b < K_; b++) {
+                    const float* cb = book + b * sub_dim_;
+                    const float d = simd::l2sq_f32(ca, cb, sub_dim_);
+                    table[a * K_ + b] = d;
+                    table[b * K_ + a] = d;  // symmetric
+                }
             }
         }
-    }
+    };
+
+    std::vector<std::thread> pool;
+    for (uint32_t t = 0; t < n_threads; t++) pool.emplace_back(worker);
+    for (auto& th : pool) th.join();
 }
 
 void PqQuantizer::encode(const float* vec, uint8_t* code_out) const {

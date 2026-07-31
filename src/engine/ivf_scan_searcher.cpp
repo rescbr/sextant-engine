@@ -298,10 +298,21 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
             // --- Two-level routing: pick top sub-shards ---
             const uint32_t n_sub =
                 static_cast<uint32_t>(shard->sub_shards.size());
-            const uint32_t sub_np_raw = config.sub_shard_n_probe_override > 0
-                ? config.sub_shard_n_probe_override
-                : index_.sub_shard_n_probe;
-            const uint32_t sub_np = std::min(sub_np_raw, n_sub);
+            uint32_t sub_np;
+            if (config.sub_shard_n_probe_override > 0) {
+                // Explicit override: fixed count (not percentage).
+                sub_np = std::min(config.sub_shard_n_probe_override, n_sub);
+            } else {
+                // Adaptive: compute from the index's probe percentage.
+                // sub_np = max(1, ceil(n_sub * pct / 100)).
+                // pct=100 → scan all; pct=50 → probe half.
+                const uint32_t pct = index_.sub_shard_probe_pct;
+                if (pct >= 100) {
+                    sub_np = n_sub;
+                } else {
+                    sub_np = std::max(1u, (n_sub * pct + 99) / 100);
+                }
+            }
 
             if (sub_np >= n_sub) {
                 // Scan all sub-shards (no sub-routing needed).

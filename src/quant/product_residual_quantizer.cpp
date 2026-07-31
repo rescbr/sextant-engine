@@ -211,7 +211,9 @@ void ProductResidualQuantizer::train(const float* samples, uint64_t n) {
     rq_codebooks_.assign(
         static_cast<size_t>(nsplits_) * M_sub_ * K_ * sub_dim_prq_, 0.0f);
 
-    const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t hw = num_threads_ > 0
+        ? num_threads_
+        : std::max(1u, std::thread::hardware_concurrency());
     const uint32_t n_threads = std::min(hw, nsplits_);
     std::atomic<uint32_t> next_split{0};
 

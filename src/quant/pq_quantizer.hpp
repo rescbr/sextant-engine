@@ -45,6 +45,12 @@ public:
     /// VamanaCore calls them monomorphically through PqQuantizer&.
     virtual void train(const float* samples, uint64_t n);
 
+    /// Set the thread cap for the next train() call. 0 (default) means use
+    /// std::thread::hardware_concurrency(). Call before train(). This prevents
+    /// oversubscription when train() runs inside an already-parallel context
+    /// (e.g. the build's encode_pool worker or the estimator's mini-build loop).
+    void set_num_threads(uint32_t n) { num_threads_ = n; }
+
     /// Enable/disable covariance-based anisotropic codebook training.
     ///
     /// When enabled, each subspace's dimensions are scaled by √w_d before
@@ -231,6 +237,12 @@ protected:
     uint16_t m_;
     uint8_t bits_;
     uint64_t seed_;
+
+    /// Thread count for train(). 0 = use hardware_concurrency() at train()
+    /// time. Set via set_num_threads() before train() to cap parallelism
+    /// (e.g. when train() runs inside an already-parallel build, spawning
+    /// hardware_concurrency() workers per call causes oversubscription).
+    uint32_t num_threads_ = 0;
 
     uint32_t K_;           ///< 2^bits centroids per segment
     uint32_t sub_dim_;     ///< dim / m
