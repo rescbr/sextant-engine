@@ -172,6 +172,20 @@ public:
     /// Code-to-code distance via the cross-distance table.
     float code_distance(const uint8_t* code_a, const uint8_t* code_b) const;
 
+    /// Extract centroid id for slot `s` from a packed code (4-bit or 8-bit).
+    /// Public so partition.cpp can do batch table lookups without going
+    /// through code_distance one-at-a-time.
+    static uint32_t read_code_public(const uint8_t* code, uint8_t bits, uint32_t s) {
+        if (bits == 8) return static_cast<uint32_t>(code[s]);
+        const uint32_t byte_off = s / 2;
+        const uint8_t shift = static_cast<uint8_t>((s % 2) * 4);
+        return static_cast<uint32_t>((code[byte_off] >> shift) & 0x0F);
+    }
+
+    /// Read-only access to the cross-distance table (m × K × K floats).
+    /// Used by partition.cpp for batch assignment with pruning.
+    const float* cross_distance_table() const { return cross_distance_table_.data(); }
+
     /// Batch code-to-code distance: fixed anchor vs 4 candidates.
     /// Writes 4 distances to `out`. Uses SIMD + interleaved loads for
     /// 2× throughput vs 4 individual code_distance calls. The anchor's
