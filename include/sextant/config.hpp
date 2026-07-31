@@ -264,6 +264,10 @@ struct SearchConfig {
     /// recall-0.99 point on arxiv-nomic per the hybrid-IVF spike). Ignored
     /// for graph-mode indexes.
     uint32_t fastscan_W = 0;
+
+    /// Sub-shard probe override. 0 = use the index's built-in sub_shard_n_probe
+    /// (from manifest). >0 = override at search time.
+    uint32_t sub_shard_n_probe_override = 0;
 };
 
 /// Adaptive parameters resolved from dataset/machine properties (Issue 37).

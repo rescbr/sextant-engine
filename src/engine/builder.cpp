@@ -1772,9 +1772,14 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                 }
             }
 
+            // Partition with closure overlap. Sub-shard boundary vectors
+            // are replicated to multiple sub-shards to prevent recall loss
+            // when sub_np < S. Use ratio-based closure (1.05) — the absolute
+            // margin is harder to calibrate for the scan quantizer's distance
+            // scale (4-bit PQ code distances are in different units than FP16).
             auto sub_assignment = partition_codes(
                 qscan, flat_codes.data(), shard_n, code_sz, S,
-                /*closure=*/1.0f, /*iters=*/5, encode_threads,
+                /*closure=*/1.05f, /*iters=*/5, encode_threads,
                 /*seed=*/0xC0DE1234ULL + k,
                 /*balance_factor=*/0.0f,
                 /*closure_epsilon=*/0.0f);

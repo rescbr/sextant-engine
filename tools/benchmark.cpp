@@ -512,8 +512,9 @@ int run_ivf_scan_benchmark(const std::string& index,
                            uint32_t n_probe_req,
                            uint32_t early_exit_req,
                            float multiprobe_ratio_req,
-                           uint32_t fastscan_w_req,
-                           uint32_t panorama_lvl_d);
+                            uint32_t fastscan_w_req,
+                            uint32_t panorama_lvl_d,
+                            uint32_t sub_shard_np_req);
 
 int main(int argc, char* argv[]) {
     sextant::init_logging();
@@ -540,6 +541,11 @@ int main(int argc, char* argv[]) {
         "When >0, rerank computes distances incrementally over level-chunks "
         "and prunes candidates via Cauchy-Schwarz lower bounds. ~2x rerank "
         "speedup on IP at 0 recall loss. Recommended: 8 for IP, 0 for L2sq.",
+        false, 0);
+    p.add<uint32_t>("sub-shard-n-probe", 0,
+        "Override sub-shard probe count at search time. 0 = use the index's "
+        "built-in value from the manifest. >0 = scan only the N nearest "
+        "sub-shards per coarse shard.",
         false, 0);
     p.add<uint32_t>("io-limit", 0, "Search I/O budget (0 = unlimited)", false, 0);
     p.add<uint32_t>("limit", 0, "Max queries to run (0 = all)", false, 0);
@@ -623,6 +629,7 @@ int main(int argc, char* argv[]) {
     const float multiprobe_ratio_req = p.get<float>("multiprobe-ratio");
     const uint32_t fastscan_w_req = p.get<uint32_t>("fastscan-w");
     const uint32_t panorama_levels_req = p.get<uint32_t>("panorama-levels");
+    const uint32_t sub_shard_np_req = p.get<uint32_t>("sub-shard-n-probe");
 
     // IVF dispatch: if `<index>.shards/` is a directory, this is an IVF
     // index. Two IVF flavors share the `.shards/` layout:
@@ -643,7 +650,7 @@ int main(int argc, char* argv[]) {
                 k, L, rerank, io_limit, limit,
                 n_threads_hint, cache_size_req,
                 n_probe_req, early_exit_req, multiprobe_ratio_req,
-                fastscan_w_req, panorama_levels_req);
+                fastscan_w_req, panorama_levels_req, sub_shard_np_req);
         }
         return run_ivf_benchmark(index, query_path, base_data, gt_path,
                                  k, L, rerank, io_limit, limit,
@@ -1254,8 +1261,9 @@ int run_ivf_scan_benchmark(const std::string& index,
                            uint32_t n_probe_req,
                            uint32_t early_exit_req,
                            float multiprobe_ratio_req,
-                           uint32_t fastscan_w_req,
-                           uint32_t panorama_lvl_d) {
+                            uint32_t fastscan_w_req,
+                            uint32_t panorama_lvl_d,
+                            uint32_t sub_shard_np_req) {
     (void)L;             // scan path has no beam width
     (void)io_limit;      // scan reads the whole shard — no node visit cap
     (void)cache_size_req;// scan bypasses the BlockCache (sequential stream)
@@ -1408,6 +1416,7 @@ int run_ivf_scan_benchmark(const std::string& index,
         // fastscan_W: 0 (default) → auto-derived from shard size in the
         // searcher. Override with --fastscan-w for manual tuning.
         scfg.fastscan_W = fastscan_w_req;
+        scfg.sub_shard_n_probe_override = sub_shard_np_req;
 
         std::vector<double> latencies_us;
         latencies_us.reserve(n_queries);
