@@ -491,9 +491,24 @@ std::vector<Candidate> IVFScanSearcher::search_body_rabitq_(
     // The heap carries REAL L2sq distances (finalized per-lane), not raw scan
     // tokens. Lower-bound admission: a candidate survives if its estimated
     // distance minus its error bound is below the current W-th distance.
+    //
+    // Adaptive early-exit (B+D): same geometric-gap and code-budget logic
+    // as the PQ path. See search_body_ for details.
     w.scored_f.clear();
+    const float adaptive_gap = config.adaptive_probe_gap;
+    const uint32_t code_budget = config.scan_code_budget;
+    uint32_t codes_scanned = 0;
 
     for (uint32_t p = 0; p < n_probe_eff; p++) {
+        // B: geometric gap early-exit.
+        if (adaptive_gap > 1.0f && p > 0 && w.scored_f.size() >= k) {
+            const float cur_d = w.cent_dists[p - 1].first;
+            const float next_d = w.cent_dists[p].first;
+            if (cur_d > 0.0f && next_d / cur_d > adaptive_gap) break;
+        }
+        // D: code budget exhausted.
+        if (code_budget > 0 && codes_scanned >= code_budget) break;
+
         const uint32_t c = w.cent_dists[p].second;
         auto& shard = index_.shards[c];
         if (!shard || !shard->codes) continue;
@@ -594,6 +609,7 @@ std::vector<Candidate> IVFScanSearcher::search_body_rabitq_(
                 w.scored_f.emplace_back(d, shard->row_ids[local_idx]);
             }
         }
+        codes_scanned += shard->count;
     }
 
     // --- 3. Dedup by RowId, keep MIN finalized distance (RaBitQ distances ---

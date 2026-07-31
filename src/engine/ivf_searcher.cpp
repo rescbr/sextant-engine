@@ -197,7 +197,21 @@ std::vector<Candidate> IVFSearcher::search_body_(const float* query, uint32_t k,
         }
     });
 
+    // Adaptive early-exit (B): geometric gap between consecutive centroids.
+    // Same logic as the scan path — if the next shard is much farther, the
+    // graph search there won't find better candidates. The graph path also
+    // has io_limit (per-shard node visit cap) and early_exit_patience
+    // (convergence-based), but those are per-shard, not across-shard.
+    const float adaptive_gap = config.adaptive_probe_gap;
+
     for (uint32_t p = 0; p < n_probe_eff; p++) {
+        // B: geometric gap early-exit.
+        if (adaptive_gap > 1.0f && p > 0 && w.scored.size() >= k_local) {
+            const float cur_d = w.cent_dists[p - 1].first;
+            const float next_d = w.cent_dists[p].first;
+            if (cur_d > 0.0f && next_d / cur_d > adaptive_gap) break;
+        }
+
         const uint32_t c = w.cent_dists[p].second;
         auto& shard = index_.shards[c];
         if (!shard || !shard->core) continue;
