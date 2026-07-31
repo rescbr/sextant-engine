@@ -33,12 +33,16 @@ namespace {
 ///   <quantizer_type>
 ///   <prq_nsplits>
 ///   <sub_shard_probe_pct>
+///   <adaptive_probe_gap>
+///   <median_lid>
 /// Returns false if the file is missing or malformed (all fields required).
 bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
                         uint32_t& n_probe_default, uint16_t& m4,
                         uint8_t& scan_pq_bits, std::string& quantizer_type,
                         uint32_t& prq_nsplits,
-                        uint32_t& sub_shard_probe_pct) {
+                        uint32_t& sub_shard_probe_pct,
+                        float& adaptive_probe_gap,
+                        float& median_lid) {
     std::ifstream f(path);
     if (!f) return false;
     std::string tok;
@@ -65,6 +69,8 @@ bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
     if (!read_line(quantizer_type)) return false;
     if (!read_line(prq_nsplits)) return false;
     if (!read_line(sub_shard_probe_pct)) return false;
+    if (!read_line(adaptive_probe_gap)) return false;
+    if (!read_line(median_lid)) return false;
     return true;
 }
 
@@ -165,7 +171,9 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     uint32_t prq_nsplits = 0;
     if (!read_scan_manifest(manifest_path, K, dim, n_probe_default, m4,
                             scan_pq_bits, quantizer_type, prq_nsplits,
-                            idx->sub_shard_probe_pct)) {
+                            idx->sub_shard_probe_pct,
+                            idx->adaptive_probe_gap,
+                            idx->median_lid)) {
         throw Error(ErrorCode::CorruptIndex,
                     "IVFScanIndex: cannot read manifest '" + manifest_path + "'");
     }

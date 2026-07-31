@@ -912,6 +912,21 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
     p.prq_ils_perturb = base.prq_ils_perturb;
     p.prq_lsq_train_iters = base.prq_lsq_train_iters;
 
+    // Derive adaptive_probe_gap from LID. On low-d_eff manifolds, centroid
+    // distances grow steeply → large natural gaps → earlier exit is safe →
+    // higher gap. On high-d_eff data, distances grow gradually → smaller
+    // gaps → need more probes → lower gap. Formula calibrated on arxiv100k
+    // (LID 13, gap=1.3 optimal) and Sphere (d_eff~2, gap=1.5 safe):
+    //   gap = clamp(1.0 + 8.0 / max(d_eff, 2.0), 1.1, 2.0)
+    // where d_eff = max(median_lid, 2.0) as a floor.
+    {
+        const float d_eff = std::max(static_cast<float>(median_lid), 2.0f);
+        p.adaptive_probe_gap = std::clamp(1.0f + 8.0f / d_eff, 1.1f, 2.0f);
+        p.median_lid = static_cast<float>(median_lid);
+        spdlog::info("[sextant] estimate_config: adaptive_probe_gap = {:.2f} "
+                     "(d_eff={:.1f})", p.adaptive_probe_gap, d_eff);
+    }
+
     spdlog::info("[sextant] estimate_config: final → R={} alpha={:.1f} "
                  "pq_m={} pq_bits={} L_build={} K={}",
                  p.R, p.alpha, p.pq_m, static_cast<int>(p.pq_bits), p.L_build,

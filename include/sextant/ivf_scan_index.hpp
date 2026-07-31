@@ -109,6 +109,15 @@ struct IVFScanIndex {
     /// when that is >0 (treated as a fixed count, not a percentage).
     uint32_t sub_shard_probe_pct = 50;
 
+    /// Adaptive probe gap baked at build time (derived from LID). When
+    /// SearchConfig::adaptive_probe_gap == 0 (auto), the searcher uses
+    /// this value. See docs/closure_d_eff_analysis.md for the derivation.
+    float adaptive_probe_gap = 1.5f;
+
+    /// Median LID measured at build time. Stored for diagnostics and
+    /// future recalibration of derived parameters.
+    float median_lid = 0.0f;
+
     std::string path;
 
     IVFScanIndex() = default;

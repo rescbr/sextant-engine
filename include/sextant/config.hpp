@@ -206,6 +206,10 @@ struct BuildConfig {
     /// How many sub-shards to probe per coarse shard at search time.
     /// 0 or 1 = scan all sub-shards (flat). >1 = two-level routing.
     uint32_t sub_shard_n_probe = 1;
+    /// Adaptive probe gap (0 = auto, derived from LID by the estimator).
+    float adaptive_probe_gap = 0.0f;
+    /// Median LID (0 = unmeasured; set by the estimator).
+    float median_lid = 0.0f;
 };
 
 /// Result of a build operation.
@@ -274,10 +278,11 @@ struct SearchConfig {
     /// next shard's centroid distance is significantly farther than the current.
     /// If cent_dist[p+1] / cent_dist[p] > adaptive_probe_gap, stop scanning.
     /// This lets easy queries (tight neighborhood) stop early while hard queries
-    /// (spread neighborhood) keep probing. 0 = disabled (scan all n_probe).
-    /// Default 1.5 (stop when the next centroid is 50% farther). Set to 0
-    /// to disable.
-    float adaptive_probe_gap = 1.5f;
+    /// (spread neighborhood) keep probing.
+    ///   0 = auto (use the index's baked value from the manifest)
+    ///  <0 = off (scan all n_probe)
+    ///  >1 = explicit gap value
+    float adaptive_probe_gap = 0.0f;
 
     /// Scan code budget (D): maximum total codes (vectors) to scan across all
     /// probed shards. 0 = unlimited (scan all n_probe shards). When set, shards
@@ -305,6 +310,8 @@ struct ResolvedParams {
     float closure_epsilon = 0.0f;  ///< Absolute margin for SPANN-style boundary posting. 0 = ratio-based.
     uint32_t sub_shard_threshold = 0;  ///< Max vectors per sub-shard (0 = off).
     uint32_t sub_shard_n_probe = 1;    ///< Sub-shards to probe per shard (0/1 = scan all).
+    float adaptive_probe_gap = 1.5f;   ///< Geometric-gap early-exit (derived from LID).
+    float median_lid = 0.0f;           ///< Median LID measured at build time (0 = unmeasured).
     uint16_t n_entry_points = 16;   ///< K-means centroid count for entry-point selection
     uint16_t n_search_entry_points = 4;  ///< Multi-start: top-M entry points per query
     float target_recall = 0.0f;     ///< Recall target the index was built for (0 = unspecified). Drives search early-exit.

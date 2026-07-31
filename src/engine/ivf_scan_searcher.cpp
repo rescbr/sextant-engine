@@ -153,7 +153,9 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
     // Both are optional (gap=0 / budget=0 = disabled, scan all n_probe_eff).
     w.scored.clear();
     const uint32_t invalid = 0xFFFFFFFFu;
-    const float adaptive_gap = config.adaptive_probe_gap;
+    const float adaptive_gap = config.adaptive_probe_gap != 0.0f
+        ? config.adaptive_probe_gap
+        : index_.adaptive_probe_gap;
     const uint32_t code_budget = config.scan_code_budget;
     uint32_t codes_scanned = 0;
 
@@ -495,7 +497,9 @@ std::vector<Candidate> IVFScanSearcher::search_body_rabitq_(
     // Adaptive early-exit (B+D): same geometric-gap and code-budget logic
     // as the PQ path. See search_body_ for details.
     w.scored_f.clear();
-    const float adaptive_gap = config.adaptive_probe_gap;
+    const float adaptive_gap = config.adaptive_probe_gap != 0.0f
+        ? config.adaptive_probe_gap
+        : index_.adaptive_probe_gap;
     const uint32_t code_budget = config.scan_code_budget;
     uint32_t codes_scanned = 0;
 

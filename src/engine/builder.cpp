@@ -2313,7 +2313,9 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                 std::to_string(static_cast<unsigned>(scan_bits)) + "\n" +
                 params.quantizer_type + "\n" +
                 std::to_string(manifest_nsplits) + "\n" +
-                std::to_string(sub_probe_pct) + "\n";
+                std::to_string(sub_probe_pct) + "\n" +
+                std::to_string(params.adaptive_probe_gap) + "\n" +
+                std::to_string(params.median_lid) + "\n";
             write_padded(f, commit.data(), commit.size(), 0);
             f.sync();
         }

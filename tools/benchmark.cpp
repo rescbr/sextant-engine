@@ -549,12 +549,13 @@ int main(int argc, char* argv[]) {
         "built-in value from the manifest. >0 = scan only the N nearest "
         "sub-shards per coarse shard.",
         false, 0);
-    p.add<float>("adaptive-probe-gap", 0,
+    p.add<std::string>("adaptive-probe-gap", 0,
         "Adaptive probe early-exit: stop scanning when the next shard's centroid "
-        "is significantly farther than the current (ratio > gap). 0 = disabled. "
-        "Default 1.5 (stop when next centroid is 50% farther). Lets easy "
-        "queries stop early; hard queries keep probing.",
-        false, 1.5f);
+        "is significantly farther than the current (ratio > gap). "
+        "'auto' (default) = use the index's baked value from the manifest. "
+        "'off' = disabled (scan all n_probe). "
+        "A float >1.0 (e.g. 1.3) = explicit gap value.",
+        false, "auto");
     p.add<uint32_t>("scan-code-budget", 0,
         "Maximum total codes (vectors) to scan across all probed shards. "
         "0 = unlimited. Shards scanned in centroid-distance order until budget "
@@ -643,7 +644,15 @@ int main(int argc, char* argv[]) {
     const uint32_t fastscan_w_req = p.get<uint32_t>("fastscan-w");
     const uint32_t panorama_levels_req = p.get<uint32_t>("panorama-levels");
     const uint32_t sub_shard_np_req = p.get<uint32_t>("sub-shard-n-probe");
-    const float adaptive_gap_req = p.get<float>("adaptive-probe-gap");
+    // Parse adaptive-probe-gap: "auto" → 0 (use manifest), "off" → -1,
+    // otherwise parse as float.
+    const std::string adaptive_gap_str = p.get<std::string>("adaptive-probe-gap");
+    float adaptive_gap_req = 0.0f;  // auto
+    if (adaptive_gap_str == "off" || adaptive_gap_str == "0") {
+        adaptive_gap_req = -1.0f;   // disabled
+    } else if (adaptive_gap_str != "auto") {
+        adaptive_gap_req = std::stof(adaptive_gap_str);
+    }
     const uint32_t scan_budget_req = p.get<uint32_t>("scan-code-budget");
 
     // IVF dispatch: if `<index>.shards/` is a directory, this is an IVF

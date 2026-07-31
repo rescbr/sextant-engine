@@ -202,7 +202,11 @@ std::vector<Candidate> IVFSearcher::search_body_(const float* query, uint32_t k,
     // graph search there won't find better candidates. The graph path also
     // has io_limit (per-shard node visit cap) and early_exit_patience
     // (convergence-based), but those are per-shard, not across-shard.
-    const float adaptive_gap = config.adaptive_probe_gap;
+    // 0 = auto (1.5 default; graph-IVF manifest doesn't carry a baked value).
+    // <0 = off. >1 = explicit.
+    const float adaptive_gap = config.adaptive_probe_gap != 0.0f
+        ? config.adaptive_probe_gap
+        : 1.5f;
 
     for (uint32_t p = 0; p < n_probe_eff; p++) {
         // B: geometric gap early-exit.
