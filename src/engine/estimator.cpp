@@ -903,6 +903,14 @@ EstimateResult Estimator::estimate_config(VectorSource& source,
     p.closure_epsilon = base.closure_epsilon;
     p.sub_shard_threshold = base.sub_shard_threshold;
     p.sub_shard_n_probe = base.sub_shard_n_probe;
+    p.quantizer_type = base.quantizer_type;
+    p.prq_nsplits = base.prq_nsplits;
+    p.prq_beam_size = base.prq_beam_size;
+    p.prq_encode_mode = base.prq_encode_mode;
+    p.prq_icm_iters = base.prq_icm_iters;
+    p.prq_ils_iters = base.prq_ils_iters;
+    p.prq_ils_perturb = base.prq_ils_perturb;
+    p.prq_lsq_train_iters = base.prq_lsq_train_iters;
 
     spdlog::info("[sextant] estimate_config: final → R={} alpha={:.1f} "
                  "pq_m={} pq_bits={} L_build={} K={}",
