@@ -514,7 +514,9 @@ int run_ivf_scan_benchmark(const std::string& index,
                            float multiprobe_ratio_req,
                             uint32_t fastscan_w_req,
                             uint32_t panorama_lvl_d,
-                            uint32_t sub_shard_np_req);
+                            uint32_t sub_shard_np_req,
+                            float adaptive_gap_req,
+                            uint32_t scan_budget_req);
 
 int main(int argc, char* argv[]) {
     sextant::init_logging();
@@ -546,6 +548,17 @@ int main(int argc, char* argv[]) {
         "Override sub-shard probe count at search time. 0 = use the index's "
         "built-in value from the manifest. >0 = scan only the N nearest "
         "sub-shards per coarse shard.",
+        false, 0);
+    p.add<float>("adaptive-probe-gap", 0,
+        "Adaptive probe early-exit: stop scanning when the next shard's centroid "
+        "is significantly farther than the current (ratio > gap). 0 = disabled. "
+        "Recommended: 1.5 (stop when next centroid is 50% farther). Lets easy "
+        "queries stop early; hard queries keep probing.",
+        false, 0.0f);
+    p.add<uint32_t>("scan-code-budget", 0,
+        "Maximum total codes (vectors) to scan across all probed shards. "
+        "0 = unlimited. Shards scanned in centroid-distance order until budget "
+        "exhausted. Adapts to skew: small shards cheap, large ones may be skipped.",
         false, 0);
     p.add<uint32_t>("io-limit", 0, "Search I/O budget (0 = unlimited)", false, 0);
     p.add<uint32_t>("limit", 0, "Max queries to run (0 = all)", false, 0);
@@ -630,6 +643,8 @@ int main(int argc, char* argv[]) {
     const uint32_t fastscan_w_req = p.get<uint32_t>("fastscan-w");
     const uint32_t panorama_levels_req = p.get<uint32_t>("panorama-levels");
     const uint32_t sub_shard_np_req = p.get<uint32_t>("sub-shard-n-probe");
+    const float adaptive_gap_req = p.get<float>("adaptive-probe-gap");
+    const uint32_t scan_budget_req = p.get<uint32_t>("scan-code-budget");
 
     // IVF dispatch: if `<index>.shards/` is a directory, this is an IVF
     // index. Two IVF flavors share the `.shards/` layout:
@@ -650,7 +665,8 @@ int main(int argc, char* argv[]) {
                 k, L, rerank, io_limit, limit,
                 n_threads_hint, cache_size_req,
                 n_probe_req, early_exit_req, multiprobe_ratio_req,
-                fastscan_w_req, panorama_levels_req, sub_shard_np_req);
+                fastscan_w_req, panorama_levels_req, sub_shard_np_req,
+                adaptive_gap_req, scan_budget_req);
         }
         return run_ivf_benchmark(index, query_path, base_data, gt_path,
                                  k, L, rerank, io_limit, limit,
@@ -1263,7 +1279,9 @@ int run_ivf_scan_benchmark(const std::string& index,
                            float multiprobe_ratio_req,
                             uint32_t fastscan_w_req,
                             uint32_t panorama_lvl_d,
-                            uint32_t sub_shard_np_req) {
+                            uint32_t sub_shard_np_req,
+                            float adaptive_gap_req,
+                            uint32_t scan_budget_req) {
     (void)L;             // scan path has no beam width
     (void)io_limit;      // scan reads the whole shard — no node visit cap
     (void)cache_size_req;// scan bypasses the BlockCache (sequential stream)
@@ -1417,6 +1435,8 @@ int run_ivf_scan_benchmark(const std::string& index,
         // searcher. Override with --fastscan-w for manual tuning.
         scfg.fastscan_W = fastscan_w_req;
         scfg.sub_shard_n_probe_override = sub_shard_np_req;
+        scfg.adaptive_probe_gap = adaptive_gap_req;
+        scfg.scan_code_budget = scan_budget_req;
 
         std::vector<double> latencies_us;
         latencies_us.reserve(n_queries);

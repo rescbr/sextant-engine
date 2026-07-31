@@ -269,6 +269,21 @@ struct SearchConfig {
     /// Sub-shard probe override. 0 = use the index's built-in sub_shard_n_probe
     /// (from manifest). >0 = override at search time.
     uint32_t sub_shard_n_probe_override = 0;
+
+    /// Adaptive probe early-exit (B): after scanning each shard, check if the
+    /// next shard's centroid distance is significantly farther than the current.
+    /// If cent_dist[p+1] / cent_dist[p] > adaptive_probe_gap, stop scanning.
+    /// This lets easy queries (tight neighborhood) stop early while hard queries
+    /// (spread neighborhood) keep probing. 0 = disabled (scan all n_probe).
+    /// Recommended: 1.5 (stop when the next centroid is 50% farther).
+    float adaptive_probe_gap = 0.0f;
+
+    /// Scan code budget (D): maximum total codes (vectors) to scan across all
+    /// probed shards. 0 = unlimited (scan all n_probe shards). When set, shards
+    /// are scanned in centroid-distance order until the budget is exhausted.
+    /// This adapts to skew: small shards are cheap (scanned fully), large shards
+    /// may be skipped if the budget runs out. Recommended: ~np × mean_shard_size.
+    uint32_t scan_code_budget = 0;
 };
 
 /// Adaptive parameters resolved from dataset/machine properties (Issue 37).

@@ -143,13 +143,19 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
     // heap's front is the W-th nearest (the eviction candidate). When the heap
     // is full and a new dist is smaller than the front, pop the front and push.
     //
-    // Profiling note: tried replacing this with flat-collect-all + post-sort
-    // (the spike's pattern) — it was ~15% SLOWER despite avoiding log-W heap
-    // ops, because flat-collect grows a per-shard buffer to ~22k pairs (vs the
-    // heap's fixed W=300), and the reallocation + 22k pair writes outweigh the
-    // heap-op savings. The heap's bounded memory is the right trade here.
+    // Adaptive early-exit (B+D): shards are scanned in centroid-distance order
+    // (already sorted). Two stopping criteria:
+    //   B (adaptive_probe_gap): if cent_dists[p+1] / cent_dists[p] > gap,
+    //      the next shard is in a "geometric gap" — significantly farther.
+    //      Stop scanning (the neighborhood is covered).
+    //   D (scan_code_budget): track total codes scanned; stop when the budget
+    //      is exhausted. Adapts to skew: cheap small shards scanned first.
+    // Both are optional (gap=0 / budget=0 = disabled, scan all n_probe_eff).
     w.scored.clear();
     const uint32_t invalid = 0xFFFFFFFFu;
+    const float adaptive_gap = config.adaptive_probe_gap;
+    const uint32_t code_budget = config.scan_code_budget;
+    uint32_t codes_scanned = 0;
 
     // Helper: scan one code stream (flat shard or sub-shard) and merge
     // results into the global w.scored accumulator. Uses a local heap.
@@ -290,6 +296,23 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
     };
 
     for (uint32_t p = 0; p < n_probe_eff; p++) {
+        // --- Adaptive early-exit checks (B+D) ---
+        // B: geometric gap. If the next centroid is much farther than the
+        //    current, we've covered the neighborhood. Only check after the
+        //    first shard (need a baseline distance) and when the heap has
+        //    enough candidates to be meaningful.
+        if (adaptive_gap > 1.0f && p > 0 && w.scored.size() >= k) {
+            const float cur_d = w.cent_dists[p - 1].first;
+            const float next_d = w.cent_dists[p].first;
+            if (cur_d > 0.0f && next_d / cur_d > adaptive_gap) {
+                break;  // geometric gap — stop scanning
+            }
+        }
+        // D: code budget exhausted.
+        if (code_budget > 0 && codes_scanned >= code_budget) {
+            break;
+        }
+
         const uint32_t c = w.cent_dists[p].second;
         auto& shard = index_.shards[c];
         if (!shard) continue;
@@ -317,8 +340,10 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
             if (sub_np >= n_sub) {
                 // Scan all sub-shards (no sub-routing needed).
                 for (auto& ss : shard->sub_shards) {
-                    if (ss.codes)
+                    if (ss.codes) {
                         scan_one(*ss.codes, ss.row_ids, w.query_fp16.data());
+                        codes_scanned += ss.count;
+                    }
                 }
             } else {
                 // Route to top-N sub-shards by FP16 distance.
@@ -337,13 +362,16 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
                                   sub_dists.end());
                 for (uint32_t s = 0; s < sub_np; s++) {
                     auto& ss = shard->sub_shards[sub_dists[s].second];
-                    if (ss.codes)
+                    if (ss.codes) {
                         scan_one(*ss.codes, ss.row_ids, w.query_fp16.data());
+                        codes_scanned += ss.count;
+                    }
                 }
             }
         } else if (shard->codes) {
             // --- Flat shard (existing path) ---
             scan_one(*shard->codes, shard->row_ids, w.query_fp16.data());
+            codes_scanned += shard->count;
         }
     }
 
