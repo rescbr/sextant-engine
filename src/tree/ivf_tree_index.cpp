@@ -1032,7 +1032,7 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
             // plus any within closure_epsilon (SPANN-style boundary replication).
             // For IP: distances are negated dots; "within ε" means the
             // absolute difference |d - min_d| ≤ ε.
-            std::array<float, 256> root_dists;  // max k_root=256
+            std::vector<float> root_dists(k_root);
             float min_d = std::numeric_limits<float>::max();
             for (uint32_t c = 0; c < k_root; ++c) {
                 root_dists[c] = simd::dist_f16(metric, fvec,
@@ -2156,7 +2156,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                         // |proj|² is constant across centroids (skip).
                         // |centroid|² is precomputed once.
                         // argmin dist = argmin(-2·proj·centroid + |centroid|²)
-                        float cent_norms[256];
+                        std::vector<float> cent_norms(k_root);
                         for (uint32_t c = 0; c < k_root; ++c) {
                             cent_norms[c] = simd::dot_f32(
                                 root_centroids_pca[c].data(),
@@ -2164,7 +2164,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                         }
                         for (uint32_t i = s; i < e; ++i) {
                             const float* xi = &vec_buf[i * dim];
-                            float proj[64];
+                            std::vector<float> proj(pca_dims);
                             for (uint32_t k = 0; k < pca_dims; ++k)
                                 proj[k] = simd::dot_f32(
                                     &rotation[k * dim], xi, dim) - mean_proj[k];
@@ -2172,7 +2172,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                             uint32_t best_c = 0;
                             for (uint32_t c = 0; c < k_root; ++c) {
                                 const float dot = simd::dot_f32(
-                                    proj, root_centroids_pca[c].data(), pca_dims);
+                                    proj.data(), root_centroids_pca[c].data(), pca_dims);
                                 const float d = cent_norms[c] - 2.0f * dot;
                                 if (d < best_d) { best_d = d; best_c = c; }
                             }
@@ -2397,7 +2397,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                 futs.push_back(std::async(std::launch::async,
                     [&](uint32_t s, uint32_t e) {
                         std::vector<uint8_t> code(code_size);
-                        float proj[64];
+                        std::vector<float> proj(pca_dims);
                         for (uint32_t i = s; i < e; ++i) {
                             const float* xi = &vec_buf[i * dim];
                             // Project to PCA space.
@@ -2408,7 +2408,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                             float min_d = std::numeric_limits<float>::max();
                             for (uint32_t c = 0; c < k_root; ++c) {
                                 const float dot = simd::dot_f32(
-                                    proj, root_centroids_pca[c].data(), pca_dims);
+                                    proj.data(), root_centroids_pca[c].data(), pca_dims);
                                 const float d = cent_norms[c] - 2.0f * dot;
                                 if (d < min_d) min_d = d;
                             }
@@ -2418,7 +2418,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                             // Find closure targets.
                             for (uint32_t c = 0; c < k_root; ++c) {
                                 const float dot = simd::dot_f32(
-                                    proj, root_centroids_pca[c].data(), pca_dims);
+                                    proj.data(), root_centroids_pca[c].data(), pca_dims);
                                 const float d = cent_norms[c] - 2.0f * dot;
                                 if (std::fabs(d - min_d) <= closure_epsilon)
                                     chunk_targets[i].push_back(c);
