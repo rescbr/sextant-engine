@@ -178,6 +178,20 @@ public:
     /// Code-to-code distance via the cross-distance table.
     float code_distance(const uint8_t* code_a, const uint8_t* code_b) const;
 
+    /// Build the IP cross-distance table (m × K × K, code-to-code inner product).
+    /// Used by partition_codes for IP-metric partitioning. Idempotent.
+    void build_ip_cross_distance_table() const;
+
+    /// Read-only access to the IP cross-distance table (empty if not built).
+    const std::vector<float>& ip_cross_distance_table() const {
+        return ip_cross_distance_table_;
+    }
+
+    /// Code-to-code inner product distance via the IP cross-distance table.
+    /// Returns -dot (so smaller = more similar, consistent with code_distance).
+    /// Falls back to the codebook-direct path if the IP table is empty.
+    float code_distance_ip(const uint8_t* code_a, const uint8_t* code_b) const;
+
     /// Extract centroid id for slot `s` from a packed code (4-bit or 8-bit).
     /// Public so partition.cpp can do batch table lookups without going
     /// through code_distance one-at-a-time.
@@ -273,6 +287,11 @@ protected:
 
     /// Cross-distance table: m × K × K floats (code-to-code).
     std::vector<float> cross_distance_table_;
+
+    /// IP cross-distance table: m × K × K floats (code-to-code inner product).
+    /// Used by partition_codes for IP-metric partitioning. Empty for L2sq.
+    /// Built on demand by build_ip_cross_distance_table().
+    mutable std::vector<float> ip_cross_distance_table_;
 
     /// Populate `centroid_sqnorms_` from the trained codebook. Called at the
     /// end of train(); cheap (m*K tiny norm computations, ~12K at m=96).

@@ -195,6 +195,17 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
     const float* tbl = quantizer.cross_distance_table();
     const bool is_ip = (quantizer.metric() == MetricKind::InnerProduct);
 
+    // For IP-metric partitioning: use IP-aware code distances instead of
+    // the default L2sq cross-distance table. The L2sq table produces near-
+    // constant distances on unit-normalized data (||a-b||² ≈ 2-2⟨a,b⟩),
+    // causing k-means to oscillate (60-72% churn on Sphere-IP). IP distances
+    // directly capture angular structure → better partitioning.
+    if (is_ip) {
+        quantizer.build_ip_cross_distance_table();
+        tbl = quantizer.ip_cross_distance_table().data();
+        spdlog::info("[sextant] partition: using IP-aware code distances");
+    }
+
     auto parallel_assign = [&](void) {
         std::atomic<uint32_t> next_id{0};
         std::vector<std::future<void>> futs;

@@ -723,6 +723,62 @@ void PqQuantizer::build_cross_distance_table() {
     for (auto& th : pool) th.join();
 }
 
+void PqQuantizer::build_ip_cross_distance_table() const {
+    if (!ip_cross_distance_table_.empty()) return;  // already built
+    ip_cross_distance_table_.assign(
+        static_cast<size_t>(m_) * K_ * K_, 0.0f);
+
+    const uint32_t hw = num_threads_ > 0
+        ? num_threads_
+        : std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t n_threads = std::min(hw, static_cast<uint32_t>(m_));
+
+    std::atomic<uint32_t> next_seg{0};
+    auto worker = [&]() {
+        uint32_t s;
+        while ((s = next_seg.fetch_add(1, std::memory_order_relaxed)) < m_) {
+            const float* book = codebook_.data() + size_t(s) * K_ * sub_dim_;
+            float* table = ip_cross_distance_table_.data() + size_t(s) * K_ * K_;
+            for (uint32_t a = 0; a < K_; a++) {
+                const float* ca = book + a * sub_dim_;
+                for (uint32_t b = 0; b < K_; b++) {
+                    const float* cb = book + b * sub_dim_;
+                    // Negative dot product (so smaller = more similar).
+                    table[a * K_ + b] = -simd::dot_f32(ca, cb, sub_dim_);
+                }
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (uint32_t t = 0; t < n_threads; t++) pool.emplace_back(worker);
+    for (auto& th : pool) th.join();
+}
+
+float PqQuantizer::code_distance_ip(const uint8_t* code_a,
+                                     const uint8_t* code_b) const {
+    if (!ip_cross_distance_table_.empty()) {
+        float acc = 0.0f;
+        const float* table_base = ip_cross_distance_table_.data();
+        for (uint32_t s = 0; s < m_; s++) {
+            const uint32_t ca = read_code(code_a, bits_, s);
+            const uint32_t cb = read_code(code_b, bits_, s);
+            acc += table_base[size_t(s) * K_ * K_ + ca * K_ + cb];
+        }
+        return acc;
+    }
+    // Fallback: compute from codebook directly.
+    float acc = 0.0f;
+    for (uint32_t s = 0; s < m_; s++) {
+        const uint32_t ca = read_code(code_a, bits_, s);
+        const uint32_t cb = read_code(code_b, bits_, s);
+        const float* book = codebook_.data() + size_t(s) * K_ * sub_dim_;
+        acc += -simd::dot_f32(book + ca * sub_dim_, book + cb * sub_dim_,
+                              sub_dim_);
+    }
+    return acc;
+}
+
 void PqQuantizer::encode(const float* vec, uint8_t* code_out) const {
     std::memset(code_out, 0, code_size());
     const float* v = vec;
