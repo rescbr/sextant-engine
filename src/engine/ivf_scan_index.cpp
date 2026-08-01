@@ -1,5 +1,6 @@
 #include "sextant/ivf_scan_index.hpp"
 
+#include "engine/manifest_io.hpp"
 #include "engine/sidecar_io.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "quant/product_residual_quantizer.hpp"
@@ -23,55 +24,16 @@ IVFScanIndex::~IVFScanIndex() = default;
 
 namespace {
 
-/// Read the line-oriented IVF-scan manifest. Format (one token per line):
-///   ready
-///   <K>
-///   <dim>
-///   <n_probe_default>
-///   <m4>
-///   <scan_pq_bits>
-///   <quantizer_type>
-///   <prq_nsplits>
-///   <sub_shard_probe_pct>
-///   <adaptive_probe_gap>
-///   <median_lid>
-/// Returns false if the file is missing or malformed (all fields required).
-bool read_scan_manifest(const std::string& path, uint32_t& K, Dim& dim,
-                        uint32_t& n_probe_default, uint16_t& m4,
-                        uint8_t& scan_pq_bits, std::string& quantizer_type,
-                        uint32_t& prq_nsplits,
-                        uint32_t& sub_shard_probe_pct,
-                        float& adaptive_probe_gap,
-                        float& median_lid) {
+/// Read the TOML IVF-scan manifest. Throws on missing/malformed file.
+IVFScanManifest read_scan_manifest(const std::string& path) {
     std::ifstream f(path);
-    if (!f) return false;
-    std::string tok;
-    if (!std::getline(f, tok)) return false;
-    if (tok != "ready") {
-        spdlog::warn("[sextant] IVFScanIndex: manifest not ready (first line='{}')",
-                     tok);
-        return false;
+    if (!f) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "IVFScanIndex: manifest not found at '" + path + "'");
     }
-    auto read_line = [&](auto& out) -> bool {
-        std::string line;
-        if (!std::getline(f, line)) return false;
-        std::istringstream iss(line);
-        iss >> out;
-        return !iss.fail();
-    };
-    if (!read_line(K)) return false;
-    if (!read_line(dim)) return false;
-    if (!read_line(n_probe_default)) return false;
-    if (!read_line(m4)) return false;
-    uint16_t bits_raw = 4;
-    if (!read_line(bits_raw)) return false;
-    scan_pq_bits = (bits_raw == 8) ? 8 : 4;
-    if (!read_line(quantizer_type)) return false;
-    if (!read_line(prq_nsplits)) return false;
-    if (!read_line(sub_shard_probe_pct)) return false;
-    if (!read_line(adaptive_probe_gap)) return false;
-    if (!read_line(median_lid)) return false;
-    return true;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ivf_scan_manifest_from_toml(ss.str());
 }
 
 /// Read the shared scan codebook (a serialized PqQuantizer blob prefixed by a
@@ -163,31 +125,28 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
     idx->path = shards_dir;
 
     const std::string manifest_path = shards_dir + "/manifest";
-    uint32_t K = 0, n_probe_default = 1;
-    Dim dim = 0;
-    uint16_t m4 = 0;
-    uint8_t scan_pq_bits = 4;
-    std::string quantizer_type = "pq";
-    uint32_t prq_nsplits = 0;
-    if (!read_scan_manifest(manifest_path, K, dim, n_probe_default, m4,
-                            scan_pq_bits, quantizer_type, prq_nsplits,
-                            idx->sub_shard_probe_pct,
-                            idx->adaptive_probe_gap,
-                            idx->median_lid)) {
-        throw Error(ErrorCode::CorruptIndex,
-                    "IVFScanIndex: cannot read manifest '" + manifest_path + "'");
-    }
-    if (K == 0 || dim == 0 || m4 == 0) {
+    const auto manif = read_scan_manifest(manifest_path);
+    if (manif.K == 0 || manif.dim == 0 || manif.m4 == 0) {
         throw Error(ErrorCode::CorruptIndex,
                     "IVFScanIndex: manifest has K/dim/m4 = 0");
     }
-    idx->K = K;
-    idx->dim = dim;
-    idx->n_probe_default = n_probe_default > 0 ? n_probe_default : 1;
-    idx->m4 = m4;
-    idx->scan_pq_bits = scan_pq_bits;
-    idx->quantizer_type = quantizer_type;
-    idx->prq_nsplits = prq_nsplits;
+    idx->K = manif.K;
+    idx->dim = manif.dim;
+    idx->n_probe_default = manif.n_probe_default > 0 ? manif.n_probe_default : 1;
+    idx->m4 = manif.m4;
+    idx->scan_pq_bits = manif.scan_pq_bits;
+    idx->quantizer_type = manif.quantizer_type;
+    idx->prq_nsplits = manif.prq_nsplits;
+    idx->sub_shard_probe_pct = manif.sub_shard_probe_pct;
+    idx->adaptive_probe_gap = manif.adaptive_probe_gap;
+    idx->median_lid = manif.median_lid;
+
+    uint32_t K = manif.K;
+    Dim dim = manif.dim;
+    uint16_t m4 = manif.m4;
+    uint8_t scan_pq_bits = manif.scan_pq_bits;
+    const std::string& quantizer_type = idx->quantizer_type;
+    uint32_t prq_nsplits = manif.prq_nsplits;
 
     // Load centroids (raw FP16, same layout as IVFIndex).
     {
@@ -269,21 +228,14 @@ std::unique_ptr<IVFScanIndex> IVFScanIndex::read(const std::string& shards_dir) 
                 shard->count += ss.count;
                 shard->sub_shards.push_back(std::move(ss));
             }
-            // Read sub-centroid offsets from shard.manifest.
+            // Read sub-centroid offsets from shard.manifest (TOML).
             const std::string shard_manifest = shard_dir + "/shard.manifest";
             std::ifstream smf(shard_manifest);
             if (smf) {
-                std::string tok;
-                std::getline(smf, tok); // "ready"
-                uint32_t n_subs = 0;
-                std::getline(smf, tok);
-                std::istringstream(tok) >> n_subs;
-                for (uint32_t s = 0; s < n_subs; s++) {
-                    uint32_t off = 0;
-                    std::getline(smf, tok);
-                    std::istringstream(tok) >> off;
-                    shard->sub_centroid_offsets.push_back(off);
-                }
+                std::ostringstream ss;
+                ss << smf.rdbuf();
+                auto [n_subs, offsets] = shard_offsets_from_toml(ss.str());
+                shard->sub_centroid_offsets = std::move(offsets);
             }
             idx->shards[k] = std::move(shard);
             continue;

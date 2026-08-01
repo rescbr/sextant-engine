@@ -1,5 +1,6 @@
 #include "sextant/ivf_index.hpp"
 
+#include "engine/manifest_io.hpp"
 #include "sidecar_io.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
@@ -20,53 +21,23 @@ using engine_detail::read_exact;
 
 namespace {
 
-/// Parse the IVF manifest. We deliberately avoid a JSON dependency: the
-/// manifest is a tiny line-oriented text file we control on both sides.
-///   line 1: "ready"
-///   line 2: K
-///   line 3: dim
-///   line 4: n_probe_default
-///   line 5: closure_factor
-struct IVFManifest {
-    uint32_t K = 0;
-    Dim dim = 0;
-    uint32_t n_probe_default = 1;
-    float closure_factor = 1.0f;
-};
-
-IVFManifest read_ivf_manifest(const std::string& path) {
+/// Parse the IVF graph manifest (TOML). Throws on parse error or invalid values.
+IVFGraphManifest read_ivf_manifest(const std::string& path) {
     std::ifstream f(path);
     if (!f) {
         throw Error(ErrorCode::CorruptIndex,
                     "IVFIndex::read: cannot open manifest '" + path + "'");
     }
-    std::string ready_line;
-    std::getline(f, ready_line);
-    if (ready_line != "ready") {
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    IVFGraphManifest m;
+    try {
+        m = ivf_graph_manifest_from_toml(ss.str());
+    } catch (const Error& e) {
         throw Error(ErrorCode::CorruptIndex,
-                    "IVFIndex::read: manifest not ready (first line: '" +
-                        ready_line + "')");
+                    "IVFIndex::read: manifest parse failed on '" + path +
+                        "': " + e.what());
     }
-    IVFManifest m;
-    std::string line;
-    auto read_u32 = [&](uint32_t& out) {
-        if (!std::getline(f, line)) {
-            throw Error(ErrorCode::CorruptIndex,
-                        "IVFIndex::read: manifest truncated");
-        }
-        out = static_cast<uint32_t>(std::stoul(line));
-    };
-    auto read_f32 = [&](float& out) {
-        if (!std::getline(f, line)) {
-            throw Error(ErrorCode::CorruptIndex,
-                        "IVFIndex::read: manifest truncated");
-        }
-        out = std::stof(line);
-    };
-    read_u32(m.K);
-    read_u32(m.dim);
-    read_u32(m.n_probe_default);
-    read_f32(m.closure_factor);
     if (m.K == 0 || m.dim == 0) {
         throw Error(ErrorCode::CorruptIndex,
                     "IVFIndex::read: manifest has K=0 or dim=0");

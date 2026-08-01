@@ -23,6 +23,8 @@ test_sources = [
     'test_memgraph.cpp',
     'test_cli.cpp',
     'test_partition.cpp',
+    'test_tree_phase0.cpp',
+    'test_tree_phase1.cpp',
 ]
 
 foreach src : test_sources

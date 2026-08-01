@@ -14,6 +14,7 @@
 
 #include "fbin_io.hpp"
 #include "sextant/config.hpp"
+#include "sextant/crash_handler.hpp"
 #include "sextant/ivf_scan_searcher.hpp"
 #include "sextant/ivf_searcher.hpp"
 #include "sextant/searcher.hpp"
@@ -519,6 +520,7 @@ int run_ivf_scan_benchmark(const std::string& index,
                             uint32_t scan_budget_req);
 
 int main(int argc, char* argv[]) {
+    sextant::install_crash_handler();
     sextant::init_logging();
 
     cmdline::parser p;

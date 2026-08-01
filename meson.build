@@ -96,6 +96,14 @@ numkong_inc = include_directories('third_party/numkong/include')
 # CTPL and cmdline: committed headers, include path only.
 third_party_inc = include_directories('third_party')
 
+# cpptoml: header-only TOML parser (for tree manifest serialization).
+cpptoml_proj = subproject('cpptoml')
+cpptoml_dep = cpptoml_proj.get_variable('cpptoml_dep')
+
+# cpptrace: stack traces on crash (signal handler in main).
+cpptrace_proj = subproject('cpptrace')
+cpptrace_dep = cpptrace_proj.get_variable('cpptrace_dep')
+
 # --- Engine library -----------------------------------------------------------
 engine_inc = include_directories('include')
 src_inc = include_directories('src')
@@ -126,6 +134,13 @@ engine_sources = [
     'src/engine/estimator.cpp',
     'src/engine/fbin_source.cpp',
     'src/engine/partition.cpp',
+    'src/engine/manifest_io.cpp',
+    # Hierarchical IVF tree (Phase 0: infrastructure)
+    'src/tree/page_file.cpp',
+    'src/tree/page_allocator.cpp',
+    'src/tree/superblock.cpp',
+    'src/tree/tree_manifest.cpp',
+    'src/tree/ivf_tree_index.cpp',
     'src/logging.cpp',
     'src/system.cpp',
 ]
@@ -133,14 +148,14 @@ engine_sources = [
 sextant_lib = static_library('sextant',
     engine_sources,
     include_directories: [engine_inc, src_inc, third_party_inc],
-    dependencies: [nsync_dep, spdlog_dep],
+    dependencies: [nsync_dep, spdlog_dep, cpptoml_dep, cpptrace_dep],
     install: false,
 )
 
 sextant_dep = declare_dependency(
     link_with: sextant_lib,
     include_directories: [engine_inc, src_inc],
-    dependencies: [nsync_dep, spdlog_dep],
+    dependencies: [nsync_dep, spdlog_dep, cpptoml_dep, cpptrace_dep],
 )
 
 # --- CLI tool -----------------------------------------------------------------

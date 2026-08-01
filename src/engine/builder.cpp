@@ -20,6 +20,7 @@
 #include "memory_source.hpp"
 #include "partition.hpp"
 #include "probe.hpp"
+#include "manifest_io.hpp"
 #include "sidecar_io.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
@@ -1396,7 +1397,7 @@ BuildResult Builder::build_ivf(VectorSource& source, const std::string& index_pa
                      static_cast<uint64_t>(K) * vec_bytes);
     }
 
-    // --- 5. manifest (line-oriented text; IVFIndex::read commit point) ---
+    // --- 5. manifest (TOML; IVFIndex::read commit point) ---
     // Written LAST via temp + rename so its presence signals a complete build.
     {
         // np ∝ √K: the single best-validated scaling law (3 datasets, LID
@@ -1406,24 +1407,13 @@ BuildResult Builder::build_ivf(VectorSource& source, const std::string& index_pa
                                      : std::max(1u, static_cast<uint32_t>(
                                            2.0f * std::sqrt(float(K))));
         const std::string path = shards_dir + "/manifest";
-        const std::string tmp = path + ".tmp";
-        {
-            DirectFile f(tmp, true);
-            std::string commit =
-                std::string("ready\n") +
-                std::to_string(K) + "\n" +
-                std::to_string(index_.dim) + "\n" +
-                std::to_string(n_probe) + "\n" +
-                std::to_string(closure_factor) + "\n";
-            write_padded(f, commit.data(), commit.size(), 0);
-            f.sync();
-        }
-        std::error_code rec;
-        std::filesystem::rename(tmp, path, rec);
-        if (rec) {
-            throw Error(ErrorCode::IoError,
-                        "build_ivf: manifest rename failed: " + rec.message());
-        }
+        IVFGraphManifest m;
+        m.K = K;
+        m.dim = index_.dim;
+        m.n_probe_default = n_probe;
+        m.closure_factor = closure_factor;
+        write_manifest_atomic(path, ivf_graph_manifest_to_toml(m));
+
         spdlog::info("[sextant] wrote {} (K={} n_probe_default={} closure_factor="
                      "{:.4f})", path, K, n_probe, closure_factor);
     }
@@ -1976,33 +1966,21 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                 // Per-sub-shard manifest.
                 {
                     const std::string mpath = sub_dir + "/.manifest";
-                    const std::string tmp = mpath + ".tmp";
-                    DirectFile f(tmp, true);
-                    std::string commit = std::string("ready\n") +
-                        std::to_string(sub_n) + "\n" +
-                        std::to_string(dim) + "\n" +
-                        std::to_string(m4) + "\n";
-                    write_padded(f, commit.data(), commit.size(), 0);
-                    f.sync();
-                    std::error_code rec;
-                    std::filesystem::rename(tmp, mpath, rec);
+                    ShardManifest sm;
+                    sm.count = sub_n;
+                    sm.dim = dim;
+                    sm.m4 = m4;
+                    write_manifest_atomic(mpath, shard_manifest_to_toml(sm));
                 }
                 spdlog::info("[sextant] build_ivf_scan: shard {}/{} sub {}/{} "
                              "({} vectors)", k + 1, K, s, S, sub_n);
             }
 
-            // Write shard.manifest (sub-centroid offsets).
+            // Write shard.manifest (sub-centroid offsets, TOML).
             {
                 const std::string mpath = shard_dir + "/shard.manifest";
-                const std::string tmp = mpath + ".tmp";
-                DirectFile f(tmp, true);
-                std::string commit = "ready\n" + std::to_string(S) + "\n";
-                for (uint32_t s = 0; s < S; s++)
-                    commit += std::to_string(sub_offsets[s]) + "\n";
-                write_padded(f, commit.data(), commit.size(), 0);
-                f.sync();
-                std::error_code rec;
-                std::filesystem::rename(tmp, mpath, rec);
+                write_manifest_atomic(mpath,
+                    shard_offsets_to_toml(S, sub_offsets));
             }
             return 1;
         }
@@ -2148,27 +2126,14 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                          sizeof(h));
             f.sync();
         }
-        // Per-shard manifest (atomic commit).
+        // Per-shard manifest (atomic commit, TOML).
         {
             const std::string path = shard_dir + "/.manifest";
-            const std::string tmp = path + ".tmp";
-            {
-                DirectFile f(tmp, true);
-                std::string commit =
-                    std::string("ready\n") +
-                    std::to_string(shard_n) + "\n" +
-                    std::to_string(dim) + "\n" +
-                    std::to_string(m4) + "\n";
-                write_padded(f, commit.data(), commit.size(), 0);
-                f.sync();
-            }
-            std::error_code rec;
-            std::filesystem::rename(tmp, path, rec);
-            if (rec) {
-                throw Error(ErrorCode::IoError,
-                            "build_ivf_scan: shard manifest rename failed: " +
-                                rec.message());
-            }
+            ShardManifest sm;
+            sm.count = shard_n;
+            sm.dim = dim;
+            sm.m4 = m4;
+            write_manifest_atomic(path, shard_manifest_to_toml(sm));
         }
 
         spdlog::info("[sextant] build_ivf_scan: shard {}/{} ({} vectors, "
@@ -2284,7 +2249,7 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
         f.sync();
     }
 
-    // --- 7. manifest (line-oriented text; IVFScanIndex::read commit point) ---
+    // --- 7. manifest (TOML; IVFScanIndex::read commit point) ---
     {
         // np ∝ √K: the single best-validated scaling law (3 datasets, LID
         // 13-21, recall 0.55-0.99). K/4 over-probes at K>16.
@@ -2293,39 +2258,28 @@ BuildResult Builder::build_ivf_scan(VectorSource& source,
                                      : std::max(1u, static_cast<uint32_t>(
                                            2.0f * std::sqrt(float(K))));
         const std::string path = shards_dir + "/manifest";
-        const std::string tmp = path + ".tmp";
-        {
-            DirectFile f(tmp, true);
-            const uint32_t manifest_nsplits =
-                (params.quantizer_type == "prq")
-                    ? static_cast<ProductResidualQuantizer&>(qscan).nsplits()
-                    : 0;
-            // sub_probe_pct: integer percentage (0-100). At search time,
-            // sub_np = max(1, ceil(n_sub * pct / 100)) per shard.
-            const uint32_t sub_probe_pct = static_cast<uint32_t>(
-                sub_probe_fraction * 100.0f + 0.5f);
-            std::string commit =
-                std::string("ready\n") +
-                std::to_string(K) + "\n" +
-                std::to_string(dim) + "\n" +
-                std::to_string(n_probe) + "\n" +
-                std::to_string(m4) + "\n" +
-                std::to_string(static_cast<unsigned>(scan_bits)) + "\n" +
-                params.quantizer_type + "\n" +
-                std::to_string(manifest_nsplits) + "\n" +
-                std::to_string(sub_probe_pct) + "\n" +
-                std::to_string(params.adaptive_probe_gap) + "\n" +
-                std::to_string(params.median_lid) + "\n";
-            write_padded(f, commit.data(), commit.size(), 0);
-            f.sync();
-        }
-        std::error_code rec;
-        std::filesystem::rename(tmp, path, rec);
-        if (rec) {
-            throw Error(ErrorCode::IoError,
-                        "build_ivf_scan: manifest rename failed: " +
-                            rec.message());
-        }
+        const uint32_t manifest_nsplits =
+            (params.quantizer_type == "prq")
+                ? static_cast<ProductResidualQuantizer&>(qscan).nsplits()
+                : 0;
+        // sub_probe_pct: integer percentage (0-100). At search time,
+        // sub_np = max(1, ceil(n_sub * pct / 100)) per shard.
+        const uint32_t sub_probe_pct = static_cast<uint32_t>(
+            sub_probe_fraction * 100.0f + 0.5f);
+
+        IVFScanManifest m;
+        m.K = K;
+        m.dim = dim;
+        m.n_probe_default = n_probe;
+        m.m4 = m4;
+        m.scan_pq_bits = scan_bits;
+        m.quantizer_type = params.quantizer_type;
+        m.prq_nsplits = manifest_nsplits;
+        m.sub_shard_probe_pct = sub_probe_pct;
+        m.adaptive_probe_gap = params.adaptive_probe_gap;
+        m.median_lid = params.median_lid;
+        write_manifest_atomic(path, ivf_scan_manifest_to_toml(m));
+
         spdlog::info("[sextant] wrote {} (K={} n_probe_default={} m4={})",
                      path, K, n_probe, m4);
     }
@@ -3016,31 +2970,12 @@ void Builder::write_meta_file(const ResolvedParams& params,
 void Builder::write_manifest_file(const ResolvedParams& params,
                                   const std::pair<uint64_t, uint64_t>& uuid) {
     const std::string path = index_.path + ".manifest";
-    const std::string tmp = path + ".tmp";
-    {
-        DirectFile f(tmp, true);
-        SidecarHeader h;
-        fill_header(h, kMagicManifest, index_.count, index_.dim, uuid);
-        write_padded(f, &h, sizeof(h), 0);
-        // The manifest is the commit point. We record the four sidecar
-        // basenames + a "ready" marker.
-        std::string commit =
-            std::string("ready\n") +
-            std::to_string(index_.count) + "\n" +
-            std::to_string(index_.dim) + "\n" +
-            std::to_string(params.R) + "\n" +
-            std::to_string(params.pq_m) + "\n";
-        write_padded(f, commit.data(), commit.size(), sizeof(h));
-        f.sync();
-    }
-    // Atomic rename: the manifest appears all at once, signaling a
-    // complete, consistent build.
-    std::error_code ec;
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) {
-        throw Error(ErrorCode::IoError,
-                    "Builder::flush: manifest rename failed: " + ec.message());
-    }
+    GraphManifest m;
+    m.n_vectors = index_.count;
+    m.dim = index_.dim;
+    m.R = params.R;
+    m.pq_m = params.pq_m;
+    write_manifest_atomic(path, graph_manifest_to_toml(m));
     spdlog::info("[sextant] wrote {} (commit point)", path);
 }
 

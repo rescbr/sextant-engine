@@ -17,11 +17,13 @@
 #include "shared_cli.hpp"
 #include "sextant/builder.hpp"
 #include "sextant/config.hpp"
+#include "sextant/crash_handler.hpp"
 #include "sextant/error.hpp"
 #include "sextant/estimator.hpp"
 #include "sextant/index.hpp"
 #include "sextant/logging.hpp"
 #include "sextant/searcher.hpp"
+#include "tree/ivf_tree_index.hpp"
 
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
@@ -45,6 +47,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -445,6 +448,206 @@ int cmd_search(int argc, char* argv[]) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// build-tree: build a hierarchical IVF tree index
+// ---------------------------------------------------------------------------
+
+int cmd_build_tree(int argc, char* argv[]) {
+    using namespace sextant_cli;
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("input", 0, "Base vectors (.fbin)", true);
+    p.add<std::string>("index", 0, "Output tree file path", true);
+    p.add<uint32_t>("k-root", 0, "Root branching factor (0=auto)", false, 0);
+    p.add<uint32_t>("leaf-capacity", 0, "Max vectors per leaf", false, 5000);
+    p.add<uint16_t>("pq4-m", 0, "PQ subquantizers for 4-bit scan (0=dim/4)", false, 0);
+    p.add<uint32_t>("pq-bits", 0, "PQ bits (4 or 8)", false, 4);
+    p.add<std::string>("quantizer", 0, "pq / prq / rabitq", false, "pq");
+    p.add<std::string>("metric", 0, "l2sq / ip", false, "l2sq");
+    p.add<float>("closure-epsilon", 0, "Absolute margin for closure (-1=auto)", false, -1.0f);
+    p.add<float>("balance-factor", 0, "SPANN balance factor (0=off)", false, 4.0f);
+    p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
+    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.parse_check(argc, argv);
+
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") set_log_level(LogLevel::Debug);
+        else if (lvl == "warn") set_log_level(LogLevel::Warn);
+        else if (lvl == "error") set_log_level(LogLevel::Error);
+    }
+
+    tree::IVFTreeIndex::BuildConfig cfg;
+    cfg.k_root = p.get<uint32_t>("k-root");
+    cfg.leaf_capacity = p.get<uint32_t>("leaf-capacity");
+    cfg.num_threads = p.get<uint32_t>("threads");
+    cfg.params.pq4_m = p.get<uint16_t>("pq4-m");
+    cfg.params.scan_pq_bits = static_cast<uint8_t>(p.get<uint32_t>("pq-bits"));
+    cfg.params.quantizer_type = p.get<std::string>("quantizer");
+    const std::string metric = p.get<std::string>("metric");
+    cfg.params.metric = (metric == "ip") ? MetricKind::InnerProduct
+                                          : MetricKind::L2Sq;
+    cfg.params.closure_epsilon = p.get<float>("closure-epsilon");
+    cfg.params.partition_balance_factor = p.get<float>("balance-factor");
+
+    const std::string input = p.get<std::string>("input");
+    const std::string index_path = p.get<std::string>("index");
+
+    auto result = tree::IVFTreeIndex::build(input, index_path, cfg);
+    std::cout << "built tree index '" << index_path
+              << "': n=" << result.n_vectors
+              << " dim=" << result.dim
+              << " m4=" << static_cast<int>(result.pq_m)
+              << " in " << result.build_time_sec << "s\n";
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// tree-search: search a hierarchical IVF tree index
+// ---------------------------------------------------------------------------
+
+int cmd_tree_search(int argc, char* argv[]) {
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("index", 0, "Tree index file", true);
+    p.add<std::string>("query", 0, "Query vectors (.fbin)", true);
+    p.add<std::string>("ground-truth", 0, "Ground-truth .gt file", false, "");
+    p.add<uint32_t>("topk", 0, "K nearest neighbors", false, 10);
+    p.add<uint32_t>("n-probe", 0, "Root probe count (0=manifest default)", false, 0);
+    p.add<uint32_t>("fastscan-w", 0, "Rerank shortlist per shard (0=300)", false, 0);
+    p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
+    p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
+    p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
+    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.parse_check(argc, argv);
+
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") set_log_level(LogLevel::Debug);
+        else if (lvl == "warn") set_log_level(LogLevel::Warn);
+        else if (lvl == "error") set_log_level(LogLevel::Error);
+    }
+
+    auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"));
+
+    // Read query file.
+    FbinHeader qh;
+    if (!read_fbin_header(p.get<std::string>("query"), qh) ||
+        qh.dim != idx->dim()) {
+        std::cerr << "tree-search: invalid query file (dim=" << qh.dim
+                  << ", expected " << idx->dim() << ")\n";
+        return 1;
+    }
+
+    const uint32_t k = p.get<uint32_t>("topk");
+    uint32_t num_threads = p.get<uint32_t>("threads");
+    if (num_threads == 0)
+        num_threads = std::max(1u, std::thread::hardware_concurrency());
+
+    SearchConfig scfg;
+    scfg.k = k;
+    scfg.n_probe = p.get<uint32_t>("n-probe");
+    scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
+    scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
+
+    std::ifstream qf(p.get<std::string>("query"), std::ios::binary);
+    qf.seekg(8);
+    // (queries are read in bulk below for parallel processing)
+
+    // Load ground truth if provided.
+    std::vector<std::vector<RowId>> gt;
+    if (!p.get<std::string>("ground-truth").empty()) {
+        std::ifstream gtf(p.get<std::string>("ground-truth"), std::ios::binary);
+        if (gtf) {
+            uint32_t gt_n = 0, gt_k = 0;
+            gtf.read(reinterpret_cast<char*>(&gt_n), 4);
+            gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+            gt.resize(gt_n);
+            std::vector<uint32_t> row(gt_k);
+            for (uint32_t i = 0; i < gt_n; ++i) {
+                gtf.read(reinterpret_cast<char*>(row.data()),
+                         gt_k * sizeof(uint32_t));
+                gt[i].assign(row.begin(), row.end());  // uint32 → int64
+            }
+            std::cerr << "loaded ground truth: " << gt_n << " queries, k="
+                      << gt_k << "\n";
+        }
+    }
+
+    std::ofstream out_file;
+    std::ostream* out = &std::cout;
+    if (!p.get<std::string>("output").empty()) {
+        out_file.open(p.get<std::string>("output"));
+        out = &out_file;
+    }
+
+    uint64_t total_hits = 0;
+    uint64_t total_queries = 0;
+
+    // Read all queries into memory for parallel processing.
+    std::vector<float> queries(static_cast<size_t>(qh.n) * qh.dim);
+    qf.read(reinterpret_cast<char*>(queries.data()),
+            static_cast<std::streamsize>(qh.n * qh.dim * sizeof(float)));
+    qf.close();
+
+    std::vector<std::vector<Candidate>> all_results(qh.n);
+
+    const auto t0 = std::chrono::steady_clock::now();
+
+    if (num_threads <= 1) {
+        for (uint32_t qi = 0; qi < qh.n; ++qi) {
+            all_results[qi] = idx->search(
+                &queries[static_cast<size_t>(qi) * qh.dim], k, scfg);
+        }
+    } else {
+        // Query-level parallelism: each query is independent.
+        std::vector<std::future<void>> futs;
+        std::atomic<uint32_t> next_qi{0};
+        for (uint32_t t = 0; t < num_threads; ++t) {
+            futs.push_back(std::async(std::launch::async, [&]() {
+                while (true) {
+                    const uint32_t qi = next_qi.fetch_add(1);
+                    if (qi >= qh.n) break;
+                    all_results[qi] = idx->search(
+                        &queries[static_cast<size_t>(qi) * qh.dim], k, scfg);
+                }
+            }));
+        }
+        for (auto& f : futs) f.get();
+    }
+
+    // Tally recall + emit results (serial — I/O bound).
+    for (uint32_t qi = 0; qi < qh.n; ++qi) {
+        const auto& results = all_results[qi];
+        if (!gt.empty() && qi < gt.size()) {
+            std::unordered_set<RowId> gt_set(gt[qi].begin(), gt[qi].end());
+            for (const auto& c : results) {
+                if (gt_set.count(c.row_id)) ++total_hits;
+            }
+            ++total_queries;
+        }
+        for (const auto& c : results) {
+            *out << qi << '\t' << c.row_id << '\t' << c.dist << '\n';
+        }
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    const double qps = (secs > 0) ? qh.n / secs : 0;
+
+    std::cerr << "\n═══ Tree Search Results ═══\n";
+    std::cerr << "queries: " << qh.n << "\n";
+    std::cerr << "k: " << k << "\n";
+    std::cerr << "time: " << secs << "s (" << qps << " QPS)\n";
+    if (total_queries > 0) {
+        const float recall = float(total_hits) / (total_queries * k);
+        std::cerr << "recall@" << k << ": " << recall << "\n";
+    }
+    return 0;
+}
+
 int cmd_insert(int argc, char* argv[]) {
     cmdline::parser p;
     p.add<std::string>("index", 0, "Index name/path prefix", true);
@@ -488,6 +691,13 @@ int cmd_insert(int argc, char* argv[]) {
 void print_usage() {
     std::cerr << "Usage: sextant <command> [options]\n"
               << "Commands:\n"
+              << "  build-tree  Build a hierarchical IVF tree index (single file).\n"
+              << "              --input --index --k-root --leaf-capacity --pq4-m\n"
+              << "              --pq-bits --quantizer (pq/prq/rabitq) --metric\n"
+              << "              --closure-epsilon --balance-factor --threads\n"
+              << "  tree-search Search a tree index. Computes recall if --ground-truth.\n"
+              << "              --index --query --topk --n-probe --fastscan-w\n"
+              << "              --adaptive-probe-gap --ground-truth --threads\n"
               << "  build      Build an index from a .fbin file (explicit params).\n"
               << "             Build path selection (mutually exclusive):\n"
               << "               (default)  IVF-list-scan + 4-bit PQ FastScan\n"
@@ -517,6 +727,7 @@ void print_usage() {
 int run_analyze(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
+    sextant::install_crash_handler();
     sextant::init_logging();
 
     if (argc < 2) {
@@ -535,10 +746,14 @@ int main(int argc, char* argv[]) {
     try {
         if (cmd == "build") {
             return cmd_build(sub_argc, sub_argv.data());
+        } else if (cmd == "build-tree") {
+            return cmd_build_tree(sub_argc, sub_argv.data());
         } else if (cmd == "autobuild") {
             return cmd_autobuild(sub_argc, sub_argv.data());
         } else if (cmd == "search") {
             return cmd_search(sub_argc, sub_argv.data());
+        } else if (cmd == "tree-search") {
+            return cmd_tree_search(sub_argc, sub_argv.data());
         } else if (cmd == "insert") {
             return cmd_insert(sub_argc, sub_argv.data());
         } else if (cmd == "analyze") {
