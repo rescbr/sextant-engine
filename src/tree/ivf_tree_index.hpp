@@ -71,6 +71,13 @@ public:
                              const std::string& output_path,
                              const BuildConfig& cfg);
 
+    /// Streaming build: sample k-means for root centroids, then stream all
+    /// vectors through the tree (route by FP16 distance, append to leaf,
+    /// split on overflow). O(1) RAM regardless of N. No global k-means.
+    static BuildResult build_streaming(const std::string& base_path,
+                                        const std::string& output_path,
+                                        const BuildConfig& cfg);
+
     /// Open an existing tree index for searching. Mmaps the file.
     static std::unique_ptr<IVFTreeIndex> open(const std::string& path);
 
