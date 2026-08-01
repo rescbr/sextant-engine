@@ -561,9 +561,22 @@ int cmd_tree_search(int argc, char* argv[]) {
     if (!p.get<std::string>("ground-truth").empty()) {
         std::ifstream gtf(p.get<std::string>("ground-truth"), std::ios::binary);
         if (gtf) {
+            // GT format: [magic "GTMM":4B][n:u32][k:u32][metric:u8][ids][dists]
+            // Legacy: [n:u32][k:u32][ids][dists] (no magic)
+            constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
+            uint32_t maybe_magic = 0;
+            gtf.read(reinterpret_cast<char*>(&maybe_magic), 4);
             uint32_t gt_n = 0, gt_k = 0;
-            gtf.read(reinterpret_cast<char*>(&gt_n), 4);
-            gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+            if (maybe_magic == kGtMagic) {
+                gtf.read(reinterpret_cast<char*>(&gt_n), 4);
+                gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+                uint8_t metric_byte = 0;
+                gtf.read(reinterpret_cast<char*>(&metric_byte), 1);
+            } else {
+                // Legacy: first 4 bytes are n, not magic.
+                gt_n = maybe_magic;
+                gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+            }
             gt.resize(gt_n);
             std::vector<uint32_t> row(gt_k);
             for (uint32_t i = 0; i < gt_n; ++i) {

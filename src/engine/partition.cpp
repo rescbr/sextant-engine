@@ -223,11 +223,40 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
         for (auto& f : futs) f.get();
     };
 
+    // Track assignment changes for early convergence detection.
+    // K-means typically converges in 3-5 iterations; the fixed 10-iter default
+    // wastes significant time at scale (10M × K=2000 = ~290s/iter).
+    std::vector<uint32_t> prev_assign;
+
     for (uint32_t iter = 0; iter < iterations; iter++) {
         const auto iter_t0 = std::chrono::steady_clock::now();
+
+        // Snapshot assignments before this iteration to count changes.
+        // Only needed from iter >= 1 (iter 0 has no previous to compare).
+        uint64_t n_changed = 0;
+        if (iter > 0) {
+            // Cheap: compare assign[i] with prev_assign[i] in the assignment
+            // pass itself (avoids a separate O(n) scan). We use a thread-local
+            // counter summed atomically.
+            // Actually, the assignment function returns the new cluster;
+            // we'd need to compare old vs new inline. Simpler: snapshot
+            // before, compare after. The snapshot is O(n) memcpy — cheap
+            // relative to the O(nK) assignment.
+            prev_assign.assign(n, UINT32_MAX);
+            std::memcpy(prev_assign.data(), assign.data(),
+                        static_cast<size_t>(n) * sizeof(uint32_t));
+        }
+
         // --- Assignment pass (parallel): assign[i] = nearest centroid ---
         parallel_assign();
         const auto assign_t1 = std::chrono::steady_clock::now();
+
+        // Count how many assignments changed (early convergence signal).
+        if (iter > 0) {
+            for (uint32_t i = 0; i < n; i++) {
+                if (assign[i] != prev_assign[i]) ++n_changed;
+            }
+        }
 
         // --- Bucket assign[] into per-cluster lists (serial, cheap: O(n)) ---
         std::vector<std::vector<uint32_t>> clusters(K);
@@ -330,9 +359,27 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
         }
         for (auto& f : futs) f.get();
         const auto update_t1 = std::chrono::steady_clock::now();
-        spdlog::info("[sextant] partition: iter {}/{} medoid_update={:.1f}s",
+        const std::string change_str = (iter > 0)
+            ? std::string(", changed=") + std::to_string(n_changed) +
+              " (" + std::to_string(100.0 * n_changed / n).substr(0, 4) + "%)"
+            : "";
+        spdlog::info("[sextant] partition: iter {}/{} medoid_update={:.1f}s"
+                     "{}",
                      iter + 1, iterations,
-                     std::chrono::duration<double>(update_t1 - assign_t1).count());
+                     std::chrono::duration<double>(update_t1 - assign_t1).count(),
+                     change_str);
+
+        // Early convergence: if <1% of vectors changed cluster, stop.
+        // K-means on PQ codes converges fast (the medoid update is greedy;
+        // after 3-4 iters the partition is stable). This saves significant
+        // time at scale (10M vectors, K=2000).
+        if (iter >= 2 && iter > 0 && n_changed > 0 &&
+            static_cast<double>(n_changed) / n < 0.01) {
+            spdlog::info("[sextant] partition: converged at iter {} "
+                         "({:.2f}% changed < 1% threshold)", iter + 1,
+                         100.0 * n_changed / n);
+            break;
+        }
     }
 
     // --- Auto-compute closure_epsilon from data if requested ---
