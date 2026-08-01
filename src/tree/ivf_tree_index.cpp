@@ -743,14 +743,28 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
             params.metric, dim, m4, scan_bits, /*seed=*/42);
     }
 
-    // For RaBitQ: sign codes are centroid-relative and cannot be used for
-    // partitioning. Train a separate plain PQ (8-bit) for routing/partitioning.
-    // For PQ/PRQ: the scan quantizer IS the routing quantizer.
+    // Train a routing quantizer for partitioning. The routing quantizer is
+    // ALWAYS 8-bit (256 centroids per subquantizer) for better angular
+    // resolution than 4-bit. The scan quantizer (4-bit) is used only for
+    // leaf-level FastScan codes.
+    //
+    // Why: 4-bit PQ codes can't distinguish angularly close vectors on
+    // high-LID data (Sphere-IP: 72% k-means churn). 8-bit PQ has 16× more
+    // resolution per subquantizer → better partitioning → higher recall.
+    //
+    // RaBitQ already needs a routing PQ (sign codes are centroid-relative).
+    // For 4-bit PQ/PRQ, we add one here. For 8-bit PQ, the scan quantizer
+    // already has 8-bit resolution — no separate routing PQ needed.
     std::unique_ptr<PqQuantizer> routing_quantizer;
     if (params.quantizer_type == "rabitq") {
         routing_quantizer = std::make_unique<PqQuantizer>(
             params.metric, dim, m4, /*bits=*/8, /*seed=*/42);
+    } else if (scan_bits == 4) {
+        // 4-bit scan quantizer: train a separate 8-bit routing PQ.
+        routing_quantizer = std::make_unique<PqQuantizer>(
+            params.metric, dim, m4, /*bits=*/8, /*seed=*/42);
     }
+    // For 8-bit scan quantizer: routing_quantizer stays null → use scan quantizer.
 
     // Train on a sample.
     {
@@ -773,18 +787,18 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
     }
 
     // The quantizer used for partitioning and routing codes.
-    // For RaBitQ: the routing PQ. For PQ/PRQ: the scan quantizer itself.
+    // When a routing_quantizer exists (4-bit scan or RaBitQ), partitioning uses
+    // the 8-bit routing PQ. Otherwise, the scan quantizer serves both roles.
     PqQuantizer& routing_q = routing_quantizer ? *routing_quantizer : *quantizer;
     const uint32_t routing_code_size = routing_q.code_size();
 
-    // Encode all vectors with the routing quantizer (for partitioning).
-    // Also encode with the scan quantizer (for leaf codes) if different.
-    const bool is_rabitq_build = (params.quantizer_type == "rabitq");
-    const uint32_t encode_stride = is_rabitq_build
-        ? static_cast<RaBitQQuantizer&>(*quantizer).full_code_size()
-        : quantizer->code_size();
+    // Encode all vectors with the routing quantizer for partitioning.
+    // When routing != scan (4-bit scan or RaBitQ), leaf codes are re-encoded
+    // per-leaf with the scan quantizer during the leaf-write phase.
+    const bool needs_reencode = static_cast<bool>(routing_quantizer);
+    const uint32_t encode_stride = routing_code_size;
     const uint32_t code_size = routing_code_size;
-    spdlog::info("[sextant] build_tree: encoding {} vectors (code_size={})",
+    spdlog::info("[sextant] build_tree: encoding {} vectors (routing code_size={})",
                  n, code_size);
 
     // Encode all vectors. For RaBitQ, encode with the routing PQ (for
@@ -824,15 +838,16 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
                 if (start >= end) break;
                 futs.push_back(std::async(std::launch::async,
                     [&buf, dim, &all_codes, &routing_q, encode_stride, offset,
-                     is_rabitq_build, &quantizer]
+                     needs_reencode, &quantizer]
                     (uint32_t s, uint32_t e) {
                         for (uint32_t i = s; i < e; ++i) {
                             const float* vec = buf.data() +
                                 static_cast<size_t>(i) * dim;
                             uint8_t* code_out = all_codes.data() +
                                 static_cast<size_t>(offset + i) * encode_stride;
-                            if (is_rabitq_build) {
-                                // Encode with routing PQ for partitioning.
+                            if (needs_reencode) {
+                                // Encode with routing PQ (8-bit) for partitioning.
+                                // Scan codes are re-encoded per-leaf later.
                                 routing_q.encode(vec, code_out);
                             } else {
                                 quantizer->encode(vec, code_out);
@@ -972,15 +987,16 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
     const uint32_t bb = m4 * 16;  // [m][16] for both 4-bit and 8-bit
     const bool is_rabitq = (params.quantizer_type == "rabitq");
 
-    // For RaBitQ: re-open the base file to re-encode relative to each leaf
-    // centroid. RaBitQ sign codes are residual (centroid-relative).
+    // When needs_reencode (4-bit scan with 8-bit routing, or RaBitQ),
+    // re-open the base file to re-encode each vector with the scan quantizer
+    // during leaf writing. RaBitQ also encodes relative to the leaf centroid.
     FILE* base_f2 = nullptr;
     std::vector<float> leaf_centroid_f32;
-    if (is_rabitq) {
+    if (needs_reencode) {
         base_f2 = std::fopen(base_path.c_str(), "rb");
         if (!base_f2) {
             throw Error(ErrorCode::IoError,
-                        "IVFTreeIndex::build: cannot reopen base for RaBitQ");
+                        "IVFTreeIndex::build: cannot reopen base for re-encoding");
         }
         leaf_centroid_f32.resize(dim);
     }
@@ -1025,8 +1041,9 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
 
         // For RaBitQ: decode the leaf centroid and re-encode each vector
         // relative to it. For PQ/PRQ: use the pre-encoded absolute codes.
-        std::vector<uint8_t> rabitq_packed;
-        std::vector<float> rabitq_factors;  // per-leaf, for RaBitQ
+    std::vector<uint8_t> rabitq_packed;
+    std::vector<uint8_t> scan_packed;  // re-encoded scan codes (4-bit PQ/PRQ)
+    std::vector<float> rabitq_factors;  // per-leaf, for RaBitQ
         if (is_rabitq) {
             // Decode the leaf centroid (PQ code → FP32).
             if (l < pa.centroids.size()) {
@@ -1067,6 +1084,15 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
                         static_cast<RaBitQQuantizer&>(*quantizer).factors_offset();
                     std::memcpy(&rabitq_factors[gi * 2],
                                 rabitq_packed.data() + fac_off, 2 * sizeof(float));
+                } else if (needs_reencode) {
+                    // 4-bit scan with 8-bit routing: re-encode with scan quantizer.
+                    std::vector<float> vec(dim);
+                    std::fseek(base_f2, 8 + static_cast<long>(gid) * dim * sizeof(float),
+                               SEEK_SET);
+                    std::fread(vec.data(), sizeof(float), dim, base_f2);
+                    scan_packed.assign(quantizer->code_size(), 0);
+                    quantizer->encode(vec.data(), scan_packed.data());
+                    code = scan_packed.data();
                 } else {
                     code = all_codes.data() +
                         static_cast<size_t>(gid) * code_size;
