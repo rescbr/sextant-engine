@@ -2099,7 +2099,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     // After refinement, do one final emission pass: assign + closure + encode +
     // write leaves.
     const auto t_lloyd = std::chrono::steady_clock::now();
-    const uint32_t max_lloyd_passes = 5;
+    const uint32_t max_lloyd_passes = 10;
     const bool is_ip = (params.metric == MetricKind::InnerProduct);
 
     // Per-cluster accumulators (double for numerical stability).
