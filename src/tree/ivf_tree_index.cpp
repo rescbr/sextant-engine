@@ -13,6 +13,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -816,6 +817,42 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
         }
     }
 
+    // --- 3b. Compute closure epsilon from the sample ---
+    // The closure margin is calibrated from the mean GAP between the nearest
+    // and second-nearest centroid distances. This is metric-invariant:
+    // for L2sq, the gap is (d_2nd - d_1st) ≥ 0. For IP (negated dot), the
+    // gap is also (d_2nd - d_1st) ≥ 0 (since d_1st is more negative).
+    // Using the gap instead of the absolute distance avoids the IP pathology
+    // where all distances are ≈ -1.0 but the meaningful signal is in the
+    // small differences.
+    float closure_epsilon = 0.0f;
+    {
+        const uint32_t sample_for_eps = std::min<uint32_t>(4096, train_n);
+        double sum_gap = 0.0;
+        for (uint32_t i = 0; i < sample_for_eps; ++i) {
+            const float16_t* vec = &sample_fp16[i * dim];
+            float d1 = std::numeric_limits<float>::max();
+            float d2 = std::numeric_limits<float>::max();
+            for (uint32_t c = 0; c < k_root; ++c) {
+                const float d = simd::dist_f16(metric, vec,
+                                                root_centroids[c].data(), dim);
+                if (d < d1) { d2 = d1; d1 = d; }
+                else if (d < d2) { d2 = d; }
+            }
+            // Gap = how much farther the 2nd-nearest is vs the nearest.
+            // For boundary vectors this gap is small → they're near 2+ centroids.
+            sum_gap += (d2 - d1);
+        }
+        const double mean_gap = sum_gap / sample_for_eps;
+        // ε = 0.5 × mean gap. Vectors whose 2nd-nearest is within ε of their
+        // nearest get replicated. At 0.5× the mean gap, ~30-40% of vectors
+        // get replicated to a 2nd leaf (the boundary set).
+        closure_epsilon = static_cast<float>(mean_gap * 0.5);
+        spdlog::info("[sextant] build_streaming: closure_epsilon = {:.4f} "
+                     "(auto, mean_gap={:.4f}, sample={})",
+                     closure_epsilon, mean_gap, sample_for_eps);
+    }
+
     // --- 4. Set up leaf buffers ---
     // Each root child has an in-memory leaf buffer. When it fills, flush
     // as a leaf extent and start a new one. Track all flushed leaves per
@@ -907,28 +944,34 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
             const float16_t* fvec = &fp16_buf[i * dim];
             const float* fvec32 = &vec_buf[i * dim];
 
-            // Route: FP16 distance to root centroids.
-            float best_d = std::numeric_limits<float>::max();
-            uint32_t best_c = 0;
+            // Route: FP16 distance to all root centroids. Assign to nearest
+            // plus any within closure_epsilon (SPANN-style boundary replication).
+            // For IP: distances are negated dots; "within ε" means the
+            // absolute difference |d - min_d| ≤ ε.
+            std::array<float, 256> root_dists;  // max k_root=256
+            float min_d = std::numeric_limits<float>::max();
             for (uint32_t c = 0; c < k_root; ++c) {
-                const float d = simd::dist_f16(metric, fvec,
-                                                root_centroids[c].data(), dim);
-                if (d < best_d) { best_d = d; best_c = c; }
+                root_dists[c] = simd::dist_f16(metric, fvec,
+                                                 root_centroids[c].data(), dim);
+                if (root_dists[c] < min_d) min_d = root_dists[c];
             }
 
-            // Encode 4-bit scan code.
+            // Encode 4-bit scan code ONCE, copy to each target buffer.
             std::vector<uint8_t> code(code_size);
             quantizer->encode(fvec32, code.data());
 
-            // Append to buffer.
-            auto& buf = buffers[best_c];
-            buf.codes.insert(buf.codes.end(), code.begin(), code.end());
-            buf.row_ids.push_back(static_cast<RowId>(offset + i));
-            buf.fp16_vecs.insert(buf.fp16_vecs.end(), fvec, fvec + dim);
+            for (uint32_t c = 0; c < k_root; ++c) {
+                // Assign if within closure_epsilon of the nearest.
+                if (std::fabs(root_dists[c] - min_d) > closure_epsilon) continue;
 
-            // Flush on overflow.
-            if (buf.row_ids.size() >= leaf_cap) {
-                flush_buffer(best_c);
+                auto& buf = buffers[c];
+                buf.codes.insert(buf.codes.end(), code.begin(), code.end());
+                buf.row_ids.push_back(static_cast<RowId>(offset + i));
+                buf.fp16_vecs.insert(buf.fp16_vecs.end(), fvec, fvec + dim);
+
+                if (buf.row_ids.size() >= leaf_cap) {
+                    flush_buffer(c);
+                }
             }
         }
 
