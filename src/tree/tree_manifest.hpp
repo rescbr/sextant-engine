@@ -37,6 +37,7 @@ struct TreeManifest {
     // [routing]
     float adaptive_probe_gap = 0.0f;  // 0 = disabled, >0 = gap threshold
     float median_lid = 0.0f;          // median local intrinsic dimensionality
+    uint32_t pca_dims = 0;            // PCA routing dims (0 = no PCA routing)
 
     // [partition]
     float balance_factor = 4.0f;

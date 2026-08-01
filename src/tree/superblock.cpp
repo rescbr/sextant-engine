@@ -25,6 +25,8 @@ void Superblock::init_fresh(PageId bitmap_page, uint32_t bitmap_pages) {
     disk_.codebook_pages = 0;
     disk_.config_page = kInvalidPage;
     disk_.config_pages = 0;
+    disk_.pca_page = kInvalidPage;
+    disk_.pca_pages = 0;
     disk_.n_pages = bitmap_page + bitmap_pages;  // file covers superblocks + bitmap
 }
 

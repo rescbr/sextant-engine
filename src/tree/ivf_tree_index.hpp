@@ -63,6 +63,7 @@ public:
         float adaptive_probe_gap = 0.0f;
         float median_lid = 0.0f;
         uint32_t num_threads = 0;
+        uint32_t pca_dims = 32;      // PCA dimensions for build_streaming_pca
     };
 
     /// Build a tree index from a flat fbin file.
@@ -137,6 +138,17 @@ private:
         const float16_t* centroid;  // points into mmap
     };
     std::vector<RootChild> root_children_;
+
+    // --- PCA routing state (loaded from pca blob if pca_dims > 0) ---
+    uint32_t pca_dims_ = 0;           // 0 = no PCA routing (use FP16)
+    std::vector<float> pca_proj_;     // projection matrix: pca_dims × dim (row-major)
+    std::vector<float> pca_mean_proj_; // mean projection: pca_dims (precomputed dot(proj_k, mean))
+    std::vector<float> pca_root_centroids_; // k_root × pca_dims (root centroids in PCA space)
+    // For depth=2: leaf centroids in PCA space, stored per level-1 child.
+    // Flat array: all leaves' PCA centroids, indexed by leaf order.
+    // The search accesses them via the mmap'd level-1 node structure.
+    std::vector<float> pca_leaf_centroids_; // n_leaves_total × pca_dims
+    std::vector<uint32_t> pca_leaf_base_;  // per root child: starting global leaf ID
 
     /// Parse the root node from the mmap.
     void load_root_from_mmap();

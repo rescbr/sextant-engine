@@ -34,6 +34,7 @@ std::string manifest_to_toml(const TreeManifest& m) {
     auto routing = cpptoml::make_table();
     routing->insert("adaptive_probe_gap", static_cast<double>(m.adaptive_probe_gap));
     routing->insert("median_lid", static_cast<double>(m.median_lid));
+    routing->insert("pca_dims", static_cast<int64_t>(m.pca_dims));
     root->insert("routing", routing);
 
     // [partition]
@@ -99,6 +100,9 @@ TreeManifest manifest_from_toml(const std::string& toml) {
         }
         if (auto lid = routing->get_as<double>("median_lid")) {
             m.median_lid = static_cast<float>(*lid);
+        }
+        if (auto pd = routing->get_as<int64_t>("pca_dims")) {
+            m.pca_dims = static_cast<uint32_t>(*pd);
         }
     }
 

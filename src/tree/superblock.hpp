@@ -68,9 +68,13 @@ struct SuperblockDisk {
     PageId   config_page;            // TOML blob start page
     uint32_t config_pages;           // TOML blob extent length
 
-    // Reserved for future use (filter headers, journal, version-specific fields).
-    // Fields total 72 bytes (verified); padding fills the rest of one 4KB page.
-    uint8_t reserved2[4096 - 72];
+    // PCA routing data (0 pages = no PCA routing)
+    PageId   pca_page;               // PCA blob start (projection + centroids)
+    uint32_t pca_pages;              // PCA blob extent length
+
+    // Reserved for future use.
+    // Fields total: 72 + 8 = 80 bytes; padding fills the rest of one 4KB page.
+    uint8_t  reserved2[4096 - 80];
 };
 static_assert(sizeof(SuperblockDisk) == kPageSize,
               "SuperblockDisk must be exactly one page");
@@ -111,6 +115,8 @@ public:
     uint32_t codebook_pages() const { return disk_.codebook_pages; }
     PageId   config_page() const { return disk_.config_page; }
     uint32_t config_pages() const { return disk_.config_pages; }
+    PageId   pca_page() const { return disk_.pca_page; }
+    uint32_t pca_pages() const { return disk_.pca_pages; }
 
     void set_root(PageId page, uint32_t pages) {
         disk_.root_node_page = page;
@@ -134,6 +140,10 @@ public:
     void set_config(PageId page, uint32_t pages) {
         disk_.config_page = page;
         disk_.config_pages = pages;
+    }
+    void set_pca(PageId page, uint32_t pages) {
+        disk_.pca_page = page;
+        disk_.pca_pages = pages;
     }
 
 private:

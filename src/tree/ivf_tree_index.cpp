@@ -111,6 +111,36 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
         idx->quantizer_->deserialize(qblob_data, static_cast<size_t>(qblob_size));
     }
 
+    // Load PCA routing data if present.
+    if (idx->manifest_.pca_dims > 0 && idx->superblock_.pca_page() != kInvalidPage) {
+        const auto pp = idx->superblock_.pca_page();
+        const auto npg = idx->superblock_.pca_pages();
+        std::vector<uint8_t> blob(static_cast<size_t>(npg) * kPageSize);
+        idx->file_.read_pages(pp, npg, blob.data());
+        const float* f = reinterpret_cast<const float*>(blob.data());
+        const uint32_t pd = idx->manifest_.pca_dims;
+        const uint32_t d = idx->manifest_.dim;
+        const uint32_t kr = idx->manifest_.k_root;
+        const uint32_t nl = idx->manifest_.n_leaves;
+
+        idx->pca_dims_ = pd;
+        size_t off = 0;
+        // Projection matrix (pd × d).
+        idx->pca_proj_.assign(f + off, f + off + pd * d);
+        off += pd * d;
+        // Mean projection (pd).
+        idx->pca_mean_proj_.assign(f + off, f + off + pd);
+        off += pd;
+        // Root centroids in PCA space (kr × pd).
+        idx->pca_root_centroids_.assign(f + off, f + off + kr * pd);
+        off += kr * pd;
+        // Leaf centroids in PCA space (nl × pd).
+        idx->pca_leaf_centroids_.assign(f + off, f + off + nl * pd);
+
+        spdlog::info("[sextant] IVFTreeIndex: PCA routing enabled ({} dims)",
+                     pd);
+    }
+
     // mmap the file read-only for search.
     idx->mmap_size_ = idx->file_.num_pages() * kPageSize;
     void* addr = ::mmap(nullptr, idx->mmap_size_, PROT_READ, MAP_SHARED,
@@ -124,6 +154,27 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
 
     // Parse the root node from the mmap.
     idx->load_root_from_mmap();
+
+    // If PCA routing: build leaf_id mapping for depth=2 trees.
+    // The pca_leaf_centroids_ array is indexed by global leaf ID (the order
+    // leaves were written during build). At search time, we need to map from
+    // (root_child, local_child) → global_leaf_id.
+    if (idx->pca_dims_ > 0 && idx->manifest_.depth == 2) {
+        // Walk the level-1 nodes to assign global IDs.
+        uint32_t global_id = 0;
+        for (uint32_t c = 0; c < idx->root_children_.size(); ++c) {
+            const auto& rc = idx->root_children_[c];
+            if (rc.is_leaf || rc.page == kInvalidPage) continue;
+            const uint8_t* node_ptr = idx->mmap_base_ +
+                static_cast<uint64_t>(rc.page) * kPageSize;
+            const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
+            // Store the starting global ID for this root child.
+            // We'll use this at search time: global_id = start + local_child.
+            // Store as a parallel array.
+            idx->pca_leaf_base_.push_back(global_id);
+            global_id += nh->n_children;
+        }
+    }
 
     spdlog::info("[sextant] IVFTreeIndex: opened '{}' (depth={}, k_root={}, "
                  "n_leaves={}, dim={}, m4={}, quantizer={})",
@@ -189,19 +240,41 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         quantizer_->build_fastscan_lut4(query, lut4.data(), nullptr);
     }
 
-    // Cast query to FP16 for routing.
+    // Cast query to FP16 for routing (used for non-PCA path + leaf centroid reads).
     std::vector<float16_t> query_fp16(manifest_.dim);
     cast_fp32_to_fp16(query, query_fp16.data(), manifest_.dim);
     const MetricKind metric = quantizer_->metric();
 
-    // --- Route at level 0: FP16 dist to all root centroids ---
+    // --- Project query to PCA space if PCA routing is enabled ---
+    std::vector<float> query_pca;
+    if (pca_dims_ > 0) {
+        query_pca.resize(pca_dims_);
+        for (uint32_t k = 0; k < pca_dims_; ++k) {
+            query_pca[k] = simd::dot_f32(&pca_proj_[k * manifest_.dim],
+                                          query, manifest_.dim)
+                           - pca_mean_proj_[k];
+        }
+    }
+
+    // --- Route at level 0 ---
     const uint32_t k_root = root_header_->n_children;
     std::vector<std::pair<float, uint32_t>> root_dists;
     root_dists.reserve(k_root);
     for (uint32_t c = 0; c < k_root; ++c) {
-        const float d = simd::dist_f16(metric, query_fp16.data(),
-                                        root_children_[c].centroid,
-                                        manifest_.dim);
+        float d;
+        if (pca_dims_ > 0) {
+            // PCA-space L2sq to root centroid.
+            const float* rc = &pca_root_centroids_[c * pca_dims_];
+            d = 0.0f;
+            for (uint32_t k = 0; k < pca_dims_; ++k) {
+                const float diff = query_pca[k] - rc[k];
+                d += diff * diff;
+            }
+        } else {
+            // Original FP16 distance.
+            d = simd::dist_f16(metric, query_fp16.data(),
+                               root_children_[c].centroid, manifest_.dim);
+        }
         root_dists.emplace_back(d, c);
     }
     std::sort(root_dists.begin(), root_dists.end());
@@ -246,10 +319,21 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             child_dists.reserve(nh->n_children);
             for (uint32_t j = 0; j < nh->n_children; ++j) {
                 const auto* ce = reinterpret_cast<const ChildEntry*>(p);
-                const float16_t* cent = reinterpret_cast<const float16_t*>(
-                    p + sizeof(ChildEntry));
-                const float d = simd::dist_f16(metric, query_fp16.data(),
-                                                cent, manifest_.dim);
+                float d;
+                if (pca_dims_ > 0 && child_idx < pca_leaf_base_.size()) {
+                    const uint32_t gid = pca_leaf_base_[child_idx] + j;
+                    const float* lc = &pca_leaf_centroids_[gid * pca_dims_];
+                    d = 0.0f;
+                    for (uint32_t kk = 0; kk < pca_dims_; ++kk) {
+                        const float diff = query_pca[kk] - lc[kk];
+                        d += diff * diff;
+                    }
+                } else {
+                    const float16_t* cent = reinterpret_cast<const float16_t*>(
+                        p + sizeof(ChildEntry));
+                    d = simd::dist_f16(metric, query_fp16.data(),
+                                        cent, manifest_.dim);
+                }
                 child_dists.emplace_back(d, j);
                 p += cesize;
             }
@@ -1825,7 +1909,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     // PCA dimensions: project to this many components for routing.
     // Default: 32 (captures meaningful variance without being too large
     // for k-means to find structure). For d_eff≈2 data, even 8-16 PCs suffice.
-    const uint32_t pca_dims = std::min(dim, 32u);
+    const uint32_t pca_dims = std::min(dim, cfg.pca_dims > 0 ? cfg.pca_dims : 32u);
 
     // --- 1. Sample + train quantizer ---
     const auto t_sample = std::chrono::steady_clock::now();
@@ -1929,10 +2013,10 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
             &sample_pca[src * pca_dims], &sample_pca[(src + 1) * pca_dims]);
     }
 
+    std::vector<uint32_t> prev_assign(train_n, UINT32_MAX);
     for (uint32_t iter = 0; iter < 10; ++iter) {
         std::vector<std::vector<uint32_t>> assigns(k_root);
         uint32_t n_changed = 0;
-        std::vector<uint32_t> prev_assign(train_n, UINT32_MAX);
         for (uint32_t i = 0; i < train_n; ++i) {
             const float* vi = &sample_pca[i * pca_dims];
             float best_d = std::numeric_limits<float>::max();
@@ -2301,7 +2385,48 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     manifest.n_probe_ln = cfg.n_probe_ln > 0 ? cfg.n_probe_ln : 4;
     manifest.adaptive_probe_gap = cfg.adaptive_probe_gap;
     manifest.median_lid = cfg.median_lid;
+    manifest.pca_dims = pca_dims;  // enable PCA routing at search time
     manifest.balance_factor = params.partition_balance_factor;
+
+    // --- Write PCA routing blob ---
+    // Layout: [pca_dims:u32][proj:pca_dims×dim f32][mean_proj:pca_dims f32]
+    //         [root_centroids:k_root×pca_dims f32]
+    //         [leaf_centroids:n_leaves×pca_dims f32]
+    PageId pca_page = kInvalidPage;
+    uint32_t pca_npg = 0;
+    if (pca_dims > 0) {
+        std::vector<float> pca_blob;
+        // Projection matrix (pca_dims × dim).
+        for (uint32_t k = 0; k < pca_dims; ++k)
+            for (uint16_t d = 0; d < dim; ++d)
+                pca_blob.push_back(rotation[k * dim + d]);
+        // Mean projection (pca_dims).
+        for (uint32_t k = 0; k < pca_dims; ++k)
+            pca_blob.push_back(mean_proj[k]);
+        // Root centroids in PCA space (k_root × pca_dims).
+        for (uint32_t c = 0; c < k_root; ++c)
+            for (uint32_t k = 0; k < pca_dims; ++k)
+                pca_blob.push_back(root_centroids_pca[c][k]);
+        // Leaf centroids in PCA space (n_leaves × pca_dims).
+        for (uint32_t l = 0; l < n_leaves_total; ++l) {
+            // Project the leaf's original-space FP16 centroid to PCA space.
+            for (uint32_t k = 0; k < pca_dims; ++k) {
+                double acc = 0.0;
+                for (uint16_t d = 0; d < dim; ++d)
+                    acc += rotation[k * dim + d] *
+                           static_cast<float>(all_leaves[l].centroid[d]);
+                pca_blob.push_back(static_cast<float>(acc - mean_proj[k]));
+            }
+        }
+
+        const size_t blob_bytes = pca_blob.size() * sizeof(float);
+        pca_npg = static_cast<uint32_t>((blob_bytes + kPageSize - 1) / kPageSize);
+        pca_page = alloc.alloc_extent(file, pca_npg);
+        std::vector<uint8_t> b(pca_npg * kPageSize, 0);
+        std::memcpy(b.data(), pca_blob.data(), blob_bytes);
+        file.write_pages(pca_page, pca_npg, b.data());
+    }
+
     std::string cfg_toml = manifest_to_toml(manifest);
     const uint32_t cfg_npg = static_cast<uint32_t>((cfg_toml.size()+kPageSize-1)/kPageSize);
     const PageId cfg_page = alloc.alloc_extent(file, cfg_npg);
@@ -2319,6 +2444,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     sb.set_bitmap(bitmap_page, bitmap_pages);
     sb.set_codebook(cb_page, cb_npg);
     sb.set_config(cfg_page, cfg_npg);
+    sb.set_pca(pca_page, pca_npg);
     sb.commit(file);
     file.sync();
 
