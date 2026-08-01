@@ -432,6 +432,25 @@ B (gap) + D (budget) at every level. Filter pruning at every level.
 
 ### Phase 4: Dynamic insert/delete + vacuum
 - Leaf split/merge. Journal for atomicity. Tombstones + vacuum.
+- **Incremental Lloyd rebalancing:** When a batch of new vectors arrives,
+  route each to its nearest root centroid, accumulate per-region. When a
+  region's buffer is large enough (or on schedule), run local Lloyd on
+  just that root child's subtree:
+  1. Re-read the region's leaf centroids from disk
+  2. Project new vectors + existing members to PCA space
+  3. Run 3-5 Lloyd iterations (K_leaf centroids, not K_root)
+  4. Rewrite affected leaf extents
+  5. Update level-1 node's child pointers + PCA leaf centroids
+  - The multi-pass streaming Lloyd from Phase 1 is the REUSABLE PRIMITIVE.
+    Same code, scoped to a subtree instead of the full tree.
+  - Early-exit: if new vectors don't shift the partition (convergence on
+    pass 1-2), skip the rewrite — no I/O needed. Cheap when distribution
+    is stable.
+  - At 1B scale: each root child has ~N/K_root vectors. For K_root=512,
+    that's ~2M vectors per region = 6GB. May need streaming even for the
+    subtree, but it's 1/K_root of the full problem.
+  - Spherical k-means: renormalize centroids to unit length each iteration
+    (correct for IP on sphere data — the arithmetic mean drifts off-sphere).
 
 ### Phase 5: Filtered search
 - Filter summary headers. Predicate-aware pruning at every level.

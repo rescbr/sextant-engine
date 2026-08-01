@@ -2090,9 +2090,191 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     spdlog::info("[sextant] build_streaming_pca: closure_eps={:.4f}",
                  closure_epsilon);
 
-    // --- 5. Stream all vectors ---
-    // Project each vector to PCA space, route to nearest root centroid (+closure),
-    // encode scan code in original space, append to leaf buffer.
+    // --- 5. Multi-pass streaming Lloyd refinement ---
+    // Instead of one greedy pass, do P Lloyd passes over the file:
+    // Each pass: project → assign → accumulate per-cluster sums → update centroids.
+    // This is global k-means, but streaming from disk. O(1) RAM (only centroids
+    // + accumulators in memory). Converges to the same fixed point as in-RAM k-means.
+    //
+    // After refinement, do one final emission pass: assign + closure + encode +
+    // write leaves.
+    const auto t_lloyd = std::chrono::steady_clock::now();
+    const uint32_t max_lloyd_passes = 5;
+    const bool is_ip = (params.metric == MetricKind::InnerProduct);
+
+    // Per-cluster accumulators (double for numerical stability).
+    std::vector<std::vector<double>> cluster_sums(k_root, std::vector<double>(pca_dims, 0.0));
+    std::vector<uint64_t> cluster_counts(k_root, 0);
+    std::vector<uint32_t> prev_assignment;  // for change tracking (sampled)
+
+    for (uint32_t pass = 0; pass < max_lloyd_passes; ++pass) {
+        const auto pass_t0 = std::chrono::steady_clock::now();
+        // Reset accumulators.
+        for (uint32_t c = 0; c < k_root; ++c) {
+            std::fill(cluster_sums[c].begin(), cluster_sums[c].end(), 0.0);
+            cluster_counts[c] = 0;
+        }
+
+        // Stream all vectors: project + assign + accumulate (parallel).
+        std::fseek(f, 8, SEEK_SET);
+        const uint32_t chunk_n = 100'000;
+        std::vector<float> vec_buf(chunk_n * dim);
+        uint64_t vectors_done = 0;
+
+        // Per-thread accumulators (avoid false sharing: pad to cache line).
+        const uint32_t hw = cfg.num_threads > 0
+            ? cfg.num_threads
+            : std::max(1u, std::thread::hardware_concurrency());
+        std::vector<std::vector<double>> t_sums(
+            hw, std::vector<double>(k_root * pca_dims, 0.0));
+        std::vector<std::vector<uint64_t>> t_counts(hw, std::vector<uint64_t>(k_root, 0));
+
+        while (vectors_done < n) {
+            const uint32_t take = static_cast<uint32_t>(
+                std::min<uint64_t>(chunk_n, n - vectors_done));
+            if (std::fread(vec_buf.data(), sizeof(float),
+                           static_cast<size_t>(take) * dim, f)
+                != static_cast<size_t>(take) * dim) {
+                std::fclose(f);
+                throw Error(ErrorCode::IoError, "Lloyd pass read failed");
+            }
+
+            // Parallel assign + accumulate.
+            std::vector<std::future<void>> futs;
+            const uint32_t n_threads = std::min(hw, take);
+            const uint32_t per = (take + n_threads - 1) / n_threads;
+            for (uint32_t t = 0; t < n_threads; ++t) {
+                const uint32_t start = t * per;
+                const uint32_t end = std::min(start + per, take);
+                if (start >= end) break;
+                futs.push_back(std::async(std::launch::async,
+                    [&](uint32_t tid, uint32_t s, uint32_t e) {
+                        double* sums = t_sums[tid].data();
+                        uint64_t* counts = t_counts[tid].data();
+                        // Precompute centroid norms (constant per pass).
+                        // dist = |proj|² - 2·proj·centroid + |centroid|²
+                        // |proj|² is constant across centroids (skip).
+                        // |centroid|² is precomputed once.
+                        // argmin dist = argmin(-2·proj·centroid + |centroid|²)
+                        float cent_norms[256];
+                        for (uint32_t c = 0; c < k_root; ++c) {
+                            cent_norms[c] = simd::dot_f32(
+                                root_centroids_pca[c].data(),
+                                root_centroids_pca[c].data(), pca_dims);
+                        }
+                        for (uint32_t i = s; i < e; ++i) {
+                            const float* xi = &vec_buf[i * dim];
+                            float proj[64];
+                            for (uint32_t k = 0; k < pca_dims; ++k)
+                                proj[k] = simd::dot_f32(
+                                    &rotation[k * dim], xi, dim) - mean_proj[k];
+                            float best_d = std::numeric_limits<float>::max();
+                            uint32_t best_c = 0;
+                            for (uint32_t c = 0; c < k_root; ++c) {
+                                const float dot = simd::dot_f32(
+                                    proj, root_centroids_pca[c].data(), pca_dims);
+                                const float d = cent_norms[c] - 2.0f * dot;
+                                if (d < best_d) { best_d = d; best_c = c; }
+                            }
+                            for (uint32_t k = 0; k < pca_dims; ++k)
+                                sums[best_c * pca_dims + k] += proj[k];
+                            ++counts[best_c];
+                        }
+                    }, t, start, end));
+            }
+            for (auto& fut : futs) fut.get();
+            vectors_done += take;
+        }
+
+        // Reduce per-thread accumulators into cluster_sums/cluster_counts.
+        for (uint32_t c = 0; c < k_root; ++c) {
+            std::fill(cluster_sums[c].begin(), cluster_sums[c].end(), 0.0);
+            cluster_counts[c] = 0;
+            for (uint32_t t = 0; t < hw; ++t) {
+                for (uint32_t k = 0; k < pca_dims; ++k)
+                    cluster_sums[c][k] += t_sums[t][c * pca_dims + k];
+                cluster_counts[c] += t_counts[t][c];
+            }
+        }
+
+        // Update centroids: mean of assigned vectors.
+        uint32_t n_empty = 0;
+        for (uint32_t c = 0; c < k_root; ++c) {
+            if (cluster_counts[c] == 0) {
+                ++n_empty;
+                // Reseed from the largest cluster's centroid + small perturbation.
+                uint32_t largest = 0;
+                for (uint32_t cc = 1; cc < k_root; ++cc)
+                    if (cluster_counts[cc] > cluster_counts[largest]) largest = cc;
+                std::copy(root_centroids_pca[largest].begin(),
+                          root_centroids_pca[largest].end(),
+                          root_centroids_pca[c].begin());
+                continue;
+            }
+            const double inv = 1.0 / cluster_counts[c];
+            for (uint32_t k = 0; k < pca_dims; ++k)
+                root_centroids_pca[c][k] = static_cast<float>(
+                    cluster_sums[c][k] * inv);
+        }
+
+        const double pass_secs = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pass_t0).count();
+        spdlog::info("[sextant] build_streaming_pca: Lloyd pass {} done "
+                     "({:.1f}s, {} empty clusters)", pass + 1, pass_secs, n_empty);
+
+        // Early exit: check convergence by sampling.
+        // Project a small sample and check how many changed cluster.
+        if (pass >= 1) {
+            uint32_t sample_sz = std::min<uint32_t>(4096, train_n);
+            uint32_t n_changed = 0;
+            for (uint32_t i = 0; i < sample_sz; ++i) {
+                const float* vi = &sample_pca[i * pca_dims];
+                float best_d = std::numeric_limits<float>::max();
+                uint32_t best_c = 0;
+                for (uint32_t c = 0; c < k_root; ++c) {
+                    float d = 0.0f;
+                    for (uint32_t k = 0; k < pca_dims; ++k) {
+                        const float diff = vi[k] - root_centroids_pca[c][k];
+                        d += diff * diff;
+                    }
+                    if (d < best_d) { best_d = d; best_c = c; }
+                }
+                if (pass == 1) prev_assignment.push_back(best_c);
+                else if (best_c != prev_assignment[i % prev_assignment.size()])
+                    ++n_changed;
+            }
+            if (pass >= 2 && prev_assignment.size() > 0) {
+                float change_rate = static_cast<float>(n_changed) / sample_sz;
+                spdlog::info("[sextant] build_streaming_pca: Lloyd change rate "
+                             "{:.2f}%", 100.0f * change_rate);
+                if (change_rate < 0.01f) {
+                    spdlog::info("[sextant] build_streaming_pca: Lloyd converged "
+                                 "at pass {}", pass + 1);
+                    break;
+                }
+                // Update prev_assignment for next comparison.
+                for (uint32_t i = 0; i < sample_sz; ++i) {
+                    const float* vi = &sample_pca[i * pca_dims];
+                    float best_d = std::numeric_limits<float>::max();
+                    uint32_t best_c = 0;
+                    for (uint32_t c = 0; c < k_root; ++c) {
+                        float d = 0.0f;
+                        for (uint32_t k = 0; k < pca_dims; ++k) {
+                            const float diff = vi[k] - root_centroids_pca[c][k];
+                            d += diff * diff;
+                        }
+                        if (d < best_d) { best_d = d; best_c = c; }
+                    }
+                    prev_assignment[i] = best_c;
+                }
+            }
+        }
+    }
+    spdlog::info("[sextant] build_streaming_pca: Lloyd refinement done in {:.2f}s",
+                 std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - t_lloyd).count());
+
+    // --- 6. Emission pass: assign + closure + encode + write leaves ---
     const auto t_stream = std::chrono::steady_clock::now();
     const uint32_t code_size = quantizer->code_size();
 
@@ -2174,6 +2356,17 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         std::vector<float> vec_buf(chunk_n * dim);
         std::vector<float16_t> fp16_buf(chunk_n * dim);
         std::vector<float> pca_buf(chunk_n * pca_dims);
+
+        // Precompute centroid norms for SIMD distance (dot-product decomposition).
+        std::vector<float> cent_norms(k_root);
+        for (uint32_t c = 0; c < k_root; ++c)
+            cent_norms[c] = simd::dot_f32(root_centroids_pca[c].data(),
+                                           root_centroids_pca[c].data(), pca_dims);
+
+        const uint32_t hw = cfg.num_threads > 0
+            ? cfg.num_threads
+            : std::max(1u, std::thread::hardware_concurrency());
+
         uint64_t offset = 0;
         while (offset < n) {
             const uint32_t take = static_cast<uint32_t>(
@@ -2187,43 +2380,61 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
             cast_fp32_to_fp16(vec_buf.data(), fp16_buf.data(),
                               static_cast<size_t>(take) * dim);
 
-            // Project chunk to PCA space (SIMD: simd::dot_f32 per PC).
-            // proj[k] = dot(rotation[k], vec) - mean_proj[k]
-            for (uint32_t i = 0; i < take; ++i) {
-                const float* xi = &vec_buf[i * dim];
-                float* pi = &pca_buf[i * pca_dims];
-                for (uint32_t k = 0; k < pca_dims; ++k) {
-                    pi[k] = simd::dot_f32(&rotation[k * dim], xi, dim)
-                            - mean_proj[k];
-                }
+            // Parallel: project + route + encode. Store (target_centroids, code)
+            // per vector for serial append below.
+            // Per-vector result: the nearest centroid (+closure matches) and code.
+            // Format: for each vector, a list of target centroid IDs + the code.
+            std::vector<std::vector<uint8_t>> chunk_codes(take);
+            std::vector<std::vector<uint32_t>> chunk_targets(take);
+
+            std::vector<std::future<void>> futs;
+            const uint32_t n_threads = std::min(hw, take);
+            const uint32_t per = (take + n_threads - 1) / n_threads;
+            for (uint32_t t = 0; t < n_threads; ++t) {
+                const uint32_t start = t * per;
+                const uint32_t end = std::min(start + per, take);
+                if (start >= end) break;
+                futs.push_back(std::async(std::launch::async,
+                    [&](uint32_t s, uint32_t e) {
+                        std::vector<uint8_t> code(code_size);
+                        float proj[64];
+                        for (uint32_t i = s; i < e; ++i) {
+                            const float* xi = &vec_buf[i * dim];
+                            // Project to PCA space.
+                            for (uint32_t k = 0; k < pca_dims; ++k)
+                                proj[k] = simd::dot_f32(
+                                    &rotation[k * dim], xi, dim) - mean_proj[k];
+                            // Route: find nearest + closure matches.
+                            float min_d = std::numeric_limits<float>::max();
+                            for (uint32_t c = 0; c < k_root; ++c) {
+                                const float dot = simd::dot_f32(
+                                    proj, root_centroids_pca[c].data(), pca_dims);
+                                const float d = cent_norms[c] - 2.0f * dot;
+                                if (d < min_d) min_d = d;
+                            }
+                            // Encode scan code.
+                            quantizer->encode(xi, code.data());
+                            chunk_codes[i].assign(code.begin(), code.end());
+                            // Find closure targets.
+                            for (uint32_t c = 0; c < k_root; ++c) {
+                                const float dot = simd::dot_f32(
+                                    proj, root_centroids_pca[c].data(), pca_dims);
+                                const float d = cent_norms[c] - 2.0f * dot;
+                                if (std::fabs(d - min_d) <= closure_epsilon)
+                                    chunk_targets[i].push_back(c);
+                            }
+                        }
+                    }, start, end));
             }
+            for (auto& fut : futs) fut.get();
 
+            // Serial: append to shared buffers + flush on overflow.
             for (uint32_t i = 0; i < take; ++i) {
-                const float* pi = &pca_buf[i * pca_dims];
-                const float* fvec32 = &vec_buf[i * dim];
                 const float16_t* fvec = &fp16_buf[i * dim];
-
-                // Route in PCA space.
-                std::array<float, 256> root_dists;
-                float min_d = std::numeric_limits<float>::max();
-                for (uint32_t c = 0; c < k_root; ++c) {
-                    float d = 0.0f;
-                    for (uint32_t k = 0; k < pca_dims; ++k) {
-                        const float diff = pi[k] - root_centroids_pca[c][k];
-                        d += diff * diff;
-                    }
-                    root_dists[c] = d;
-                    if (d < min_d) min_d = d;
-                }
-
-                std::vector<uint8_t> code(code_size);
-                quantizer->encode(fvec32, code.data());
-
-                for (uint32_t c = 0; c < k_root; ++c) {
-                    if (std::fabs(root_dists[c] - min_d) > closure_epsilon)
-                        continue;
+                for (uint32_t c : chunk_targets[i]) {
                     auto& buf = buffers[c];
-                    buf.codes.insert(buf.codes.end(), code.begin(), code.end());
+                    buf.codes.insert(buf.codes.end(),
+                                     chunk_codes[i].begin(), chunk_codes[i].end());
                     buf.row_ids.push_back(static_cast<RowId>(offset + i));
                     buf.fp16_vecs.insert(buf.fp16_vecs.end(), fvec, fvec + dim);
                     if (buf.row_ids.size() >= leaf_cap)
