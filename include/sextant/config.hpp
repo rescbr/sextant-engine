@@ -234,6 +234,9 @@ struct SearchConfig {
     /// Ignored for single-shard (non-IVF) indexes.
     uint32_t n_probe = 0;
 
+    /// Tree: leaf probe count per root child (depth=2). 0 = manifest default.
+    uint32_t n_probe_ln = 0;
+
     /// IVF-probe merge oversampling: each probed shard is searched at
     /// k_local = k × merge_oversample, then results are merged/deduped and
     /// truncated to k. 1 = no oversampling. Ignored for single-shard indexes.

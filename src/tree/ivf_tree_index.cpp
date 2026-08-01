@@ -339,9 +339,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             }
             std::sort(child_dists.begin(), child_dists.end());
 
-            uint32_t n_probe_ln = manifest_.n_probe_ln > 0
-                ? manifest_.n_probe_ln
-                : 4;
+            uint32_t n_probe_ln = config.n_probe_ln > 0
+                ? config.n_probe_ln
+                : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4);
             n_probe_ln = std::min(n_probe_ln, nh->n_children);
 
             const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);
@@ -611,9 +611,9 @@ std::vector<Candidate> IVFTreeIndex::search_rabitq(const float* query,
             }
             std::sort(child_dists.begin(), child_dists.end());
 
-            uint32_t n_probe_ln = manifest_.n_probe_ln > 0
-                ? manifest_.n_probe_ln
-                : 4;
+            uint32_t n_probe_ln = config.n_probe_ln > 0
+                ? config.n_probe_ln
+                : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4);
             n_probe_ln = std::min(n_probe_ln, nh->n_children);
 
             const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);

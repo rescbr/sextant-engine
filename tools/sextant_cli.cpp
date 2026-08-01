@@ -659,6 +659,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<std::string>("ground-truth", 0, "Ground-truth .gt file", false, "");
     p.add<uint32_t>("topk", 0, "K nearest neighbors", false, 10);
     p.add<uint32_t>("n-probe", 0, "Root probe count (0=manifest default)", false, 0);
+    p.add<uint32_t>("n-probe-ln", 0, "Leaf probe count per root child (0=manifest)", false, 0);
     p.add<uint32_t>("fastscan-w", 0, "Rerank shortlist per shard (0=300)", false, 0);
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
@@ -692,6 +693,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     SearchConfig scfg;
     scfg.k = k;
     scfg.n_probe = p.get<uint32_t>("n-probe");
+    scfg.n_probe_ln = p.get<uint32_t>("n-probe-ln");
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
 
