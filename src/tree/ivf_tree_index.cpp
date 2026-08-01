@@ -1215,6 +1215,561 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
     result.dim = dim;
     result.pq_m = m4;
     result.pq_bits = scan_bits;
+     result.build_time_sec = secs;
+     return result;
+ }
+
+// ===========================================================================
+// Two-phase streaming build: greedy stream + one refinement pass.
+//
+// Phase 1: Stream all vectors greedily → compute leaf centroids (FP16 means).
+// Phase 2: Re-stream all vectors, re-assign to nearest LEAF centroid.
+//          This corrects greedy mis-assignments with one Lloyd's iteration.
+//
+// The refinement uses leaf centroids (not root centroids) — much finer
+// granularity (N/leaf_cap ≈ 2000 centroids vs K_root ≈ 44). On high-LID
+// data where greedy root routing is poor, leaf-level refinement recovers
+// most of the quality gap to global k-means.
+// ===========================================================================
+
+BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
+                                                    const std::string& output_path,
+                                                    const BuildConfig& cfg) {
+    const auto t0 = std::chrono::steady_clock::now();
+
+    FILE* f = std::fopen(base_path.c_str(), "rb");
+    if (!f) {
+        throw Error(ErrorCode::IoError, "build_streaming_refined: cannot open");
+    }
+    uint32_t header[2];
+    if (std::fread(header, sizeof(uint32_t), 2, f) != 2) {
+        std::fclose(f);
+        throw Error(ErrorCode::IoError, "build_streaming_refined: header read");
+    }
+    const uint64_t n = header[0];
+    const Dim dim = header[1];
+    if (n == 0 || dim == 0) {
+        std::fclose(f);
+        throw Error(ErrorCode::InvalidParam, "build_streaming_refined: empty");
+    }
+
+    spdlog::info("[sextant] build_streaming_refined: N={} dim={} → '{}'",
+                 n, dim, output_path);
+
+    const auto& params = cfg.params;
+    const uint16_t m4 = params.pq4_m > 0 ? params.pq4_m
+                                              : static_cast<uint16_t>(dim / 4);
+    const uint8_t scan_bits = params.scan_pq_bits;
+    const uint32_t leaf_cap = cfg.leaf_capacity > 0 ? cfg.leaf_capacity : 5000;
+
+    uint32_t k_root = cfg.k_root;
+    if (k_root == 0) {
+        k_root = static_cast<uint32_t>(std::sqrt(static_cast<double>(n) / leaf_cap));
+        k_root = std::clamp(k_root, 16u, 256u);
+    }
+
+    // Train scan quantizer on a sample.
+    const uint32_t train_n = std::min<uint64_t>(20'000, n);
+    std::vector<float> sample(static_cast<size_t>(train_n) * dim);
+    std::fseek(f, 8, SEEK_SET);
+    if (std::fread(sample.data(), sizeof(float),
+                   static_cast<size_t>(train_n) * dim, f)
+        != static_cast<size_t>(train_n) * dim) {
+        std::fclose(f);
+        throw Error(ErrorCode::IoError, "build_streaming_refined: sample read");
+    }
+
+    std::unique_ptr<PqQuantizer> quantizer;
+    uint8_t n_factors = 0;
+    if (params.quantizer_type == "prq") {
+        const uint32_t nsplits = (params.prq_nsplits > 0)
+            ? params.prq_nsplits : static_cast<uint32_t>(dim) / 8;
+        quantizer = std::make_unique<ProductResidualQuantizer>(
+            params.metric, dim, m4, scan_bits, nsplits,
+            params.prq_beam_size, 42);
+    } else if (params.quantizer_type == "rabitq") {
+        quantizer = std::make_unique<RaBitQQuantizer>(params.metric, dim, 42);
+        n_factors = 2;
+    } else {
+        quantizer = std::make_unique<PqQuantizer>(
+            params.metric, dim, m4, scan_bits, 42);
+    }
+    quantizer->train(sample.data(), train_n);
+
+    std::vector<float16_t> sample_fp16(static_cast<size_t>(train_n) * dim);
+    cast_fp32_to_fp16(sample.data(), sample_fp16.data(),
+                      static_cast<size_t>(train_n) * dim);
+
+    // Root k-means on sample (same as build_streaming).
+    std::vector<std::vector<float16_t>> root_centroids(k_root);
+    for (uint32_t c = 0; c < k_root; ++c) {
+        const uint32_t src = (c * train_n) / k_root;
+        root_centroids[c].assign(sample_fp16.data() + src * dim,
+                                 sample_fp16.data() + (src + 1) * dim);
+    }
+    const MetricKind metric = params.metric;
+    for (uint32_t iter = 0; iter < 10; ++iter) {
+        std::vector<std::vector<uint32_t>> assigns(k_root);
+        for (uint32_t i = 0; i < train_n; ++i) {
+            const float16_t* vec = &sample_fp16[i * dim];
+            float best_d = std::numeric_limits<float>::max();
+            uint32_t best_c = 0;
+            for (uint32_t c = 0; c < k_root; ++c) {
+                const float d = simd::dist_f16(metric, vec,
+                                                root_centroids[c].data(), dim);
+                if (d < best_d) { best_d = d; best_c = c; }
+            }
+            assigns[best_c].push_back(i);
+        }
+        for (uint32_t c = 0; c < k_root; ++c) {
+            if (assigns[c].empty()) {
+                uint32_t src = (c * 7919 + 1) % train_n;
+                root_centroids[c].assign(sample_fp16.data() + src * dim,
+                                         sample_fp16.data() + (src + 1) * dim);
+                continue;
+            }
+            std::vector<double> sum(dim, 0.0);
+            for (uint32_t i : assigns[c])
+                for (uint16_t d = 0; d < dim; ++d)
+                    sum[d] += static_cast<float>(sample_fp16[i * dim + d]);
+            const double inv = 1.0 / assigns[c].size();
+            for (uint16_t d = 0; d < dim; ++d)
+                root_centroids[c][d] = static_cast<float16_t>(sum[d] * inv);
+        }
+    }
+
+    // Compute closure epsilon (gap-based, same as build_streaming).
+    float closure_epsilon = 0.0f;
+    {
+        const uint32_t sample_for_eps = std::min<uint32_t>(4096, train_n);
+        double sum_gap = 0.0;
+        for (uint32_t i = 0; i < sample_for_eps; ++i) {
+            const float16_t* vec = &sample_fp16[i * dim];
+            float d1 = std::numeric_limits<float>::max();
+            float d2 = std::numeric_limits<float>::max();
+            for (uint32_t c = 0; c < k_root; ++c) {
+                const float d = simd::dist_f16(metric, vec,
+                                                root_centroids[c].data(), dim);
+                if (d < d1) { d2 = d1; d1 = d; }
+                else if (d < d2) { d2 = d; }
+            }
+            sum_gap += (d2 - d1);
+        }
+        closure_epsilon = static_cast<float>(sum_gap / sample_for_eps * 0.5);
+    }
+
+    const uint32_t code_size = quantizer->code_size();
+    const uint16_t depth = 2;
+    const uint32_t cpb = (scan_bits == 4) ? 32 : 16;
+    const uint32_t bb = m4 * 16;
+
+    // ===== PHASE 1: Greedy stream → compute leaf centroids =====
+    spdlog::info("[sextant] build_streaming_refined: phase 1 (greedy stream)");
+
+    struct LeafBuffer {
+        std::vector<float16_t> fp16_vecs;  // for centroid computation
+    };
+
+    std::vector<LeafBuffer> buffers(k_root);
+    // Leaf centroids from phase 1 (flattened: K_leaves × dim).
+    std::vector<float16_t> leaf_centroids;  // all leaf centroids, contiguous
+
+    auto flush_buffer_phase1 = [&](uint32_t c) {
+        auto& buf = buffers[c];
+        if (buf.fp16_vecs.empty()) return;
+        const uint32_t count = buf.fp16_vecs.size() / dim;
+        std::vector<double> sum(dim, 0.0);
+        for (uint32_t i = 0; i < count; ++i)
+            for (uint16_t d = 0; d < dim; ++d)
+                sum[d] += static_cast<float>(buf.fp16_vecs[i * dim + d]);
+        const double inv = 1.0 / count;
+        for (uint16_t d = 0; d < dim; ++d)
+            leaf_centroids.push_back(static_cast<float16_t>(sum[d] * inv));
+        buf.fp16_vecs.clear();
+    };
+
+    std::fseek(f, 8, SEEK_SET);
+    {
+        const uint32_t chunk_n = 100'000;
+        std::vector<float> vec_buf(chunk_n * dim);
+        std::vector<float16_t> fp16_buf(chunk_n * dim);
+        uint64_t offset = 0;
+        while (offset < n) {
+            const uint32_t take = static_cast<uint32_t>(
+                std::min<uint64_t>(chunk_n, n - offset));
+            if (std::fread(vec_buf.data(), sizeof(float),
+                           static_cast<size_t>(take) * dim, f)
+                != static_cast<size_t>(take) * dim) {
+                std::fclose(f);
+                throw Error(ErrorCode::IoError, "phase 1 read failed");
+            }
+            cast_fp32_to_fp16(vec_buf.data(), fp16_buf.data(),
+                              static_cast<size_t>(take) * dim);
+            for (uint32_t i = 0; i < take; ++i) {
+                const float16_t* fvec = &fp16_buf[i * dim];
+                float best_d = std::numeric_limits<float>::max();
+                uint32_t best_c = 0;
+                for (uint32_t c = 0; c < k_root; ++c) {
+                    const float d = simd::dist_f16(metric, fvec,
+                                                    root_centroids[c].data(), dim);
+                    if (d < best_d) { best_d = d; best_c = c; }
+                }
+                buffers[best_c].fp16_vecs.insert(
+                    buffers[best_c].fp16_vecs.end(), fvec, fvec + dim);
+                if (buffers[best_c].fp16_vecs.size() / dim >= leaf_cap)
+                    flush_buffer_phase1(best_c);
+            }
+            offset += take;
+        }
+    }
+    for (uint32_t c = 0; c < k_root; ++c) flush_buffer_phase1(c);
+
+    const uint32_t n_leaf_centroids = leaf_centroids.size() / dim;
+    spdlog::info("[sextant] build_streaming_refined: phase 1 done, "
+                 "{} leaf centroids", n_leaf_centroids);
+
+    // ===== PHASE 2: Refine — re-assign to nearest leaf centroid =====
+    // Re-stream all vectors. For each vector, find its nearest leaf centroid
+    // (among all n_leaf_centroids). Build leaf buffers from the refined
+    // assignment, with closure replication.
+    spdlog::info("[sextant] build_streaming_refined: phase 2 (refinement)");
+
+    // Compute closure epsilon at leaf granularity (from the leaf centroids).
+    float leaf_closure_eps = 0.0f;
+    {
+        // Sample vectors and measure mean gap to 2nd-nearest leaf centroid.
+        const uint32_t s = std::min<uint32_t>(2048, train_n);
+        double sum_gap = 0.0;
+        for (uint32_t i = 0; i < s; ++i) {
+            const float16_t* vec = &sample_fp16[i * dim];
+            float d1 = std::numeric_limits<float>::max();
+            float d2 = std::numeric_limits<float>::max();
+            for (uint32_t l = 0; l < n_leaf_centroids; ++l) {
+                const float d = simd::dist_f16(metric, vec,
+                    &leaf_centroids[l * dim], dim);
+                if (d < d1) { d2 = d1; d1 = d; }
+                else if (d < d2) d2 = d;
+            }
+            sum_gap += (d2 - d1);
+        }
+        leaf_closure_eps = static_cast<float>(sum_gap / s * 0.5);
+        spdlog::info("[sextant] build_streaming_refined: leaf closure_eps={:.4f}",
+                     leaf_closure_eps);
+    }
+
+    struct RefinedLeaf {
+        std::vector<uint8_t> codes;
+        std::vector<RowId> row_ids;
+        std::vector<float16_t> centroid;
+    };
+    std::vector<RefinedLeaf> all_leaves;
+
+    struct RefLeafBuffer {
+        std::vector<uint8_t> codes;
+        std::vector<RowId> row_ids;
+        std::vector<float16_t> fp16_vecs;
+    };
+    std::vector<RefLeafBuffer> leaf_buffers(n_leaf_centroids);
+
+    auto flush_ref_buffer = [&](uint32_t li) {
+        auto& buf = leaf_buffers[li];
+        if (buf.row_ids.empty()) return;
+        RefinedLeaf leaf;
+        leaf.codes = std::move(buf.codes);
+        leaf.row_ids = std::move(buf.row_ids);
+        leaf.centroid.resize(dim);
+        std::vector<double> sum(dim, 0.0);
+        for (uint32_t i = 0; i < buf.fp16_vecs.size() / dim; ++i)
+            for (uint16_t d = 0; d < dim; ++d)
+                sum[d] += static_cast<float>(buf.fp16_vecs[i * dim + d]);
+        const double inv = 1.0 / (buf.fp16_vecs.size() / dim);
+        for (uint16_t d = 0; d < dim; ++d)
+            leaf.centroid[d] = static_cast<float16_t>(sum[d] * inv);
+        all_leaves.push_back(std::move(leaf));
+        buf.codes.clear();
+        buf.row_ids.clear();
+        buf.fp16_vecs.clear();
+    };
+
+    std::fseek(f, 8, SEEK_SET);
+    {
+        const uint32_t chunk_n = 100'000;
+        std::vector<float> vec_buf(chunk_n * dim);
+        std::vector<float16_t> fp16_buf(chunk_n * dim);
+        uint64_t offset = 0;
+        while (offset < n) {
+            const uint32_t take = static_cast<uint32_t>(
+                std::min<uint64_t>(chunk_n, n - offset));
+            if (std::fread(vec_buf.data(), sizeof(float),
+                           static_cast<size_t>(take) * dim, f)
+                != static_cast<size_t>(take) * dim) {
+                std::fclose(f);
+                throw Error(ErrorCode::IoError, "phase 2 read failed");
+            }
+            cast_fp32_to_fp16(vec_buf.data(), fp16_buf.data(),
+                              static_cast<size_t>(take) * dim);
+
+            for (uint32_t i = 0; i < take; ++i) {
+                const float16_t* fvec = &fp16_buf[i * dim];
+                const float* fvec32 = &vec_buf[i * dim];
+
+                // Find nearest leaf centroid + closure matches.
+                std::array<float, 2048> leaf_dists;
+                float min_d = std::numeric_limits<float>::max();
+                for (uint32_t l = 0; l < n_leaf_centroids; ++l) {
+                    leaf_dists[l] = simd::dist_f16(metric, fvec,
+                        &leaf_centroids[l * dim], dim);
+                    if (leaf_dists[l] < min_d) min_d = leaf_dists[l];
+                }
+
+                // Encode 4-bit code once.
+                std::vector<uint8_t> code(code_size);
+                quantizer->encode(fvec32, code.data());
+
+                // Assign to nearest + closure.
+                for (uint32_t l = 0; l < n_leaf_centroids; ++l) {
+                    if (std::fabs(leaf_dists[l] - min_d) > leaf_closure_eps)
+                        continue;
+                    auto& buf = leaf_buffers[l];
+                    buf.codes.insert(buf.codes.end(), code.begin(), code.end());
+                    buf.row_ids.push_back(static_cast<RowId>(offset + i));
+                    buf.fp16_vecs.insert(buf.fp16_vecs.end(), fvec, fvec + dim);
+                    if (buf.row_ids.size() >= leaf_cap)
+                        flush_ref_buffer(l);
+                }
+            }
+            offset += take;
+            if (offset % 1'000'000 < chunk_n)
+                spdlog::info("[sextant] build_streaming_refined: phase 2 "
+                             "{}M/{}M, {} leaves",
+                             offset / 1'000'000, n / 1'000'000,
+                             all_leaves.size());
+        }
+    }
+    std::fclose(f);
+    for (uint32_t l = 0; l < n_leaf_centroids; ++l) flush_ref_buffer(l);
+
+    const uint32_t n_leaves_total = all_leaves.size();
+    spdlog::info("[sextant] build_streaming_refined: phase 2 done, {} leaves",
+                 n_leaves_total);
+
+    // ===== Write tree file (same as build_streaming) =====
+    const PageId bitmap_page = 2;
+    const uint32_t bitmap_pages = 1;
+
+    PageFile file(output_path);
+    PageAllocator alloc;
+    file.truncate(bitmap_page + bitmap_pages);
+    alloc.init(file, bitmap_page, bitmap_pages);
+
+    // Write leaf extents.
+    spdlog::info("[sextant] build_streaming_refined: writing {} leaves",
+                 n_leaves_total);
+    struct LeafPageInfo { PageId page; uint32_t pages; };
+    std::vector<LeafPageInfo> leaf_pages(n_leaves_total);
+
+    for (uint32_t l = 0; l < n_leaves_total; ++l) {
+        const auto& leaf = all_leaves[l];
+        const uint32_t count = static_cast<uint32_t>(leaf.row_ids.size());
+        if (count == 0) { leaf_pages[l] = {kInvalidPage, 0}; continue; }
+
+        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits, n_factors);
+        const PageId page = alloc.alloc_extent(file, npg);
+        leaf_pages[l] = {page, npg};
+
+        std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
+        auto* lh = reinterpret_cast<TreeLeafHeader*>(buf.data());
+        lh->count = count;
+        lh->tombstone_count = 0;
+        lh->m4 = m4;
+        lh->pq_bits = scan_bits;
+        lh->n_factors = n_factors;
+        lh->block_bytes = bb;
+        lh->codes_per_block = cpb;
+        lh->extent_pages = npg;
+
+        const uint32_t n_blocks = (count + cpb - 1) / cpb;
+        uint8_t* codes_out = buf.data() + leaf_codes_offset();
+        for (uint32_t b = 0; b < n_blocks; ++b) {
+            const uint32_t base = b * cpb;
+            uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
+            std::memset(blk, 0, bb);
+            for (uint32_t j = 0; j < cpb; ++j) {
+                const uint32_t gi = base + j;
+                if (gi >= count) break;
+                const uint8_t* code = leaf.codes.data() + gi * code_size;
+                if (scan_bits == 4) {
+                    const uint8_t nbi = j % 16;
+                    const bool hi = (j >= 16);
+                    for (uint16_t s = 0; s < m4; ++s) {
+                        uint8_t nib = (s / 2 < code_size)
+                            ? ((s % 2 == 0) ? (code[s/2] & 0x0F) : (code[s/2] >> 4))
+                            : 0;
+                        if (hi) blk[s * 16 + nbi] |= (nib << 4);
+                        else    blk[s * 16 + nbi] |= nib;
+                    }
+                } else {
+                    for (uint16_t s = 0; s < m4; ++s)
+                        blk[s * 16 + j] = (s < code_size) ? code[s] : 0;
+                }
+            }
+        }
+        RowId* rids = reinterpret_cast<RowId*>(
+            buf.data() + leaf_rowids_offset(n_blocks, bb));
+        std::memcpy(rids, leaf.row_ids.data(), count * sizeof(RowId));
+        file.write_pages(page, npg, buf.data());
+    }
+
+    // Group leaves by nearest root centroid for the level-1 tree structure.
+    // Each root child points to the leaves whose centroid is nearest to it.
+    std::vector<std::vector<uint32_t>> root_to_leaves(k_root);
+    for (uint32_t l = 0; l < n_leaves_total; ++l) {
+        if (leaf_pages[l].page == kInvalidPage) continue;
+        float best_d = std::numeric_limits<float>::max();
+        uint32_t best_c = 0;
+        for (uint32_t c = 0; c < k_root; ++c) {
+            const float d = simd::dist_f16(metric,
+                all_leaves[l].centroid.data(),
+                root_centroids[c].data(), dim);
+            if (d < best_d) { best_d = d; best_c = c; }
+        }
+        root_to_leaves[best_c].push_back(l);
+    }
+
+    // Write level-1 nodes.
+    std::vector<RootChildData> root_child_data(k_root);
+    for (uint32_t c = 0; c < k_root; ++c) {
+        root_child_data[c].centroid = root_centroids[c];
+        const auto& leaves = root_to_leaves[c];
+        if (leaves.empty()) {
+            root_child_data[c].is_leaf = 0;
+            root_child_data[c].page = kInvalidPage;
+            root_child_data[c].pages = 0;
+            continue;
+        }
+        const uint32_t n_children = static_cast<uint32_t>(leaves.size());
+        const uint32_t npg = node_extent_pages(dim, n_children);
+        const PageId page = alloc.alloc_extent(file, npg);
+        std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
+        auto* nh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+        nh->n_children = n_children;
+        nh->extent_pages = npg;
+        nh->dim = dim;
+        const uint32_t cesize = child_entry_size(dim);
+        uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
+        for (uint32_t j = 0; j < n_children; ++j) {
+            const uint32_t li = leaves[j];
+            auto* ce = reinterpret_cast<ChildEntry*>(p);
+            ce->child_page = leaf_pages[li].page;
+            ce->child_pages = leaf_pages[li].pages;
+            ce->is_leaf = 1;
+            float16_t* cent = reinterpret_cast<float16_t*>(p + sizeof(ChildEntry));
+            std::memcpy(cent, all_leaves[li].centroid.data(),
+                        dim * sizeof(float16_t));
+            p += cesize;
+        }
+        file.write_pages(page, npg, buf.data());
+        root_child_data[c].is_leaf = 0;
+        root_child_data[c].page = page;
+        root_child_data[c].pages = npg;
+    }
+
+    // Write root node.
+    const uint32_t root_npg = node_extent_pages(dim, k_root);
+    const PageId root_page = alloc.alloc_extent(file, root_npg);
+    {
+        std::vector<uint8_t> buf(static_cast<size_t>(root_npg) * kPageSize, 0);
+        auto* rh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+        rh->n_children = k_root;
+        rh->extent_pages = root_npg;
+        rh->dim = dim;
+        const uint32_t cesize = child_entry_size(dim);
+        uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
+        for (uint32_t c = 0; c < k_root; ++c) {
+            auto* ce = reinterpret_cast<ChildEntry*>(p);
+            ce->child_page = root_child_data[c].page;
+            ce->child_pages = root_child_data[c].pages;
+            ce->is_leaf = root_child_data[c].is_leaf;
+            float16_t* cent = reinterpret_cast<float16_t*>(p + sizeof(ChildEntry));
+            std::memcpy(cent, root_child_data[c].centroid.data(),
+                        dim * sizeof(float16_t));
+            p += cesize;
+        }
+        file.write_pages(root_page, root_npg, buf.data());
+    }
+
+    // Codebook.
+    std::vector<uint8_t> qblob;
+    quantizer->serialize(qblob);
+    const uint64_t qblob_size = qblob.size();
+    std::vector<uint8_t> qblob_sized(sizeof(qblob_size) + qblob.size());
+    std::memcpy(qblob_sized.data(), &qblob_size, sizeof(qblob_size));
+    std::memcpy(qblob_sized.data() + sizeof(qblob_size), qblob.data(), qblob.size());
+    const uint32_t cb_npg = static_cast<uint32_t>(
+        (qblob_sized.size() + kPageSize - 1) / kPageSize);
+    const PageId cb_page = alloc.alloc_extent(file, cb_npg);
+    {
+        std::vector<uint8_t> buf(static_cast<size_t>(cb_npg) * kPageSize, 0);
+        std::memcpy(buf.data(), qblob_sized.data(), qblob_sized.size());
+        file.write_pages(cb_page, cb_npg, buf.data());
+    }
+
+    // Config blob.
+    TreeManifest manifest;
+    manifest.dim = dim;
+    manifest.m4 = m4;
+    manifest.scan_pq_bits = scan_bits;
+    manifest.quantizer_type = params.quantizer_type;
+    manifest.prq_nsplits = (params.quantizer_type == "prq")
+        ? static_cast<uint32_t>(static_cast<ProductResidualQuantizer&>(*quantizer).nsplits())
+        : 0;
+    manifest.depth = depth;
+    manifest.k_root = k_root;
+    manifest.leaf_capacity = leaf_cap;
+    manifest.n_leaves = n_leaves_total;
+    manifest.n_probe_l0 = cfg.n_probe_l0 > 0 ? cfg.n_probe_l0
+        : static_cast<uint32_t>(std::max(1.0, 2.0 * std::sqrt(double(k_root))));
+    manifest.n_probe_ln = cfg.n_probe_ln > 0 ? cfg.n_probe_ln : 4;
+    manifest.adaptive_probe_gap = cfg.adaptive_probe_gap;
+    manifest.median_lid = cfg.median_lid;
+    manifest.balance_factor = params.partition_balance_factor;
+
+    std::string cfg_toml = manifest_to_toml(manifest);
+    const uint32_t cfg_npg = static_cast<uint32_t>(
+        (cfg_toml.size() + kPageSize - 1) / kPageSize);
+    const PageId cfg_page = alloc.alloc_extent(file, cfg_npg);
+    {
+        std::vector<uint8_t> buf(static_cast<size_t>(cfg_npg) * kPageSize, 0);
+        std::memcpy(buf.data(), cfg_toml.data(), cfg_toml.size());
+        file.write_pages(cfg_page, cfg_npg, buf.data());
+    }
+
+    alloc.flush_bitmap(file);
+    Superblock sb;
+    sb.init_fresh(bitmap_page, bitmap_pages);
+    sb.set_root(root_page, root_npg);
+    sb.set_depth(depth);
+    sb.set_n_leaves(n_leaves_total);
+    sb.set_n_pages(file.num_pages());
+    sb.set_free_list(alloc.free_list_head(), alloc.n_free_pages());
+    sb.set_bitmap(bitmap_page, bitmap_pages);
+    sb.set_codebook(cb_page, cb_npg);
+    sb.set_config(cfg_page, cfg_npg);
+    sb.commit(file);
+    file.sync();
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    spdlog::info("[sextant] build_streaming_refined complete: N={} k_root={} "
+                 "n_leaves={} in {:.2f}s (file={} pages)",
+                 n, k_root, n_leaves_total, secs, file.num_pages());
+
+    BuildResult result;
+    result.index_path = output_path;
+    result.n_vectors = n;
+    result.dim = dim;
+    result.pq_m = m4;
+    result.pq_bits = scan_bits;
     result.build_time_sec = secs;
     return result;
 }

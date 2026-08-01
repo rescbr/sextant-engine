@@ -78,6 +78,13 @@ public:
                                         const std::string& output_path,
                                         const BuildConfig& cfg);
 
+    /// Two-phase streaming build: greedy stream (phase 1) + one refinement
+    /// pass that re-assigns each vector to its nearest leaf centroid (phase 2).
+    /// Combines streaming speed with k-means-quality assignment.
+    static BuildResult build_streaming_refined(const std::string& base_path,
+                                                const std::string& output_path,
+                                                const BuildConfig& cfg);
+
     /// Open an existing tree index for searching. Mmaps the file.
     static std::unique_ptr<IVFTreeIndex> open(const std::string& path);
 

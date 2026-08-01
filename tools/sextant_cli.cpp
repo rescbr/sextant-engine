@@ -492,6 +492,53 @@ int cmd_build_tree_streaming(int argc, char* argv[]) {
               << " dim=" << result.dim
               << " m4=" << static_cast<int>(result.pq_m)
               << " in " << result.build_time_sec << "s\n";
+     return 0;
+ }
+
+// ---------------------------------------------------------------------------
+// build-tree-refined: two-phase streaming (greedy + refinement)
+// ---------------------------------------------------------------------------
+int cmd_build_tree_refined(int argc, char* argv[]) {
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("input", 0, "Base vectors (.fbin)", true);
+    p.add<std::string>("index", 0, "Output tree file path", true);
+    p.add<uint32_t>("k-root", 0, "Root branching factor (0=auto)", false, 0);
+    p.add<uint32_t>("leaf-capacity", 0, "Max vectors per leaf", false, 5000);
+    p.add<uint16_t>("pq4-m", 0, "PQ subquantizers (0=dim/4)", false, 0);
+    p.add<uint32_t>("pq-bits", 0, "PQ bits (4 or 8)", false, 4);
+    p.add<std::string>("quantizer", 0, "pq / prq / rabitq", false, "pq");
+    p.add<std::string>("metric", 0, "l2sq / ip", false, "l2sq");
+    p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
+    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.parse_check(argc, argv);
+
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") set_log_level(LogLevel::Debug);
+        else if (lvl == "warn") set_log_level(LogLevel::Warn);
+        else if (lvl == "error") set_log_level(LogLevel::Error);
+    }
+
+    tree::IVFTreeIndex::BuildConfig cfg;
+    cfg.k_root = p.get<uint32_t>("k-root");
+    cfg.leaf_capacity = p.get<uint32_t>("leaf-capacity");
+    cfg.num_threads = p.get<uint32_t>("threads");
+    cfg.params.pq4_m = p.get<uint16_t>("pq4-m");
+    cfg.params.scan_pq_bits = static_cast<uint8_t>(p.get<uint32_t>("pq-bits"));
+    cfg.params.quantizer_type = p.get<std::string>("quantizer");
+    const std::string metric = p.get<std::string>("metric");
+    cfg.params.metric = (metric == "ip") ? MetricKind::InnerProduct
+                                          : MetricKind::L2Sq;
+
+    auto result = tree::IVFTreeIndex::build_streaming_refined(
+        p.get<std::string>("input"), p.get<std::string>("index"), cfg);
+    std::cout << "built tree index (refined) '" << result.index_path
+              << "': n=" << result.n_vectors
+              << " dim=" << result.dim
+              << " m4=" << static_cast<int>(result.pq_m)
+              << " in " << result.build_time_sec << "s\n";
     return 0;
 }
 
@@ -810,6 +857,8 @@ int main(int argc, char* argv[]) {
             return cmd_build_tree(sub_argc, sub_argv.data());
         } else if (cmd == "build-tree-streaming") {
             return cmd_build_tree_streaming(sub_argc, sub_argv.data());
+        } else if (cmd == "build-tree-refined") {
+            return cmd_build_tree_refined(sub_argc, sub_argv.data());
         } else if (cmd == "autobuild") {
             return cmd_autobuild(sub_argc, sub_argv.data());
         } else if (cmd == "search") {
