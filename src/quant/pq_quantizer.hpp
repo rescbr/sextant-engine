@@ -12,6 +12,14 @@
 
 namespace sextant {
 
+/// Compute the PCA rotation matrix (dim × dim, row-major) from a sample.
+/// Returns R = V^T where C = V Λ V^T is the eigendecomposition of the sample
+/// covariance. Rows of R are eigenvectors ordered by descending eigenvalue.
+/// On failure (degenerate covariance, n < 2), returns empty.
+std::vector<float> compute_pca_rotation_public(const float* samples, uint64_t n,
+                                                uint32_t dim,
+                                                std::vector<double>* eigvals_out = nullptr);
+
 class PqQuantizer {
 public:
     PqQuantizer(MetricKind metric, Dim dim, uint16_t m, uint8_t bits = 8,

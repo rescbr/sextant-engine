@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <numeric>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -517,10 +518,73 @@ std::vector<float> compute_pca_rotation(const float* samples, uint64_t n,
             rotation[r * dim + c] = static_cast<float>(eigvecs[c * dim + r]);
         }
     }
+     return rotation;
+ }
+
+}  // namespace
+
+std::vector<float> compute_pca_rotation_public(const float* samples, uint64_t n,
+                                                uint32_t dim,
+                                                std::vector<double>* eigvals_out) {
+    if (n < 2 || dim == 0) return {};
+    // Mean.
+    std::vector<double> mean(dim, 0.0);
+    for (uint64_t i = 0; i < n; i++) {
+        const float* v = samples + i * dim;
+        for (uint32_t d = 0; d < dim; d++) mean[d] += v[d];
+    }
+    for (uint32_t d = 0; d < dim; d++) mean[d] /= static_cast<double>(n);
+
+    // Covariance (upper triangle, then mirror).
+    std::vector<double> cov(size_t(dim) * dim, 0.0);
+    for (uint64_t i = 0; i < n; i++) {
+        const float* v = samples + i * dim;
+        for (uint32_t a = 0; a < dim; a++) {
+            const double da = static_cast<double>(v[a]) - mean[a];
+            for (uint32_t b = a; b < dim; b++) {
+                const double db = static_cast<double>(v[b]) - mean[b];
+                cov[a * dim + b] += da * db;
+            }
+        }
+    }
+    const double inv_df = 1.0 / static_cast<double>(n - 1);
+    bool nonzero = false;
+    for (uint32_t a = 0; a < dim; a++) {
+        cov[a * dim + a] *= inv_df;
+        if (cov[a * dim + a] > 1e-15) nonzero = true;
+        for (uint32_t b = a + 1; b < dim; b++) {
+            cov[a * dim + b] *= inv_df;
+            cov[b * dim + a] = cov[a * dim + b];
+        }
+    }
+    if (!nonzero) return {};
+
+    std::vector<double> eigvals, eigvecs;
+    jacobi_eigen(cov, dim, eigvals, &eigvecs);
+
+    // Sort eigenvectors by descending eigenvalue.
+    std::vector<uint32_t> order(dim);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+              [&](uint32_t a, uint32_t b) { return eigvals[a] > eigvals[b]; });
+
+    if (eigvals_out) {
+        eigvals_out->resize(dim);
+        for (uint32_t i = 0; i < dim; i++)
+            (*eigvals_out)[i] = eigvals[order[i]];
+    }
+
+    // Build rotation R (dim × dim) with rows = eigenvectors in sorted order.
+    // R[k][d] = eigvecs[d * dim + order[k]]
+    std::vector<float> rotation(size_t(dim) * dim);
+    for (uint32_t k = 0; k < dim; k++) {
+        for (uint32_t d = 0; d < dim; d++) {
+            rotation[k * dim + d] = static_cast<float>(eigvecs[d * dim + order[k]]);
+        }
+    }
     return rotation;
 }
 
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // Construction

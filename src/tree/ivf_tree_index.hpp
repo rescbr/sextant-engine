@@ -85,6 +85,13 @@ public:
                                                 const std::string& output_path,
                                                 const BuildConfig& cfg);
 
+    /// PCA-preconditioned streaming build: project vectors onto top-k PCs
+    /// before routing. On high-LID data (d_eff≈2), this exposes the manifold
+    /// structure so k-means converges. Scan codes stay in original space.
+    static BuildResult build_streaming_pca(const std::string& base_path,
+                                            const std::string& output_path,
+                                            const BuildConfig& cfg);
+
     /// Open an existing tree index for searching. Mmaps the file.
     static std::unique_ptr<IVFTreeIndex> open(const std::string& path);
 
