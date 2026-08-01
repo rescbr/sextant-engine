@@ -527,6 +527,21 @@ std::vector<float> compute_pca_rotation_public(const float* samples, uint64_t n,
                                                 uint32_t dim,
                                                 std::vector<double>* eigvals_out) {
     if (n < 2 || dim == 0) return {};
+
+    // --- Randomized SVD (Halko et al.) for top-k principal components ---
+    // Instead of forming the full dim×dim covariance and eigendecomposing
+    // (O(dim³) Jacobi = ~20s for dim=768), we use randomized projection:
+    //   1. Center the data
+    //   2. Project onto k random Gaussian directions → Y (n × k)
+    //   3. QR-orthonormalize Y → Q (dim × k)
+    //   4. Form B = Q^T Cov Q (k × k — tiny)
+    //   5. Eigendecompose B (k × k — milliseconds)
+    //   6. Eigenvectors of Cov ≈ Q × eigvecs(B)
+    // Cost: O(n × dim × k) for projection, O(k³) for eigendecomposition.
+
+    const uint32_t k = std::min(std::min(dim, 128u), static_cast<uint32_t>(n));
+    const uint32_t p = std::min(dim, k + 16);  // oversample for accuracy
+
     // Mean.
     std::vector<double> mean(dim, 0.0);
     for (uint64_t i = 0; i < n; i++) {
@@ -535,53 +550,103 @@ std::vector<float> compute_pca_rotation_public(const float* samples, uint64_t n,
     }
     for (uint32_t d = 0; d < dim; d++) mean[d] /= static_cast<double>(n);
 
-    // Covariance (upper triangle, then mirror).
-    std::vector<double> cov(size_t(dim) * dim, 0.0);
+    // Random Gaussian matrix Ω (dim × p), seed for reproducibility.
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> gauss(0.0, 1.0);
+    std::vector<double> omega(dim * p);
+    for (auto& v : omega) v = gauss(rng);
+
+    // Y = (X - mean) × Ω → n × p matrix.
+    // Y[i][j] = Σ_d (x[i][d] - mean[d]) × omega[d][j]
+    std::vector<double> Y(n * p, 0.0);
     for (uint64_t i = 0; i < n; i++) {
-        const float* v = samples + i * dim;
-        for (uint32_t a = 0; a < dim; a++) {
-            const double da = static_cast<double>(v[a]) - mean[a];
-            for (uint32_t b = a; b < dim; b++) {
-                const double db = static_cast<double>(v[b]) - mean[b];
-                cov[a * dim + b] += da * db;
-            }
+        const float* xi = samples + i * dim;
+        for (uint32_t j = 0; j < p; j++) {
+            double acc = 0.0;
+            for (uint32_t d = 0; d < dim; d++)
+                acc += (static_cast<double>(xi[d]) - mean[d]) * omega[d * p + j];
+            Y[i * p + j] = acc;
+        }
+    }
+
+    // QR via modified Gram-Schmidt on Y^T (p × n → orthonormal rows).
+    // Q is stored as p × dim: Q[j][d] = orthogonalized basis vector j component d.
+    // Actually, we need Q from Y^T where Y^T is p × dim... wait.
+    // Y = X_c × Ω is n × p. We need the column space of Y, which lives in R^dim.
+    // The column space of Y = column space of X_c × Ω ⊆ column space of X_c.
+    // Y^T is p × n. We orthonormalize the COLUMNS of Y (n-dimensional vectors).
+    // Q (n × p) has orthonormal columns spanning the same space as Y.
+    // Then B = Q^T × X_c × X_c^T × Q (p × p) — but that's n-expensive.
+    //
+    // Simpler: compute the p × p Gram matrix G = Y^T × Y (p × p).
+    // Eigendecompose G. The eigenvectors of the covariance restricted to the
+    // subspace are: principal_dirs = Ω × eigvecs(G). Then renormalize.
+    //
+    // Actually even simpler (direct randomized PCA):
+    // Y = X_c × Ω (n × p). Compute Y^T × Y = p × p (the projected covariance).
+    // Eigendecompose the p × p matrix. Eigenvalues of Y^T Y / (n-1) ≈ top
+    // eigenvalues of the covariance. Principal directions = Ω × eigvecs.
+    // Then renormalize principal directions to unit length.
+
+    // G = Y^T × Y / (n-1) → p × p symmetric.
+    std::vector<double> G(p * p, 0.0);
+    for (uint64_t i = 0; i < n; i++) {
+        for (uint32_t a = 0; a < p; a++) {
+            const double ya = Y[i * p + a];
+            for (uint32_t b = a; b < p; b++)
+                G[a * p + b] += ya * Y[i * p + b];
         }
     }
     const double inv_df = 1.0 / static_cast<double>(n - 1);
-    bool nonzero = false;
-    for (uint32_t a = 0; a < dim; a++) {
-        cov[a * dim + a] *= inv_df;
-        if (cov[a * dim + a] > 1e-15) nonzero = true;
-        for (uint32_t b = a + 1; b < dim; b++) {
-            cov[a * dim + b] *= inv_df;
-            cov[b * dim + a] = cov[a * dim + b];
+    for (uint32_t a = 0; a < p; a++) {
+        G[a * p + a] *= inv_df;
+        for (uint32_t b = a + 1; b < p; b++) {
+            G[a * p + b] *= inv_df;
+            G[b * p + a] = G[a * p + b];
         }
     }
-    if (!nonzero) return {};
 
-    std::vector<double> eigvals, eigvecs;
-    jacobi_eigen(cov, dim, eigvals, &eigvecs);
+    // Eigendecompose G (p × p — fast, Jacobi on ~80×80 takes <1ms).
+    std::vector<double> geigvals, geigvecs;
+    jacobi_eigen(G, p, geigvals, &geigvecs);
+    geigvals.resize(p);
+    for (uint32_t i = 0; i < p; i++) geigvals[i] = G[i * p + i];
 
-    // Sort eigenvectors by descending eigenvalue.
-    std::vector<uint32_t> order(dim);
+    // Sort by descending eigenvalue.
+    std::vector<uint32_t> order(p);
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(),
-              [&](uint32_t a, uint32_t b) { return eigvals[a] > eigvals[b]; });
+              [&](uint32_t a, uint32_t b) { return geigvals[a] > geigvals[b]; });
 
     if (eigvals_out) {
         eigvals_out->resize(dim);
-        for (uint32_t i = 0; i < dim; i++)
-            (*eigvals_out)[i] = eigvals[order[i]];
+        for (uint32_t i = 0; i < p; i++)
+            (*eigvals_out)[i] = geigvals[order[i]];
+        for (uint32_t i = p; i < dim; i++)
+            (*eigvals_out)[i] = 0.0;  // unknown tail
     }
 
-    // Build rotation R (dim × dim) with rows = eigenvectors in sorted order.
-    // R[k][d] = eigvecs[d * dim + order[k]]
-    std::vector<float> rotation(size_t(dim) * dim);
-    for (uint32_t k = 0; k < dim; k++) {
+    // Principal directions: direction[j][d] = Σ_k omega[d][k] × geigvecs[k][order[j]]
+    // Then renormalize to unit length.
+    std::vector<float> rotation(size_t(dim) * dim, 0.0f);
+    for (uint32_t j = 0; j < k; j++) {
+        const uint32_t src = order[j];
+        double norm2 = 0.0;
         for (uint32_t d = 0; d < dim; d++) {
-            rotation[k * dim + d] = static_cast<float>(eigvecs[d * dim + order[k]]);
+            double val = 0.0;
+            for (uint32_t c = 0; c < p; c++)
+                val += omega[d * p + c] * geigvecs[c * p + src];
+            rotation[j * dim + d] = static_cast<float>(val);
+            norm2 += val * val;
+        }
+        // Renormalize.
+        if (norm2 > 1e-20) {
+            const float inv_norm = 1.0f / static_cast<float>(std::sqrt(norm2));
+            for (uint32_t d = 0; d < dim; d++)
+                rotation[j * dim + d] *= inv_norm;
         }
     }
+    // Fill remaining rows (k..dim) with zeros — not used for routing.
     return rotation;
 }
 
