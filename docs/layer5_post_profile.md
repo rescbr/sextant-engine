@@ -1,7 +1,7 @@
 # Post-Layer-5 Profile — arxiv-nomic 1.34M @ 8t production point
 
 **Captured:** 2026-07-21 on GCP `c4a-standard-8-lssd` (Axion / Neoverse-V2, arm64-sve2).
-Binaries built from HEAD post-L5 (commits through `285c82a`).
+Binaries built from HEAD post-L5 (commits through `dcc0dd4`).
 
 ## Workload
 - Index: arxiv-nomic 1.34M (R=32, L_build=100, pq_m=96/8-bit, K=1 monolithic)

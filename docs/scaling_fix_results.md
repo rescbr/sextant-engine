@@ -16,7 +16,7 @@ L=400 rr=2 (recall 0.9088-0.9092 across all runs — no recall regression).
 
 ## Per-step breakdown
 
-### Step 1 (commit `66f4ac6`): thread-local stat counters
+### Step 1 (commit `2adc27b`): thread-local stat counters
 
 `BlockCache::record_access` and `PagedNodeStore::tl_hits_/tl_misses_` both
 did a `fetch_add` on shared atomics per cache lookup. Thread-local
@@ -26,7 +26,7 @@ atomic.
 `__aarch64_ldadd8_relax` dropped from **30.61% → <1.5%** of cycles at 8t.
 8t QPS: 1108 → 1281 (+15.6%).
 
-### Step 2 (commit `416ce1e`): read-lock lookup + atomic sketch
+### Step 2 (commit `6a841d1`): read-lock lookup + atomic sketch
 
 `CacheShard::lookup` took the exclusive write lock on every read (LRU
 mutation). Switched to `ScopedReadLock`; the W-TinyLFU sketch became fully
@@ -38,7 +38,7 @@ under graph-traversal access skew).
 `nsync_mu_rlock`+`runlock` (parallel reader pair). 8t QPS: 1281 → 1554
 (+21.3%). Scaling: 37% → 46%.
 
-### Step 3 (commit `447cdc0`): cached TLBlockCache& + deadlock fix
+### Step 3 (commit `d8f4100`): cached TLBlockCache& + deadlock fix
 
 Two changes in the L1 hot path:
 
@@ -122,8 +122,8 @@ leaving bandwidth on the table.
 
 ## Layer 2 architectural refactor — verification (2026-07-20)
 
-The full architectural refactor (commit `ac98359` Layer 0 → `5b1e40d`
-Layer 2 Phase E + `fe74cf7` alpha-sweep fix) split the 3269-line Engine
+The full architectural refactor (commit `de73596` Layer 0 → `ca28f56`
+Layer 2 Phase E + `949ad72` alpha-sweep fix) split the 3269-line Engine
 god-object into four focused classes:
 
   Builder    — bulk-build + mutate an Index (~1760 LOC)
@@ -192,7 +192,7 @@ Raw results archived at `results/profiling/layer2_20260720_8t_sweep/`.
 
 - At 1.34M scale, alpha=1.0 works (recall 0.91). This is in tension
   with the small-N (100K) alpha-sweep finding where alpha=1.0 collapsed
-  recall to 0.40 (commit `fe74cf7` fixed the un-gated sweep to default
+  recall to 0.40 (commit `949ad72` fixed the un-gated sweep to default
   to 1.2). Here, the user passed `--proximity-target 0.95`, the gated
   sweep ran, and alpha=1.0 met the gate while alpha=1.2 did not —
   legitimate selection at production scale. The small-N failure mode

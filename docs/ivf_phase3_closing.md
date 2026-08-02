@@ -52,10 +52,10 @@ on single-node throughput.
 
 | change | commit | effect |
 |--------|--------|--------|
-| FHM `l2sq_f16` (`vfmlalq`) | `2a4538c` | +33% QPS local, +4% c4a merged. Rising tide for both paths. |
-| A1 sub-clustered entry points | `282142b` | 8 k-means medoids per shard (replaces stride sampling). Modest recall help. |
-| Multi-probe | `f9a5f8b` | Recall lever + distributed dispatch primitive. ~10% QPS per +1pp recall. |
-| Route quality tool | `eac0d78`, `1ee1383` | Measured routing recall (closure-aware) + multi-probe tradeoffs. |
+| FHM `l2sq_f16` (`vfmlalq`) | `b5368f3` | +33% QPS local, +4% c4a merged. Rising tide for both paths. |
+| A1 sub-clustered entry points | `86aeae8` | 8 k-means medoids per shard (replaces stride sampling). Modest recall help. |
+| Multi-probe | `d41651f` | Recall lever + distributed dispatch primitive. ~10% QPS per +1pp recall. |
+| Route quality tool | `b1b9caa`, `1ee1383` | Measured routing recall (closure-aware) + multi-probe tradeoffs. |
 | K sweep doc | — | Operating-point curve; K=16-32 practical range. |
 
 ## What was tested and rejected (with reasons)
@@ -93,7 +93,7 @@ patience, K, multi-probe ratio) trading recall for speed — not algorithmic win
 
 OPQ (PCA rotation — the real data-adaptive SVD rotation, not the earlier FHT
 random rotation) **was implemented and tested at full 1.34M scale** (commits
-`7a39697`, `f7d4977`; documented in `docs/quantization_findings.md`). Results:
+`4580c88`, `b0ecfed`; documented in `docs/quantization_findings.md`). Results:
 - arxiv100k: PQ-only recall@100 0.8955 → 0.9058 (+1.03pp)
 - **arxiv-nomic 1.34M: 0.7300 → 0.7300 (0pp)**
 
@@ -181,10 +181,10 @@ remainder at batch4 throughput. Small but free.
 
 ### Tier 2 — tested, dead ends (do NOT revisit)
 
-- **OPQ (PCA rotation)**: implemented (`7a39697`), 0pp at 1.34M scale. The PQ
+- **OPQ (PCA rotation)**: implemented (`4580c88`), 0pp at 1.34M scale. The PQ
   ceiling is structural (concentration of measure), not codebook-quality.
-- **Anisotropic PQ** (both per-vector and per-subspace): tested (`820d3cd`,
-  `26b54da`), recall degraded or flat.
+- **Anisotropic PQ** (both per-vector and per-subspace): tested (`5651d1d`,
+  `5997d7d`), recall degraded or flat.
 - **A2/A3** (entry-point selection/count): neutral-to-negative.
 - **B1** (two-level parallelism): throughput-negative (memory-bandwidth wall).
 - **C1** (frontier-saturation skip): redundant with DynamicWidth + early-exit.

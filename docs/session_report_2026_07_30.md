@@ -92,14 +92,14 @@ fine-K boundary losses cost ~3pp (routing coverage, not closure).
 
 Three commits accelerating the build's k-means phase:
 
-1. **SIMD batch4 assignment** (`00180a4`): Uses the existing
+1. **SIMD batch4 assignment** (`cadd8ee`): Uses the existing
    `code_distance_batch4` (SVE2/NEON gather-load) to evaluate 4 centroids
    per vector simultaneously. 1.5× faster on macOS NEON; more on c4a SVE2.
 
-2. **Centroid padding** (`bffc330`): Pad centroids to a multiple of 4,
+2. **Centroid padding** (`5350956`): Pad centroids to a multiple of 4,
    eliminating the scalar tail branch.
 
-3. **Heap-buffer-overflow fix** (`2160ba5`): The batch4 padding made
+3. **Heap-buffer-overflow fix** (`e181559`): The batch4 padding made
    `centroids.size() = K_padded`, but the closure pass sized `dists(K)`.
    Fixed to `dists(centroids.size())`. Caught by ASAN on arxiv-nomic 1.34M.
 
@@ -221,21 +221,21 @@ higher recall at similar or better QPS than current flat+W=300.
 
 | Commit | Description |
 |--------|-------------|
-| `20b7a07` | spike: PQ error bounds — NEGATIVE RESULT |
-| `de1abc5` | spike: Panorama progressive rerank — POSITIVE |
-| `bbb5799` | benchmark: Panorama flag + timing fix |
+| `d64455b` | spike: PQ error bounds — NEGATIVE RESULT |
+| `1aab867` | spike: Panorama progressive rerank — POSITIVE |
+| `42a781e` | benchmark: Panorama flag + timing fix |
 | `f5e7372` | gcp_bench: fix --ivf flag + Panorama A/B |
-| `55f44b4` | docs: selective rerank findings + next steps |
-| `00180a4` | partition: SIMD batch4 k-means assignment |
-| `bffc330` | partition: pad centroids to multiple of 4 |
-| `ab60637` | docs: analytical c(K) derivation |
-| `d1387f4` | partition: defensive c(K) + absolute-margin closure |
-| `3de68e0` | feat: sub-shard Phase 1 — build-time routing |
-| `052cc29` | feat: sub-shard Phase 2 — closure + search override |
-| `6d8a99b` | feat: remove sub-shard S cap |
-| `0be77d3` | fix: sub-shard k-means serial (avoid nested pool) |
-| `80e6a31` | fix: propagate sub_shard params through estimator |
-| `2160ba5` | fix: heap-buffer-overflow in closure pass |
-| `85cb47c` | docs: reorder sub-shard phases to 1→3→2 |
-| `f0112b8` | docs: sub-shard design document |
+| `f42c3fa` | docs: selective rerank findings + next steps |
+| `cadd8ee` | partition: SIMD batch4 k-means assignment |
+| `5350956` | partition: pad centroids to multiple of 4 |
+| `58dde20` | docs: analytical c(K) derivation |
+| `eaf679e` | partition: defensive c(K) + absolute-margin closure |
+| `55a546e` | feat: sub-shard Phase 1 — build-time routing |
+| `9962113` | feat: sub-shard Phase 2 — closure + search override |
+| `c6ed359` | feat: remove sub-shard S cap |
+| `c2e614f` | fix: sub-shard k-means serial (avoid nested pool) |
+| `94da56a` | fix: propagate sub_shard params through estimator |
+| `e181559` | fix: heap-buffer-overflow in closure pass |
+| `0d960b3` | docs: reorder sub-shard phases to 1→3→2 |
+| `429b42e` | docs: sub-shard design document |
 | + others | gcp_bench fixes, memory updates |

@@ -10,7 +10,7 @@ The former three-tier "HDC" design (FP16 ball → PQ ADC → FP32 rerank) was
 **retired** on 2026-07-24. The FP16 ball tier — which was presented as Sextant's
 novel contribution — turned out to actively hurt recall (premature convergence)
 and QPS (FP16 compute more expensive than PQ-ADC LUT sum). See
-`results/p2.3-noball/` and commit `2dca950`.
+`results/p2.3-noball/` and commit `5edf49b`.
 
 **This is not novel.** ADC + rerank is the standard PQ-ANN architecture used
 by DiskANN, FAISS, ScaNN, and others. The "HDC" framing was based on the FP16

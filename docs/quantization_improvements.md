@@ -171,7 +171,7 @@ measured. Summary of what's dead vs alive.**
 
 ### What's DEAD (do not revisit as parameter tweaks)
 
-**OPQ via PCA rotation (`7a39697`):** +1.03pp on arxiv100k, **0pp at 1.34M
+**OPQ via PCA rotation (`4580c88`):** +1.03pp on arxiv100k, **0pp at 1.34M
 scale** (0.7300 → 0.7300). This implemented the rotation half of OPQ — PCA
 eigendecomposition of the data covariance, R = V^T, rotate training data +
 queries to the eigenbasis before PQ splitting. This is the standard "OPQ via
@@ -195,10 +195,10 @@ untested but low expected value (<30% chance of meaningful gain at 1.34M given
 the PCA-init result + the dataset's decorrelation profile).** Not worth the
 implementation effort vs the architectural alternatives below.
 
-**Per-vector anisotropic proxy (`820d3cd`):** recall *degraded* monotonically
+**Per-vector anisotropic proxy (`5651d1d`):** recall *degraded* monotonically
 with λ. Per-vector direction ≠ expected query direction.
 
-**Per-subspace covariance scale-transform (`26b54da`):** −0.56pp. The global
+**Per-subspace covariance scale-transform (`5997d7d`):** −0.56pp. The global
 anisotropy is spread across 96 subspaces; each 8-dim sub-covariance is nearly
 isotropic, so per-subspace weighting can't redistribute error.
 

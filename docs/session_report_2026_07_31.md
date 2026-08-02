@@ -9,9 +9,9 @@ the critical combined benchmark (task #1). Five commits shipped.
 
 | Commit | Description |
 |--------|-------------|
-| `851daf0` | fix: respect --threads in PQ training + skip entry-point k-means for scan path |
-| `2ba5115` | feat: evidence-backed default flags from benchmark analysis |
-| `e37101c` | fix: estimator not propagating quantizer_type/prq params to build |
+| `8bf0036` | fix: respect --threads in PQ training + skip entry-point k-means for scan path |
+| `2cd8770` | feat: evidence-backed default flags from benchmark analysis |
+| `4e1cf76` | fix: estimator not propagating quantizer_type/prq params to build |
 
 ## 1. PQ Training Thread Fix
 
