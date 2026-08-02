@@ -64,6 +64,7 @@ public:
         float median_lid = 0.0f;
         uint32_t num_threads = 0;
         uint32_t pca_dims = 32;      // PCA dimensions for build_streaming_pca
+        uint32_t max_lloyd_passes = 10;  // max streaming Lloyd refinement passes
     };
 
     /// Build a tree index from a flat fbin file.

@@ -559,6 +559,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<std::string>("metric", 0, "l2sq / ip", false, "l2sq");
     p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
     p.add<uint32_t>("pca-dims", 0, "PCA dimensions (default 32)", false, 32);
+    p.add<uint32_t>("max-lloyd-passes", 0, "Max streaming Lloyd passes (default 10)", false, 10);
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
     p.parse_check(argc, argv);
 
@@ -574,6 +575,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     cfg.leaf_capacity = p.get<uint32_t>("leaf-capacity");
     cfg.num_threads = p.get<uint32_t>("threads");
     cfg.pca_dims = p.get<uint32_t>("pca-dims");
+    cfg.max_lloyd_passes = p.get<uint32_t>("max-lloyd-passes");
     cfg.params.pq4_m = p.get<uint16_t>("pq4-m");
     cfg.params.scan_pq_bits = static_cast<uint8_t>(p.get<uint32_t>("pq-bits"));
     cfg.params.quantizer_type = p.get<std::string>("quantizer");
