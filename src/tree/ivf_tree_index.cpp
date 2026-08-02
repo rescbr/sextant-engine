@@ -160,7 +160,9 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
     // leaves were written during build). At search time, we need to map from
     // (root_child, local_child) → global_leaf_id.
     if (idx->pca_dims_ > 0 && idx->manifest_.depth == 2) {
-        // Walk the level-1 nodes to assign global IDs.
+        // Build pca_leaf_base_ indexed by root child ID (not sequential).
+        // Empty children get a sentinel (UINT32_MAX).
+        idx->pca_leaf_base_.assign(idx->root_children_.size(), UINT32_MAX);
         uint32_t global_id = 0;
         for (uint32_t c = 0; c < idx->root_children_.size(); ++c) {
             const auto& rc = idx->root_children_[c];
@@ -168,10 +170,7 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
             const uint8_t* node_ptr = idx->mmap_base_ +
                 static_cast<uint64_t>(rc.page) * kPageSize;
             const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
-            // Store the starting global ID for this root child.
-            // We'll use this at search time: global_id = start + local_child.
-            // Store as a parallel array.
-            idx->pca_leaf_base_.push_back(global_id);
+            idx->pca_leaf_base_[c] = global_id;
             global_id += nh->n_children;
         }
     }
@@ -320,7 +319,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             for (uint32_t j = 0; j < nh->n_children; ++j) {
                 const auto* ce = reinterpret_cast<const ChildEntry*>(p);
                 float d;
-                if (pca_dims_ > 0 && child_idx < pca_leaf_base_.size()) {
+                if (pca_dims_ > 0 && child_idx < pca_leaf_base_.size() &&
+                    pca_leaf_base_[child_idx] != UINT32_MAX) {
                     const uint32_t gid = pca_leaf_base_[child_idx] + j;
                     const float* lc = &pca_leaf_centroids_[gid * pca_dims_];
                     d = 0.0f;
