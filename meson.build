@@ -11,6 +11,45 @@ project('sextant-engine', 'cpp',
 
 cpp = meson.get_compiler('cpp')
 
+# --- Build version (git commit + dirty flag) ----------------------------------
+# Captured at meson setup / reconfigure time and baked into build/version.h as
+# SEXTANT_GIT_SHA / SEXTANT_GIT_DIRTY. Lets `sextant --version` and `sextant_bench
+# --version` report exactly which source produced the binary — critical for
+# matching a dev-VM's prebuilt binary back to a local change set.
+#
+# The SHA shortens to 7 chars (git's default abbreviated length). "dirty" is set
+# when the working tree or index has uncommitted changes; binaries built from a
+# dirty tree are flagged so a stale/dirty build is never mistaken for a clean one.
+git = find_program('git', required: false)
+if git.found()
+    git_sha = run_command(git, 'rev-parse', '--short=7', 'HEAD',
+                          check: false, capture: true).stdout().strip()
+    # `git status --porcelain` prints one line per uncommitted entry. We use
+    # --untracked-files=no so the dirty flag reflects only tracked-source
+    # changes — an untracked build/ dir (or scratch files) would otherwise make
+    # every in-tree build look dirty. Any non-empty output means dirty.
+    git_dirty_out = run_command(git, 'status', '--porcelain', '--untracked-files=no',
+                                check: false, capture: true).stdout().strip()
+    git_dirty = (git_dirty_out != '') ? '1' : '0'
+    if git_sha == ''
+        git_sha = 'unknown'
+    endif
+else
+    git_sha = 'unknown'
+    git_dirty = '0'
+endif
+version_data = configuration_data()
+version_data.set('SEXTANT_VERSION', meson.project_version())
+version_data.set('SEXTANT_GIT_SHA', git_sha)
+version_data.set('SEXTANT_GIT_DIRTY', git_dirty)
+# Generated into the build dir (not committed); included via version_inc below.
+version_h = configure_file(
+    input: 'version.h.in',
+    output: 'version.h',
+    configuration: version_data,
+)
+version_inc = include_directories('.')
+
 # --- Compiler flags -----------------------------------------------------------
 # Warnings are errors for engine code. Third-party headers (numkong, ctpl,
 # cmdline, nsync) are added as -isystem below so their warnings are suppressed

@@ -15,6 +15,7 @@
 #include "engine/fbin_source.hpp"
 #include "fbin_io.hpp"
 #include "shared_cli.hpp"
+#include "sextant_version.hpp"
 #include "sextant/builder.hpp"
 #include "sextant/config.hpp"
 #include "sextant/crash_handler.hpp"
@@ -849,7 +850,8 @@ int cmd_insert(int argc, char* argv[]) {
 }
 
 void print_usage() {
-    std::cerr << "Usage: sextant <command> [options]\n"
+    std::cerr << sextant::version_string("sextant") << "\n\n"
+              << "Usage: sextant <command> [options]\n"
               << "Commands:\n"
               << "  build-tree  Build a hierarchical IVF tree index (single file).\n"
               << "              --input --index --k-root --leaf-capacity --pq4-m\n"
@@ -926,6 +928,9 @@ int main(int argc, char* argv[]) {
             return run_analyze(sub_argc, sub_argv.data());
         } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {
             print_usage();
+            return 0;
+        } else if (cmd == "--version" || cmd == "-V") {
+            std::cerr << sextant::version_string("sextant") << '\n';
             return 0;
         } else {
             std::cerr << "sextant: unknown command '" << cmd << "'\n";

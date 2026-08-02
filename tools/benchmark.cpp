@@ -15,6 +15,7 @@
 #include "fbin_io.hpp"
 #include "sextant/config.hpp"
 #include "sextant/crash_handler.hpp"
+#include "sextant_version.hpp"
 #include "sextant/ivf_scan_searcher.hpp"
 #include "sextant/ivf_searcher.hpp"
 #include "sextant/searcher.hpp"
@@ -592,6 +593,30 @@ int main(int argc, char* argv[]) {
                  "shards/query (c4a K=21 arxiv-nomic 1.34M). Set to 1.0 to disable. "
                  "See docs/ivf_routing_analysis.md.",
                  false, 1.05f);
+    p.add("version", 'V', "Print version (git commit + dirty flag) and exit");
+
+    // Intercept --version/-V and --help/-h BEFORE parse_check: the parser errors
+    // on missing required args (--index, --queries, ...) before an exist() check
+    // would run, so a bare `sextant_bench --version` would fail. Scanning argv
+    // directly lets these flags work with no other args present. For --help we
+    // emit the version banner first, then let parse_check print the full usage.
+    {
+        bool want_version = false;
+        bool want_help = false;
+        for (int i = 1; i < argc; ++i) {
+            std::string_view a = argv[i];
+            if (a == "--version" || a == "-V") want_version = true;
+            else if (a == "--help" || a == "-h" || a == "-?") want_help = true;
+        }
+        if (want_version) {
+            std::cerr << sextant::version_string("sextant_bench") << '\n';
+            return 0;
+        }
+        if (want_help) {
+            std::cerr << sextant::version_string("sextant_bench") << "\n\n";
+        }
+    }
+
     p.parse_check(argc, argv);
 
     // Set log level (must come after init_logging() above and before any
