@@ -187,7 +187,6 @@ void PageAllocator::free_extent(PageFile& file, PageId start, uint32_t count) {
 }
 
 void PageAllocator::grow(PageFile& file, uint64_t extra_pages) {
-    const uint64_t old_n_pages = n_pages_;
     const uint64_t new_n_pages = n_pages_ + extra_pages;
 
     grow_bitmap(new_n_pages);

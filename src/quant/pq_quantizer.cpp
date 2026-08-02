@@ -1051,9 +1051,8 @@ void PqQuantizer::build_fastscan_lut(const float* query,
     // `Searcher::build_query_lut` simple). Cost is m×K×4 bytes scratch +
     // one preprocess_query call per query — negligible vs the search itself.
     //
-    // Stack-allocated when m×K fits (m=96/K=256 → 96KB, too large for stack);
-    // heap-alloc via std::vector otherwise. This is per-query, not per-batch.
-    const size_t lut_f32_bytes = static_cast<size_t>(m_) * K_ * sizeof(float);
+    // Heap-alloc via std::vector (m×K can be large: m=96/K=256 → 96KB, too
+    // large for stack). This is per-query, not per-batch.
     std::vector<float> lut_f32(m_ * K_);
     preprocess_query(query, lut_f32.data());
     simd::quantize_lut_u8(lut_f32.data(), m_, K_, lut8, scale, offset);

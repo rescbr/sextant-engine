@@ -97,18 +97,6 @@ static inline void pq4_block32(const uint8_t* code_block, const uint8_t* lut4,
     vst1q_u32(out + 28, vmovl_u16(vget_high_u16(acc_hi_b)));
 }
 
-// Encode one vector to 4-bit packed codes (m/2 bytes). (Unused in this spike —
-// encode_dataset_4bit below uses q.encode directly. Kept for reference.)
-static void encode_4bit(const PqQuantizer& q, const float* vec, uint8_t* out) {
-    const uint32_t m = q.m();
-    const uint32_t cs = q.code_size();
-    std::vector<uint8_t> unpacked(cs, 0);
-    q.encode(vec, unpacked.data());
-    for (uint32_t j = 0; j < m / 2; j++) {
-        out[j] = (uint8_t)((unpacked[2*j + 1] & 0xF) << 4) | (unpacked[2*j] & 0xF);
-    }
-}
-
 // Build the 4-bit LUT for a query: m segments × 16 entries.
 // Uses the FAISS NormTableScaler approach (per-query GLOBAL scale, not
 // per-segment) so cross-segment distances compose correctly. Per-segment
@@ -252,7 +240,6 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> packed(q4.code_size());
         std::vector<float> ref_lut(q4.lut_size());
         q4.preprocess_query(query, ref_lut.data());
-        int mismatches = 0;
         for (uint32_t i = 0; i < std::min<uint32_t>(20, db.n); i++) {
             q4.encode(db.data.data() + size_t(i)*db.dim, packed.data());
             const float ref_d = q4.lut_distance(packed.data(), ref_lut.data());

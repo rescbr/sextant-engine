@@ -12,7 +12,12 @@ project('sextant-engine', 'cpp',
 cpp = meson.get_compiler('cpp')
 
 # --- Compiler flags -----------------------------------------------------------
-warning_flags = ['-Wall', '-Wextra', '-Wpedantic', '-Wno-unused-parameter']
+# Warnings are errors for engine code. Third-party headers (numkong, ctpl,
+# cmdline, nsync) are added as -isystem below so their warnings are suppressed
+# and -Werror doesn't fire on code we don't own. Each subproject is its own
+# meson project (own project() call), so these add_project_arguments don't leak
+# into nsync/spdlog/cpptoml/cpptrace/gtest builds.
+warning_flags = ['-Wall', '-Wextra', '-Wpedantic', '-Wno-unused-parameter', '-Werror']
 foreach flag : warning_flags
     if cpp.has_argument(flag)
         add_project_arguments(flag, language: 'cpp')
@@ -90,11 +95,13 @@ spdlog_dep = dependency('spdlog')
 
 # NumKong: header-only. Only used by scripts/bench_preprocess_query.cpp
 # (an old microbench). NOT used by the engine itself. Add the include path
-# only to scripts that actually need it.
-numkong_inc = include_directories('third_party/numkong/include')
+# only to scripts that actually need it. is_system silences numkong's own
+# -Wmissing-braces noise under -Werror.
+numkong_inc = include_directories('third_party/numkong/include', is_system: true)
 
-# CTPL and cmdline: committed headers, include path only.
-third_party_inc = include_directories('third_party')
+# CTPL and cmdline: committed headers, include path only. is_system silences
+# any third-party warnings under -Werror.
+third_party_inc = include_directories('third_party', is_system: true)
 
 # cpptoml: header-only TOML parser (for tree manifest serialization).
 cpptoml_proj = subproject('cpptoml')

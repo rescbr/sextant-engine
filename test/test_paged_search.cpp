@@ -331,7 +331,7 @@ TEST(PagedSearch, NodeStoreReadsAndCaches) {
         EXPECT_EQ(store.graph_reads(), 1u);
 
         // Pin node 0 again — should hit the cache (no new graph reads).
-        PinResult pr2 = store.pin_node(0); const uint8_t* n0_again = pr2.data;
+        (void)store.pin_node(0);
         EXPECT_EQ(store.graph_reads(), 1u);  // still 1 — cache hit
 
         // Pin node 0's code — first code access reads from disk.

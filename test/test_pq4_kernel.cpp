@@ -199,7 +199,6 @@ TEST(Pq4ScanMany, TailBlockMaskingSetsInvalidLanes) {
     // A tail block with only the first 5 lanes valid. Masked lanes must be
     // 0xFFFFFFFF (never argmin-winners).
     constexpr uint32_t m = 4;
-    constexpr uint32_t n_blocks = 1;
     Rng rng(777);
     std::vector<uint8_t> blocks(static_cast<size_t>(m) * 16);
     std::vector<uint8_t> lut4(static_cast<size_t>(m) * 16);

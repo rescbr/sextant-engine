@@ -301,6 +301,10 @@ TEST(MemGraph, EngineOpenInstallsMemGraphAndMaintainsRecall) {
     EXPECT_GT(searcher.memgraph_cached_count(), 0u);
     EXPECT_LE(searcher.memgraph_cached_count(), idx->count);
     ASSERT_GT(recall_total, 0u);
+    // Diagnostic counters (not asserted — see comment above). Kept for ad-hoc
+    // debugging via a debugger breakpoint; silence -Wunused-but-set-variable.
+    (void)exact_nn_hits;
+    (void)recall_hits;
 
     remove_sidecars(index_path);
     std::remove(fbin.c_str());

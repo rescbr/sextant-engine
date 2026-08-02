@@ -225,7 +225,6 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     const uint32_t m = manifest_.m4;
     const uint32_t codes_per_block = scan_8bit ? 16 : 32;
     const uint32_t block_bytes = m * 16;  // [m][16] for both 4-bit and 8-bit
-    const bool is_rabitq = (manifest_.quantizer_type == "rabitq");
 
     // LUT buffers.
     std::vector<uint8_t> lut4(scan_8bit ? 0 : m * 16);
@@ -317,7 +316,6 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             std::vector<std::pair<float, uint32_t>> child_dists;
             child_dists.reserve(nh->n_children);
             for (uint32_t j = 0; j < nh->n_children; ++j) {
-                const auto* ce = reinterpret_cast<const ChildEntry*>(p);
                 float d;
                 if (pca_dims_ > 0 && child_idx < pca_leaf_base_.size() &&
                     pca_leaf_base_[child_idx] != UINT64_MAX) {
@@ -421,10 +419,6 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const uint8_t* codes = leaf_ptr + leaf_codes_offset();
         const RowId* row_ids = reinterpret_cast<const RowId*>(
             leaf_ptr + leaf_rowids_offset(n_blocks, block_bytes));
-        const float* factors = is_rabitq
-            ? reinterpret_cast<const float*>(
-                leaf_ptr + leaf_factors_offset(n_blocks, block_bytes, count))
-            : nullptr;
 
         // Compute the valid_mask for the tail block.
         const uint32_t full_blocks = count / codes_per_block;
@@ -601,7 +595,6 @@ std::vector<Candidate> IVFTreeIndex::search_rabitq(const float* query,
             std::vector<std::pair<float, uint32_t>> child_dists;
             child_dists.reserve(nh->n_children);
             for (uint32_t j = 0; j < nh->n_children; ++j) {
-                const auto* ce = reinterpret_cast<const ChildEntry*>(p);
                 const float16_t* cent = reinterpret_cast<const float16_t*>(
                     p + sizeof(ChildEntry));
                 const float d = simd::dist_f16(metric, query_fp16.data(),
@@ -881,7 +874,6 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
             assigns[best_c].push_back(i);
         }
         // Update centroids: FP32 mean → FP16.
-        uint32_t n_changed = 0;
         for (uint32_t c = 0; c < k_root; ++c) {
             if (assigns[c].empty()) {
                 // Reseed from a random sample vector.
@@ -948,7 +940,6 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
     };
 
     const uint32_t code_size = quantizer->code_size();
-    const bool is_rabitq = (params.quantizer_type == "rabitq");
 
     std::vector<LeafBuffer> buffers(k_root);
     std::vector<std::vector<float16_t>> leaf_centroids_fp16;  // all flushed leaves
@@ -1422,26 +1413,6 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
         }
     }
 
-    // Compute closure epsilon (gap-based, same as build_streaming).
-    float closure_epsilon = 0.0f;
-    {
-        const uint32_t sample_for_eps = std::min<uint32_t>(4096, train_n);
-        double sum_gap = 0.0;
-        for (uint32_t i = 0; i < sample_for_eps; ++i) {
-            const float16_t* vec = &sample_fp16[i * dim];
-            float d1 = std::numeric_limits<float>::max();
-            float d2 = std::numeric_limits<float>::max();
-            for (uint32_t c = 0; c < k_root; ++c) {
-                const float d = simd::dist_f16(metric, vec,
-                                                root_centroids[c].data(), dim);
-                if (d < d1) { d2 = d1; d1 = d; }
-                else if (d < d2) { d2 = d; }
-            }
-            sum_gap += (d2 - d1);
-        }
-        closure_epsilon = static_cast<float>(sum_gap / sample_for_eps * 0.5);
-    }
-
     const uint32_t code_size = quantizer->code_size();
     const uint16_t depth = 2;
     const uint32_t cpb = (scan_bits == 4) ? 32 : 16;
@@ -1900,10 +1871,22 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     const uint8_t scan_bits = params.scan_pq_bits;
     const uint32_t leaf_cap = cfg.leaf_capacity > 0 ? cfg.leaf_capacity : 5000;
 
+    // n_leaves estimate: vectors / leaf_capacity.
+    const uint64_t n_leaves_est = std::max<uint64_t>(1, n / leaf_cap);
+
     uint32_t k_root = cfg.k_root;
     if (k_root == 0) {
-        k_root = static_cast<uint32_t>(std::sqrt(static_cast<double>(n) / leaf_cap));
-        k_root = std::clamp(k_root, 16u, 256u);
+        // K_root = round_pow2(n_leaves / 4).
+        // Rationale: each root child holds ~4 leaves on average. This gives
+        // finer leaf granularity (more n_probe_ln budget) and faster search
+        // (fewer vectors per leaf). round_pow2 picks the nearest power of two
+        // for cache-aligned child extents.
+        const uint64_t target = std::max<uint64_t>(1, n_leaves_est / 4);
+        uint32_t p2 = 1;
+        while (p2 * 2 <= target) p2 *= 2;
+        if (p2 < (1u << 30) && (target - p2) > (p2 * 2 - target))
+            p2 *= 2;  // next power of two is closer
+        k_root = std::clamp(p2, 4u, 65536u);
     }
 
     // PCA dimensions: project to this many components for routing.
@@ -1994,14 +1977,35 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t_pca).count());
 
-    // Project the sample for k-means (SIMD dot product per PC).
+    // Project the sample for k-means (parallelized across threads).
+    // Each vector: pca_dims dot products of length dim.
+    // With train_n=20k, dim=768, pca_dims=32 this is ~490M MACs —
+    // serial it takes ~2s, parallel across all cores it's <0.3s.
     std::vector<float> sample_pca(static_cast<size_t>(train_n) * pca_dims);
-    for (uint32_t i = 0; i < train_n; ++i) {
-        const float* xi = &sample[i * dim];
-        float* pi = &sample_pca[i * pca_dims];
-        for (uint32_t k = 0; k < pca_dims; ++k) {
-            pi[k] = simd::dot_f32(&rotation[k * dim], xi, dim) - mean_proj[k];
+    {
+        const uint32_t proj_hw = cfg.num_threads > 0
+            ? cfg.num_threads
+            : std::max(1u, std::thread::hardware_concurrency());
+        const uint32_t n_threads = std::min(proj_hw, train_n);
+        std::vector<std::future<void>> futs;
+        const uint32_t per = (train_n + n_threads - 1) / n_threads;
+        for (uint32_t t = 0; t < n_threads; ++t) {
+            const uint32_t start = t * per;
+            const uint32_t end = std::min(start + per, train_n);
+            if (start >= end) break;
+            futs.push_back(std::async(std::launch::async,
+                [&](uint32_t s, uint32_t e) {
+                    for (uint32_t i = s; i < e; ++i) {
+                        const float* xi = &sample[i * dim];
+                        float* pi = &sample_pca[i * pca_dims];
+                        for (uint32_t k = 0; k < pca_dims; ++k) {
+                            pi[k] = simd::dot_f32(
+                                &rotation[k * dim], xi, dim) - mean_proj[k];
+                        }
+                    }
+                }, start, end));
         }
+        for (auto& fut : futs) fut.get();
     }
 
     // --- 3. K-means in PCA space (root centroids) ---
@@ -2099,8 +2103,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     // After refinement, do one final emission pass: assign + closure + encode +
     // write leaves.
     const auto t_lloyd = std::chrono::steady_clock::now();
-    const uint32_t max_lloyd_passes = 10;
-    const bool is_ip = (params.metric == MetricKind::InnerProduct);
+    const uint32_t max_lloyd_passes = cfg.max_lloyd_passes > 0 ? cfg.max_lloyd_passes : 10;
 
     // Per-cluster accumulators (double for numerical stability).
     std::vector<std::vector<double>> cluster_sums(k_root, std::vector<double>(pca_dims, 0.0));

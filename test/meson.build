@@ -2,7 +2,9 @@
 gtest_dep = dependency('gtest')
 gtest_main_dep = dependency('gtest_main')
 
-test_inc = include_directories('../include', '../src', '../third_party')
+# third_party as is_system so its headers (ctpl/cmdline) don't trip -Werror.
+test_inc = include_directories('../include', '../src', '../third_party',
+    is_system: true)
 
 test_sources = [
     'test_storage.cpp',

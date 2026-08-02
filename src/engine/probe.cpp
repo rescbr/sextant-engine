@@ -273,7 +273,7 @@ ProbedConfig probe_best_config(const float* pool, uint32_t pool_n, Dim dim,
     if (all.empty()) {
         all_out = all;
         return {ms.empty() ? uint16_t{0} : ms.front(), uint8_t{8}, 0, 0,
-                0.0, 0.0, 0.0, 0.0};
+                0.0, 0.0, 0.0, 0.0, 0.0};
     }
 
     for (auto& c : all) {

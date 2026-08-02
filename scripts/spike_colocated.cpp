@@ -99,7 +99,8 @@ int main(int argc, char** argv) {
     auto t0 = secs();
     auto idx = Index::read(idx_path);
     const double load_secs = secs() - t0;
-    printf("  loaded in %.2fs: n=%u dim=%u\n", load_secs, idx->count, idx->dim);
+    printf("  loaded in %.2fs: n=%llu dim=%u\n", load_secs,
+           (unsigned long long)idx->count, idx->dim);
 
     const PqQuantizer& q = *idx->quantizer;
     const uint32_t code_size = q.code_size();
@@ -109,7 +110,8 @@ int main(int argc, char** argv) {
     // for rerank. Index::read doesn't keep the flat buffers resident; we
     // re-encode every vector with the loaded quantizer into our own flat
     // codes array, and read raw vectors from base_path on demand.
-    printf("Re-encoding %u vectors (flat codes array for spike)...\n", idx->count);
+    printf("Re-encoding %llu vectors (flat codes array for spike)...\n",
+           (unsigned long long)idx->count);
     std::vector<uint8_t> codes_all((size_t)idx->count * code_size, 0);
     t0 = secs();
     {

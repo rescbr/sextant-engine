@@ -168,7 +168,6 @@ int main(int argc, char** argv) {
 
     // Baseline: full D-dim rerank (no pruning).
     {
-        uint64_t total_dims = 0;
         uint64_t total_hits = 0;
         for (uint32_t qi = 0; qi < nq; qi++) {
             const auto& sl = shortlists[qi];
@@ -184,8 +183,6 @@ int main(int argc, char** argv) {
                 if (r < reranked.size() && r < sl.size() &&
                     reranked[r].second == sl[r].second)
                     total_hits++;
-
-            total_dims += uint64_t(W) * D;
         }
         const float recall = float(total_hits) / (nq * TOPK);
         printf("  %8s %8s %12.1f %12.1f %12.2f %10.4f %10s\n",

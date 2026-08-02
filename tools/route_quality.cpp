@@ -238,7 +238,6 @@ int main(int argc, char** argv) {
 
     // --- For each query: routed shards (top-n_probe by FP16) + coverage analysis.
     const uint32_t nps[] = {1, 2, 4, 8, 16, 32};
-    const uint32_t ks[] = {10, 100};
     // accumulators[routed_np][eval_k] = sum of coverage over queries
     double routed_cov[6][2] = {{0}};
     double oracle_cov[6][2] = {{0}};

@@ -108,7 +108,6 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
     cast_fp32_to_fp16(query, w.query_fp16.data(), index_.dim);
     const MetricKind metric = index_.quantizer->metric();
     const uint32_t m = index_.m4;
-    const uint32_t codes_per_block = scan_8bit ? 16 : 32;
 
     // --- 2. Route: FP16 L2sq/IP to each centroid, pick n_probe nearest ---
     // (Plus the multi-probe extension from IVFSearcher — variable per query.)
@@ -152,7 +151,6 @@ std::vector<Candidate> IVFScanSearcher::search_body_(
     //      is exhausted. Adapts to skew: cheap small shards scanned first.
     // Both are optional (gap=0 / budget=0 = disabled, scan all n_probe_eff).
     w.scored.clear();
-    const uint32_t invalid = 0xFFFFFFFFu;
     const float adaptive_gap = config.adaptive_probe_gap != 0.0f
         ? config.adaptive_probe_gap
         : index_.adaptive_probe_gap;

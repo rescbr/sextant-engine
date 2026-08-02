@@ -183,7 +183,6 @@ PartitionAssignment partition_codes(const PqQuantizer& quantizer,
     // Scratch for the assignment-pass distance computation (per-thread, via
     // the pool's TLS slot would be cleaner but the K-sized buffer is tiny —
     // ~256 floats — so per-thread heap is fine).
-    const uint32_t lut_stride = K;  // dists is K floats per code
 
     ctpl::thread_pool_tls<PartWorkerState> pool(num_threads);
 
