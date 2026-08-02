@@ -21,11 +21,13 @@ namespace sextant::tree {
 inline constexpr uint32_t kPageSize = 4096;
 
 /// Page index type. The tree file is a linear array of pages.
-/// At 4KB/page, a uint32_t index covers 16TB — more than enough.
-using PageId = uint32_t;
+/// uint64_t covers 2^64 × 4KB = effectively unlimited. Previous uint32_t
+/// limited to 16TB — too tight for 10B+ workloads with fragmentation +
+/// filter metadata.
+using PageId = uint64_t;
 
 /// Sentinel for "no page" (invalid / nil).
-inline constexpr PageId kInvalidPage = 0xFFFFFFFFu;
+inline constexpr PageId kInvalidPage = 0xFFFFFFFFFFFFFFFFull;
 
 /// Buffered, page-aligned file for the IVF tree.
 ///

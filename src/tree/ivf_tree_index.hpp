@@ -35,7 +35,7 @@ namespace sextant::tree {
 /// A routed leaf candidate: the extent to scan + routing context.
 struct LeafCandidate {
     PageId   page;           // leaf extent start page
-    uint32_t pages;          // leaf extent length
+    uint64_t pages;          // leaf extent length
     float    centroid_dist;  // distance from query to the leaf's parent centroid
     const float16_t* centroid;  // FP16 centroid of the leaf (for RaBitQ LUT rebuild)
 };
@@ -133,7 +133,7 @@ private:
     // Points into mmap_base_ at the root node's child entries.
     struct RootChild {
         PageId page;
-        uint32_t pages;
+        uint64_t pages;
         uint16_t is_leaf;
         const float16_t* centroid;  // points into mmap
     };
@@ -148,7 +148,7 @@ private:
     // Flat array: all leaves' PCA centroids, indexed by leaf order.
     // The search accesses them via the mmap'd level-1 node structure.
     std::vector<float> pca_leaf_centroids_; // n_leaves_total × pca_dims
-    std::vector<uint32_t> pca_leaf_base_;  // per root child: starting global leaf ID
+    std::vector<uint64_t> pca_leaf_base_;  // per root child: starting global leaf ID
 
     /// Parse the root node from the mmap.
     void load_root_from_mmap();

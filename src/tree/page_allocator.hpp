@@ -47,7 +47,7 @@ public:
     /// (`n_pages`, `free_list_head`, `n_free_pages`) and loads the bitmap into
     /// memory.
     void load(PageFile& file, PageId bitmap_page, uint32_t bitmap_pages,
-              uint64_t n_pages, PageId free_list_head, uint32_t n_free_pages);
+              uint64_t n_pages, PageId free_list_head, uint64_t n_free_pages);
 
     /// Allocate a single page. Returns kInvalidPage if the file is full
     /// (caller should extend via `grow`).
@@ -76,7 +76,7 @@ public:
 
     uint64_t n_pages() const { return n_pages_; }
     PageId free_list_head() const { return free_list_head_; }
-    uint32_t n_free_pages() const { return n_free_pages_; }
+    uint64_t n_free_pages() const { return n_free_pages_; }
     PageId bitmap_page() const { return bitmap_page_; }
     uint32_t bitmap_pages() const { return bitmap_pages_; }
 
@@ -103,7 +103,7 @@ private:
     uint32_t bitmap_pages_ = 0;               ///< number of bitmap pages
     uint64_t n_pages_ = 0;                    ///< total pages in file
     PageId free_list_head_ = kInvalidPage;    ///< first free page (or nil)
-    uint32_t n_free_pages_ = 0;               ///< free list length
+    uint64_t n_free_pages_ = 0;               ///< free list length
 
     /// In-memory bitmap. One bit per page. Bit set = allocated.
     /// Grows as the file grows. Always covers [0, n_pages_).

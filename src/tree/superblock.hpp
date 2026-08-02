@@ -49,12 +49,12 @@ struct SuperblockDisk {
     // Tree metadata
     uint16_t depth;                  // tree depth (1 = flat, 2 = two-level, ...)
     uint16_t reserved1;              // alignment padding
-    uint32_t n_leaves;               // total leaf count
+    uint64_t n_leaves;               // total leaf count
 
     // Allocator state
     uint64_t n_pages;                // total pages in file
     PageId   free_list_head;         // first free page (kInvalidPage if empty)
-    uint32_t n_free_pages;           // free list length
+    uint64_t n_free_pages;           // free list length
 
     // Bitmap
     PageId   alloc_bitmap_page;      // bitmap start page
@@ -73,8 +73,8 @@ struct SuperblockDisk {
     uint32_t pca_pages;              // PCA blob extent length
 
     // Reserved for future use.
-    // Fields total: 72 + 8 = 80 bytes; padding fills the rest of one 4KB page.
-    uint8_t  reserved2[4096 - 80];
+    // Fields total: 8+8 + 8+4 + 2+2+8 + 8+8+8 + 8+4 + 8+4 + 8+4 + 8+4 = 112 bytes
+    uint8_t  reserved2[4096 - 128];
 };
 static_assert(sizeof(SuperblockDisk) == kPageSize,
               "SuperblockDisk must be exactly one page");
@@ -105,10 +105,10 @@ public:
     PageId   root_node_page() const { return disk_.root_node_page; }
     uint32_t root_node_pages() const { return disk_.root_node_pages; }
     uint16_t depth() const { return disk_.depth; }
-    uint32_t n_leaves() const { return disk_.n_leaves; }
+    uint64_t n_leaves() const { return disk_.n_leaves; }
     uint64_t n_pages() const { return disk_.n_pages; }
     PageId   free_list_head() const { return disk_.free_list_head; }
-    uint32_t n_free_pages() const { return disk_.n_free_pages; }
+    uint64_t n_free_pages() const { return disk_.n_free_pages; }
     PageId   alloc_bitmap_page() const { return disk_.alloc_bitmap_page; }
     uint32_t alloc_bitmap_pages() const { return disk_.alloc_bitmap_pages; }
     PageId   codebook_page() const { return disk_.codebook_page; }
@@ -123,9 +123,9 @@ public:
         disk_.root_node_pages = pages;
     }
     void set_depth(uint16_t d) { disk_.depth = d; }
-    void set_n_leaves(uint32_t n) { disk_.n_leaves = n; }
+    void set_n_leaves(uint64_t n) { disk_.n_leaves = n; }
     void set_n_pages(uint64_t n) { disk_.n_pages = n; }
-    void set_free_list(PageId head, uint32_t n_free) {
+    void set_free_list(PageId head, uint64_t n_free) {
         disk_.free_list_head = head;
         disk_.n_free_pages = n_free;
     }

@@ -162,7 +162,7 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
     if (idx->pca_dims_ > 0 && idx->manifest_.depth == 2) {
         // Build pca_leaf_base_ indexed by root child ID (not sequential).
         // Empty children get a sentinel (UINT32_MAX).
-        idx->pca_leaf_base_.assign(idx->root_children_.size(), UINT32_MAX);
+        idx->pca_leaf_base_.assign(idx->root_children_.size(), UINT64_MAX);
         uint32_t global_id = 0;
         for (uint32_t c = 0; c < idx->root_children_.size(); ++c) {
             const auto& rc = idx->root_children_[c];
@@ -320,7 +320,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 const auto* ce = reinterpret_cast<const ChildEntry*>(p);
                 float d;
                 if (pca_dims_ > 0 && child_idx < pca_leaf_base_.size() &&
-                    pca_leaf_base_[child_idx] != UINT32_MAX) {
+                    pca_leaf_base_[child_idx] != UINT64_MAX) {
                     const uint32_t gid = pca_leaf_base_[child_idx] + j;
                     const float* lc = &pca_leaf_centroids_[gid * pca_dims_];
                     d = 0.0f;
@@ -342,7 +342,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             uint32_t n_probe_ln = config.n_probe_ln > 0
                 ? config.n_probe_ln
                 : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4);
-            n_probe_ln = std::min(n_probe_ln, nh->n_children);
+            n_probe_ln = std::min(static_cast<uint64_t>(n_probe_ln), nh->n_children);
 
             const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);
             for (uint32_t j = 0; j < n_probe_ln; ++j) {
@@ -614,7 +614,7 @@ std::vector<Candidate> IVFTreeIndex::search_rabitq(const float* query,
             uint32_t n_probe_ln = config.n_probe_ln > 0
                 ? config.n_probe_ln
                 : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4);
-            n_probe_ln = std::min(n_probe_ln, nh->n_children);
+            n_probe_ln = std::min(static_cast<uint64_t>(n_probe_ln), nh->n_children);
 
             const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);
             for (uint32_t j = 0; j < n_probe_ln; ++j) {

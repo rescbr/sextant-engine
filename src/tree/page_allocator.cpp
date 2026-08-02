@@ -78,7 +78,7 @@ void PageAllocator::init(PageFile& file, PageId bitmap_page,
 
 void PageAllocator::load(PageFile& file, PageId bitmap_page,
                          uint32_t bitmap_pages, uint64_t n_pages,
-                         PageId free_list_head, uint32_t n_free_pages) {
+                         PageId free_list_head, uint64_t n_free_pages) {
     bitmap_page_ = bitmap_page;
     bitmap_pages_ = bitmap_pages;
     n_pages_ = n_pages;
@@ -198,7 +198,7 @@ void PageAllocator::grow(PageFile& file, uint64_t extra_pages) {
 
     // The new pages are free (bitmap bits = 0, already zero from grow_bitmap).
     // Track the count for the superblock's n_free_pages field.
-    n_free_pages_ += static_cast<uint32_t>(extra_pages);
+    n_free_pages_ += extra_pages;
 }
 
 void PageAllocator::flush_bitmap(PageFile& file) const {
