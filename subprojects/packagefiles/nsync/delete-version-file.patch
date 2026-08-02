@@ -1,0 +1,6 @@
+diff --git a/version b/version
+deleted file mode 100644
+--- a/version
++++ /dev/null
+@@ -1 +0,0 @@
+-1.30.0

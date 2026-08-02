@@ -1,0 +1,10 @@
+[wrap-file]
+directory = nsync-5b420ef6b16532a4fad4be1fde8e483b6b7bd8f4
+source_url = https://github.com/google/nsync/archive/5b420ef6b16532a4fad4be1fde8e483b6b7bd8f4.tar.gz
+source_filename = nsync-1.30.0.tar.gz
+source_hash = cea0b9be6039ea0b2ead2e430d0ecafa38ec54e1a918d2dcb94969cc666218ad
+patch_directory = nsync
+diff_files = nsync/delete-version-file.patch
+
+[provide]
+dependency_names = nsync

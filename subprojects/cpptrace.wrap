@@ -1,0 +1,9 @@
+[wrap-file]
+directory = cpptrace-91b6b78e408a8b1c0b7146c9034a03156c082da2
+source_url = https://github.com/jeremy-rifkin/cpptrace/archive/91b6b78e408a8b1c0b7146c9034a03156c082da2.tar.gz
+source_filename = cpptrace-1.0.4.tar.gz
+source_hash = 5cb597799c7ebedd422f9e2bd83c84046b9ddc65d04e0724b6332a6cf6fb4e02
+patch_directory = cpptrace
+
+[provide]
+dependency_names = cpptrace

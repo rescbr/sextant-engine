@@ -1,0 +1,9 @@
+[wrap-file]
+directory = cpptoml-fededad7169e538ca47e11a9ee9251bc361a9a65
+source_url = https://github.com/skystrife/cpptoml/archive/fededad7169e538ca47e11a9ee9251bc361a9a65.tar.gz
+source_filename = cpptoml-0.5.0.tar.gz
+source_hash = 7bd5ce29434cc24ed8fc87093f031124cd33a84858b309855a0b5dc3f72e0bd5
+patch_directory = cpptoml
+
+[provide]
+dependency_names = cpptoml

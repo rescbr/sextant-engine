@@ -3,9 +3,15 @@ build/
 builddir/
 .build/
 
-# WrapDB downloaded subproject sources (fetched by meson setup)
+# WrapDB downloaded subproject sources (fetched/extracted by meson setup).
+# nsync/cpptoml/cpptrace use wraps with patch_directory overlays + a deletion
+# diff (see subprojects/packagefiles/); their extracted trees match the
+# upstream tarball's leading directory name (a git SHA).
 subprojects/spdlog-*/
 subprojects/googletest-*/
+subprojects/nsync-*/
+subprojects/cpptoml-*/
+subprojects/cpptrace-*/
 subprojects/packagecache/
 
 # IDE / editor
