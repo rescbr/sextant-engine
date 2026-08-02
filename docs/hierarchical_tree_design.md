@@ -418,11 +418,24 @@ B (gap) + D (budget) at every level. Filter pruning at every level.
 - Superblock read/write (with shadow + atomic flip).
 - 16 tests, all passing.
 
-### Phase 1: Two-level tree (bulk build, bottom-up)
+### Phase 1: Two-level tree (bulk build) ✅
 - `IVFTreeIndex` (in-memory + page-file).
-- Bottom-up build: leaf k-means → centroid grouping → write file.
-- Search: two-level routing + leaf scan (mmap).
-- **Validation:** Sphere 10M. Target: recall ≥0.70 @ QPS ≥400.
+- Three build paths: global k-means, streaming greedy, streaming Lloyd PCA.
+- Search: two-level routing + leaf scan (mmap). PCA routing at search time.
+- Three quantizers: PQ (4/8-bit), PRQ (4-bit), RaBitQ (4-bit + factors).
+- Multithreaded search (8 threads, 5.8× scaling).
+- CLI: build-tree, build-tree-streaming, build-tree-refined, build-tree-pca, tree-search.
+- **Validation results (c4a, 8-core ARM, NVMe):**
+  - Sphere-IP 10M: recall@10 = 0.839 @ 348 QPS (K=512 np=64)
+  - MSMARCO 8.7M: recall@10 = 0.976 @ 720 QPS (K=1024 np=64)
+  - Prior flat scan ceiling: Sphere 0.68 @ 453 QPS.
+  - Build: 120-420s (Lloyd PCA) vs 3528s (global k-means).
+
+### Phase 1 parameter defaults (analytically derived)
+- K_root = round_pow2(n_leaves / 4) where n_leaves = N / leaf_cap × 1.5
+- n_probe = 8, n_probe_ln = 8 (golden config)
+- Golden config transfers across datasets; recall is dataset-difficulty-bound
+- At 1B: K_root≈65k, np/npln unchanged. Add depth-3 tier if K_root > 4096.
 
 ### Phase 2: Dynamic depth
 - Auto-choose depth from N.
