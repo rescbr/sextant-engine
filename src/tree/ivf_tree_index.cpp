@@ -2424,8 +2424,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     // route efficiently, so we add an intermediate level (depth-3): the root
     // gets k_l1 children (L1 nodes), each L1 node groups k_root/k_l1 fine
     // centroids (L2 nodes → leaves). k_root stays as the fine-cluster count.
-    const uint32_t k_root_max_depth2 = cfg.k_root_max_depth2 > 0
-        ? cfg.k_root_max_depth2 : 512u;
+    const uint32_t k_root_max_depth2 = cfg.k_root_max_depth2;
     uint16_t depth = 2;
     uint32_t k_l1 = 0;
     if (k_root > k_root_max_depth2) {
