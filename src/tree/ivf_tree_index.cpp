@@ -875,7 +875,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         std::vector<float> decoded_vec(manifest_.dim);
 
         for (const auto& entry : heap) {
-            std::memset(code_buf.data(), 0, code_sz);
+            // extract_code_from_leaf fully writes every code byte for both
+            // 4-bit (both nibbles of each byte) and 8-bit (one byte/segment)
+            // layouts, so no prior zeroing of code_buf is needed.
             extract_code_from_leaf(entry.leaf_ptr, entry.local_idx,
                                    manifest_.summary_size, manifest_.m4,
                                    manifest_.scan_pq_bits, codes_per_block,
@@ -2925,6 +2927,37 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         std::vector<const uint8_t*> payload_ptrs;
     };
     std::vector<LeafBuffer> buffers(k_root);
+
+    // Phase H: leaf-level closure carry state, one per root cluster. After a
+    // leaf flushes, vectors within leaf_closure_eps of that leaf's centroid are
+    // snapshotted into the carry buffer; they are replicated into the *next*
+    // leaf of the same root cluster if they fall within leaf_closure_eps of its
+    // centroid. This mirrors the root-level SPANN-style boundary replication at
+    // the leaf granularity and is disabled entirely when
+    // cfg.leaf_closure_multiplier <= 0 (the default).
+    struct LeafCarry {
+        std::vector<uint8_t> codes;       // code_size bytes per row
+        std::vector<RowId> row_ids;
+        std::vector<float16_t> fp16_vecs; // dim per row
+        std::vector<MemColumnData> filter_cols;  // only when has_filter
+        std::vector<uint32_t> payload_lens;      // only when has_payload
+        std::vector<const uint8_t*> payload_ptrs;
+    };
+    std::vector<LeafCarry> carry(k_root);
+    // Per-root-cluster previous leaf centroid (FP16) for calibrating the leaf
+    // closure epsilon from observed leaf-centroid gaps.
+    std::vector<std::vector<float16_t>> prev_leaf_centroid(k_root);
+    // Per-root-cluster leaf closure epsilon. Seeded from the root closure
+    // epsilon and refined from the first observed leaf-centroid gap.
+    std::vector<float> leaf_closure_eps(k_root, 0.0f);
+    // Reusable FP16 centroid scratch for flush_buffer (computed before the
+    // buffer data is moved, used by the carry-in/carry-out closure logic).
+    std::vector<float16_t> leaf_centroid_tmp;
+    const bool leaf_closure_on = cfg.leaf_closure_multiplier > 0.0f;
+    if (leaf_closure_on) {
+        for (uint32_t c = 0; c < k_root; ++c)
+            leaf_closure_eps[c] = closure_epsilon * cfg.leaf_closure_multiplier;
+    }
     if (has_filter) {
         for (auto& b : buffers) {
             b.filter_cols.resize(n_schema_cols);
@@ -3004,15 +3037,10 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     auto flush_buffer = [&](uint32_t c) {
         auto& buf = buffers[c];
         if (buf.row_ids.empty()) return;
-        FlushedLeaf leaf;
-        leaf.codes = std::move(buf.codes);
-        leaf.row_ids = std::move(buf.row_ids);
-        if (has_filter) leaf.filter_cols = std::move(buf.filter_cols);
-        leaf.payload_lens = std::move(buf.payload_lens);
-        leaf.payload_ptrs = std::move(buf.payload_ptrs);
-        leaf.centroid.resize(dim);
-        std::vector<double> sum(dim, 0.0);
         const uint32_t cnt = buf.fp16_vecs.size() / dim;
+        // Compute the leaf centroid (in FP16) before moving the buffer data.
+        leaf_centroid_tmp.resize(dim);
+        std::vector<double> sum(dim, 0.0);
         for (uint32_t i = 0; i < cnt; ++i)
             for (uint16_t d = 0; d < dim; ++d)
                 sum[d] += static_cast<float>(buf.fp16_vecs[i * dim + d]);
@@ -3020,7 +3048,83 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         std::vector<float> centroid_f32(dim);
         compute_centroid_spherical(sum.data(), cnt, dim, metric, centroid_f32.data());
         for (uint16_t d = 0; d < dim; ++d)
-            leaf.centroid[d] = static_cast<float16_t>(centroid_f32[d]);
+            leaf_centroid_tmp[d] = static_cast<float16_t>(centroid_f32[d]);
+
+        // Refine leaf_closure_eps[c] from the gap to the previous leaf centroid
+        // of this root cluster (only on the second flush onward).
+        if (leaf_closure_on && !prev_leaf_centroid[c].empty()) {
+            const float gap = simd::dist_f16(metric, prev_leaf_centroid[c].data(),
+                                             leaf_centroid_tmp.data(), dim);
+            // Calibrate: epsilon = multiplier × centroid gap, but never below the
+            // seed so early (tight) clusters don't drop the carry mechanism.
+            const float calibrated =
+                gap * cfg.leaf_closure_multiplier;
+            if (calibrated > leaf_closure_eps[c])
+                leaf_closure_eps[c] = calibrated;
+        }
+
+        // Phase H carry-IN: replicate carried boundary vectors from the
+        // previous flush of this root cluster if they are within
+        // leaf_closure_eps[c] of THIS leaf's centroid. Append before moving.
+        if (leaf_closure_on && !carry[c].codes.empty()) {
+            const float eps_c = leaf_closure_eps[c];
+            const uint32_t code_size_local = code_size;
+            const uint32_t carry_n = static_cast<uint32_t>(carry[c].row_ids.size());
+            for (uint32_t i = 0; i < carry_n; ++i) {
+                const float16_t* v = &carry[c].fp16_vecs[i * dim];
+                if (simd::dist_f16(metric, v, leaf_centroid_tmp.data(), dim) > eps_c)
+                    continue;
+                buf.codes.insert(buf.codes.end(),
+                                 carry[c].codes.begin() + i * code_size_local,
+                                 carry[c].codes.begin() + (i + 1) * code_size_local);
+                buf.row_ids.push_back(carry[c].row_ids[i]);
+                buf.fp16_vecs.insert(buf.fp16_vecs.end(), v, v + dim);
+                if (has_filter)
+                    append_filter_row(buf.filter_cols, carry[c].row_ids[i]);
+                if (has_payload) {
+                    buf.payload_lens.push_back(carry[c].payload_lens[i]);
+                    buf.payload_ptrs.push_back(carry[c].payload_ptrs[i]);
+                }
+            }
+        }
+
+        FlushedLeaf leaf;
+
+        // Phase H carry-OUT: snapshot the buffer's boundary vectors (those
+        // within leaf_closure_eps[c] of this leaf's centroid) into a fresh
+        // carry buffer for the *next* flush of this root cluster. MUST run
+        // before std::move-ing buf into leaf (after the move, buf's vectors
+        // are empty). Uses the original row count `cnt` (excludes carry-IN
+        // rows, which are themselves boundary vectors already replicated here).
+        if (leaf_closure_on) {
+            const float eps_c = leaf_closure_eps[c];
+            LeafCarry next_carry;
+            const uint32_t code_size_local = code_size;
+            for (uint32_t i = 0; i < cnt; ++i) {
+                const float16_t* v = &buf.fp16_vecs[i * dim];
+                if (simd::dist_f16(metric, v, leaf_centroid_tmp.data(), dim) > eps_c)
+                    continue;
+                next_carry.codes.insert(next_carry.codes.end(),
+                                        buf.codes.begin() + i * code_size_local,
+                                        buf.codes.begin() + (i + 1) * code_size_local);
+                next_carry.row_ids.push_back(buf.row_ids[i]);
+                next_carry.fp16_vecs.insert(next_carry.fp16_vecs.end(), v, v + dim);
+                if (has_payload) {
+                    next_carry.payload_lens.push_back(buf.payload_lens[i]);
+                    next_carry.payload_ptrs.push_back(buf.payload_ptrs[i]);
+                }
+            }
+            carry[c] = std::move(next_carry);
+            prev_leaf_centroid[c] = leaf_centroid_tmp;  // copy
+        }
+
+        leaf.codes = std::move(buf.codes);
+        leaf.row_ids = std::move(buf.row_ids);
+        if (has_filter) leaf.filter_cols = std::move(buf.filter_cols);
+        leaf.payload_lens = std::move(buf.payload_lens);
+        leaf.payload_ptrs = std::move(buf.payload_ptrs);
+        leaf.centroid = leaf_centroid_tmp;  // copy the FP16 centroid
+
         root_to_leaves[c].push_back(static_cast<uint32_t>(all_leaves.size()));
         all_leaves.push_back(std::move(leaf));
         buf.codes.clear();
@@ -3032,6 +3136,10 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
             for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
                 buf.filter_cols[cc].type = cfg.filter_schema.columns[cc].type;
     };
+
+    // leaf_centroid_tmp declared before flush_buffer (above) — reused FP16
+    // centroid scratch for the carry logic.
+
 
     // Precompute FP16 root centroids for the search path (the tree stores
     // root centroids in original FP16 space, not PCA space — we project back).
