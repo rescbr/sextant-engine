@@ -70,7 +70,7 @@ public:
         uint32_t num_threads = 0;
         uint32_t pca_dims = 32;      // PCA dimensions for build_streaming_pca
         uint32_t max_lloyd_passes = 10;  // max streaming Lloyd refinement passes
-        uint32_t k_root_max_depth2 = 512;  // k_root above this forces depth-3
+        uint32_t k_root_max_depth2 = 2048;  // k_root above this forces depth-3
         Schema filter_schema;        // empty = no filter columns (today's behavior)
 
         /// Filter column data (Phase C). When non-empty, filter column values
