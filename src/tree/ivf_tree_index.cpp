@@ -2917,51 +2917,29 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     struct LeafBuffer {
         std::vector<uint8_t> codes;
         std::vector<RowId> row_ids;
-        std::vector<float16_t> fp16_vecs;
+        // Incremental centroid accumulator (replaces fp16_vecs). A running
+        // FP32-sum (stored as double for stability) + count per buffer.
+        // At flush time, divide sum by count to get the centroid. This keeps
+        // the per-buffer footprint at O(leaf_cap × (code_size + 8) + dim×8)
+        // instead of O(leaf_cap × dim × 2).
+        std::vector<double> centroid_sum;
+        uint32_t centroid_count = 0;
         // Filter column data for the rows in this buffer (Phase C).
-        // One entry per schema column. Populated only when filter_column_data
-        // is non-empty. Each MemColumnData is scoped to this leaf's rows.
         std::vector<MemColumnData> filter_cols;
-        // Payload info for the rows in this buffer (Phase E). Populated only
-        // when cfg.payload_data is non-empty. Per-row length + data pointer.
+        // Payload info for the rows in this buffer (Phase E).
         std::vector<uint32_t> payload_lens;
         std::vector<const uint8_t*> payload_ptrs;
     };
     std::vector<LeafBuffer> buffers(k_root);
+    for (auto& b : buffers) b.centroid_sum.assign(dim, 0.0);
 
-    // Phase H: leaf-level closure carry state, one per root cluster. After a
-    // leaf flushes, vectors within leaf_closure_eps of that leaf's centroid are
-    // snapshotted into the carry buffer; they are replicated into the *next*
-    // leaf of the same root cluster if they fall within leaf_closure_eps of its
-    // centroid. This mirrors the root-level SPANN-style boundary replication at
-    // the leaf granularity and is disabled entirely when
-    // cfg.leaf_closure_multiplier <= 0 (the default).
-     /// Maximum carry entries per root cluster (bounded to prevent OOM at scale).
-     static constexpr uint32_t kLeafCarryMax = 64;
-
-     struct LeafCarry {
-         std::vector<uint8_t> codes;       // code_size bytes per row
-         std::vector<RowId> row_ids;
-         std::vector<float16_t> fp16_vecs; // dim per row
-         std::vector<MemColumnData> filter_cols;  // only when has_filter
-         std::vector<uint32_t> payload_lens;      // only when has_payload
-         std::vector<const uint8_t*> payload_ptrs;
-     };
-    std::vector<LeafCarry> carry(k_root);
-    // Per-root-cluster previous leaf centroid (FP16) for calibrating the leaf
-    // closure epsilon from observed leaf-centroid gaps.
-    std::vector<std::vector<float16_t>> prev_leaf_centroid(k_root);
-    // Per-root-cluster leaf closure epsilon. Seeded from the root closure
-    // epsilon and refined from the first observed leaf-centroid gap.
-    std::vector<float> leaf_closure_eps(k_root, 0.0f);
-    // Reusable FP16 centroid scratch for flush_buffer (computed before the
-    // buffer data is moved, used by the carry-in/carry-out closure logic).
-    std::vector<float16_t> leaf_centroid_tmp;
-    const bool leaf_closure_on = cfg.leaf_closure_multiplier > 0.0f;
-    if (leaf_closure_on) {
-        for (uint32_t c = 0; c < k_root; ++c)
-            leaf_closure_eps[c] = closure_epsilon * cfg.leaf_closure_multiplier;
+    if (cfg.leaf_closure_multiplier > 0.0f) {
+        spdlog::warn("[sextant] build_streaming_pca: leaf_closure_multiplier={} "
+                     "is ignored by the streaming build (O(1) RAM path stores no "
+                     "fp16 vectors); use a non-streaming build for leaf closure.",
+                     cfg.leaf_closure_multiplier);
     }
+
     if (has_filter) {
         for (auto& b : buffers) {
             b.filter_cols.resize(n_schema_cols);
@@ -3027,232 +3005,202 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         }
     };
 
-    struct FlushedLeaf {
-        std::vector<uint8_t> codes;
-        std::vector<RowId> row_ids;
-        std::vector<float16_t> centroid;
-        std::vector<MemColumnData> filter_cols;  // Phase C
-        std::vector<uint32_t> payload_lens;      // Phase E
-        std::vector<const uint8_t*> payload_ptrs; // Phase E
+    // --- O(1)-RAM streaming leaf writer ---
+    // Leaf extents are written DIRECTLY to the tree file's PageFile +
+    // PageAllocator at flush time. No spill files, no read-back phase. The
+    // only post-emission in-memory state is a small LeafMeta vector
+    // (page + pages + centroid per leaf) + per-leaf filter summaries.
+    struct LeafMeta {
+        PageId page;
+        uint32_t pages;
+        std::vector<float16_t> centroid;  // dim FP16 values
     };
 
-    // --- Spill-to-disk for flushed leaves (O(1) RAM) ---
-    // Instead of holding all leaves in memory (O(N) RAM → OOM at scale), each
-    // flushed leaf is appended to a per-root-cluster spill file. The write
-    // phase reads them back sequentially. Memory is bounded by one buffer per
-    // cluster (k_root × leaf_capacity × entry_size), not by the total leaf set.
-    //
-    // Spill directory: same parent as the output tree file (fast local disk).
-    // Filename: sextant_spill_<pid>_<cluster>.bin  (PID avoids parallel clashes).
+    // Per-root-cluster leaf ordering (global leaf index per cluster). Built
+    // during emission and consumed by the internal-node write phase.
     std::vector<std::vector<uint32_t>> root_to_leaves(k_root);
     std::vector<uint32_t> n_leaves_in_cluster(k_root, 0);
+    std::vector<LeafMeta> leaf_metas;             // grows as leaves are flushed
+    std::vector<std::vector<uint8_t>> leaf_summaries;  // filter summary per leaf
 
-    const std::filesystem::path spill_dir =
-        std::filesystem::path(output_path).parent_path();
-    const std::string spill_prefix =
-        (spill_dir.empty() ? std::filesystem::current_path() : spill_dir)
-            .string() + "/sextant_spill_" + std::to_string(::getpid()) + "_";
+    // The PageFile + PageAllocator are initialized BEFORE the emission pass so
+    // leaves can be allocated + written at flush time. The file starts with
+    // just the bitmap (page 2); leaves are allocated sequentially.
+    const PageId bitmap_page = 2;
+    const uint32_t bitmap_pages = 1;
+    PageFile file(output_path);
+    PageAllocator alloc;
+    file.truncate(bitmap_page + bitmap_pages);
+    alloc.init(file, bitmap_page, bitmap_pages);
 
-    std::vector<std::ofstream> spill_files(k_root);
-    auto open_spill = [&](uint32_t c) {
-        std::string path = spill_prefix + std::to_string(c) + ".bin";
-        spill_files[c].open(path, std::ios::binary | std::ios::trunc);
-        if (!spill_files[c])
-            throw Error(ErrorCode::IoError,
-                        "build_streaming_pca: cannot open spill file " + path);
-    };
-
-    // Serialize one MemColumnData to an ostream. Mirrors the in-memory layout:
-    // the type tag is known from the schema (not re-stored), so only the
-    // per-type data vectors are written.
-    auto write_mem_column = [&](std::ostream& os, const MemColumnData& col) {
-        const auto w = [&]() -> uint32_t {
-            switch (col.type) {
-                case ColumnType::Int32: case ColumnType::Float:
-                case ColumnType::Bool:  return 4;
-                case ColumnType::Int64: return 8;
-                default: return 0;
-            }
-        }();
-        if (w > 0) {
-            const uint64_t sz = col.fixed_data.size();
-            os.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
-            os.write(reinterpret_cast<const char*>(col.fixed_data.data()),
-                     static_cast<std::streamsize>(col.fixed_data.size()));
-        } else if (col.type == ColumnType::String) {
-            const uint64_t noff = col.str_offsets.size();
-            os.write(reinterpret_cast<const char*>(&noff), sizeof(noff));
-            os.write(reinterpret_cast<const char*>(col.str_offsets.data()),
-                     static_cast<std::streamsize>(noff * sizeof(uint32_t)));
-            os.write(reinterpret_cast<const char*>(col.str_lengths.data()),
-                     static_cast<std::streamsize>(noff * sizeof(uint16_t)));
-            const uint64_t nd = col.str_data.size();
-            os.write(reinterpret_cast<const char*>(&nd), sizeof(nd));
-            os.write(reinterpret_cast<const char*>(col.str_data.data()),
-                     static_cast<std::streamsize>(nd));
-        } else if (col.type == ColumnType::Set) {
-            const uint64_t nc = col.set_counts.size();
-            os.write(reinterpret_cast<const char*>(&nc), sizeof(nc));
-            os.write(reinterpret_cast<const char*>(col.set_counts.data()),
-                     static_cast<std::streamsize>(nc * sizeof(uint8_t)));
-            os.write(reinterpret_cast<const char*>(col.set_offsets.data()),
-                     static_cast<std::streamsize>(nc * sizeof(uint32_t)));
-            const uint64_t ne = col.set_elem_lengths.size();
-            os.write(reinterpret_cast<const char*>(&ne), sizeof(ne));
-            os.write(reinterpret_cast<const char*>(col.set_elem_lengths.data()),
-                     static_cast<std::streamsize>(ne * sizeof(uint16_t)));
-            const uint64_t nd = col.set_elem_data.size();
-            os.write(reinterpret_cast<const char*>(&nd), sizeof(nd));
-            os.write(reinterpret_cast<const char*>(col.set_elem_data.data()),
-                     static_cast<std::streamsize>(nd));
-        }
-    };
-
-    auto write_leaf_to_spill = [&](uint32_t c, const FlushedLeaf& leaf) {
-        if (!spill_files[c].is_open()) open_spill(c);
-        auto& os = spill_files[c];
-        const uint32_t count = static_cast<uint32_t>(leaf.row_ids.size());
-        os.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        os.write(reinterpret_cast<const char*>(leaf.codes.data()),
-                 static_cast<std::streamsize>(leaf.codes.size()));
-        os.write(reinterpret_cast<const char*>(leaf.row_ids.data()),
-                 static_cast<std::streamsize>(count * sizeof(RowId)));
-        os.write(reinterpret_cast<const char*>(leaf.centroid.data()),
-                 static_cast<std::streamsize>(dim * sizeof(float16_t)));
-        if (has_filter) {
-            for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
-                write_mem_column(os, leaf.filter_cols[cc]);
-        }
-        // Payload is not serialized: payload_lens is derivable from row_ids via
-        // cfg.payload_offsets, and payload_ptrs recompute from cfg.payload_data.
-        // (Keeps spill size minimal; payload is already on disk in the source.)
-        os.flush();
-    };
+    const uint32_t cpb = (scan_bits == 4) ? 32 : 16;
+    const uint32_t bb = m4 * 16;
 
     auto flush_buffer = [&](uint32_t c) {
         auto& buf = buffers[c];
         if (buf.row_ids.empty()) return;
-        const uint32_t cnt = buf.fp16_vecs.size() / dim;
-        // Compute the leaf centroid (in FP16) before moving the buffer data.
-        leaf_centroid_tmp.resize(dim);
-        std::vector<double> sum(dim, 0.0);
-        for (uint32_t i = 0; i < cnt; ++i)
-            for (uint16_t d = 0; d < dim; ++d)
-                sum[d] += static_cast<float>(buf.fp16_vecs[i * dim + d]);
-        // Spherical k-means: compute mean, renormalize for IP metric.
+        const uint32_t count = static_cast<uint32_t>(buf.row_ids.size());
+
+        // Compute the leaf centroid from the incremental accumulator.
         std::vector<float> centroid_f32(dim);
-        compute_centroid_spherical(sum.data(), cnt, dim, metric, centroid_f32.data());
+        compute_centroid_spherical(buf.centroid_sum.data(), buf.centroid_count,
+                                   dim, metric, centroid_f32.data());
+        std::vector<float16_t> leaf_centroid(dim);
         for (uint16_t d = 0; d < dim; ++d)
-            leaf_centroid_tmp[d] = static_cast<float16_t>(centroid_f32[d]);
+            leaf_centroid[d] = static_cast<float16_t>(centroid_f32[d]);
 
-        // Refine leaf_closure_eps[c] from the gap to the previous leaf centroid
-        // of this root cluster (only on the second flush onward).
-        if (leaf_closure_on && !prev_leaf_centroid[c].empty()) {
-            const float gap = simd::dist_f16(metric, prev_leaf_centroid[c].data(),
-                                             leaf_centroid_tmp.data(), dim);
-            // Calibrate: epsilon = multiplier × centroid gap, but never below the
-            // seed so early (tight) clusters don't drop the carry mechanism.
-            const float calibrated =
-                gap * cfg.leaf_closure_multiplier;
-            if (calibrated > leaf_closure_eps[c])
-                leaf_closure_eps[c] = calibrated;
+        // Phase C: filter column region size for this leaf.
+        const uint64_t fcb = has_filter
+            ? filter_columns_bytes(count, cfg.filter_schema, buf.filter_cols) : 0;
+
+        // Build-time validation warnings (architecture plan §3.5.2).
+        const uint32_t n_blocks_chk = (count + cpb - 1) / cpb;
+        const uint64_t pq_code_bytes =
+            static_cast<uint64_t>(n_blocks_chk) * bb;
+        if (has_filter && pq_code_bytes > 0 && fcb > 10ull * pq_code_bytes) {
+            spdlog::warn("[sextant] build_streaming_pca: leaf {} filter column "
+                         "data ({}B) > 10× PQ codes ({}B)",
+                         leaf_metas.size(), fcb, pq_code_bytes);
         }
 
-        // Phase H carry-IN: replicate carried boundary vectors from the
-        // previous flush of this root cluster if they are within
-        // leaf_closure_eps[c] of THIS leaf's centroid. Append before moving.
-        if (leaf_closure_on && !carry[c].codes.empty()) {
-            const float eps_c = leaf_closure_eps[c];
-            const uint32_t code_size_local = code_size;
-            const uint32_t carry_n = static_cast<uint32_t>(carry[c].row_ids.size());
-            for (uint32_t i = 0; i < carry_n; ++i) {
-                const float16_t* v = &carry[c].fp16_vecs[i * dim];
-                if (simd::dist_f16(metric, v, leaf_centroid_tmp.data(), dim) > eps_c)
-                    continue;
-                buf.codes.insert(buf.codes.end(),
-                                 carry[c].codes.begin() + i * code_size_local,
-                                 carry[c].codes.begin() + (i + 1) * code_size_local);
-                buf.row_ids.push_back(carry[c].row_ids[i]);
-                buf.fp16_vecs.insert(buf.fp16_vecs.end(), v, v + dim);
-                if (has_filter)
-                    append_filter_row(buf.filter_cols, carry[c].row_ids[i]);
-                if (has_payload) {
-                    buf.payload_lens.push_back(carry[c].payload_lens[i]);
-                    buf.payload_ptrs.push_back(carry[c].payload_ptrs[i]);
+        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits,
+                                               n_factors, summary_size, fcb);
+        if (npg > 512) {
+            spdlog::warn("[sextant] build_streaming_pca: leaf {} extent = {} "
+                         "pages (> 512)", leaf_metas.size(), npg);
+        }
+        const PageId page = alloc.alloc_extent(file, npg);
+
+        std::vector<uint8_t> obuf(static_cast<size_t>(npg) * kPageSize, 0);
+        auto* lh = reinterpret_cast<TreeLeafHeader*>(obuf.data());
+        lh->magic = kTreeLeafMagic;
+        lh->count = count; lh->tombstone_count = 0; lh->m4 = m4;
+        lh->pq_bits = scan_bits; lh->n_factors = n_factors;
+        lh->block_bytes = bb; lh->codes_per_block = cpb; lh->extent_pages = npg;
+        lh->summary_size = summary_size;
+        lh->n_filter_columns = cfg.filter_schema.n_filter_columns();
+
+        // Phase E: allocate + build the payload extent for this leaf.
+        PageId payload_page = kInvalidPage;
+        uint32_t payload_npg = 0;
+        std::vector<uint8_t> pbuf;
+        if (has_payload && !buf.payload_lens.empty()) {
+            uint64_t total_data = 0;
+            for (uint32_t i = 0; i < count; ++i)
+                total_data += buf.payload_lens[i];
+            const uint64_t payload_bytes =
+                static_cast<uint64_t>(count) * 4 +  // offsets
+                static_cast<uint64_t>(count) * 4 +  // lengths
+                total_data;                          // data
+            payload_npg = static_cast<uint32_t>(
+                (payload_bytes + kPageSize - 1) / kPageSize);
+            payload_page = alloc.alloc_extent(file, payload_npg);
+
+            pbuf.assign(static_cast<size_t>(payload_npg) * kPageSize, 0);
+            uint32_t* offsets = reinterpret_cast<uint32_t*>(pbuf.data());
+            uint32_t* lengths = offsets + count;
+            uint8_t* pdata = reinterpret_cast<uint8_t*>(lengths + count);
+            uint32_t acc = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t plen = buf.payload_lens[i];
+                offsets[i] = acc;
+                lengths[i] = plen;
+                std::memcpy(pdata + acc, buf.payload_ptrs[i], plen);
+                acc += plen;
+            }
+        }
+        lh->payload_extent_page = payload_page;
+        lh->payload_extent_pages = payload_npg;
+        lh->summary_dirty = 0;
+        lh->next_dirty = kInvalidPage;
+
+        // Phase C: per-leaf filter summary (min/max + blooms).
+        std::vector<uint8_t> leaf_summary;
+        if (summary_size > 0) {
+            write_filter_summary(obuf.data() + leaf_filter_offset(),
+                                 summary_size, cfg.filter_schema, count,
+                                 buf.filter_cols);
+            leaf_summary.resize(summary_size);
+            std::memcpy(leaf_summary.data(),
+                        obuf.data() + leaf_filter_offset(), summary_size);
+        }
+
+        const uint32_t n_blocks = (count + cpb - 1) / cpb;
+        uint8_t* codes_out = obuf.data() + leaf_codes_offset(summary_size);
+        for (uint32_t b = 0; b < n_blocks; ++b) {
+            const uint32_t base = b * cpb;
+            uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
+            std::memset(blk, 0, bb);
+            for (uint32_t j = 0; j < cpb; ++j) {
+                const uint32_t gi = base + j;
+                if (gi >= count) break;
+                const uint8_t* code = buf.codes.data() + gi * code_size;
+                if (scan_bits == 4) {
+                    const uint8_t nbi = j % 16; const bool hi = (j >= 16);
+                    for (uint16_t s = 0; s < m4; ++s) {
+                        uint8_t nib = (s/2 < code_size)
+                            ? ((s%2==0) ? (code[s/2]&0x0F) : (code[s/2]>>4)) : 0;
+                        if (hi) blk[s*16+nbi] |= (nib<<4);
+                        else    blk[s*16+nbi] |= nib;
+                    }
+                } else {
+                    for (uint16_t s = 0; s < m4; ++s)
+                        blk[s*16+j] = (s < code_size) ? code[s] : 0;
                 }
             }
         }
+        RowId* rids = reinterpret_cast<RowId*>(
+            obuf.data() + leaf_rowids_offset(summary_size, n_blocks, bb));
+        std::memcpy(rids, buf.row_ids.data(), count * sizeof(RowId));
 
-        FlushedLeaf leaf;
-
-        // Phase H carry-OUT: snapshot the buffer's boundary vectors (those
-        // within leaf_closure_eps[c] of this leaf's centroid) into a fresh
-        // carry buffer for the *next* flush of this root cluster. MUST run
-        // before std::move-ing buf into leaf (after the move, buf's vectors
-        // are empty). Uses the original row count `cnt` (excludes carry-IN
-        // rows, which are themselves boundary vectors already replicated here).
-        // Capped at LeafCarry::MAX_CARRY to bound memory at scale (1024 root
-        // clusters × 64 carry × 768d FP16 = ~96MB worst case).
-        if (leaf_closure_on) {
-            const float eps_c = leaf_closure_eps[c];
-            // Collect (distance, index) for boundary vectors, then keep the
-            // MAX_CARRY closest. This bounds carry memory regardless of leaf size.
-            std::vector<std::pair<float, uint32_t>> boundary;
-            for (uint32_t i = 0; i < cnt; ++i) {
-                const float16_t* v = &buf.fp16_vecs[i * dim];
-                const float d = simd::dist_f16(metric, v, leaf_centroid_tmp.data(), dim);
-                if (d <= eps_c)
-                    boundary.emplace_back(d, i);
+        // Phase C: filter column data region (after factors).
+        if (fcb > 0) {
+            const uint64_t fc_off =
+                leaf_factors_offset(summary_size, n_blocks, bb, count);
+            lh->filter_columns_offset = fc_off;
+            const uint64_t written = write_filter_columns(
+                obuf.data() + fc_off, count, cfg.filter_schema, buf.filter_cols);
+            if (written != fcb) {
+                throw Error(ErrorCode::CorruptIndex,
+                    "build_streaming_pca: filter column bytes mismatch "
+                    "(wrote " + std::to_string(written) + ", expected " +
+                    std::to_string(fcb) + ")");
             }
-            // Sort by distance (ascending) and keep the closest MAX_CARRY.
-            if (boundary.size() > kLeafCarryMax) {
-                std::partial_sort(boundary.begin(),
-                                   boundary.begin() + kLeafCarryMax,
-                                   boundary.end());
-                boundary.resize(kLeafCarryMax);
-            }
-            // Build the carry from the selected boundary vectors.
-            LeafCarry next_carry;
-            const uint32_t code_size_local = code_size;
-            for (const auto& [d, i] : boundary) {
-                const float16_t* v = &buf.fp16_vecs[i * dim];
-                next_carry.codes.insert(next_carry.codes.end(),
-                                        buf.codes.begin() + i * code_size_local,
-                                        buf.codes.begin() + (i + 1) * code_size_local);
-                next_carry.row_ids.push_back(buf.row_ids[i]);
-                next_carry.fp16_vecs.insert(next_carry.fp16_vecs.end(), v, v + dim);
-                if (has_payload) {
-                    next_carry.payload_lens.push_back(buf.payload_lens[i]);
-                    next_carry.payload_ptrs.push_back(buf.payload_ptrs[i]);
-                }
-            }
-            carry[c] = std::move(next_carry);
-            prev_leaf_centroid[c] = leaf_centroid_tmp;  // copy
+        } else {
+            lh->filter_columns_offset = 0;
         }
 
-        leaf.codes = std::move(buf.codes);
-        leaf.row_ids = std::move(buf.row_ids);
-        if (has_filter) leaf.filter_cols = std::move(buf.filter_cols);
-        leaf.payload_lens = std::move(buf.payload_lens);
-        leaf.payload_ptrs = std::move(buf.payload_ptrs);
-        leaf.centroid = leaf_centroid_tmp;  // copy the FP16 centroid
+        lh->header_crc = header_crc(lh, offsetof(TreeLeafHeader, header_crc));
+        file.write_pages(page, npg, obuf.data());
 
-        root_to_leaves[c].push_back(n_leaves_in_cluster[c]);
-        write_leaf_to_spill(c, leaf);
+        // Phase E: write the payload extent.
+        if (payload_page != kInvalidPage && payload_npg > 0)
+            file.write_pages(payload_page, payload_npg, pbuf.data());
+
+        // Record metadata + cache the filter summary for bottom-up propagation.
+        // The global leaf index is the current leaf_metas size (flush order).
+        // root_to_leaves[c] stores the global indices of cluster c's leaves;
+        // because leaves flush in arrival order (not cluster order), these
+        // indices are NOT contiguous — the internal-node write phase must use
+        // them directly rather than assuming cluster-contiguous layout.
+        root_to_leaves[c].push_back(
+            static_cast<uint32_t>(leaf_metas.size()));
         n_leaves_in_cluster[c]++;
+        leaf_metas.push_back(LeafMeta{page, npg, std::move(leaf_centroid)});
+        leaf_summaries.push_back(std::move(leaf_summary));
+
+        // Reset the buffer for the next leaf in this cluster.
         buf.codes.clear();
         buf.row_ids.clear();
-        buf.fp16_vecs.clear();
+        std::fill(buf.centroid_sum.begin(), buf.centroid_sum.end(), 0.0);
+        buf.centroid_count = 0;
+        buf.payload_lens.clear();
+        buf.payload_ptrs.clear();
         if (has_filter) buf.filter_cols.assign(n_schema_cols, MemColumnData{});
-        // Re-initialize the per-column types after assign.
         if (has_filter)
             for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
                 buf.filter_cols[cc].type = cfg.filter_schema.columns[cc].type;
     };
-
-    // leaf_centroid_tmp declared before flush_buffer (above) — reused FP16
-    // centroid scratch for the carry logic.
-
 
     // Precompute FP16 root centroids for the search path (the tree stores
     // root centroids in original FP16 space, not PCA space — we project back).
@@ -3407,7 +3355,10 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                     buf.codes.insert(buf.codes.end(),
                                      chunk_codes[i].begin(), chunk_codes[i].end());
                     buf.row_ids.push_back(rid);
-                    buf.fp16_vecs.insert(buf.fp16_vecs.end(), fvec, fvec + dim);
+                    // Incremental centroid accumulator (replaces fp16_vecs).
+                    for (uint16_t d = 0; d < dim; ++d)
+                        buf.centroid_sum[d] += static_cast<float>(fvec[d]);
+                    ++buf.centroid_count;
                     if (has_filter) append_filter_row(buf.filter_cols, rid);
                     if (has_payload) {
                         const uint32_t r = offset + i;
@@ -3436,286 +3387,19 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     std::fclose(f);
     for (uint32_t c = 0; c < k_root; ++c) flush_buffer(c);
 
-    // Close spill write streams; they'll be reopened for reading below.
-    for (uint32_t c = 0; c < k_root; ++c) {
-        if (spill_files[c].is_open()) spill_files[c].close();
-    }
-    uint32_t n_leaves_total = 0;
-    for (uint32_t c = 0; c < k_root; ++c) n_leaves_total += n_leaves_in_cluster[c];
+    uint32_t n_leaves_total = static_cast<uint32_t>(leaf_metas.size());
     spdlog::info("[sextant] build_streaming_pca: streamed {} vectors, {} leaves "
                  "in {:.2f}s", n, n_leaves_total,
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t_stream).count());
 
-    // Reopen spill files for reading. Empty clusters (no leaves) have no file.
-    auto spill_path = [&](uint32_t c) {
-        return spill_prefix + std::to_string(c) + ".bin";
-    };
-    std::vector<std::ifstream> spill_in(k_root);
-    for (uint32_t c = 0; c < k_root; ++c) {
-        if (n_leaves_in_cluster[c] == 0) continue;
-        spill_in[c].open(spill_path(c), std::ios::binary);
-        if (!spill_in[c])
-            throw Error(ErrorCode::IoError,
-                        "build_streaming_pca: cannot reopen spill file " +
-                        spill_path(c));
-    }
-
-    // Deserialize one MemColumnData of the given type from an istream.
-    auto read_mem_column = [&](std::istream& is, ColumnType type,
-                               MemColumnData& col) {
-        col.type = type;
-        switch (type) {
-            case ColumnType::Int32: case ColumnType::Int64:
-            case ColumnType::Float: case ColumnType::Bool: {
-                uint64_t sz; is.read(reinterpret_cast<char*>(&sz), sizeof(sz));
-                col.fixed_data.resize(sz);
-                is.read(reinterpret_cast<char*>(col.fixed_data.data()),
-                        static_cast<std::streamsize>(sz));
-                break;
-            }
-            case ColumnType::String: {
-                uint64_t noff; is.read(reinterpret_cast<char*>(&noff), sizeof(noff));
-                col.str_offsets.resize(noff);
-                is.read(reinterpret_cast<char*>(col.str_offsets.data()),
-                        static_cast<std::streamsize>(noff * sizeof(uint32_t)));
-                col.str_lengths.resize(noff);
-                is.read(reinterpret_cast<char*>(col.str_lengths.data()),
-                        static_cast<std::streamsize>(noff * sizeof(uint16_t)));
-                uint64_t nd; is.read(reinterpret_cast<char*>(&nd), sizeof(nd));
-                col.str_data.resize(nd);
-                is.read(reinterpret_cast<char*>(col.str_data.data()),
-                        static_cast<std::streamsize>(nd));
-                break;
-            }
-            case ColumnType::Set: {
-                uint64_t nc; is.read(reinterpret_cast<char*>(&nc), sizeof(nc));
-                col.set_counts.resize(nc);
-                is.read(reinterpret_cast<char*>(col.set_counts.data()),
-                        static_cast<std::streamsize>(nc * sizeof(uint8_t)));
-                col.set_offsets.resize(nc);
-                is.read(reinterpret_cast<char*>(col.set_offsets.data()),
-                        static_cast<std::streamsize>(nc * sizeof(uint32_t)));
-                uint64_t ne; is.read(reinterpret_cast<char*>(&ne), sizeof(ne));
-                col.set_elem_lengths.resize(ne);
-                is.read(reinterpret_cast<char*>(col.set_elem_lengths.data()),
-                        static_cast<std::streamsize>(ne * sizeof(uint16_t)));
-                uint64_t nd; is.read(reinterpret_cast<char*>(&nd), sizeof(nd));
-                col.set_elem_data.resize(nd);
-                is.read(reinterpret_cast<char*>(col.set_elem_data.data()),
-                        static_cast<std::streamsize>(nd));
-                break;
-            }
-        }
-    };
-
-    // Read the next leaf from cluster c's spill stream into `out`.
-    // Reconstructs payload_lens/payload_ptrs from row_ids + cfg (payload lives
-    // in the source, which is still resident during the build).
-    auto read_leaf_from_spill = [&](uint32_t c, FlushedLeaf& out) {
-        auto& is = spill_in[c];
-        uint32_t count;
-        is.read(reinterpret_cast<char*>(&count), sizeof(count));
-        out.codes.resize(static_cast<size_t>(count) * code_size);
-        is.read(reinterpret_cast<char*>(out.codes.data()),
-                static_cast<std::streamsize>(out.codes.size()));
-        out.row_ids.resize(count);
-        is.read(reinterpret_cast<char*>(out.row_ids.data()),
-                static_cast<std::streamsize>(count * sizeof(RowId)));
-        out.centroid.resize(dim);
-        is.read(reinterpret_cast<char*>(out.centroid.data()),
-                static_cast<std::streamsize>(dim * sizeof(float16_t)));
-        if (has_filter) {
-            out.filter_cols.resize(n_schema_cols);
-            for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
-                read_mem_column(is, cfg.filter_schema.columns[cc].type,
-                                out.filter_cols[cc]);
-        }
-        if (has_payload) {
-            out.payload_lens.resize(count);
-            out.payload_ptrs.resize(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                const uint32_t r = static_cast<uint32_t>(out.row_ids[i]);
-                out.payload_lens[i] =
-                    cfg.payload_offsets[r + 1] - cfg.payload_offsets[r];
-                out.payload_ptrs[i] =
-                    cfg.payload_data + cfg.payload_offsets[r];
-            }
-        }
-    };
-
-    // --- 6. Write tree file ---
+    // --- 7. Write tree file: internal nodes, root, codebook, config, blobs ---
+    // All leaf extents (+ payloads) were written directly to `file` at flush
+    // time. The PageFile + PageAllocator are already initialized. This phase
+    // only writes the tree structure above the leaves.
+    // root_to_leaves[c][j] already holds the global leaf_metas index of cluster
+    // c's j-th leaf (assigned at flush time, in flush/arrival order).
     const auto t_write = std::chrono::steady_clock::now();
-    const PageId bitmap_page = 2;
-    const uint32_t bitmap_pages = 1;
-    PageFile file(output_path);
-    PageAllocator alloc;
-    file.truncate(bitmap_page + bitmap_pages);
-    alloc.init(file, bitmap_page, bitmap_pages);
-
-    // NOTE: `depth` and `k_l1` were computed above (depth-2 vs depth-3).
-    const uint32_t cpb = (scan_bits == 4) ? 32 : 16;
-    const uint32_t bb = m4 * 16;
-
-    // Assign global leaf indices by concatenating clusters in ascending order.
-    // root_to_leaves[c][j] becomes the GLOBAL index of cluster c's j-th leaf.
-    // leaf_cluster[g] = the cluster owning global leaf g (for spill reads).
-    std::vector<uint32_t> leaf_cluster(n_leaves_total);
-    {
-        uint32_t g = 0;
-        for (uint32_t c = 0; c < k_root; ++c) {
-            for (auto& li : root_to_leaves[c]) {
-                li = g;
-                leaf_cluster[g] = c;
-                ++g;
-            }
-        }
-    }
-
-    // Write leaf extents.
-    // Cache each leaf's filter summary so internal nodes (L2/L1/root) can
-    // propagate summaries bottom-up. No-op when summary_size == 0.
-    std::vector<std::vector<uint8_t>> leaf_summaries(n_leaves_total);
-    struct LeafPageInfo { PageId page; uint32_t pages; };
-    std::vector<LeafPageInfo> leaf_pages(n_leaves_total);
-    // Also cache each leaf's centroid (needed for the PCA blob later).
-    std::vector<std::vector<float16_t>> leaf_centroids_cache(n_leaves_total);
-    for (uint32_t l = 0; l < n_leaves_total; ++l) {
-        FlushedLeaf leaf;
-        read_leaf_from_spill(leaf_cluster[l], leaf);
-        leaf_centroids_cache[l] = leaf.centroid;  // cache before leaf is freed
-        const uint32_t count = static_cast<uint32_t>(leaf.row_ids.size());
-        if (count == 0) { leaf_pages[l] = {kInvalidPage, 0}; continue; }
-
-        // Phase C: compute filter column region size for this leaf.
-        const uint64_t fcb = has_filter
-            ? filter_columns_bytes(count, cfg.filter_schema, leaf.filter_cols) : 0;
-
-        // Build-time validation warnings (architecture plan §3.5.2).
-        const uint32_t n_blocks_chk = (count + cpb - 1) / cpb;
-        const uint64_t pq_code_bytes =
-            static_cast<uint64_t>(n_blocks_chk) * bb;
-        if (has_filter && pq_code_bytes > 0 && fcb > 10ull * pq_code_bytes) {
-            spdlog::warn("[sextant] build_streaming_pca: leaf {} filter column "
-                         "data ({}B) > 10× PQ codes ({}B)", l, fcb, pq_code_bytes);
-        }
-
-        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits,
-                                               n_factors, summary_size, fcb);
-        if (npg > 512) {
-            spdlog::warn("[sextant] build_streaming_pca: leaf {} extent = {} "
-                         "pages (> 512)", l, npg);
-        }
-        const PageId page = alloc.alloc_extent(file, npg);
-        leaf_pages[l] = {page, npg};
-
-        std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
-        auto* lh = reinterpret_cast<TreeLeafHeader*>(buf.data());
-        lh->magic = kTreeLeafMagic;
-        lh->count = count; lh->tombstone_count = 0; lh->m4 = m4;
-        lh->pq_bits = scan_bits; lh->n_factors = n_factors;
-        lh->block_bytes = bb; lh->codes_per_block = cpb; lh->extent_pages = npg;
-        lh->summary_size = summary_size;
-        lh->n_filter_columns = cfg.filter_schema.n_filter_columns();
-        // Phase E: allocate + build the payload extent for this leaf. The
-        // header pointers must be set before the CRC is computed below.
-        PageId payload_page = kInvalidPage;
-        uint32_t payload_npg = 0;
-        std::vector<uint8_t> pbuf;  // built when has payload
-        if (has_payload && !leaf.payload_lens.empty()) {
-            // Payload extent size: offsets + lengths + packed data.
-            uint64_t total_data = 0;
-            for (uint32_t i = 0; i < count; ++i)
-                total_data += leaf.payload_lens[i];
-            const uint64_t payload_bytes =
-                static_cast<uint64_t>(count) * 4 +  // offsets
-                static_cast<uint64_t>(count) * 4 +  // lengths
-                total_data;                          // data
-            payload_npg = static_cast<uint32_t>(
-                (payload_bytes + kPageSize - 1) / kPageSize);
-            payload_page = alloc.alloc_extent(file, payload_npg);
-
-            pbuf.assign(static_cast<size_t>(payload_npg) * kPageSize, 0);
-            uint32_t* offsets = reinterpret_cast<uint32_t*>(pbuf.data());
-            uint32_t* lengths = offsets + count;
-            uint8_t* pdata = reinterpret_cast<uint8_t*>(lengths + count);
-            uint32_t acc = 0;
-            for (uint32_t i = 0; i < count; ++i) {
-                const uint32_t plen = leaf.payload_lens[i];
-                offsets[i] = acc;
-                lengths[i] = plen;
-                std::memcpy(pdata + acc, leaf.payload_ptrs[i], plen);
-                acc += plen;
-            }
-        }
-        lh->payload_extent_page = payload_page;
-        lh->payload_extent_pages = payload_npg;
-        lh->summary_dirty = 0;
-        lh->next_dirty = kInvalidPage;
-
-        // Phase C: write the per-leaf filter summary (min/max + blooms).
-        if (summary_size > 0) {
-            write_filter_summary(buf.data() + leaf_filter_offset(),
-                                 summary_size, cfg.filter_schema, count,
-                                 leaf.filter_cols);
-            // Cache for bottom-up propagation to internal nodes.
-            leaf_summaries[l].resize(summary_size);
-            std::memcpy(leaf_summaries[l].data(),
-                        buf.data() + leaf_filter_offset(), summary_size);
-        }
-
-        const uint32_t n_blocks = (count + cpb - 1) / cpb;
-        uint8_t* codes_out = buf.data() + leaf_codes_offset(summary_size);
-        for (uint32_t b = 0; b < n_blocks; ++b) {
-            const uint32_t base = b * cpb;
-            uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
-            std::memset(blk, 0, bb);
-            for (uint32_t j = 0; j < cpb; ++j) {
-                const uint32_t gi = base + j;
-                if (gi >= count) break;
-                const uint8_t* code = leaf.codes.data() + gi * code_size;
-                if (scan_bits == 4) {
-                    const uint8_t nbi = j % 16; const bool hi = (j >= 16);
-                    for (uint16_t s = 0; s < m4; ++s) {
-                        uint8_t nib = (s/2 < code_size)
-                            ? ((s%2==0) ? (code[s/2]&0x0F) : (code[s/2]>>4)) : 0;
-                        if (hi) blk[s*16+nbi] |= (nib<<4);
-                        else    blk[s*16+nbi] |= nib;
-                    }
-                } else {
-                    for (uint16_t s = 0; s < m4; ++s)
-                        blk[s*16+j] = (s < code_size) ? code[s] : 0;
-                }
-            }
-        }
-        RowId* rids = reinterpret_cast<RowId*>(
-            buf.data() + leaf_rowids_offset(summary_size, n_blocks, bb));
-        std::memcpy(rids, leaf.row_ids.data(), count * sizeof(RowId));
-
-        // Phase C: write the filter column data region (after factors).
-        if (fcb > 0) {
-            const uint64_t fc_off =
-                leaf_factors_offset(summary_size, n_blocks, bb, count);
-            lh->filter_columns_offset = fc_off;
-            const uint64_t written = write_filter_columns(
-                buf.data() + fc_off, count, cfg.filter_schema, leaf.filter_cols);
-            if (written != fcb) {
-                throw Error(ErrorCode::CorruptIndex,
-                    "build_streaming_pca: filter column bytes mismatch "
-                    "(wrote " + std::to_string(written) + ", expected " +
-                    std::to_string(fcb) + ")");
-            }
-        } else {
-            lh->filter_columns_offset = 0;
-        }
-
-        lh->header_crc = header_crc(lh, offsetof(TreeLeafHeader, header_crc));
-        file.write_pages(page, npg, buf.data());
-
-        // Phase E: write the payload extent (allocated + built above).
-        if (payload_page != kInvalidPage && payload_npg > 0)
-            file.write_pages(payload_page, payload_npg, pbuf.data());
-    }
 
     // Write the per-fine-centroid internal nodes (depth=2: these are L1 nodes
     // that the root points to; depth=3: these are L2 nodes grouped under L1).
@@ -3742,11 +3426,11 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         for (uint32_t j = 0; j < nch; ++j) {
             const uint32_t li = leaves[j];
             auto* ce = reinterpret_cast<ChildEntry*>(p);
-            ce->child_page = leaf_pages[li].page;
-            ce->child_pages = leaf_pages[li].pages;
+            ce->child_page = leaf_metas[li].page;
+            ce->child_pages = leaf_metas[li].pages;
             ce->is_leaf = 1;
             float16_t* cent = reinterpret_cast<float16_t*>(p + sizeof(ChildEntry));
-            std::memcpy(cent, leaf_centroids_cache[li].data(), dim*sizeof(float16_t));
+            std::memcpy(cent, leaf_metas[li].centroid.data(), dim*sizeof(float16_t));
             // Propagate the child leaf's summary into the child entry.
             if (summary_size > 0 && li < leaf_summaries.size() &&
                 !leaf_summaries[li].empty()) {
@@ -3976,7 +3660,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                 double acc = 0.0;
                 for (uint16_t d = 0; d < dim; ++d)
                     acc += rotation[k * dim + d] *
-                           static_cast<float>(leaf_centroids_cache[l][d]);
+                           static_cast<float>(leaf_metas[l].centroid[d]);
                 pca_blob.push_back(static_cast<float>(acc - mean_proj[k]));
             }
         }
@@ -4025,15 +3709,6 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     sb.set_cardinality(card_page, card_npg);
     sb.commit(file);
     file.sync();
-
-    // Clean up spill files (temporary, per-cluster leaf buffers).
-    for (uint32_t c = 0; c < k_root; ++c) {
-        if (spill_in[c].is_open()) spill_in[c].close();
-        if (n_leaves_in_cluster[c] > 0) {
-            std::error_code ec;
-            std::filesystem::remove(spill_path(c), ec);
-        }
-    }
 
     const auto t1 = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(t1 - t0).count();
