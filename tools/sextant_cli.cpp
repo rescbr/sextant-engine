@@ -563,7 +563,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
     p.add<uint32_t>("pca-dims", 0, "PCA dimensions (default 32)", false, 32);
     p.add<uint32_t>("max-lloyd-passes", 0, "Max streaming Lloyd passes (default 10)", false, 10);
-    p.add<float>("closure-mult", 0, "Closure epsilon multiplier (default 0.25)", false, 0.25f);
+    p.add<float>("closure-mult", 0, "Closure epsilon multiplier (default 0.15)", false, 0.15f);
     p.add<std::string>("filter-data", 0, "Filter column data sidecar (.fdat)", false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
     p.parse_check(argc, argv);
@@ -581,7 +581,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     cfg.num_threads = p.get<uint32_t>("threads");
     cfg.pca_dims = p.get<uint32_t>("pca-dims");
     cfg.max_lloyd_passes = p.get<uint32_t>("max-lloyd-passes");
-    cfg.closure_multiplier = p.get<float>("closure-mult");
+    cfg.closure_multiplier = p.get<float>("closure-mult") > 0 ? p.get<float>("closure-mult") : 0.15f;
     cfg.params.pq4_m = p.get<uint16_t>("pq4-m");
     cfg.params.scan_pq_bits = static_cast<uint8_t>(p.get<uint32_t>("pq-bits"));
     cfg.params.quantizer_type = p.get<std::string>("quantizer");
