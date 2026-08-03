@@ -4,6 +4,7 @@
 /// Build and search configuration structs.
 
 #include <sextant/types.hpp>
+#include <sextant/schema.hpp>
 #include <cstdint>
 
 namespace sextant {
@@ -293,6 +294,22 @@ struct SearchConfig {
     /// This adapts to skew: small shards are cheap (scanned fully), large shards
     /// may be skipped if the budget runs out. Recommended: ~np × mean_shard_size.
     uint32_t scan_code_budget = 0;
+
+    /// Rerank top-W candidates by decoding PQ codes to FP32 and computing the
+    /// exact distance to the query. The PQ-approximate distances used during
+    /// the FastScan heap have non-trivial error (especially on high-LID data);
+    /// re-sorting the W≈300 candidates by exact FP32 distance dramatically
+    /// improves recall@k at ~W × (decode + one SIMD distance) overhead. When
+    /// false, the top-k are extracted using the raw PQ-approximate distances.
+    /// Default: true (almost always helps). Ignored for the RaBitQ path, which
+    /// already finalizes in float precision.
+    bool rerank = true;
+
+    /// Filter predicates (Phase D). Empty = no filtering (today's behavior).
+    std::vector<Predicate> predicates;
+
+    /// Whether to return opaque payload blobs with results (Phase E).
+    bool with_payload = false;
 };
 
 /// Adaptive parameters resolved from dataset/machine properties (Issue 37).

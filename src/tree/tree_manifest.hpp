@@ -12,6 +12,8 @@
 /// parameters that the search path needs (dim, m4, n_probe, routing gaps, etc.)
 /// and that the estimator/builder computed.
 
+#include <sextant/schema.hpp>
+
 #include <cstdint>
 #include <string>
 
@@ -29,6 +31,8 @@ struct TreeManifest {
     // [tree]
     uint16_t depth = 0;
     uint32_t k_root = 0;          // branching factor at root
+    uint32_t k_l1 = 0;            // depth-3: actual root branching (n L1 nodes).
+                                  // 0 = depth <= 2 (root children = L1 or leaves).
     uint32_t leaf_capacity = 0;   // max vectors per leaf
     uint32_t n_leaves = 0;
     uint32_t n_probe_l0 = 0;      // probe count at level 0
@@ -42,6 +46,10 @@ struct TreeManifest {
     // [partition]
     float balance_factor = 4.0f;
     uint32_t sub_shard_probe_pct = 0;  // 0 = disabled
+
+    // [schema]  (Phase A; empty = no filter columns)
+    Schema schema;                 // empty = no filter columns
+    uint32_t summary_size = 0;     // schema-determined summary size (0 = none)
 };
 
 /// Serialize a TreeManifest to a TOML string.

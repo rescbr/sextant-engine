@@ -44,6 +44,23 @@ struct Chunk {
     const float* vectors;   ///< count × dim, row-major
     const RowId* row_ids;   ///< count entries
     uint32_t count;
+
+    /// Filter column data for this chunk (Phase C). One entry per schema
+    /// column, in schema declaration order. nullptr when the source has no
+    /// filter schema. Each entry points to a FilterColumnData structure
+    /// appropriate for the column's type.
+    ///
+    /// For fixed-width types (int32/int64/float/bool): data points directly
+    /// to a contiguous array of count × width bytes.
+    ///
+    /// For string/set types: data points to a FilterStringColumn /
+    /// FilterSetColumn structure (defined in filter_column_data.hpp).
+    const void* const* filter_columns = nullptr;
+
+    /// Opaque payload blobs (Phase E). Nullptr when no payload.
+    /// payload_offsets[i] .. payload_offsets[i+1] gives the byte range for row i.
+    const uint8_t* payload_data = nullptr;
+    const uint32_t* payload_offsets = nullptr;  ///< count+1 entries
 };
 
 /// Block size for sidecar file I/O (256 KB).

@@ -7,6 +7,8 @@
 #include "quant/rabitq_quantizer.hpp"
 #include "util/fp16.hpp"
 #include "simd_kernels.hpp"
+#include "tree/filter_column_write.hpp"  // Phase C: filter column write path
+#include "tree/filter_scan.hpp"         // Phase D: filter predicate evaluation
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
 
@@ -28,6 +30,36 @@
 #include <unistd.h>
 
 namespace sextant::tree {
+
+// ===========================================================================
+// Helper functions
+// ===========================================================================
+
+/// Renormalize `vec` (dim floats) to unit length. No-op if already zero.
+/// Uses SIMD for the norm computation (simd::dot_f32).
+inline void renormalize_unit(float* vec, uint16_t dim) {
+    const float norm_sq = simd::dot_f32(vec, vec, dim);
+    if (norm_sq > 0.0f) {
+        const float inv_norm = 1.0f / std::sqrt(norm_sq);
+        for (uint16_t d = 0; d < dim; ++d) vec[d] *= inv_norm;
+    }
+}
+
+/// Compute centroid from accumulator `sum` (dim doubles) with `count` vectors.
+/// For InnerProduct metric, renormalizes to unit length (spherical k-means).
+/// For L2Sq metric, computes arithmetic mean (no renormalization).
+/// Writes result to `out` (dim floats).
+inline void compute_centroid_spherical(const double* sum, uint64_t count,
+                                       uint16_t dim, MetricKind metric,
+                                       float* out) {
+    const double inv = 1.0 / static_cast<double>(count);
+    for (uint16_t d = 0; d < dim; ++d) {
+        out[d] = static_cast<float>(sum[d] * inv);
+    }
+    if (metric == MetricKind::InnerProduct) {
+        renormalize_unit(out, dim);
+    }
+}
 
 /// Working data for building a root child entry (build-time only).
 struct RootChildData {
@@ -120,7 +152,6 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
         const float* f = reinterpret_cast<const float*>(blob.data());
         const uint32_t pd = idx->manifest_.pca_dims;
         const uint32_t d = idx->manifest_.dim;
-        const uint32_t kr = idx->manifest_.k_root;
         const uint32_t nl = idx->manifest_.n_leaves;
 
         idx->pca_dims_ = pd;
@@ -132,13 +163,31 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
         idx->pca_mean_proj_.assign(f + off, f + off + pd);
         off += pd;
         // Root centroids in PCA space (kr × pd).
+        // For depth>=3: the root has k_l1 children (super-cluster centroids).
+        // For depth<=2: the root has k_root children.
+        const uint32_t kr = (idx->manifest_.depth >= 3 && idx->manifest_.k_l1 > 0)
+            ? idx->manifest_.k_l1 : idx->manifest_.k_root;
         idx->pca_root_centroids_.assign(f + off, f + off + kr * pd);
         off += kr * pd;
         // Leaf centroids in PCA space (nl × pd).
+        // For depth>=3 this array is unused (deeper routing is FP16), but it
+        // is still present in the blob layout; read it to keep off correct.
         idx->pca_leaf_centroids_.assign(f + off, f + off + nl * pd);
 
         spdlog::info("[sextant] IVFTreeIndex: PCA routing enabled ({} dims)",
                      pd);
+    }
+
+    // Load the cardinality table (Phase D) if present. deserialize() reads
+    // n_vectors_ from the blob header, so no separate reconstruction is needed.
+    if (idx->superblock_.cardinality_page() != kInvalidPage &&
+        idx->superblock_.cardinality_pages() > 0) {
+        const auto cp = idx->superblock_.cardinality_page();
+        const auto cpg = idx->superblock_.cardinality_pages();
+        std::vector<uint8_t> blob(static_cast<size_t>(cpg) * kPageSize);
+        idx->file_.read_pages(cp, cpg, blob.data());
+        idx->card_table_.deserialize(blob.data(),
+            static_cast<size_t>(cpg) * kPageSize);
     }
 
     // mmap the file read-only for search.
@@ -193,9 +242,14 @@ void IVFTreeIndex::load_root_from_mmap() {
     const uint8_t* root_ptr = mmap_base_ +
         static_cast<uint64_t>(root_page) * kPageSize;
     root_header_ = reinterpret_cast<const TreeNodeHeader*>(root_ptr);
+    if (root_header_->magic != kTreeNodeMagic) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "IVFTreeIndex: root node magic mismatch");
+    }
 
     const uint16_t dim = manifest_.dim;
-    const uint32_t cesize = child_entry_size(dim);
+    const uint32_t summary_size = manifest_.summary_size;
+    const uint32_t cesize = child_entry_size(dim, summary_size);
     root_children_.resize(root_header_->n_children);
     const uint8_t* p = root_ptr + sizeof(TreeNodeHeader);
     for (uint32_t i = 0; i < root_header_->n_children; ++i) {
@@ -213,11 +267,63 @@ void IVFTreeIndex::load_root_from_mmap() {
 // Search
 // ===========================================================================
 
+namespace {
+
+/// A max-heap entry for the FastScan candidate selection. Carries enough
+/// state to decode the candidate's PQ code back to FP32 for reranking:
+/// `leaf_ptr` (the mmap base of the leaf extent) and `local_idx` (the
+/// vector's index within that leaf). `pq_dist` is the PQ-approximate
+/// uint32 ADC distance used to order the heap during the scan.
+struct HeapEntry {
+    uint32_t pq_dist;
+    int64_t  row_id;
+    const uint8_t* leaf_ptr;   // mmap base of the leaf extent
+    uint32_t local_idx;        // vector index within the leaf
+};
+
+/// Extract a standard packed PQ code from a leaf's FastScan block layout.
+/// Re-packs the interleaved FastScan blocks back into the compact code
+/// representation that `decode_code` consumes (lo nibble = even segment,
+/// hi nibble = odd segment for 4-bit; one byte per segment for 8-bit).
+/// `out` must hold at least `code_size` bytes.
+inline void extract_code_from_leaf(const uint8_t* leaf_ptr, uint32_t local_idx,
+                                   uint32_t summary_size, uint16_t m4,
+                                   uint8_t pq_bits, uint32_t codes_per_block,
+                                   uint32_t block_bytes, uint8_t* out) {
+    const uint32_t block = local_idx / codes_per_block;
+    const uint32_t slot  = local_idx % codes_per_block;
+    const uint8_t* codes_base = leaf_ptr + leaf_codes_offset(summary_size);
+    const uint8_t* blk = codes_base + static_cast<uint64_t>(block) * block_bytes;
+
+    if (pq_bits == 8) {
+        // 16 vectors/block; segment s code at blk[s * 16 + slot].
+        const uint32_t byte_idx = slot;
+        for (uint16_t s = 0; s < m4; ++s) out[s] = blk[s * 16 + byte_idx];
+    } else {
+        // 32 vectors/block; slot < 16 uses lo nibble, slot >= 16 uses hi.
+        const uint32_t byte_idx = slot % 16;
+        const bool is_hi = (slot >= 16);
+        for (uint16_t s = 0; s < m4; ++s) {
+            const uint8_t nib = is_hi
+                ? static_cast<uint8_t>(blk[s * 16 + byte_idx] >> 4)
+                : static_cast<uint8_t>(blk[s * 16 + byte_idx] & 0x0F);
+            const uint32_t byte_off = s / 2;
+            const uint8_t shift = static_cast<uint8_t>((s % 2) * 4);
+            out[byte_off] = static_cast<uint8_t>(
+                ((s % 2 == 0) ? (out[byte_off] & 0xF0u) : (out[byte_off] & 0x0Fu))
+                | (nib << shift));
+        }
+    }
+}
+
+}  // namespace
+
 std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
-                                             const SearchConfig& config) const {
+                                             const SearchConfig& config,
+    std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs) const {
     // RaBitQ needs per-leaf LUT rebuild + factor finalization — separate path.
     if (manifest_.quantizer_type == "rabitq") {
-        return search_rabitq(query, k, config);
+        return search_rabitq(query, k, config, payload_locs);
     }
 
     // Build the FastScan LUT once per query.
@@ -254,22 +360,162 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         }
     }
 
-    // --- Route at level 0 ---
+    // --- Resolve predicate column indices (once per query) ---
+    // Phase D: if predicates are present, map each predicate's column name to
+    // its schema column index up-front. A predicate referencing an unknown
+    // column yields no results.
+    std::vector<uint32_t> pred_col_indices;
+    if (!config.predicates.empty()) {
+        pred_col_indices.reserve(config.predicates.size());
+        for (const auto& pred : config.predicates) {
+            const auto* col = manifest_.schema.find(pred.column);
+            if (!col) {
+                return {};  // Predicate references unknown column.
+            }
+            pred_col_indices.push_back(
+                static_cast<uint32_t>(col - manifest_.schema.columns.data()));
+        }
+    }
+    const bool has_predicates = !config.predicates.empty();
+
+    // --- Route: iterative descent from root to leaves ---
+    //
+    // At each level we hold a frontier of (distance, child descriptor). The
+    // frontier is expanded one level at a time: each internal node is read
+    // from the mmap, its children are scored, and the top-n_probe_ln are kept.
+    // Leaf frontier entries are carried through unchanged. After the final
+    // descent, all surviving leaf entries become scan candidates.
+    //
+    // Level 0 (root) uses PCA-space distances when pca_dims_ > 0. For depth=2
+    // with PCA enabled, the L1→leaf step also uses PCA leaf centroids. For
+    // depth>=3, deeper levels (L1→L2, L2→leaves) route by FP16 distance to the
+    // inline child centroids (the data is already well-partitioned there).
+    struct ProbeEntry {
+        float    dist;
+        PageId   page;
+        uint64_t pages;
+        uint16_t is_leaf;
+        const float16_t* centroid;  // inline FP16 centroid (points into mmap)
+    };
+
+    const uint32_t cesize = child_entry_size(manifest_.dim, manifest_.summary_size);
+    const float gap = (config.adaptive_probe_gap > 0)
+        ? config.adaptive_probe_gap
+        : manifest_.adaptive_probe_gap;
+
+    const uint32_t n_probe_ln_cfg = config.n_probe_ln > 0
+        ? config.n_probe_ln
+        : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4);
+
+    // Lambda: read an internal node from mmap, score children, push top-n onto
+    // `out`. `use_pca_leaves` selects PCA leaf-centroid lookup (depth=2 path).
+    auto expand_internal = [&](const ProbeEntry& e, bool use_pca_leaves,
+                               uint32_t root_child_for_pca,
+                               std::vector<ProbeEntry>& out) {
+        const uint8_t* node_ptr = mmap_base_ +
+            static_cast<uint64_t>(e.page) * kPageSize;
+        const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
+        const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
+
+        std::vector<std::pair<float, uint32_t>> child_dists;
+        child_dists.reserve(nh->n_children);
+        // Summary offset within each child entry (after the inline FP16
+        // centroid). Used for subtree-level pruning during routing.
+        const uint32_t child_summary_off =
+            sizeof(ChildEntry) + manifest_.dim * sizeof(float16_t);
+        for (uint32_t j = 0; j < nh->n_children; ++j) {
+            // Summary-aware routing: skip children whose filter summary rules
+            // out all matches for the predicates (prunes whole subtrees during
+            // descent, not just leaves after descent). Conservative — never
+            // produces false negatives.
+            if (has_predicates && manifest_.summary_size > 0) {
+                const uint8_t* child_summary = p + child_summary_off;
+                if (!summary_may_match(child_summary, manifest_.summary_size,
+                                       manifest_.schema, config.predicates,
+                                       pred_col_indices)) {
+                    p += cesize;
+                    continue;  // PRUNED: subtree can't contain matches
+                }
+            }
+            float d;
+            if (use_pca_leaves && root_child_for_pca < pca_leaf_base_.size() &&
+                pca_leaf_base_[root_child_for_pca] != UINT64_MAX) {
+                const uint32_t gid = static_cast<uint32_t>(
+                    pca_leaf_base_[root_child_for_pca]) + j;
+                const float* lc = &pca_leaf_centroids_[gid * pca_dims_];
+                d = 0.0f;
+                for (uint32_t kk = 0; kk < pca_dims_; ++kk) {
+                    const float diff = query_pca[kk] - lc[kk];
+                    d += diff * diff;
+                }
+            } else {
+                const float16_t* cent = reinterpret_cast<const float16_t*>(
+                    p + sizeof(ChildEntry));
+                d = simd::dist_f16(metric, query_fp16.data(),
+                                    cent, manifest_.dim);
+            }
+            child_dists.emplace_back(d, j);
+            p += cesize;
+        }
+        std::sort(child_dists.begin(), child_dists.end());
+
+        const uint32_t n_probe_ln = std::min(
+            static_cast<uint64_t>(n_probe_ln_cfg), nh->n_children);
+        const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);
+        for (uint32_t j = 0; j < n_probe_ln; ++j) {
+            if (gap > 0 && j > 0 &&
+                child_dists[j].first > child_dists[j - 1].first * gap) break;
+            const uint32_t idx = child_dists[j].second;
+            const auto* ce = reinterpret_cast<const ChildEntry*>(
+                p2 + idx * cesize);
+            if (ce->child_page == kInvalidPage) continue;  // empty child
+            const float16_t* cent = reinterpret_cast<const float16_t*>(
+                reinterpret_cast<const uint8_t*>(ce) + sizeof(ChildEntry));
+            out.push_back({child_dists[j].first, ce->child_page,
+                           ce->child_pages, ce->is_leaf, cent});
+        }
+    };
+
+    // --- Level 0: root children ---
     const uint32_t k_root = root_header_->n_children;
+    uint32_t n_probe_l0 = config.n_probe > 0
+        ? config.n_probe
+        : manifest_.n_probe_l0;
+    n_probe_l0 = std::min(n_probe_l0, k_root);
+
+    // Score root children, sort, select top-n_probe_l0 with gap pruning. We
+    // track each entry's root-child index (needed later for the depth=2 PCA
+    // leaf-centroid lookup).
     std::vector<std::pair<float, uint32_t>> root_dists;
     root_dists.reserve(k_root);
+    // Summary offset within each root child entry (after the inline FP16
+    // centroid). root_children_[c].centroid points at the centroid, which sits
+    // at child-entry offset sizeof(ChildEntry); the summary follows it.
+    const uint32_t root_child_summary_bytes =
+        manifest_.dim * sizeof(float16_t);
     for (uint32_t c = 0; c < k_root; ++c) {
+        // Summary-aware routing at the root: prune whole root subtrees whose
+        // filter summary rules out all predicate matches.
+        if (has_predicates && manifest_.summary_size > 0) {
+            const uint8_t* child_summary =
+                reinterpret_cast<const uint8_t*>(root_children_[c].centroid)
+                + root_child_summary_bytes;
+            if (!summary_may_match(child_summary, manifest_.summary_size,
+                                   manifest_.schema, config.predicates,
+                                   pred_col_indices)) {
+                continue;  // PRUNED: root subtree can't contain matches
+            }
+        }
         float d;
         if (pca_dims_ > 0) {
             // PCA-space L2sq to root centroid.
-            const float* rc = &pca_root_centroids_[c * pca_dims_];
+            const float* rcc = &pca_root_centroids_[c * pca_dims_];
             d = 0.0f;
-            for (uint32_t k = 0; k < pca_dims_; ++k) {
-                const float diff = query_pca[k] - rc[k];
+            for (uint32_t kk = 0; kk < pca_dims_; ++kk) {
+                const float diff = query_pca[kk] - rcc[kk];
                 d += diff * diff;
             }
         } else {
-            // Original FP16 distance.
             d = simd::dist_f16(metric, query_fp16.data(),
                                root_children_[c].centroid, manifest_.dim);
         }
@@ -277,92 +523,90 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     }
     std::sort(root_dists.begin(), root_dists.end());
 
-    uint32_t n_probe_l0 = config.n_probe > 0
-        ? config.n_probe
-        : manifest_.n_probe_l0;
-    n_probe_l0 = std::min(n_probe_l0, k_root);
+    std::vector<ProbeEntry> frontier;
+    std::vector<uint32_t>   root_idx;  // root-child index per frontier entry
+    frontier.reserve(n_probe_l0);
+    for (uint32_t i = 0; i < n_probe_l0 && i < root_dists.size(); ++i) {
+        if (gap > 0 && i > 0 &&
+            root_dists[i].first > root_dists[i - 1].first * gap) break;
+        const uint32_t c = root_dists[i].second;
+        const auto& rc = root_children_[c];
+        frontier.push_back({root_dists[i].first, rc.page, rc.pages,
+                            rc.is_leaf, rc.centroid});
+        root_idx.push_back(c);
+    }
 
-    // --- Collect leaf candidates ---
-    // For Phase 1 (2-level tree): root children are either leaves (depth=1)
-    // or level-1 internal nodes (depth=2). For depth=2, we probe each
-    // selected level-1 node's children.
-    std::vector<LeafCandidate> candidates;
-    const float gap = (config.adaptive_probe_gap > 0)
-        ? config.adaptive_probe_gap
-        : manifest_.adaptive_probe_gap;
+    // --- Descend through internal levels ---
+    // depth=1 → no descent (frontier is already leaves).
+    // depth=2 → one expansion (root children → leaves).
+    // depth=3 → two expansions (root → L1 → L2, then L2 → leaves).
+    const bool pca_depth2 = (pca_dims_ > 0 && manifest_.depth == 2);
+    for (uint16_t level = 1; level < manifest_.depth; ++level) {
+        std::vector<ProbeEntry> next_frontier;
+        std::vector<uint32_t>   next_root_idx;  // only meaningful for depth=2
+        next_frontier.reserve(frontier.size() * std::max(1u, n_probe_ln_cfg));
 
-    for (uint32_t i = 0; i < n_probe_l0; ++i) {
-        const auto& [dist, child_idx] = root_dists[i];
-        const auto& rc = root_children_[child_idx];
-
-        // Adaptive gap pruning.
-        if (gap > 0 && i > 0) {
-            if (root_dists[i].first > root_dists[i - 1].first * gap) break;
+        for (uint32_t fi = 0; fi < frontier.size(); ++fi) {
+            const auto& e = frontier[fi];
+            if (e.is_leaf) {
+                // Already a leaf — carry through.
+                next_frontier.push_back(e);
+                if (pca_depth2) next_root_idx.push_back(root_idx[fi]);
+                continue;
+            }
+            if (e.page == kInvalidPage) continue;  // empty internal node
+            // At the root→L1 step of a depth=2 PCA tree, use PCA leaf
+            // centroids; elsewhere route by FP16 inline centroids.
+            const bool use_pca_leaves = pca_depth2 && (level == 1);
+            const uint32_t rc_for_pca = use_pca_leaves ? root_idx[fi] : 0;
+            const size_t before = next_frontier.size();
+            expand_internal(e, use_pca_leaves, rc_for_pca, next_frontier);
+            // Propagate root-child index to children (only needed for the
+            // depth=2 PCA path, which terminates at this level).
+            if (pca_depth2 && level == 1) {
+                for (size_t j = before; j < next_frontier.size(); ++j)
+                    next_root_idx.push_back(root_idx[fi]);
+            }
         }
+        if (next_frontier.empty()) break;
+        frontier = std::move(next_frontier);
+        root_idx = std::move(next_root_idx);
+    }
 
-        if (rc.is_leaf) {
-            // Depth=1: root child IS a leaf.
-            if (rc.page == kInvalidPage) continue;  // empty group
-            candidates.push_back({rc.page, rc.pages, dist, rc.centroid});
-        } else {
-            // Depth=2: root child is an internal node. Read its children
-            // from the mmap and route.
-            const uint8_t* node_ptr = mmap_base_ +
-                static_cast<uint64_t>(rc.page) * kPageSize;
-            const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
-            const uint32_t cesize = child_entry_size(manifest_.dim);
-            const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
-
-            std::vector<std::pair<float, uint32_t>> child_dists;
-            child_dists.reserve(nh->n_children);
-            for (uint32_t j = 0; j < nh->n_children; ++j) {
-                float d;
-                if (pca_dims_ > 0 && child_idx < pca_leaf_base_.size() &&
-                    pca_leaf_base_[child_idx] != UINT64_MAX) {
-                    const uint32_t gid = pca_leaf_base_[child_idx] + j;
-                    const float* lc = &pca_leaf_centroids_[gid * pca_dims_];
-                    d = 0.0f;
-                    for (uint32_t kk = 0; kk < pca_dims_; ++kk) {
-                        const float diff = query_pca[kk] - lc[kk];
-                        d += diff * diff;
-                    }
-                } else {
-                    const float16_t* cent = reinterpret_cast<const float16_t*>(
-                        p + sizeof(ChildEntry));
-                    d = simd::dist_f16(metric, query_fp16.data(),
-                                        cent, manifest_.dim);
-                }
-                child_dists.emplace_back(d, j);
-                p += cesize;
-            }
-            std::sort(child_dists.begin(), child_dists.end());
-
-            uint32_t n_probe_ln = config.n_probe_ln > 0
-                ? config.n_probe_ln
-                : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4);
-            n_probe_ln = std::min(static_cast<uint64_t>(n_probe_ln), nh->n_children);
-
-            const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);
-            for (uint32_t j = 0; j < n_probe_ln; ++j) {
-                if (gap > 0 && j > 0) {
-                    if (child_dists[j].first >
-                        child_dists[j - 1].first * gap) break;
-                }
-                const uint32_t idx = child_dists[j].second;
-                const auto* ce = reinterpret_cast<const ChildEntry*>(
-                    p2 + idx * cesize);
-                if (ce->child_page == kInvalidPage) continue;  // empty leaf
-                // The leaf's centroid is inline in the child entry.
-                const float16_t* leaf_cent = reinterpret_cast<const float16_t*>(
-                    reinterpret_cast<const uint8_t*>(ce) + sizeof(ChildEntry));
-                candidates.push_back({ce->child_page, ce->child_pages,
-                                      child_dists[j].first, leaf_cent});
-            }
+    // --- Collect leaf candidates from the final frontier ---
+    std::vector<LeafCandidate> candidates;
+    for (const auto& e : frontier) {
+        if (e.is_leaf && e.page != kInvalidPage) {
+            candidates.push_back({e.page, e.pages, e.dist, e.centroid});
         }
     }
 
     if (candidates.empty()) {
         return {};
+    }
+
+    // --- Phase D: summary-based leaf pruning ---
+    // Before scanning, drop any candidate leaf whose summary rules out all
+    // matches for the predicates (numeric range miss or bloom negative). This
+    // skips entire leaves, saving the FastScan cost at low selectivity.
+    if (has_predicates) {
+        std::vector<LeafCandidate> pruned;
+        pruned.reserve(candidates.size());
+        for (const auto& cand : candidates) {
+            if (cand.page == kInvalidPage) continue;
+            const uint8_t* leaf_ptr = mmap_base_ +
+                static_cast<uint64_t>(cand.page) * kPageSize;
+            const uint8_t* summary = leaf_ptr + leaf_filter_offset();
+            if (summary_may_match(summary, manifest_.summary_size,
+                                  manifest_.schema, config.predicates,
+                                  pred_col_indices)) {
+                pruned.push_back(cand);
+            }
+        }
+        candidates = std::move(pruned);
+        if (candidates.empty()) {
+            return {};
+        }
     }
 
     // --- Prefetch leaf extents ---
@@ -380,26 +624,95 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     }
 
     // --- Scan leaves ---
-    const uint32_t W = std::max(config.fastscan_W > 0 ? config.fastscan_W : 300u, k);
+    // Phase D (§3.9): adaptive W driven by predicate selectivity.
+    // selectivity = estimated fraction of rows passing all predicates.
+    // At low selectivity, widen W so enough survivors remain to fill top-k.
+    float selectivity = 1.0f;
+    if (has_predicates) {
+        if (!card_table_.empty()) {
+            // Cardinality table has exact per-value frequencies for all column
+            // types (numeric, string, set). This gives vector-level selectivity.
+            selectivity = card_table_.selectivity_combined(
+                manifest_.schema, config.predicates, pred_col_indices);
+        } else {
+            // Fallback: root-summary-based subtree overlap estimation.
+            // This overestimates (subtree-level, not vector-level) but is
+            // better than 1.0 when no cardinality table exists.
+            selectivity = 1.0f;
+            std::vector<const uint8_t*> root_summaries(root_children_.size());
+            const uint32_t dim = manifest_.dim;
+            for (uint32_t c = 0; c < root_children_.size(); ++c) {
+                root_summaries[c] = reinterpret_cast<const uint8_t*>(
+                    root_children_[c].centroid) + dim * sizeof(float16_t);
+            }
+            for (uint32_t p = 0; p < config.predicates.size(); ++p) {
+                const auto& pred = config.predicates[p];
+                const uint32_t col_idx = pred_col_indices[p];
+                const auto& col = manifest_.schema.columns[col_idx];
+                float s = 1.0f;
+                if (col.type == ColumnType::Int32 || col.type == ColumnType::Int64 ||
+                    col.type == ColumnType::Float) {
+                    s = estimate_numeric_selectivity(
+                        root_summaries.data(),
+                        static_cast<uint32_t>(root_children_.size()),
+                        manifest_.summary_size, manifest_.schema,
+                        pred, col_idx);
+                }
+                selectivity *= std::max(s, 0.0001f);
+            }
+            selectivity = std::min(selectivity, 1.0f);
+        }
+    }
 
-    // Max-heap of (distance, global_row_id).
-    std::vector<std::pair<uint32_t, int64_t>> heap;
+    // Brute-force PQ-decode fallback for extreme low selectivity (<1%).
+    // At <1%, the filtered ANN path wastes effort — too few survivors per
+    // leaf. Instead, scan ALL matching leaves' filter columns for exact
+    // matches, PQ-decode those vectors, compute exact distance.
+    if (has_predicates && selectivity > 0.0f && selectivity < 0.01f) {
+        return search_brute_force_filtered(query, k, config, pred_col_indices,
+                                           payload_locs);
+    }
+
+    uint32_t W = std::max(config.fastscan_W > 0 ? config.fastscan_W : 300u, k);
+    if (has_predicates) {
+        // Adaptive W: the heap collects top-W by PQ distance WITHOUT predicate
+        // filtering (deferred). We need W wide enough that the true matching
+        // neighbors make it into the heap despite PQ noise. The non-filtered
+        // W=300 already captures 99% of true neighbors. Filtering only removes
+        // candidates that happen to not match the predicate — it doesn't change
+        // which candidates are nearest to the query. So a modest overscan (2x)
+        // suffices: W = max(300, k * 2 / selectivity) ensures enough survivors.
+        // Summary pruning already skips non-matching leaves, so wider W costs
+        // more heap operations (compute), not more I/O.
+        constexpr float kOverscan = 2.0f;
+        const uint32_t adaptive_w = selectivity > 0.001f
+            ? static_cast<uint32_t>(static_cast<float>(k) / selectivity * kOverscan)
+            : k * 200u;  // extreme low selectivity — brute-force triggers before this
+        W = std::max(W, adaptive_w);
+        W = std::max(W, k * 10u);  // floor
+    }
+
+    // Max-heap of (pq_dist, row_id, leaf_ptr, local_idx). The leaf_ptr /
+    // local_idx are carried so the rerank step can decode each candidate's
+    // PQ code back to FP32 without a row_id → code lookup.
+    std::vector<HeapEntry> heap;
     heap.reserve(W + 32);
-    const auto heap_less = [](const auto& a, const auto& b) {
-        return a.first < b.first;
+    const auto heap_less = [](const HeapEntry& a, const HeapEntry& b) {
+        return a.pq_dist < b.pq_dist;
     };
 
-    auto heap_replace = [&](uint32_t new_d, int64_t new_id) {
-        heap[0] = {new_d, new_id};
+    auto heap_replace = [&](uint32_t new_d, int64_t new_id,
+                            const uint8_t* leaf_ptr, uint32_t local_idx) {
+        heap[0] = {new_d, new_id, leaf_ptr, local_idx};
         uint32_t pos = 0;
         const uint32_t n = heap.size();
         while (true) {
             const uint32_t left = 2 * pos + 1;
             const uint32_t right = 2 * pos + 2;
             uint32_t largest = pos;
-            if (left < n && heap[left].first > heap[largest].first)
+            if (left < n && heap[left].pq_dist > heap[largest].pq_dist)
                 largest = left;
-            if (right < n && heap[right].first > heap[largest].first)
+            if (right < n && heap[right].pq_dist > heap[largest].pq_dist)
                 largest = right;
             if (largest == pos) break;
             std::swap(heap[pos], heap[largest]);
@@ -416,9 +729,13 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         if (count == 0) continue;
 
         const uint32_t n_blocks = (count + codes_per_block - 1) / codes_per_block;
-        const uint8_t* codes = leaf_ptr + leaf_codes_offset();
+        const uint8_t* codes = leaf_ptr + leaf_codes_offset(manifest_.summary_size);
         const RowId* row_ids = reinterpret_cast<const RowId*>(
-            leaf_ptr + leaf_rowids_offset(n_blocks, block_bytes));
+            leaf_ptr + leaf_rowids_offset(manifest_.summary_size,
+                                          n_blocks, block_bytes));
+
+        // Phase D: filter columns are evaluated AFTER heap selection, not during
+        // scan. No col_views parsing needed here.
 
         // Compute the valid_mask for the tail block.
         const uint32_t full_blocks = count / codes_per_block;
@@ -444,7 +761,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 if (heap.size() < W) {
                     for (uint32_t j = 0; j < 16; ++j) {
                         if (out[j] == 0xFFFFFFFFu) continue;
-                        heap.emplace_back(out[j], row_ids[base + j]);
+                        heap.push_back({out[j], row_ids[base + j], leaf_ptr, base + j});
                         if (heap.size() == W) {
                             std::make_heap(heap.begin(), heap.end(), heap_less);
                             break;
@@ -452,15 +769,15 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     }
                     if (heap.size() < W) continue;
                 }
-                const uint32_t front_d = heap[0].first;
+                const uint32_t front_d = heap[0].pq_dist;
                 uint32_t block_min = 0xFFFFFFFFu;
                 for (uint32_t j = 0; j < 16; ++j)
                     if (out[j] < block_min) block_min = out[j];
                 if (block_min >= front_d) continue;
                 for (uint32_t j = 0; j < 16; ++j) {
-                    if (out[j] == 0xFFFFFFFFu || out[j] >= heap[0].first)
+                    if (out[j] == 0xFFFFFFFFu || out[j] >= heap[0].pq_dist)
                         continue;
-                    heap_replace(out[j], row_ids[base + j]);
+                    heap_replace(out[j], row_ids[base + j], leaf_ptr, base + j);
                 }
             } else {
                 uint32_t out[32];
@@ -470,7 +787,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 if (heap.size() < W) {
                     for (uint32_t j = 0; j < 32; ++j) {
                         if (!((valid_mask >> j) & 1u)) continue;
-                        heap.emplace_back(out[j], row_ids[base + j]);
+                        heap.push_back({out[j], row_ids[base + j], leaf_ptr, base + j});
                         if (heap.size() == W) {
                             std::make_heap(heap.begin(), heap.end(), heap_less);
                             break;
@@ -479,7 +796,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     if (heap.size() < W) continue;
                 }
 
-                const uint32_t front_d = heap[0].first;
+                const uint32_t front_d = heap[0].pq_dist;
                 uint32_t block_min = 0xFFFFFFFFu;
                 for (uint32_t j = 0; j < 32; ++j)
                     if ((valid_mask >> j) & 1u)
@@ -488,8 +805,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
                 for (uint32_t j = 0; j < 32; ++j) {
                     if (!((valid_mask >> j) & 1u)) continue;
-                    if (out[j] >= heap[0].first) continue;
-                    heap_replace(out[j], row_ids[base + j]);
+                    if (out[j] >= heap[0].pq_dist) continue;
+                    heap_replace(out[j], row_ids[base + j], leaf_ptr, base + j);
                 }
             }
         }
@@ -498,33 +815,182 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // --- Extract top-k from the heap ---
     std::vector<Candidate> results;
     results.reserve(heap.size());
-    for (const auto& [d, id] : heap) {
-        results.push_back({id, static_cast<float>(d)});
+
+    // Phase E: when payload locations are requested, carry (leaf_ptr, local_idx)
+    // alongside each result through dedup/sort/truncate. The heap entries'
+    // payload locations are valid mmap pointers (stable for the index's life).
+    struct ResultWithLoc {
+        Candidate cand;
+        const uint8_t* leaf_ptr;
+        uint32_t local_idx;
+    };
+    const bool want_locs = (payload_locs != nullptr);
+    std::vector<ResultWithLoc> results_loc;
+    if (want_locs) results_loc.reserve(heap.size());
+
+    // --- Phase D: filter the heap survivors by predicate ---
+    // Predicates are evaluated AFTER heap selection, not during the scan.
+    // This is the "fastest code is code that doesn't run" principle: we only
+    // evaluate predicates on the W heap survivors (not on every scanned candidate).
+    // The heap is large enough (W = k/selectivity * overscan) to contain enough
+    // matching candidates even at low selectivity.
+    //
+    // Optimization: group heap entries by leaf_ptr so we parse each leaf's
+    // filter columns only once (not once per entry). Multiple heap entries
+    // from the same leaf share the same column layout.
+    if (has_predicates && !heap.empty()) {
+        // Sort by leaf_ptr so entries from the same leaf are contiguous.
+        std::sort(heap.begin(), heap.end(),
+                  [](const HeapEntry& a, const HeapEntry& b) {
+                      return a.leaf_ptr < b.leaf_ptr;
+                  });
+        std::vector<HeapEntry> filtered;
+        filtered.reserve(heap.size());
+        const uint8_t* cur_leaf = nullptr;
+        std::vector<ColumnView> cols;
+        for (const auto& entry : heap) {
+            if (entry.leaf_ptr != cur_leaf) {
+                cur_leaf = entry.leaf_ptr;
+                const auto* lh = reinterpret_cast<const TreeLeafHeader*>(cur_leaf);
+                auto layout = LeafFilterLayout::compute(cur_leaf, manifest_.m4,
+                    manifest_.scan_pq_bits, lh->n_factors, manifest_.summary_size);
+                cols = parse_filter_columns(layout.filter_base, lh->count,
+                                             manifest_.schema);
+            }
+            if (eval_all_predicates(cols, manifest_.schema, entry.local_idx,
+                                     config.predicates, pred_col_indices))
+                filtered.push_back(entry);
+        }
+        heap = std::move(filtered);
     }
-    // The heap is a max-heap; we want ascending order.
-    // Dedup by row_id (closure may replicate vectors across leaves).
-    std::sort(results.begin(), results.end(),
-              [](const Candidate& a, const Candidate& b) {
-                  if (a.row_id != b.row_id) return a.row_id < b.row_id;
-                  return a.dist < b.dist;
+
+    if (config.rerank && !heap.empty()) {
+        // Rerank: decode each of the W candidates' PQ codes back to FP32 and
+        // compute the exact distance to the query. Re-sorting by exact
+        // distance fixes the PQ-approximation error and substantially
+        // improves recall@k. Per-query serial (W≈300 is cheap; the CLI
+        // parallelizes across queries).
+        const uint32_t code_sz = quantizer_->code_size();
+        std::vector<uint8_t> code_buf(code_sz);
+        std::vector<float> decoded_vec(manifest_.dim);
+
+        for (const auto& entry : heap) {
+            std::memset(code_buf.data(), 0, code_sz);
+            extract_code_from_leaf(entry.leaf_ptr, entry.local_idx,
+                                   manifest_.summary_size, manifest_.m4,
+                                   manifest_.scan_pq_bits, codes_per_block,
+                                   block_bytes, code_buf.data());
+            quantizer_->decode_code(code_buf.data(), decoded_vec.data());
+            const float exact_dist =
+                (metric == MetricKind::InnerProduct)
+                    ? -simd::dot_f32(query, decoded_vec.data(), manifest_.dim)
+                    :  simd::l2sq_f32(query, decoded_vec.data(), manifest_.dim);
+            if (want_locs) {
+                results_loc.push_back({{entry.row_id, exact_dist},
+                                        entry.leaf_ptr, entry.local_idx});
+            } else {
+                results.push_back({entry.row_id, exact_dist});
+            }
+        }
+    } else {
+        // No rerank: use the raw PQ-approximate uint32 distances.
+        for (const auto& entry : heap) {
+            if (want_locs) {
+                results_loc.push_back({{entry.row_id,
+                                         static_cast<float>(entry.pq_dist)},
+                                        entry.leaf_ptr, entry.local_idx});
+            } else {
+                results.push_back({entry.row_id,
+                                   static_cast<float>(entry.pq_dist)});
+            }
+        }
+    }
+
+    if (!want_locs) {
+        // Dedup by row_id (closure may replicate vectors across leaves → same
+        // row_id appears with different distances → keep the min). Sort by
+        // row_id first so duplicates are adjacent, with min-dist tiebreak.
+        std::sort(results.begin(), results.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      if (a.row_id != b.row_id) return a.row_id < b.row_id;
+                      return a.dist < b.dist;
+                  });
+        auto last = std::unique(results.begin(), results.end(),
+                                [](const Candidate& a, const Candidate& b) {
+                                    return a.row_id == b.row_id;
+                                });
+        results.erase(last, results.end());
+        if (results.size() > k) {
+            std::nth_element(results.begin(), results.begin() + k, results.end(),
+                             [](const Candidate& a, const Candidate& b) {
+                                 return a.dist < b.dist;
+                             });
+            results.resize(k);
+        }
+        std::sort(results.begin(), results.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.dist < b.dist;
+                  });
+        return results;
+    }
+
+    // --- Payload-location path: same dedup/sort/truncate, carrying locs ---
+    // Dedup by row_id (keep min-dist; the row_id sort makes duplicates adjacent).
+    std::sort(results_loc.begin(), results_loc.end(),
+              [](const ResultWithLoc& a, const ResultWithLoc& b) {
+                  if (a.cand.row_id != b.cand.row_id)
+                      return a.cand.row_id < b.cand.row_id;
+                  return a.cand.dist < b.cand.dist;
               });
-    auto last = std::unique(results.begin(), results.end(),
-                            [](const Candidate& a, const Candidate& b) {
-                                return a.row_id == b.row_id;
-                            });
-    results.erase(last, results.end());
-    if (results.size() > k) {
-        std::nth_element(results.begin(), results.begin() + k, results.end(),
-                         [](const Candidate& a, const Candidate& b) {
-                             return a.dist < b.dist;
+    auto last_loc = std::unique(results_loc.begin(), results_loc.end(),
+                                [](const ResultWithLoc& a, const ResultWithLoc& b) {
+                                    return a.cand.row_id == b.cand.row_id;
+                                });
+    results_loc.erase(last_loc, results_loc.end());
+    if (results_loc.size() > k) {
+        std::nth_element(results_loc.begin(), results_loc.begin() + k,
+                         results_loc.end(),
+                         [](const ResultWithLoc& a, const ResultWithLoc& b) {
+                             return a.cand.dist < b.cand.dist;
                          });
-        results.resize(k);
+        results_loc.resize(k);
     }
-    std::sort(results.begin(), results.end(),
-              [](const Candidate& a, const Candidate& b) {
-                  return a.dist < b.dist;
+    std::sort(results_loc.begin(), results_loc.end(),
+              [](const ResultWithLoc& a, const ResultWithLoc& b) {
+                  return a.cand.dist < b.cand.dist;
               });
+    results.clear();
+    results.reserve(results_loc.size());
+    payload_locs->clear();
+    payload_locs->reserve(results_loc.size());
+    for (auto& rl : results_loc) {
+        payload_locs->push_back({rl.leaf_ptr, rl.local_idx});
+        results.push_back(rl.cand);
+    }
     return results;
+}
+
+// ===========================================================================
+// Payload fetch (Phase E) — O(1) read from the leaf's payload extent.
+// ===========================================================================
+
+std::string_view IVFTreeIndex::fetch_payload(const uint8_t* leaf_ptr,
+                                              uint32_t slot) const {
+    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+    if (lh->payload_extent_page == kInvalidPage || lh->payload_extent_pages == 0)
+        return {};  // no payload extent for this leaf
+    if (slot >= lh->count)
+        return {};  // out of range
+
+    const uint8_t* payload_base = mmap_base_ +
+        static_cast<uint64_t>(lh->payload_extent_page) * kPageSize;
+    const uint32_t* offsets = reinterpret_cast<const uint32_t*>(payload_base);
+    const uint32_t* lengths = offsets + lh->count;
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(lengths + lh->count);
+
+    const uint32_t off = offsets[slot];
+    const uint32_t len = lengths[slot];
+    return std::string_view(reinterpret_cast<const char*>(data + off), len);
 }
 
 // ===========================================================================
@@ -533,7 +999,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
 std::vector<Candidate> IVFTreeIndex::search_rabitq(const float* query,
                                                      uint32_t k,
-                                                     const SearchConfig& config)
+                                                     const SearchConfig& config,
+    std::vector<std::pair<const uint8_t*, uint32_t>>* /*payload_locs*/)
     const {
     auto& rabitq = static_cast<RaBitQQuantizer&>(*quantizer_);
     const uint32_t m = manifest_.m4;
@@ -589,7 +1056,8 @@ std::vector<Candidate> IVFTreeIndex::search_rabitq(const float* query,
             const uint8_t* node_ptr = mmap_base_ +
                 static_cast<uint64_t>(rc.page) * kPageSize;
             const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
-            const uint32_t cesize = child_entry_size(manifest_.dim);
+            const uint32_t cesize = child_entry_size(manifest_.dim,
+                                                      manifest_.summary_size);
             const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
 
             std::vector<std::pair<float, uint32_t>> child_dists;
@@ -668,11 +1136,13 @@ std::vector<Candidate> IVFTreeIndex::search_rabitq(const float* query,
         if (count == 0) continue;
 
         const uint32_t n_blocks = (count + codes_per_block - 1) / codes_per_block;
-        const uint8_t* codes = leaf_ptr + leaf_codes_offset();
+        const uint8_t* codes = leaf_ptr + leaf_codes_offset(manifest_.summary_size);
         const RowId* row_ids = reinterpret_cast<const RowId*>(
-            leaf_ptr + leaf_rowids_offset(n_blocks, block_bytes));
+            leaf_ptr + leaf_rowids_offset(manifest_.summary_size,
+                                          n_blocks, block_bytes));
         const float* factors = reinterpret_cast<const float*>(
-            leaf_ptr + leaf_factors_offset(n_blocks, block_bytes, count));
+            leaf_ptr + leaf_factors_offset(manifest_.summary_size,
+                                           n_blocks, block_bytes, count));
 
         // Convert the leaf centroid FP16 → FP32.
         for (uint32_t d = 0; d < manifest_.dim; ++d) {
@@ -790,6 +1260,7 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
         std::fclose(f);
         throw Error(ErrorCode::InvalidParam, "build_streaming: empty fbin");
     }
+    const uint32_t summary_size = cfg.filter_schema.summary_size();
 
     spdlog::info("[sextant] build_streaming: N={} dim={} → '{}'", n, dim, output_path);
 
@@ -887,9 +1358,12 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
                 for (uint16_t d = 0; d < dim; ++d)
                     sum[d] += static_cast<float>(sample_fp16[i * dim + d]);
             }
-            const double inv = 1.0 / assigns[c].size();
+            // Spherical k-means: compute mean, renormalize for IP metric.
+            std::vector<float> centroid_f32(dim);
+            compute_centroid_spherical(sum.data(), assigns[c].size(), dim,
+                                       metric, centroid_f32.data());
             for (uint16_t d = 0; d < dim; ++d)
-                root_centroids[c][d] = static_cast<float16_t>(sum[d] * inv);
+                root_centroids[c][d] = static_cast<float16_t>(centroid_f32[d]);
         }
     }
 
@@ -973,9 +1447,12 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
             for (uint16_t d = 0; d < dim; ++d)
                 sum[d] += static_cast<float>(buf.fp16_vecs[i * dim + d]);
         }
-        const double inv = 1.0 / (buf.fp16_vecs.size() / dim);
+        // Spherical k-means: compute mean, renormalize for IP metric.
+        std::vector<float> centroid_f32(dim);
+        compute_centroid_spherical(sum.data(), buf.fp16_vecs.size() / dim, dim,
+                                   metric, centroid_f32.data());
         for (uint16_t d = 0; d < dim; ++d)
-            leaf.centroid[d] = static_cast<float16_t>(sum[d] * inv);
+            leaf.centroid[d] = static_cast<float16_t>(centroid_f32[d]);
 
         // For RaBitQ: re-encode codes relative to leaf centroid.
         // The buffered codes were absolute-encoded; we need centroid-relative.
@@ -1094,12 +1571,14 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
             continue;
         }
 
-        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits, n_factors);
+        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits,
+                                               n_factors, summary_size);
         const PageId page = alloc.alloc_extent(file, npg);
         leaf_pages[l] = {page, npg};
 
         std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
         auto* lh = reinterpret_cast<TreeLeafHeader*>(buf.data());
+        lh->magic = kTreeLeafMagic;
         lh->count = count;
         lh->tombstone_count = 0;
         lh->m4 = m4;
@@ -1108,10 +1587,17 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
         lh->block_bytes = bb;
         lh->codes_per_block = cpb;
         lh->extent_pages = npg;
+        lh->summary_size = summary_size;
+        lh->n_filter_columns = cfg.filter_schema.n_filter_columns();
+        lh->filter_columns_offset = 0;
+        lh->payload_extent_page = kInvalidPage;
+        lh->payload_extent_pages = 0;
+        lh->summary_dirty = 0;
+        lh->next_dirty = kInvalidPage;
 
         // Pack FastScan blocks from the leaf's codes.
         const uint32_t n_blocks = (count + cpb - 1) / cpb;
-        uint8_t* codes_out = buf.data() + leaf_codes_offset();
+        uint8_t* codes_out = buf.data() + leaf_codes_offset(summary_size);
         for (uint32_t b = 0; b < n_blocks; ++b) {
             const uint32_t base = b * cpb;
             uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
@@ -1139,9 +1625,10 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
 
         // Row IDs.
         RowId* rids = reinterpret_cast<RowId*>(
-            buf.data() + leaf_rowids_offset(n_blocks, bb));
+            buf.data() + leaf_rowids_offset(summary_size, n_blocks, bb));
         std::memcpy(rids, leaf.row_ids.data(), count * sizeof(RowId));
 
+        lh->header_crc = header_crc(lh, offsetof(TreeLeafHeader, header_crc));
         file.write_pages(page, npg, buf.data());
     }
 
@@ -1160,17 +1647,19 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
         }
 
         const uint32_t n_children = static_cast<uint32_t>(leaves.size());
-        const uint32_t npg = node_extent_pages(dim, n_children);
+        const uint32_t npg = node_extent_pages(dim, n_children, summary_size);
         const PageId page = alloc.alloc_extent(file, npg);
 
         std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
         auto* nh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+        nh->magic = kTreeNodeMagic;
         nh->n_children = n_children;
         nh->extent_pages = npg;
         nh->dim = dim;
         nh->reserved = 0;
+        nh->magic_pad = 0;
 
-        const uint32_t cesize = child_entry_size(dim);
+        const uint32_t cesize = child_entry_size(dim, summary_size);
         uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
         for (uint32_t j = 0; j < n_children; ++j) {
             const uint32_t li = leaves[j];
@@ -1183,6 +1672,7 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
             std::memcpy(cent, all_leaves[li].centroid.data(), dim * sizeof(float16_t));
             p += cesize;
         }
+        nh->header_crc = header_crc(nh, offsetof(TreeNodeHeader, header_crc));
         file.write_pages(page, npg, buf.data());
 
         root_child_data[c].is_leaf = 0;
@@ -1191,17 +1681,19 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
     }
 
     // Write root node.
-    const uint32_t root_npg = node_extent_pages(dim, k_root);
+    const uint32_t root_npg = node_extent_pages(dim, k_root, summary_size);
     const PageId root_page = alloc.alloc_extent(file, root_npg);
     {
         std::vector<uint8_t> buf(static_cast<size_t>(root_npg) * kPageSize, 0);
         auto* rh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+        rh->magic = kTreeNodeMagic;
         rh->n_children = k_root;
         rh->extent_pages = root_npg;
         rh->dim = dim;
         rh->reserved = 0;
+        rh->magic_pad = 0;
 
-        const uint32_t cesize = child_entry_size(dim);
+        const uint32_t cesize = child_entry_size(dim, summary_size);
         uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
         for (uint32_t c = 0; c < k_root; ++c) {
             auto* ce = reinterpret_cast<ChildEntry*>(p);
@@ -1214,6 +1706,7 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
                         dim * sizeof(float16_t));
             p += cesize;
         }
+        rh->header_crc = header_crc(rh, offsetof(TreeNodeHeader, header_crc));
         file.write_pages(root_page, root_npg, buf.data());
     }
 
@@ -1252,6 +1745,8 @@ BuildResult IVFTreeIndex::build_streaming(const std::string& base_path,
     manifest.adaptive_probe_gap = cfg.adaptive_probe_gap;
     manifest.median_lid = cfg.median_lid;
     manifest.balance_factor = params.partition_balance_factor;
+    manifest.schema = cfg.filter_schema;
+    manifest.summary_size = summary_size;
 
     std::string cfg_toml = manifest_to_toml(manifest);
     const uint32_t cfg_npg = static_cast<uint32_t>(
@@ -1327,6 +1822,7 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
         std::fclose(f);
         throw Error(ErrorCode::InvalidParam, "build_streaming_refined: empty");
     }
+    const uint32_t summary_size = cfg.filter_schema.summary_size();
 
     spdlog::info("[sextant] build_streaming_refined: N={} dim={} → '{}'",
                  n, dim, output_path);
@@ -1407,9 +1903,12 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
             for (uint32_t i : assigns[c])
                 for (uint16_t d = 0; d < dim; ++d)
                     sum[d] += static_cast<float>(sample_fp16[i * dim + d]);
-            const double inv = 1.0 / assigns[c].size();
+            // Spherical k-means: compute mean, renormalize for IP metric.
+            std::vector<float> centroid_f32(dim);
+            compute_centroid_spherical(sum.data(), assigns[c].size(), dim,
+                                       metric, centroid_f32.data());
             for (uint16_t d = 0; d < dim; ++d)
-                root_centroids[c][d] = static_cast<float16_t>(sum[d] * inv);
+                root_centroids[c][d] = static_cast<float16_t>(centroid_f32[d]);
         }
     }
 
@@ -1437,9 +1936,11 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
         for (uint32_t i = 0; i < count; ++i)
             for (uint16_t d = 0; d < dim; ++d)
                 sum[d] += static_cast<float>(buf.fp16_vecs[i * dim + d]);
-        const double inv = 1.0 / count;
+        // Spherical k-means: compute mean, renormalize for IP metric.
+        std::vector<float> centroid_f32(dim);
+        compute_centroid_spherical(sum.data(), count, dim, metric, centroid_f32.data());
         for (uint16_t d = 0; d < dim; ++d)
-            leaf_centroids.push_back(static_cast<float16_t>(sum[d] * inv));
+            leaf_centroids.push_back(static_cast<float16_t>(centroid_f32[d]));
         buf.fp16_vecs.clear();
     };
 
@@ -1537,9 +2038,12 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
         for (uint32_t i = 0; i < buf.fp16_vecs.size() / dim; ++i)
             for (uint16_t d = 0; d < dim; ++d)
                 sum[d] += static_cast<float>(buf.fp16_vecs[i * dim + d]);
-        const double inv = 1.0 / (buf.fp16_vecs.size() / dim);
+        // Spherical k-means: compute mean, renormalize for IP metric.
+        std::vector<float> centroid_f32(dim);
+        compute_centroid_spherical(sum.data(), buf.fp16_vecs.size() / dim, dim,
+                                   metric, centroid_f32.data());
         for (uint16_t d = 0; d < dim; ++d)
-            leaf.centroid[d] = static_cast<float16_t>(sum[d] * inv);
+            leaf.centroid[d] = static_cast<float16_t>(centroid_f32[d]);
         all_leaves.push_back(std::move(leaf));
         buf.codes.clear();
         buf.row_ids.clear();
@@ -1628,12 +2132,14 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
         const uint32_t count = static_cast<uint32_t>(leaf.row_ids.size());
         if (count == 0) { leaf_pages[l] = {kInvalidPage, 0}; continue; }
 
-        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits, n_factors);
+        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits,
+                                               n_factors, summary_size);
         const PageId page = alloc.alloc_extent(file, npg);
         leaf_pages[l] = {page, npg};
 
         std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
         auto* lh = reinterpret_cast<TreeLeafHeader*>(buf.data());
+        lh->magic = kTreeLeafMagic;
         lh->count = count;
         lh->tombstone_count = 0;
         lh->m4 = m4;
@@ -1642,9 +2148,16 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
         lh->block_bytes = bb;
         lh->codes_per_block = cpb;
         lh->extent_pages = npg;
+        lh->summary_size = summary_size;
+        lh->n_filter_columns = cfg.filter_schema.n_filter_columns();
+        lh->filter_columns_offset = 0;
+        lh->payload_extent_page = kInvalidPage;
+        lh->payload_extent_pages = 0;
+        lh->summary_dirty = 0;
+        lh->next_dirty = kInvalidPage;
 
         const uint32_t n_blocks = (count + cpb - 1) / cpb;
-        uint8_t* codes_out = buf.data() + leaf_codes_offset();
+        uint8_t* codes_out = buf.data() + leaf_codes_offset(summary_size);
         for (uint32_t b = 0; b < n_blocks; ++b) {
             const uint32_t base = b * cpb;
             uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
@@ -1670,8 +2183,9 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
             }
         }
         RowId* rids = reinterpret_cast<RowId*>(
-            buf.data() + leaf_rowids_offset(n_blocks, bb));
+            buf.data() + leaf_rowids_offset(summary_size, n_blocks, bb));
         std::memcpy(rids, leaf.row_ids.data(), count * sizeof(RowId));
+        lh->header_crc = header_crc(lh, offsetof(TreeLeafHeader, header_crc));
         file.write_pages(page, npg, buf.data());
     }
 
@@ -1703,14 +2217,17 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
             continue;
         }
         const uint32_t n_children = static_cast<uint32_t>(leaves.size());
-        const uint32_t npg = node_extent_pages(dim, n_children);
+        const uint32_t npg = node_extent_pages(dim, n_children, summary_size);
         const PageId page = alloc.alloc_extent(file, npg);
         std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
         auto* nh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+        nh->magic = kTreeNodeMagic;
         nh->n_children = n_children;
         nh->extent_pages = npg;
         nh->dim = dim;
-        const uint32_t cesize = child_entry_size(dim);
+        nh->reserved = 0;
+        nh->magic_pad = 0;
+        const uint32_t cesize = child_entry_size(dim, summary_size);
         uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
         for (uint32_t j = 0; j < n_children; ++j) {
             const uint32_t li = leaves[j];
@@ -1723,6 +2240,7 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
                         dim * sizeof(float16_t));
             p += cesize;
         }
+        nh->header_crc = header_crc(nh, offsetof(TreeNodeHeader, header_crc));
         file.write_pages(page, npg, buf.data());
         root_child_data[c].is_leaf = 0;
         root_child_data[c].page = page;
@@ -1730,7 +2248,7 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
     }
 
     // Write root node.
-    const uint32_t root_npg = node_extent_pages(dim, k_root);
+    const uint32_t root_npg = node_extent_pages(dim, k_root, summary_size);
     const PageId root_page = alloc.alloc_extent(file, root_npg);
     {
         std::vector<uint8_t> buf(static_cast<size_t>(root_npg) * kPageSize, 0);
@@ -1738,7 +2256,7 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
         rh->n_children = k_root;
         rh->extent_pages = root_npg;
         rh->dim = dim;
-        const uint32_t cesize = child_entry_size(dim);
+        const uint32_t cesize = child_entry_size(dim, summary_size);
         uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
         for (uint32_t c = 0; c < k_root; ++c) {
             auto* ce = reinterpret_cast<ChildEntry*>(p);
@@ -1788,6 +2306,8 @@ BuildResult IVFTreeIndex::build_streaming_refined(const std::string& base_path,
     manifest.adaptive_probe_gap = cfg.adaptive_probe_gap;
     manifest.median_lid = cfg.median_lid;
     manifest.balance_factor = params.partition_balance_factor;
+    manifest.schema = cfg.filter_schema;
+    manifest.summary_size = summary_size;
 
     std::string cfg_toml = manifest_to_toml(manifest);
     const uint32_t cfg_npg = static_cast<uint32_t>(
@@ -1861,9 +2381,18 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         std::fclose(f);
         throw Error(ErrorCode::InvalidParam, "build_streaming_pca: empty");
     }
+    const uint32_t summary_size = cfg.filter_schema.summary_size();
 
     spdlog::info("[sextant] build_streaming_pca: N={} dim={} → '{}'",
                  n, dim, output_path);
+
+    // --- Phase D: initialize the global cardinality table for selectivity
+    // estimation. Populated during the emission pass and serialized after all
+    // tree nodes are written. No-op when there are no filter columns.
+    CardinalityTable card_table;
+    if (!cfg.filter_schema.empty()) {
+        card_table.init(cfg.filter_schema, n);
+    }
 
     const auto& params = cfg.params;
     const uint16_t m4 = params.pq4_m > 0 ? params.pq4_m
@@ -1889,10 +2418,34 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         k_root = std::clamp(p2, 4u, 65536u);
     }
 
+    // --- Depth selection ---
+    // k_root is the TOTAL number of fine-grained (leaf-group) clusters. When
+    // it exceeds k_root_max_depth2, a depth-2 root would be too large to
+    // route efficiently, so we add an intermediate level (depth-3): the root
+    // gets k_l1 children (L1 nodes), each L1 node groups k_root/k_l1 fine
+    // centroids (L2 nodes → leaves). k_root stays as the fine-cluster count.
+    const uint32_t k_root_max_depth2 = cfg.k_root_max_depth2 > 0
+        ? cfg.k_root_max_depth2 : 512u;
+    uint16_t depth = 2;
+    uint32_t k_l1 = 0;
+    if (k_root > k_root_max_depth2) {
+        depth = 3;
+        const uint32_t target_l1_children = 256;
+        uint32_t target = std::max(16u, k_root / target_l1_children);
+        // round to nearest power of two (same scheme as k_root above).
+        uint32_t p2 = 1;
+        while (p2 * 2 <= target) p2 *= 2;
+        if (p2 < (1u << 30) && (target - p2) > (p2 * 2 - target)) p2 *= 2;
+        k_l1 = std::clamp(p2, 16u, 512u);
+        spdlog::info("[sextant] build_streaming_pca: depth-3 (k_root={} > {}): "
+                     "k_l1={} root branching", k_root, k_root_max_depth2, k_l1);
+    }
+
     // PCA dimensions: project to this many components for routing.
     // Default: 32 (captures meaningful variance without being too large
     // for k-means to find structure). For d_eff≈2 data, even 8-16 PCs suffice.
     const uint32_t pca_dims = std::min(dim, cfg.pca_dims > 0 ? cfg.pca_dims : 32u);
+    const MetricKind metric = params.metric;
 
     // --- 1. Sample + train quantizer ---
     const auto t_sample = std::chrono::steady_clock::now();
@@ -2277,21 +2830,173 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t_lloyd).count());
 
+    // --- 5b. Depth-3 super-clustering ---
+    // When depth==3, the k_root fine-grained centroids are grouped into k_l1
+    // super-clusters (k-means in PCA space on the centroids themselves). Each
+    // fine centroid c is assigned to one super-group; the super-group becomes
+    // an L1 node whose children are the L2 nodes (fine centroids) in that
+    // group. The root's PCA centroids (stored in the blob) are these k_l1
+    // super-cluster centroids.
+    std::vector<uint32_t> super_group;        // fine_c → super-group id
+    std::vector<std::vector<float>> super_centroids_pca;  // k_l1 × pca_dims
+    if (depth == 3) {
+        const auto t_super = std::chrono::steady_clock::now();
+        super_centroids_pca.assign(k_l1, std::vector<float>(pca_dims, 0.0f));
+        // Initialize: k-means++-like even pick from the fine centroids.
+        for (uint32_t g = 0; g < k_l1; ++g) {
+            const uint32_t src = (g * k_root) / k_l1;
+            super_centroids_pca[g].assign(
+                root_centroids_pca[src].begin(),
+                root_centroids_pca[src].end());
+        }
+        super_group.assign(k_root, 0);
+        for (uint32_t iter = 0; iter < 10; ++iter) {
+            // Assign each fine centroid to nearest super-cluster.
+            std::vector<std::vector<double>> sums(
+                k_l1, std::vector<double>(pca_dims, 0.0));
+            std::vector<uint64_t> counts(k_l1, 0);
+            uint32_t n_changed = 0;
+            for (uint32_t c = 0; c < k_root; ++c) {
+                const float* fc = root_centroids_pca[c].data();
+                float best_d = std::numeric_limits<float>::max();
+                uint32_t best_g = 0;
+                for (uint32_t g = 0; g < k_l1; ++g) {
+                    float d = 0.0f;
+                    for (uint32_t k = 0; k < pca_dims; ++k) {
+                        const float diff = fc[k] - super_centroids_pca[g][k];
+                        d += diff * diff;
+                    }
+                    if (d < best_d) { best_d = d; best_g = g; }
+                }
+                if (iter > 0 && best_g != super_group[c]) ++n_changed;
+                super_group[c] = best_g;
+                for (uint32_t k = 0; k < pca_dims; ++k)
+                    sums[best_g][k] += fc[k];
+                ++counts[best_g];
+            }
+            // Update super-centroids.
+            for (uint32_t g = 0; g < k_l1; ++g) {
+                if (counts[g] == 0) {
+                    // Reseed from a random fine centroid.
+                    uint32_t src = (g * 7919 + 1) % k_root;
+                    super_centroids_pca[g].assign(
+                        root_centroids_pca[src].begin(),
+                        root_centroids_pca[src].end());
+                    continue;
+                }
+                const double inv = 1.0 / counts[g];
+                for (uint32_t k = 0; k < pca_dims; ++k)
+                    super_centroids_pca[g][k] =
+                        static_cast<float>(sums[g][k] * inv);
+            }
+            if (iter >= 2 &&
+                static_cast<double>(n_changed) / k_root < 0.01) {
+                spdlog::info("[sextant] build_streaming_pca: super-k-means "
+                             "converged at iter {}", iter + 1);
+                break;
+            }
+        }
+        spdlog::info("[sextant] build_streaming_pca: depth-3 super-clustering "
+                     "({} fine → {} groups) in {:.2f}s", k_root, k_l1,
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t_super).count());
+    }
+
     // --- 6. Emission pass: assign + closure + encode + write leaves ---
     const auto t_stream = std::chrono::steady_clock::now();
     const uint32_t code_size = quantizer->code_size();
+    const bool has_filter = !cfg.filter_column_data.empty();
+    const uint32_t n_schema_cols =
+        has_filter ? static_cast<uint32_t>(cfg.filter_schema.columns.size()) : 0;
+    const bool has_payload =
+        cfg.filter_schema.has_payload && cfg.payload_data && cfg.payload_offsets;
 
     struct LeafBuffer {
         std::vector<uint8_t> codes;
         std::vector<RowId> row_ids;
         std::vector<float16_t> fp16_vecs;
+        // Filter column data for the rows in this buffer (Phase C).
+        // One entry per schema column. Populated only when filter_column_data
+        // is non-empty. Each MemColumnData is scoped to this leaf's rows.
+        std::vector<MemColumnData> filter_cols;
+        // Payload info for the rows in this buffer (Phase E). Populated only
+        // when cfg.payload_data is non-empty. Per-row length + data pointer.
+        std::vector<uint32_t> payload_lens;
+        std::vector<const uint8_t*> payload_ptrs;
     };
     std::vector<LeafBuffer> buffers(k_root);
+    if (has_filter) {
+        for (auto& b : buffers) {
+            b.filter_cols.resize(n_schema_cols);
+            for (uint32_t c = 0; c < n_schema_cols; ++c)
+                b.filter_cols[c].type = cfg.filter_schema.columns[c].type;
+        }
+    }
+
+    /// Append the filter column values for global row_id into a leaf's
+    /// per-column MemColumnData (Phase C). Mirrors MemSourceBuilder::add_vector
+    /// + the per-type setters, but reads from cfg.filter_column_data.
+    auto append_filter_row = [&](std::vector<MemColumnData>& dst, RowId row_id) {
+        const uint32_t r = static_cast<uint32_t>(row_id);
+        for (uint32_t c = 0; c < n_schema_cols; ++c) {
+            const auto& src = cfg.filter_column_data[c];
+            auto& d = dst[c];
+            switch (d.type) {
+                case ColumnType::Int32:
+                case ColumnType::Int64:
+                case ColumnType::Float:
+                case ColumnType::Bool: {
+                    const uint8_t w = column_type_width(d.type);
+                    const uint8_t* sp = src.fixed_data.data() +
+                                        static_cast<size_t>(r) * w;
+                    d.fixed_data.insert(d.fixed_data.end(), sp, sp + w);
+                    break;
+                }
+                case ColumnType::String: {
+                    // Validation happens in MemSourceBuilder (before uint16 truncation).
+                    const uint16_t len = src.str_lengths[r];
+                    const uint32_t off = src.str_offsets[r];
+                    d.str_offsets.push_back(static_cast<uint32_t>(d.str_data.size()));
+                    d.str_lengths.push_back(len);
+                    d.str_data.insert(d.str_data.end(),
+                                      src.str_data.data() + off,
+                                      src.str_data.data() + off + len);
+                    break;
+                }
+                case ColumnType::Set: {
+                    // Validation happens in MemSourceBuilder (before uint8/uint16 truncation).
+                    const uint8_t ec = src.set_counts[r];
+                    const uint32_t off = src.set_offsets[r];
+                    d.set_counts.push_back(ec);
+                    d.set_offsets.push_back(static_cast<uint32_t>(d.set_elem_lengths.size()));
+                    // Copy element lengths + data for this row's elements.
+                    // Need cumulative byte offsets into src.set_elem_data.
+                    // (Computed lazily via src.set_elem_lengths.)
+                    // Build element byte offsets for [off .. off+ec).
+                    uint32_t byte_off = 0;
+                    for (uint32_t k = 0; k < off; ++k)
+                        byte_off += src.set_elem_lengths[k];
+                    for (uint32_t e = 0; e < ec; ++e) {
+                        const uint16_t elen = src.set_elem_lengths[off + e];
+                        d.set_elem_lengths.push_back(elen);
+                        d.set_elem_data.insert(d.set_elem_data.end(),
+                            src.set_elem_data.data() + byte_off,
+                            src.set_elem_data.data() + byte_off + elen);
+                        byte_off += elen;
+                    }
+                    break;
+                }
+            }
+        }
+    };
 
     struct FlushedLeaf {
         std::vector<uint8_t> codes;
         std::vector<RowId> row_ids;
         std::vector<float16_t> centroid;
+        std::vector<MemColumnData> filter_cols;  // Phase C
+        std::vector<uint32_t> payload_lens;      // Phase E
+        std::vector<const uint8_t*> payload_ptrs; // Phase E
     };
     std::vector<FlushedLeaf> all_leaves;
     std::vector<std::vector<uint32_t>> root_to_leaves(k_root);
@@ -2302,20 +3007,30 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         FlushedLeaf leaf;
         leaf.codes = std::move(buf.codes);
         leaf.row_ids = std::move(buf.row_ids);
+        if (has_filter) leaf.filter_cols = std::move(buf.filter_cols);
+        leaf.payload_lens = std::move(buf.payload_lens);
+        leaf.payload_ptrs = std::move(buf.payload_ptrs);
         leaf.centroid.resize(dim);
         std::vector<double> sum(dim, 0.0);
         const uint32_t cnt = buf.fp16_vecs.size() / dim;
         for (uint32_t i = 0; i < cnt; ++i)
             for (uint16_t d = 0; d < dim; ++d)
                 sum[d] += static_cast<float>(buf.fp16_vecs[i * dim + d]);
-        const double inv = 1.0 / cnt;
+        // Spherical k-means: compute mean, renormalize for IP metric.
+        std::vector<float> centroid_f32(dim);
+        compute_centroid_spherical(sum.data(), cnt, dim, metric, centroid_f32.data());
         for (uint16_t d = 0; d < dim; ++d)
-            leaf.centroid[d] = static_cast<float16_t>(sum[d] * inv);
+            leaf.centroid[d] = static_cast<float16_t>(centroid_f32[d]);
         root_to_leaves[c].push_back(static_cast<uint32_t>(all_leaves.size()));
         all_leaves.push_back(std::move(leaf));
         buf.codes.clear();
         buf.row_ids.clear();
         buf.fp16_vecs.clear();
+        if (has_filter) buf.filter_cols.assign(n_schema_cols, MemColumnData{});
+        // Re-initialize the per-column types after assign.
+        if (has_filter)
+            for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
+                buf.filter_cols[cc].type = cfg.filter_schema.columns[cc].type;
     };
 
     // Precompute FP16 root centroids for the search path (the tree stores
@@ -2434,12 +3149,54 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
             // Serial: append to shared buffers + flush on overflow.
             for (uint32_t i = 0; i < take; ++i) {
                 const float16_t* fvec = &fp16_buf[i * dim];
+                const RowId rid = static_cast<RowId>(offset + i);
+                // Phase D: record this row's filter column values in the global
+                // cardinality table (once per row, not per closure target).
+                if (!cfg.filter_schema.empty()) {
+                    const uint32_t r = offset + i;
+                    for (uint32_t c = 0; c < cfg.filter_schema.columns.size(); ++c) {
+                        const auto& col = cfg.filter_schema.columns[c];
+                        const auto& src = cfg.filter_column_data[c];
+                        if (col.type == ColumnType::String) {
+                            std::string_view sv(src.str_data.data() + src.str_offsets[r],
+                                                 src.str_lengths[r]);
+                            card_table.add_string(c, sv);
+                        } else if (col.type == ColumnType::Set) {
+                            card_table.add_set(c, src.set_counts.data(),
+                                                src.set_offsets.data(),
+                                                src.set_elem_lengths.data(),
+                                                src.set_elem_data.data(), r);
+                        } else if (col.type == ColumnType::Int32) {
+                            int32_t v;
+                            std::memcpy(&v, src.fixed_data.data() + r * 4, 4);
+                            card_table.add_numeric(c, static_cast<double>(v));
+                        } else if (col.type == ColumnType::Int64) {
+                            int64_t v;
+                            std::memcpy(&v, src.fixed_data.data() + r * 8, 8);
+                            card_table.add_numeric(c, static_cast<double>(v));
+                        } else if (col.type == ColumnType::Float) {
+                            float v;
+                            std::memcpy(&v, src.fixed_data.data() + r * 4, 4);
+                            card_table.add_numeric(c, static_cast<double>(v));
+                        }
+                    }
+                }
                 for (uint32_t c : chunk_targets[i]) {
                     auto& buf = buffers[c];
                     buf.codes.insert(buf.codes.end(),
                                      chunk_codes[i].begin(), chunk_codes[i].end());
-                    buf.row_ids.push_back(static_cast<RowId>(offset + i));
+                    buf.row_ids.push_back(rid);
                     buf.fp16_vecs.insert(buf.fp16_vecs.end(), fvec, fvec + dim);
+                    if (has_filter) append_filter_row(buf.filter_cols, rid);
+                    if (has_payload) {
+                        const uint32_t r = offset + i;
+                        const uint32_t plen =
+                            cfg.payload_offsets[r + 1] - cfg.payload_offsets[r];
+                        const uint8_t* pdata =
+                            cfg.payload_data + cfg.payload_offsets[r];
+                        buf.payload_lens.push_back(plen);
+                        buf.payload_ptrs.push_back(pdata);
+                    }
                     if (buf.row_ids.size() >= leaf_cap)
                         flush_buffer(c);
                 }
@@ -2469,29 +3226,100 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     file.truncate(bitmap_page + bitmap_pages);
     alloc.init(file, bitmap_page, bitmap_pages);
 
-    const uint16_t depth = 2;
+    // NOTE: `depth` and `k_l1` were computed above (depth-2 vs depth-3).
     const uint32_t cpb = (scan_bits == 4) ? 32 : 16;
     const uint32_t bb = m4 * 16;
 
     // Write leaf extents.
+    // Cache each leaf's filter summary so internal nodes (L2/L1/root) can
+    // propagate summaries bottom-up. No-op when summary_size == 0.
+    std::vector<std::vector<uint8_t>> leaf_summaries(n_leaves_total);
     struct LeafPageInfo { PageId page; uint32_t pages; };
     std::vector<LeafPageInfo> leaf_pages(n_leaves_total);
     for (uint32_t l = 0; l < n_leaves_total; ++l) {
         const auto& leaf = all_leaves[l];
         const uint32_t count = static_cast<uint32_t>(leaf.row_ids.size());
         if (count == 0) { leaf_pages[l] = {kInvalidPage, 0}; continue; }
-        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits, n_factors);
+
+        // Phase C: compute filter column region size for this leaf.
+        const uint64_t fcb = has_filter
+            ? filter_columns_bytes(count, cfg.filter_schema, leaf.filter_cols) : 0;
+
+        // Build-time validation warnings (architecture plan §3.5.2).
+        const uint32_t n_blocks_chk = (count + cpb - 1) / cpb;
+        const uint64_t pq_code_bytes =
+            static_cast<uint64_t>(n_blocks_chk) * bb;
+        if (has_filter && pq_code_bytes > 0 && fcb > 10ull * pq_code_bytes) {
+            spdlog::warn("[sextant] build_streaming_pca: leaf {} filter column "
+                         "data ({}B) > 10× PQ codes ({}B)", l, fcb, pq_code_bytes);
+        }
+
+        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits,
+                                               n_factors, summary_size, fcb);
+        if (npg > 512) {
+            spdlog::warn("[sextant] build_streaming_pca: leaf {} extent = {} "
+                         "pages (> 512)", l, npg);
+        }
         const PageId page = alloc.alloc_extent(file, npg);
         leaf_pages[l] = {page, npg};
 
         std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
         auto* lh = reinterpret_cast<TreeLeafHeader*>(buf.data());
+        lh->magic = kTreeLeafMagic;
         lh->count = count; lh->tombstone_count = 0; lh->m4 = m4;
         lh->pq_bits = scan_bits; lh->n_factors = n_factors;
         lh->block_bytes = bb; lh->codes_per_block = cpb; lh->extent_pages = npg;
+        lh->summary_size = summary_size;
+        lh->n_filter_columns = cfg.filter_schema.n_filter_columns();
+        // Phase E: allocate + build the payload extent for this leaf. The
+        // header pointers must be set before the CRC is computed below.
+        PageId payload_page = kInvalidPage;
+        uint32_t payload_npg = 0;
+        std::vector<uint8_t> pbuf;  // built when has payload
+        if (has_payload && !leaf.payload_lens.empty()) {
+            // Payload extent size: offsets + lengths + packed data.
+            uint64_t total_data = 0;
+            for (uint32_t i = 0; i < count; ++i)
+                total_data += leaf.payload_lens[i];
+            const uint64_t payload_bytes =
+                static_cast<uint64_t>(count) * 4 +  // offsets
+                static_cast<uint64_t>(count) * 4 +  // lengths
+                total_data;                          // data
+            payload_npg = static_cast<uint32_t>(
+                (payload_bytes + kPageSize - 1) / kPageSize);
+            payload_page = alloc.alloc_extent(file, payload_npg);
+
+            pbuf.assign(static_cast<size_t>(payload_npg) * kPageSize, 0);
+            uint32_t* offsets = reinterpret_cast<uint32_t*>(pbuf.data());
+            uint32_t* lengths = offsets + count;
+            uint8_t* pdata = reinterpret_cast<uint8_t*>(lengths + count);
+            uint32_t acc = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t plen = leaf.payload_lens[i];
+                offsets[i] = acc;
+                lengths[i] = plen;
+                std::memcpy(pdata + acc, leaf.payload_ptrs[i], plen);
+                acc += plen;
+            }
+        }
+        lh->payload_extent_page = payload_page;
+        lh->payload_extent_pages = payload_npg;
+        lh->summary_dirty = 0;
+        lh->next_dirty = kInvalidPage;
+
+        // Phase C: write the per-leaf filter summary (min/max + blooms).
+        if (summary_size > 0) {
+            write_filter_summary(buf.data() + leaf_filter_offset(),
+                                 summary_size, cfg.filter_schema, count,
+                                 leaf.filter_cols);
+            // Cache for bottom-up propagation to internal nodes.
+            leaf_summaries[l].resize(summary_size);
+            std::memcpy(leaf_summaries[l].data(),
+                        buf.data() + leaf_filter_offset(), summary_size);
+        }
 
         const uint32_t n_blocks = (count + cpb - 1) / cpb;
-        uint8_t* codes_out = buf.data() + leaf_codes_offset();
+        uint8_t* codes_out = buf.data() + leaf_codes_offset(summary_size);
         for (uint32_t b = 0; b < n_blocks; ++b) {
             const uint32_t base = b * cpb;
             uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
@@ -2515,29 +3343,55 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
             }
         }
         RowId* rids = reinterpret_cast<RowId*>(
-            buf.data() + leaf_rowids_offset(n_blocks, bb));
+            buf.data() + leaf_rowids_offset(summary_size, n_blocks, bb));
         std::memcpy(rids, leaf.row_ids.data(), count * sizeof(RowId));
+
+        // Phase C: write the filter column data region (after factors).
+        if (fcb > 0) {
+            const uint64_t fc_off =
+                leaf_factors_offset(summary_size, n_blocks, bb, count);
+            lh->filter_columns_offset = fc_off;
+            const uint64_t written = write_filter_columns(
+                buf.data() + fc_off, count, cfg.filter_schema, leaf.filter_cols);
+            if (written != fcb) {
+                throw Error(ErrorCode::CorruptIndex,
+                    "build_streaming_pca: filter column bytes mismatch "
+                    "(wrote " + std::to_string(written) + ", expected " +
+                    std::to_string(fcb) + ")");
+            }
+        } else {
+            lh->filter_columns_offset = 0;
+        }
+
+        lh->header_crc = header_crc(lh, offsetof(TreeLeafHeader, header_crc));
         file.write_pages(page, npg, buf.data());
+
+        // Phase E: write the payload extent (allocated + built above).
+        if (payload_page != kInvalidPage && payload_npg > 0)
+            file.write_pages(payload_page, payload_npg, pbuf.data());
     }
 
-    // Level-1 nodes + root node + codebook + config (same as build_streaming).
-    std::vector<RootChildData> root_child_data(k_root);
+    // Write the per-fine-centroid internal nodes (depth=2: these are L1 nodes
+    // that the root points to; depth=3: these are L2 nodes grouped under L1).
+    struct L2PageInfo { PageId page; uint32_t pages; };
+    std::vector<L2PageInfo> l2_pages(k_root, {kInvalidPage, 0});
+    // Per-L2-node summary (OR of all child leaf summaries) for propagation
+    // to L1/root. Indexed by fine centroid id c.
+    std::vector<std::vector<uint8_t>> l2_summaries(k_root);
     for (uint32_t c = 0; c < k_root; ++c) {
-        root_child_data[c].centroid = root_centroids_fp16[c];
         const auto& leaves = root_to_leaves[c];
-        if (leaves.empty()) {
-            root_child_data[c].is_leaf = 0;
-            root_child_data[c].page = kInvalidPage;
-            root_child_data[c].pages = 0;
-            continue;
-        }
+        if (leaves.empty()) continue;  // empty group → no node
         const uint32_t nch = static_cast<uint32_t>(leaves.size());
-        const uint32_t npg = node_extent_pages(dim, nch);
+        const uint32_t npg = node_extent_pages(dim, nch, summary_size);
         const PageId page = alloc.alloc_extent(file, npg);
         std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
         auto* nh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+        nh->magic = kTreeNodeMagic;
         nh->n_children = nch; nh->extent_pages = npg; nh->dim = dim;
-        const uint32_t cesize = child_entry_size(dim);
+        nh->magic_pad = 0;
+        const uint32_t cesize = child_entry_size(dim, summary_size);
+        // The summary region sits after the inline FP16 centroid.
+        const uint32_t summary_off = sizeof(ChildEntry) + dim * sizeof(float16_t);
         uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
         for (uint32_t j = 0; j < nch; ++j) {
             const uint32_t li = leaves[j];
@@ -2547,23 +3401,151 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
             ce->is_leaf = 1;
             float16_t* cent = reinterpret_cast<float16_t*>(p + sizeof(ChildEntry));
             std::memcpy(cent, all_leaves[li].centroid.data(), dim*sizeof(float16_t));
+            // Propagate the child leaf's summary into the child entry.
+            if (summary_size > 0 && li < leaf_summaries.size() &&
+                !leaf_summaries[li].empty()) {
+                std::memcpy(p + summary_off, leaf_summaries[li].data(),
+                            summary_size);
+            }
             p += cesize;
         }
+        // Compute this L2 node's own summary (OR of all child leaf summaries)
+        // for propagation to L1/root.
+        if (summary_size > 0) {
+            l2_summaries[c].resize(summary_size);
+            init_empty_summary(l2_summaries[c].data(), summary_size,
+                               cfg.filter_schema);
+            for (uint32_t j = 0; j < nch; ++j) {
+                const uint32_t li = leaves[j];
+                if (li < leaf_summaries.size() && !leaf_summaries[li].empty())
+                    merge_filter_summary(l2_summaries[c].data(),
+                                         leaf_summaries[li].data(),
+                                         summary_size);
+            }
+        }
+        nh->header_crc = header_crc(nh, offsetof(TreeNodeHeader, header_crc));
         file.write_pages(page, npg, buf.data());
-        root_child_data[c].is_leaf = 0;
-        root_child_data[c].page = page;
-        root_child_data[c].pages = npg;
+        l2_pages[c] = {page, npg};
     }
 
-    const uint32_t root_npg = node_extent_pages(dim, k_root);
+    // Build the root's child list. For depth=2 the root points directly to the
+    // per-fine-centroid nodes (L1). For depth=3 we insert an extra level: each
+    // super-group becomes an L1 node whose children are the L2 nodes in that
+    // group, and the root points to the k_l1 L1 nodes.
+    std::vector<RootChildData> root_child_data;
+    // Per-L1-node summary (OR of all child L2 summaries), indexed by group g.
+    // Only populated for depth=3; consumed by the root write loop.
+    std::vector<std::vector<uint8_t>> l1_summaries;
+    if (depth == 3) {
+        // Group fine centroids (L2 nodes) by super-group, preserving ascending
+        // fine-centroid id within each group.
+        std::vector<std::vector<uint32_t>> groups(k_l1);
+        for (uint32_t c = 0; c < k_root; ++c) groups[super_group[c]].push_back(c);
+
+        // Project each super-centroid back to FP16 original space (inline root
+        // child centroid; routing at the root uses PCA, but the tree stores an
+        // FP16 centroid in the ChildEntry).
+        auto project_pca_to_fp16 = [&](const std::vector<float>& pca,
+                                       std::vector<float16_t>& out) {
+            out.resize(dim);
+            for (uint16_t d = 0; d < dim; ++d) {
+                double val = mean[d];
+                for (uint32_t k = 0; k < pca_dims; ++k)
+                    val += pca[k] * rotation[k * dim + d];
+                out[d] = static_cast<float16_t>(val);
+            }
+        };
+
+        root_child_data.resize(k_l1);
+        if (summary_size > 0) l1_summaries.resize(k_l1);
+        const uint32_t l1_summary_off =
+            sizeof(ChildEntry) + dim * sizeof(float16_t);
+        for (uint32_t g = 0; g < k_l1; ++g) {
+            project_pca_to_fp16(super_centroids_pca[g],
+                                root_child_data[g].centroid);
+            // Collect the non-empty L2 nodes in this group.
+            std::vector<uint32_t> members;
+            for (uint32_t c : groups[g]) {
+                if (l2_pages[c].page != kInvalidPage) members.push_back(c);
+            }
+            if (members.empty()) {
+                root_child_data[g].is_leaf = 0;
+                root_child_data[g].page = kInvalidPage;
+                root_child_data[g].pages = 0;
+                continue;
+            }
+            const uint32_t nch = static_cast<uint32_t>(members.size());
+            const uint32_t npg = node_extent_pages(dim, nch, summary_size);
+            const PageId page = alloc.alloc_extent(file, npg);
+            std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
+            auto* nh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+            nh->magic = kTreeNodeMagic;
+            nh->n_children = nch; nh->extent_pages = npg; nh->dim = dim;
+            nh->magic_pad = 0;
+            const uint32_t cesize = child_entry_size(dim, summary_size);
+            uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
+            for (uint32_t c : members) {
+                auto* ce = reinterpret_cast<ChildEntry*>(p);
+                ce->child_page = l2_pages[c].page;
+                ce->child_pages = l2_pages[c].pages;
+                ce->is_leaf = 0;  // L2 node → internal
+                float16_t* cent = reinterpret_cast<float16_t*>(
+                    p + sizeof(ChildEntry));
+                std::memcpy(cent, root_centroids_fp16[c].data(),
+                            dim * sizeof(float16_t));
+                // Propagate the child L2 node's summary into the child entry.
+                if (summary_size > 0 && c < l2_summaries.size() &&
+                    !l2_summaries[c].empty()) {
+                    std::memcpy(p + l1_summary_off, l2_summaries[c].data(),
+                                summary_size);
+                }
+                p += cesize;
+            }
+            // Compute this L1 node's own summary (OR of all child L2
+            // summaries) for propagation to the root.
+            if (summary_size > 0) {
+                l1_summaries[g].resize(summary_size);
+                init_empty_summary(l1_summaries[g].data(), summary_size,
+                                   cfg.filter_schema);
+                for (uint32_t c : members) {
+                    if (c < l2_summaries.size() && !l2_summaries[c].empty())
+                        merge_filter_summary(l1_summaries[g].data(),
+                                             l2_summaries[c].data(),
+                                             summary_size);
+                }
+            }
+            nh->header_crc = header_crc(nh, offsetof(TreeNodeHeader, header_crc));
+            file.write_pages(page, npg, buf.data());
+            root_child_data[g].is_leaf = 0;
+            root_child_data[g].page = page;
+            root_child_data[g].pages = npg;
+        }
+    } else {
+        // depth=2: root points directly to the per-fine-centroid nodes.
+        root_child_data.resize(k_root);
+        for (uint32_t c = 0; c < k_root; ++c) {
+            root_child_data[c].centroid = root_centroids_fp16[c];
+            root_child_data[c].is_leaf = 0;
+            root_child_data[c].page = l2_pages[c].page;
+            root_child_data[c].pages = l2_pages[c].pages;
+        }
+    }
+
+    // Root node: depth=3 → k_l1 children; depth=2 → k_root children.
+    const uint32_t root_n_children = static_cast<uint32_t>(root_child_data.size());
+    const uint32_t root_npg = node_extent_pages(dim, root_n_children, summary_size);
     const PageId root_page = alloc.alloc_extent(file, root_npg);
     {
         std::vector<uint8_t> buf(static_cast<size_t>(root_npg) * kPageSize, 0);
         auto* rh = reinterpret_cast<TreeNodeHeader*>(buf.data());
-        rh->n_children = k_root; rh->extent_pages = root_npg; rh->dim = dim;
-        const uint32_t cesize = child_entry_size(dim);
+        rh->magic = kTreeNodeMagic;
+        rh->n_children = root_n_children; rh->extent_pages = root_npg;
+        rh->dim = dim; rh->magic_pad = 0;
+        const uint32_t cesize = child_entry_size(dim, summary_size);
+        const uint32_t root_summary_off =
+            sizeof(ChildEntry) + dim * sizeof(float16_t);
         uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
-        for (uint32_t c = 0; c < k_root; ++c) {
+        for (uint32_t c = 0; c < root_n_children; ++c) {
             auto* ce = reinterpret_cast<ChildEntry*>(p);
             ce->child_page = root_child_data[c].page;
             ce->child_pages = root_child_data[c].pages;
@@ -2571,8 +3553,20 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
             float16_t* cent = reinterpret_cast<float16_t*>(p + sizeof(ChildEntry));
             std::memcpy(cent, root_child_data[c].centroid.data(),
                         dim * sizeof(float16_t));
+            // Propagate the child subtree's summary into the root child entry.
+            // depth=3 → child is an L1 node (summary indexed by group c).
+            // depth=2 → child is an L2 node (summary indexed by fine centroid c).
+            if (summary_size > 0) {
+                const auto* src = (depth == 3)
+                    ? ((c < l1_summaries.size() && !l1_summaries[c].empty())
+                          ? l1_summaries[c].data() : nullptr)
+                    : ((c < l2_summaries.size() && !l2_summaries[c].empty())
+                          ? l2_summaries[c].data() : nullptr);
+                if (src) std::memcpy(p + root_summary_off, src, summary_size);
+            }
             p += cesize;
         }
+        rh->header_crc = header_crc(rh, offsetof(TreeNodeHeader, header_crc));
         file.write_pages(root_page, root_npg, buf.data());
     }
 
@@ -2592,7 +3586,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     manifest.quantizer_type = params.quantizer_type;
     manifest.prq_nsplits = (params.quantizer_type == "prq")
         ? static_cast<uint32_t>(static_cast<ProductResidualQuantizer&>(*quantizer).nsplits()) : 0;
-    manifest.depth = depth; manifest.k_root = k_root;
+    manifest.depth = depth; manifest.k_root = k_root; manifest.k_l1 = k_l1;
     manifest.leaf_capacity = leaf_cap; manifest.n_leaves = n_leaves_total;
     manifest.n_probe_l0 = cfg.n_probe_l0 > 0 ? cfg.n_probe_l0
         : static_cast<uint32_t>(std::max(1.0, 2.0*std::sqrt(double(k_root))));
@@ -2601,6 +3595,8 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     manifest.median_lid = cfg.median_lid;
     manifest.pca_dims = pca_dims;  // enable PCA routing at search time
     manifest.balance_factor = params.partition_balance_factor;
+    manifest.schema = cfg.filter_schema;
+    manifest.summary_size = summary_size;
 
     // --- Write PCA routing blob ---
     // Layout: [pca_dims:u32][proj:pca_dims×dim f32][mean_proj:pca_dims f32]
@@ -2617,10 +3613,16 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         // Mean projection (pca_dims).
         for (uint32_t k = 0; k < pca_dims; ++k)
             pca_blob.push_back(mean_proj[k]);
-        // Root centroids in PCA space (k_root × pca_dims).
-        for (uint32_t c = 0; c < k_root; ++c)
+        // Root centroids in PCA space.
+        // depth>=3: k_l1 super-cluster centroids (root branching = k_l1).
+        // depth<=2: k_root fine centroids (root branching = k_root).
+        const uint32_t n_root_cents = (depth >= 3) ? k_l1 : k_root;
+        for (uint32_t c = 0; c < n_root_cents; ++c) {
+            const auto& src = (depth >= 3) ? super_centroids_pca[c]
+                                           : root_centroids_pca[c];
             for (uint32_t k = 0; k < pca_dims; ++k)
-                pca_blob.push_back(root_centroids_pca[c][k]);
+                pca_blob.push_back(src[k]);
+        }
         // Leaf centroids in PCA space (n_leaves × pca_dims).
         for (uint32_t l = 0; l < n_leaves_total; ++l) {
             // Project the leaf's original-space FP16 centroid to PCA space.
@@ -2641,6 +3643,21 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         file.write_pages(pca_page, pca_npg, b.data());
     }
 
+    // --- Write the cardinality table blob (Phase D) ---
+    PageId card_page = kInvalidPage;
+    uint32_t card_npg = 0;
+    if (!cfg.filter_schema.empty() && !card_table.empty()) {
+        auto card_blob = card_table.serialize();
+        const uint64_t card_bytes = card_blob.size();
+        card_npg = static_cast<uint32_t>((card_bytes + kPageSize - 1) / kPageSize);
+        if (card_npg > 0) {
+            card_page = alloc.alloc_extent(file, card_npg);
+            std::vector<uint8_t> b(card_npg * kPageSize, 0);
+            std::memcpy(b.data(), card_blob.data(), card_bytes);
+            file.write_pages(card_page, card_npg, b.data());
+        }
+    }
+
     std::string cfg_toml = manifest_to_toml(manifest);
     const uint32_t cfg_npg = static_cast<uint32_t>((cfg_toml.size()+kPageSize-1)/kPageSize);
     const PageId cfg_page = alloc.alloc_extent(file, cfg_npg);
@@ -2659,14 +3676,15 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     sb.set_codebook(cb_page, cb_npg);
     sb.set_config(cfg_page, cfg_npg);
     sb.set_pca(pca_page, pca_npg);
+    sb.set_cardinality(card_page, card_npg);
     sb.commit(file);
     file.sync();
 
     const auto t1 = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(t1 - t0).count();
-    spdlog::info("[sextant] build_streaming_pca complete: N={} k_root={} "
-                 "n_leaves={} in {:.2f}s (write={:.2f}s, file={} pages)",
-                 n, k_root, n_leaves_total, secs,
+    spdlog::info("[sextant] build_streaming_pca complete: N={} depth={} k_root={} "
+                 "k_l1={} n_leaves={} in {:.2f}s (write={:.2f}s, file={} pages)",
+                 n, depth, k_root, k_l1, n_leaves_total, secs,
                  std::chrono::duration<double>(t1 - t_write).count(),
                  file.num_pages());
 
@@ -2706,6 +3724,7 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
         std::fclose(f);
         throw Error(ErrorCode::InvalidParam, "IVFTreeIndex::build: empty fbin");
     }
+    const uint32_t summary_size = cfg.filter_schema.summary_size();
 
     spdlog::info("[sextant] build_tree: N={} dim={} → '{}'", n, dim, output_path);
 
@@ -2725,6 +3744,7 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
     }
     const uint32_t n_leaves = std::max(1u, static_cast<uint32_t>(
         (n + leaf_cap - 1) / leaf_cap));
+    const MetricKind metric = params.metric;
 
     spdlog::info("[sextant] build_tree: k_root={} n_leaves={} leaf_cap={} m4={}",
                  k_root, n_leaves, leaf_cap, m4);
@@ -2951,9 +3971,12 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
                     sum[d] += leaf_centroids_f32[l * dim + d];
                 }
             }
-            const double inv = 1.0 / root_groups[c].size();
+            // Spherical k-means: compute mean, renormalize for IP metric.
+            std::vector<float> centroid_f32(dim);
+            compute_centroid_spherical(sum.data(), root_groups[c].size(), dim,
+                                       metric, centroid_f32.data());
             for (uint16_t d = 0; d < dim; ++d) {
-                root_centroids_f32[c * dim + d] = static_cast<float>(sum[d] * inv);
+                root_centroids_f32[c * dim + d] = centroid_f32[d];
             }
         }
     }
@@ -3022,7 +4045,8 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
             continue;
         }
 
-        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits, n_factors);
+        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits,
+                                               n_factors, summary_size);
         const PageId page = alloc.alloc_extent(file, npg);
         leaf_infos[l] = {page, npg};
 
@@ -3031,6 +4055,7 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
 
         // Header.
         auto* lh = reinterpret_cast<TreeLeafHeader*>(buf.data());
+        lh->magic = kTreeLeafMagic;
         lh->count = count;
         lh->tombstone_count = 0;
         lh->m4 = m4;
@@ -3039,10 +4064,17 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
         lh->block_bytes = bb;
         lh->codes_per_block = cpb;
         lh->extent_pages = npg;
+        lh->summary_size = summary_size;
+        lh->n_filter_columns = cfg.filter_schema.n_filter_columns();
+        lh->filter_columns_offset = 0;
+        lh->payload_extent_page = kInvalidPage;
+        lh->payload_extent_pages = 0;
+        lh->summary_dirty = 0;
+        lh->next_dirty = kInvalidPage;
 
         // FastScan code blocks.
         const uint32_t n_blocks = (count + cpb - 1) / cpb;
-        uint8_t* codes_out = buf.data() + leaf_codes_offset();
+        uint8_t* codes_out = buf.data() + leaf_codes_offset(summary_size);
 
         // For RaBitQ: decode the leaf centroid and re-encode each vector
         // relative to it. For PQ/PRQ: use the pre-encoded absolute codes.
@@ -3135,7 +4167,7 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
 
         // Row IDs.
         RowId* rids = reinterpret_cast<RowId*>(
-            buf.data() + leaf_rowids_offset(n_blocks, bb));
+            buf.data() + leaf_rowids_offset(summary_size, n_blocks, bb));
         for (uint32_t i = 0; i < count; ++i) {
             rids[i] = static_cast<RowId>(members[i]);
         }
@@ -3143,12 +4175,13 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
         // Factors (RaBitQ only).
         if (n_factors > 0) {
             float* fac = reinterpret_cast<float*>(
-                buf.data() + leaf_factors_offset(n_blocks, bb, count));
+                buf.data() + leaf_factors_offset(summary_size, n_blocks, bb, count));
             // rabitq_factors was populated during the per-vector re-encoding above.
             std::memcpy(fac, rabitq_factors.data(),
                         rabitq_factors.size() * sizeof(float));
         }
 
+        lh->header_crc = header_crc(lh, offsetof(TreeLeafHeader, header_crc));
         file.write_pages(page, npg, buf.data());
     }
 
@@ -3203,17 +4236,19 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
 
             // Build the level-1 internal node.
             const uint32_t n_children = static_cast<uint32_t>(group.size());
-            const uint32_t npg = node_extent_pages(dim, n_children);
+            const uint32_t npg = node_extent_pages(dim, n_children, summary_size);
             const PageId page = alloc.alloc_extent(file, npg);
 
             std::vector<uint8_t> buf(static_cast<size_t>(npg) * kPageSize, 0);
             auto* nh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+            nh->magic = kTreeNodeMagic;
             nh->n_children = n_children;
             nh->extent_pages = npg;
             nh->dim = dim;
             nh->reserved = 0;
+            nh->magic_pad = 0;
 
-            const uint32_t cesize = child_entry_size(dim);
+            const uint32_t cesize = child_entry_size(dim, summary_size);
             uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
             for (uint32_t j = 0; j < n_children; ++j) {
                 const uint32_t l = group[j];
@@ -3231,6 +4266,7 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
                 p += cesize;
             }
 
+            nh->header_crc = header_crc(nh, offsetof(TreeNodeHeader, header_crc));
             file.write_pages(page, npg, buf.data());
 
             root_child_data[c].is_leaf = 0;
@@ -3240,18 +4276,20 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
     }
 
     // Write the root node itself.
-    const uint32_t root_npg = node_extent_pages(dim, k_root);
+    const uint32_t root_npg = node_extent_pages(dim, k_root, summary_size);
     const PageId root_page = alloc.alloc_extent(file, root_npg);
 
     {
         std::vector<uint8_t> buf(static_cast<size_t>(root_npg) * kPageSize, 0);
         auto* rh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+        rh->magic = kTreeNodeMagic;
         rh->n_children = k_root;
         rh->extent_pages = root_npg;
         rh->dim = dim;
         rh->reserved = 0;
+        rh->magic_pad = 0;
 
-        const uint32_t cesize = child_entry_size(dim);
+        const uint32_t cesize = child_entry_size(dim, summary_size);
         uint8_t* p = buf.data() + sizeof(TreeNodeHeader);
         for (uint32_t c = 0; c < k_root; ++c) {
             auto* ce = reinterpret_cast<ChildEntry*>(p);
@@ -3265,6 +4303,7 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
                         dim * sizeof(float16_t));
             p += cesize;
         }
+        rh->header_crc = header_crc(rh, offsetof(TreeNodeHeader, header_crc));
         file.write_pages(root_page, root_npg, buf.data());
     }
 
@@ -3304,6 +4343,8 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
     manifest.adaptive_probe_gap = cfg.adaptive_probe_gap;
     manifest.median_lid = cfg.median_lid;
     manifest.balance_factor = params.partition_balance_factor;
+    manifest.schema = cfg.filter_schema;
+    manifest.summary_size = summary_size;
 
     std::string cfg_toml = manifest_to_toml(manifest);
     const uint32_t cfg_npg = static_cast<uint32_t>(
@@ -3348,6 +4389,110 @@ BuildResult IVFTreeIndex::build(const std::string& base_path,
     result.pq_bits = scan_bits;
     result.build_time_sec = secs;
     return result;
+}
+
+// ===========================================================================
+// Brute-force PQ-decode fallback for extreme low selectivity (<1%).
+// ===========================================================================
+
+std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
+    const float* query, uint32_t k, const SearchConfig& config,
+    const std::vector<uint32_t>& pred_col_indices,
+    std::vector<std::pair<const uint8_t*, uint32_t>>* /*payload_locs*/) const {
+
+    const MetricKind metric = quantizer_->metric();
+    const uint32_t code_sz = quantizer_->code_size();
+    const uint32_t summary_size = manifest_.summary_size;
+    const uint16_t m4 = manifest_.m4;
+    const uint8_t pq_bits = manifest_.scan_pq_bits;
+
+    // Walk the tree to collect ALL leaf pages. We need a full tree walk,
+    // not just routed candidates — at extreme low selectivity, the matching
+    // leaves may be in subtrees that routing wouldn't visit.
+    struct LeafInfo { PageId page; uint64_t pages; };
+    std::vector<LeafInfo> all_leaves;
+
+    const uint32_t cesize = child_entry_size(manifest_.dim, summary_size);
+
+    // Simple DFS from root.
+    std::vector<PageId> node_stack;
+    node_stack.push_back(superblock_.root_node_page());
+
+    while (!node_stack.empty()) {
+        const PageId page = node_stack.back();
+        node_stack.pop_back();
+        if (page == kInvalidPage) continue;
+        const uint8_t* node_ptr = mmap_base_ +
+            static_cast<uint64_t>(page) * kPageSize;
+        const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
+        const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
+        for (uint32_t j = 0; j < nh->n_children; ++j) {
+            const auto* ce = reinterpret_cast<const ChildEntry*>(p);
+            if (ce->child_page == kInvalidPage) { p += cesize; continue; }
+            if (ce->is_leaf) {
+                all_leaves.push_back({ce->child_page, ce->child_pages});
+            } else {
+                node_stack.push_back(ce->child_page);
+            }
+            p += cesize;
+        }
+    }
+
+    // Scan each leaf: check summary, then scan filter columns for exact matches.
+    std::vector<Candidate> results;
+    std::vector<uint8_t> code_buf(code_sz);
+    std::vector<float> decoded_vec(manifest_.dim);
+
+    for (const auto& li : all_leaves) {
+        const uint8_t* leaf_ptr = mmap_base_ +
+            static_cast<uint64_t>(li.page) * kPageSize;
+        const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+        const uint32_t count = lh->count;
+        if (count == 0) continue;
+
+        // Summary check: skip leaves that can't match.
+        const uint8_t* summary = leaf_ptr + leaf_filter_offset();
+        if (!summary_may_match(summary, summary_size, manifest_.schema,
+                                config.predicates, pred_col_indices))
+            continue;
+
+        // Parse filter columns for this leaf.
+        auto layout = LeafFilterLayout::compute(leaf_ptr, m4, pq_bits,
+                                                  lh->n_factors, summary_size);
+        auto col_views = parse_filter_columns(layout.filter_base, count,
+                                                manifest_.schema);
+
+        // Scan all rows: find exact matches.
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!eval_all_predicates(col_views, manifest_.schema, i,
+                                       config.predicates, pred_col_indices))
+                continue;
+
+            // Exact match — decode PQ code and compute distance.
+            extract_code_from_leaf(leaf_ptr, i, summary_size, m4, pq_bits,
+                                    layout.codes_per_block, layout.block_bytes,
+                                    code_buf.data());
+            quantizer_->decode_code(code_buf.data(), decoded_vec.data());
+            const float dist = (metric == MetricKind::InnerProduct)
+                ? -simd::dot_f32(query, decoded_vec.data(), manifest_.dim)
+                :  simd::l2sq_f32(query, decoded_vec.data(), manifest_.dim);
+            results.push_back({layout.row_ids[i], dist});
+        }
+    }
+
+    // Sort by distance, return top-k.
+    if (results.size() > k) {
+        std::nth_element(results.begin(), results.begin() + k, results.end(),
+                          [](const Candidate& a, const Candidate& b) {
+                              return a.dist < b.dist;
+                          });
+        results.resize(k);
+    }
+    std::sort(results.begin(), results.end(),
+              [](const Candidate& a, const Candidate& b) {
+                  return a.dist < b.dist;
+              });
+    return results;
 }
 
 }  // namespace sextant::tree

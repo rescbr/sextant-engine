@@ -24,6 +24,8 @@
 #include "sextant/index.hpp"
 #include "sextant/logging.hpp"
 #include "sextant/searcher.hpp"
+#include "tree/fsck.hpp"
+#include "tree/filter_data_io.hpp"
 #include "tree/ivf_tree_index.hpp"
 
 #include "algo/vamana_core.hpp"
@@ -561,6 +563,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
     p.add<uint32_t>("pca-dims", 0, "PCA dimensions (default 32)", false, 32);
     p.add<uint32_t>("max-lloyd-passes", 0, "Max streaming Lloyd passes (default 10)", false, 10);
+    p.add<std::string>("filter-data", 0, "Filter column data sidecar (.fdat)", false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
     p.parse_check(argc, argv);
 
@@ -583,6 +586,22 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     const std::string metric = p.get<std::string>("metric");
     cfg.params.metric = (metric == "ip") ? MetricKind::InnerProduct
                                           : MetricKind::L2Sq;
+
+    // Load filter column data sidecar (.fdat) if provided.
+    const std::string fdat_path = p.get<std::string>("filter-data");
+    if (!fdat_path.empty()) {
+        auto fdat = tree::read_filter_data(fdat_path);
+        cfg.filter_schema = fdat.schema;
+        cfg.filter_column_data = std::move(fdat.cols);
+        if (fdat.has_payload) {
+            cfg.filter_schema.has_payload = true;
+            cfg.payload_data = fdat.payload_data.data();
+            cfg.payload_offsets = fdat.payload_offsets.data();
+        }
+        std::cerr << "loaded filter data: " << fdat.n_rows << " rows, "
+                  << fdat.schema.columns.size() << " columns"
+                  << (fdat.has_payload ? ", with payload" : "") << "\n";
+    }
 
     auto result = tree::IVFTreeIndex::build_streaming_pca(
         p.get<std::string>("input"), p.get<std::string>("index"), cfg);
@@ -667,7 +686,15 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
     p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
+    p.add<std::string>("filter", 0,
+        "Filter predicate (repeatable via multiple --filter). "
+        "Format: column:op:value[:value2]. Ops: eq,ne,lt,le,gt,ge,between,prefix,in,contains. "
+        "Numeric: year:eq:2020 year:between:2010:2020 "
+        "String: category:eq:cs.AI category:prefix:cs. "
+        "Set: tags:contains:ml", false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.add("with-payload", 0,
+          "Fetch + print opaque payload blobs with results");
     p.parse_check(argc, argv);
 
     {
@@ -676,6 +703,8 @@ int cmd_tree_search(int argc, char* argv[]) {
         else if (lvl == "warn") set_log_level(LogLevel::Warn);
         else if (lvl == "error") set_log_level(LogLevel::Error);
     }
+
+    const bool with_payload = p.exist("with-payload");
 
     auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"));
 
@@ -699,6 +728,82 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.n_probe_ln = p.get<uint32_t>("n-probe-ln");
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
+
+    // Parse --filter predicates.
+    {
+        const std::string filter_str = p.get<std::string>("filter");
+        if (!filter_str.empty()) {
+            // Split by ':' — format is column:op:value[:value2].
+            // For 'in' op, value can be comma-separated.
+            std::vector<std::string> parts;
+            std::string cur;
+            for (char ch : filter_str) {
+                if (ch == ':') { parts.push_back(cur); cur.clear(); }
+                else cur += ch;
+            }
+            if (!cur.empty()) parts.push_back(cur);
+
+            if (parts.size() >= 3) {
+                Predicate pred;
+                pred.column = parts[0];
+                const std::string& op_str = parts[1];
+                const std::string& val_str = parts[2];
+
+                if (op_str == "eq")       pred.op = PredicateOp::Eq;
+                else if (op_str == "ne")  pred.op = PredicateOp::NotEq;
+                else if (op_str == "lt")  pred.op = PredicateOp::Lt;
+                else if (op_str == "le")  pred.op = PredicateOp::Le;
+                else if (op_str == "gt")  pred.op = PredicateOp::Gt;
+                else if (op_str == "ge")  pred.op = PredicateOp::Ge;
+                else if (op_str == "between") {
+                    pred.op = PredicateOp::Between;
+                    if (parts.size() >= 4) {
+                        pred.value = std::stod(val_str);
+                        pred.value2 = std::stod(parts[3]);
+                    }
+                }
+                else if (op_str == "prefix") pred.op = PredicateOp::Prefix;
+                else if (op_str == "in")     pred.op = PredicateOp::In;
+                else if (op_str == "contains") pred.op = PredicateOp::Contains;
+                else {
+                    std::cerr << "Unknown filter op: " << op_str << "\n";
+                    return 1;
+                }
+
+                // Set value based on op type.
+                if (pred.op == PredicateOp::Between) {
+                    // already set above
+                } else if (pred.op == PredicateOp::Prefix ||
+                           pred.op == PredicateOp::Eq ||
+                           pred.op == PredicateOp::NotEq) {
+                    // These could be string or numeric. Try numeric first.
+                    try { pred.value = std::stod(val_str); }
+                    catch (...) { pred.str_value = val_str; }
+                } else if (pred.op == PredicateOp::In) {
+                    // Comma-separated values.
+                    std::string s;
+                    for (char ch : val_str) {
+                        if (ch == ',') { pred.values.push_back(s); s.clear(); }
+                        else s += ch;
+                    }
+                    if (!s.empty()) pred.values.push_back(s);
+                } else if (pred.op == PredicateOp::Contains) {
+                    pred.str_value = val_str;
+                } else {
+                    // Numeric comparison ops.
+                    try { pred.value = std::stod(val_str); }
+                    catch (...) {
+                        std::cerr << "Non-numeric value for numeric op: " << val_str << "\n";
+                        return 1;
+                    }
+                }
+
+                scfg.predicates.push_back(std::move(pred));
+                std::cerr << "filter: " << pred.column << " " << op_str
+                          << " " << val_str << "\n";
+            }
+        }
+    }
 
     std::ifstream qf(p.get<std::string>("query"), std::ios::binary);
     qf.seekg(8);
@@ -754,13 +859,22 @@ int cmd_tree_search(int argc, char* argv[]) {
     qf.close();
 
     std::vector<std::vector<Candidate>> all_results(qh.n);
+    using PayloadLoc = std::pair<const uint8_t*, uint32_t>;
+    std::vector<std::vector<PayloadLoc>> all_payload_locs;
+    if (with_payload) all_payload_locs.resize(qh.n);
 
     const auto t0 = std::chrono::steady_clock::now();
 
     if (num_threads <= 1) {
         for (uint32_t qi = 0; qi < qh.n; ++qi) {
-            all_results[qi] = idx->search(
-                &queries[static_cast<size_t>(qi) * qh.dim], k, scfg);
+            if (with_payload) {
+                all_results[qi] = idx->search(
+                    &queries[static_cast<size_t>(qi) * qh.dim], k, scfg,
+                    &all_payload_locs[qi]);
+            } else {
+                all_results[qi] = idx->search(
+                    &queries[static_cast<size_t>(qi) * qh.dim], k, scfg);
+            }
         }
     } else {
         // Query-level parallelism: each query is independent.
@@ -771,8 +885,14 @@ int cmd_tree_search(int argc, char* argv[]) {
                 while (true) {
                     const uint32_t qi = next_qi.fetch_add(1);
                     if (qi >= qh.n) break;
-                    all_results[qi] = idx->search(
-                        &queries[static_cast<size_t>(qi) * qh.dim], k, scfg);
+                    if (with_payload) {
+                        all_results[qi] = idx->search(
+                            &queries[static_cast<size_t>(qi) * qh.dim], k, scfg,
+                            &all_payload_locs[qi]);
+                    } else {
+                        all_results[qi] = idx->search(
+                            &queries[static_cast<size_t>(qi) * qh.dim], k, scfg);
+                    }
                 }
             }));
         }
@@ -789,8 +909,21 @@ int cmd_tree_search(int argc, char* argv[]) {
             }
             ++total_queries;
         }
-        for (const auto& c : results) {
-            *out << qi << '\t' << c.row_id << '\t' << c.dist << '\n';
+        for (uint32_t ri = 0; ri < results.size(); ++ri) {
+            const auto& c = results[ri];
+            *out << qi << '\t' << c.row_id << '\t' << c.dist;
+            if (with_payload) {
+                auto blob = idx->fetch_payload(all_payload_locs[qi][ri].first,
+                                                all_payload_locs[qi][ri].second);
+                *out << '\t' << blob.size();
+                // Hex-encode the payload (handles arbitrary binary content).
+                for (char bch : blob) {
+                    const uint8_t b = static_cast<uint8_t>(bch);
+                    *out << "0123456789abcdef"[b >> 4]
+                         << "0123456789abcdef"[b & 0x0f];
+                }
+            }
+            *out << '\n';
         }
     }
 
@@ -849,6 +982,26 @@ int cmd_insert(int argc, char* argv[]) {
     return 0;
 }
 
+int cmd_fsck(int argc, char* argv[]) {
+    cmdline::parser p;
+    p.add<std::string>("file", 0, "Tree index file", true);
+    p.add<bool>("repair", 0, "Rebuild bitmap/free-list from tree walk", false,
+                false);
+    p.parse_check(argc, argv);
+
+    const std::string file_path = p.get<std::string>("file");
+    const bool repair = p.get<bool>("repair");
+
+    auto result = sextant::tree::fsck(file_path, repair);
+    std::cout << result.summary();
+    if (!result.all_ok()) {
+        std::cout << "\nfsck: ERRORS FOUND\n";
+        return 1;
+    }
+    std::cout << "\nfsck: OK\n";
+    return 0;
+}
+
 void print_usage() {
     std::cerr << sextant::version_string("sextant") << "\n\n"
               << "Usage: sextant <command> [options]\n"
@@ -880,7 +1033,8 @@ void print_usage() {
               << "             --pq-segments --pq-bits --pq-max-distortion --threads\n"
               << "             --log-level\n"
               << "  search     Search an index with query vectors\n"
-              << "  insert     Insert a single vector into an index\n";
+              << "  insert     Insert a single vector into an index\n"
+              << "  fsck       Check a tree index file. --repair rebuilds the bitmap/free-list.\n";
 }
 
 }  // namespace
@@ -924,6 +1078,8 @@ int main(int argc, char* argv[]) {
             return cmd_tree_search(sub_argc, sub_argv.data());
         } else if (cmd == "insert") {
             return cmd_insert(sub_argc, sub_argv.data());
+        } else if (cmd == "fsck") {
+            return cmd_fsck(sub_argc, sub_argv.data());
         } else if (cmd == "analyze") {
             return run_analyze(sub_argc, sub_argv.data());
         } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {

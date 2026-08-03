@@ -27,6 +27,9 @@ test_sources = [
     'test_partition.cpp',
     'test_tree_phase0.cpp',
     'test_tree_phase1.cpp',
+    'test_tree_estimator.cpp',
+    'test_tree_filter.cpp',
+    'test_fsck.cpp',
 ]
 
 foreach src : test_sources

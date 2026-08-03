@@ -7,6 +7,7 @@
 /// Phase 1 implements FbinSource; Phase 2 implements DuckDBChunkSource.
 
 #include <sextant/types.hpp>
+#include <sextant/schema.hpp>
 
 namespace sextant {
 
@@ -35,6 +36,10 @@ public:
     /// the O(N) sequential reservoir scan. When empty, callers fall back to
     /// Algorithm R reservoir sampling over next().
     virtual std::string path() const { return {}; }
+
+    /// Filter schema for this source. Default: empty (no filter columns).
+    /// Sources that provide filter data override this.
+    virtual Schema schema() const { return {}; }
 };
 
 }  // namespace sextant

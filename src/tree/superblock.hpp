@@ -72,9 +72,12 @@ struct SuperblockDisk {
     PageId   pca_page;               // PCA blob start (projection + centroids)
     uint32_t pca_pages;              // PCA blob extent length
 
+    // Cardinality table (0 pages = no cardinality data)
+    PageId   cardinality_page;       // per-value frequency blob (selectivity estimation)
+    uint32_t cardinality_pages;      // cardinality extent length
+
     // Reserved for future use.
-    // Fields total: 8+8 + 8+4 + 2+2+8 + 8+8+8 + 8+4 + 8+4 + 8+4 + 8+4 = 112 bytes
-    uint8_t  reserved2[4096 - 128];
+    uint8_t  reserved2[4096 - 124 - 16];  // -16 for compiler alignment padding
 };
 static_assert(sizeof(SuperblockDisk) == kPageSize,
               "SuperblockDisk must be exactly one page");
@@ -117,6 +120,8 @@ public:
     uint32_t config_pages() const { return disk_.config_pages; }
     PageId   pca_page() const { return disk_.pca_page; }
     uint32_t pca_pages() const { return disk_.pca_pages; }
+    PageId   cardinality_page() const { return disk_.cardinality_page; }
+    uint32_t cardinality_pages() const { return disk_.cardinality_pages; }
 
     void set_root(PageId page, uint32_t pages) {
         disk_.root_node_page = page;
@@ -144,6 +149,10 @@ public:
     void set_pca(PageId page, uint32_t pages) {
         disk_.pca_page = page;
         disk_.pca_pages = pages;
+    }
+    void set_cardinality(PageId page, uint32_t pages) {
+        disk_.cardinality_page = page;
+        disk_.cardinality_pages = pages;
     }
 
 private:

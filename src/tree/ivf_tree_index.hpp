@@ -21,11 +21,16 @@
 #include "tree/superblock.hpp"
 #include "tree/tree_manifest.hpp"
 #include "tree/tree_nodes.hpp"
+#include "tree/cardinality.hpp"  // CardinalityTable (Phase D selectivity estimation)
+#include "engine/mem_source.hpp"  // MemColumnData (filter column write path, Phase C)
 #include "sextant/config.hpp"
 #include "sextant/types.hpp"
+#include "sextant/schema.hpp"
 
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sextant { class PqQuantizer; }
@@ -65,6 +70,23 @@ public:
         uint32_t num_threads = 0;
         uint32_t pca_dims = 32;      // PCA dimensions for build_streaming_pca
         uint32_t max_lloyd_passes = 10;  // max streaming Lloyd refinement passes
+        uint32_t k_root_max_depth2 = 512;  // k_root above this forces depth-3
+        Schema filter_schema;        // empty = no filter columns (today's behavior)
+
+        /// Filter column data (Phase C). When non-empty, filter column values
+        /// are written to leaf extents during build. Indexed by row_id
+        /// (0..N-1). Must match filter_schema column count and types. Only
+        /// build_streaming_pca consumes this; the other build paths ignore it.
+        std::vector<MemColumnData> filter_column_data;
+
+        /// Payload data (Phase E). When non-empty, per-vector opaque payload
+        /// blobs are written to per-leaf payload extents. payload_offsets[i]
+        /// ..payload_offsets[i+1] gives the byte range for row_id i.
+        /// payload_offsets has N+1 entries. Must be non-empty when
+        /// filter_schema.has_payload is true. Only build_streaming_pca consumes
+        /// this; the other build paths ignore it.
+        const uint8_t* payload_data = nullptr;
+        const uint32_t* payload_offsets = nullptr;  // N+1 entries
     };
 
     /// Build a tree index from a flat fbin file.
@@ -101,8 +123,25 @@ public:
 
     /// Search for the k nearest neighbors of `query` (dim floats).
     /// Returns up to k candidates sorted by ascending distance.
+    ///
+    /// If `payload_locs` is non-null, it is populated with (leaf_ptr, local_idx)
+    /// for each returned result (same length/order as the returned vector),
+    /// enabling O(1) payload fetch via fetch_payload(). The search path is
+    /// unchanged otherwise — payload locations are only collected for the final
+    /// top-k after scan + rerank complete.
     std::vector<Candidate> search(const float* query, uint32_t k,
-                                  const SearchConfig& config) const;
+                                  const SearchConfig& config,
+        std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs
+            = nullptr) const;
+
+    /// Fetch the opaque payload blob for a result. O(1): reads the leaf's
+    /// payload extent from the mmap, indexes by slot.
+    /// `leaf_ptr` = mmap base of the leaf extent (from a search payload_loc).
+    /// `slot` = vector index within the leaf.
+    /// Returns the payload blob (non-owning view into mmap), or empty when
+    /// the leaf has no payload extent.
+    std::string_view fetch_payload(const uint8_t* leaf_ptr,
+                                    uint32_t slot) const;
 
     // --- Accessors ---
 
@@ -116,6 +155,10 @@ public:
     const std::string& quantizer_type() const { return manifest_.quantizer_type; }
     const PqQuantizer& quantizer() const { return *quantizer_; }
 
+    /// Global cardinality table (Phase D). Empty when no filter columns were
+    /// present at build time. Used for predicate selectivity estimation.
+    const CardinalityTable& cardinality() const { return card_table_; }
+
 private:
     // --- Open state ---
     std::string path_;
@@ -126,6 +169,7 @@ private:
     PageFile file_;
     Superblock superblock_;
     TreeManifest manifest_;
+    CardinalityTable card_table_;  // per-value frequencies for selectivity (Phase D)
     std::unique_ptr<PqQuantizer> quantizer_;
 
     // Root node (parsed from mmap at open time; points into mmap_base_).
@@ -159,7 +203,19 @@ private:
 
     /// RaBitQ-specific search (per-leaf LUT rebuild + factor finalization).
     std::vector<Candidate> search_rabitq(const float* query, uint32_t k,
-                                          const SearchConfig& config) const;
+                                          const SearchConfig& config,
+        std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs
+            = nullptr) const;
+
+    /// Brute-force PQ-decode fallback for extreme low selectivity (<1%).
+    /// Walks ALL leaves, checks summaries, scans filter columns for exact
+    /// matches, PQ-decodes matching vectors, computes exact FP32 distance.
+    /// Returns top-k by exact distance.
+    std::vector<Candidate> search_brute_force_filtered(
+        const float* query, uint32_t k, const SearchConfig& config,
+        const std::vector<uint32_t>& pred_col_indices,
+        std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs
+            = nullptr) const;
 };
 
 }  // namespace sextant::tree

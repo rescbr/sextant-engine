@@ -179,6 +179,7 @@ engine_sources = [
     'src/engine/searcher.cpp',
     'src/engine/estimator.cpp',
     'src/engine/fbin_source.cpp',
+    'src/engine/mem_source.cpp',
     'src/engine/partition.cpp',
     'src/engine/manifest_io.cpp',
     # Hierarchical IVF tree (Phase 0: infrastructure)
@@ -187,6 +188,11 @@ engine_sources = [
     'src/tree/superblock.cpp',
     'src/tree/tree_manifest.cpp',
     'src/tree/ivf_tree_index.cpp',
+    'src/tree/tree_estimator.cpp',
+    'src/tree/filter_scan.cpp',
+    'src/tree/cardinality.cpp',
+    'src/tree/filter_data_io.cpp',
+    'src/tree/fsck.cpp',
     'src/logging.cpp',
     'src/system.cpp',
 ]

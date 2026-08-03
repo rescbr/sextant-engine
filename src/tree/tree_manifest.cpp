@@ -8,6 +8,32 @@
 
 namespace sextant::tree {
 
+namespace {
+
+const char* column_type_to_string(ColumnType t) {
+    switch (t) {
+        case ColumnType::Int32:  return "int32";
+        case ColumnType::Int64:  return "int64";
+        case ColumnType::Float:  return "float";
+        case ColumnType::Bool:   return "bool";
+        case ColumnType::String: return "string";
+        case ColumnType::Set:    return "set";
+    }
+    return "int32";
+}
+
+ColumnType column_type_from_string(std::string_view s) {
+    if (s == "int32")  return ColumnType::Int32;
+    if (s == "int64")  return ColumnType::Int64;
+    if (s == "float")  return ColumnType::Float;
+    if (s == "bool")   return ColumnType::Bool;
+    if (s == "string") return ColumnType::String;
+    if (s == "set")    return ColumnType::Set;
+    return ColumnType::Int32;
+}
+
+}  // namespace
+
 std::string manifest_to_toml(const TreeManifest& m) {
     auto root = cpptoml::make_table();
 
@@ -24,6 +50,7 @@ std::string manifest_to_toml(const TreeManifest& m) {
     auto tree = cpptoml::make_table();
     tree->insert("depth", m.depth);
     tree->insert("k_root", m.k_root);
+    tree->insert("k_l1", m.k_l1);
     tree->insert("leaf_capacity", m.leaf_capacity);
     tree->insert("n_leaves", m.n_leaves);
     tree->insert("n_probe_l0", m.n_probe_l0);
@@ -42,6 +69,22 @@ std::string manifest_to_toml(const TreeManifest& m) {
     partition->insert("balance_factor", static_cast<double>(m.balance_factor));
     partition->insert("sub_shard_probe_pct", m.sub_shard_probe_pct);
     root->insert("partition", partition);
+
+    // [schema]  (only when non-empty)
+    if (!m.schema.empty()) {
+        auto schema_tbl = cpptoml::make_table();
+        schema_tbl->insert("has_payload", m.schema.has_payload);
+        schema_tbl->insert("summary_size", m.summary_size);
+        auto cols = cpptoml::make_table_array();
+        for (const auto& col : m.schema.columns) {
+            auto ct = cpptoml::make_table();
+            ct->insert("name", col.name);
+            ct->insert("type", std::string(column_type_to_string(col.type)));
+            cols->push_back(std::move(ct));
+        }
+        schema_tbl->insert("filter_columns", cols);
+        root->insert("schema", schema_tbl);
+    }
 
     std::ostringstream ss;
     ss << *root;
@@ -87,6 +130,10 @@ TreeManifest manifest_from_toml(const std::string& toml) {
     }
     m.depth = static_cast<uint16_t>(require_int(*tree, "depth"));
     m.k_root = static_cast<uint32_t>(require_int(*tree, "k_root"));
+    // k_l1 is optional (depth-3 trees; older trees omit it → 0).
+    if (auto kl1 = tree->get_as<int64_t>("k_l1")) {
+        m.k_l1 = static_cast<uint32_t>(*kl1);
+    }
     m.leaf_capacity = static_cast<uint32_t>(require_int(*tree, "leaf_capacity"));
     m.n_leaves = static_cast<uint32_t>(require_int(*tree, "n_leaves"));
     m.n_probe_l0 = static_cast<uint32_t>(require_int(*tree, "n_probe_l0"));
@@ -114,6 +161,28 @@ TreeManifest manifest_from_toml(const std::string& toml) {
         }
         if (auto ssp = partition->get_as<int64_t>("sub_shard_probe_pct")) {
             m.sub_shard_probe_pct = static_cast<uint32_t>(*ssp);
+        }
+    }
+
+    // [schema]  (optional; absent → empty schema, summary_size 0)
+    if (auto schema_tbl = root->get_table("schema")) {
+        if (auto hp = schema_tbl->get_as<bool>("has_payload")) {
+            m.schema.has_payload = *hp;
+        }
+        if (auto ss = schema_tbl->get_as<int64_t>("summary_size")) {
+            m.summary_size = static_cast<uint32_t>(*ss);
+        }
+        if (auto cols = schema_tbl->get_table_array("filter_columns")) {
+            for (const auto& ct : *cols) {
+                FilterColumn col;
+                if (auto name = ct->get_as<std::string>("name")) {
+                    col.name = *name;
+                }
+                if (auto type = ct->get_as<std::string>("type")) {
+                    col.type = column_type_from_string(*type);
+                }
+                m.schema.columns.push_back(std::move(col));
+            }
         }
     }
 
