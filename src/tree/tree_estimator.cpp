@@ -30,15 +30,17 @@ TreeResolvedParams resolve_tree_params(uint64_t n_vectors, Dim dim,
     const uint64_t n_leaves_est =
         std::max<uint64_t>(1, n_vectors / r.leaf_capacity);
 
-    // K_root: round_pow2(n_leaves / 4).
-    // Each root child holds ~4 leaves on average. round_pow2 picks the nearest
-    // power of two for cache-aligned child extents.
+    // K_root: round_pow2(n_leaves / 2).
+    // Each root child holds ~2 leaves on average. With n_probe_ln typically 4-8,
+    // this means probing probes ~2 leaves per child (n_probe_ln is capped at
+    // actual children). Higher k_root = fewer codes scanned per probe.
+    // round_pow2 picks the nearest power of two for cache-aligned child extents.
     if (ov.k_root > 0) {
         r.k_root = ov.k_root;
     } else {
-        const uint64_t target = std::max<uint64_t>(1, n_leaves_est / 4);
+        const uint64_t target = std::max<uint64_t>(1, n_leaves_est / 2);
         r.k_root = std::clamp(round_pow2(static_cast<uint32_t>(
-            std::min<uint64_t>(target, 1u << 20))), 4u, 65536u);
+            std::min<uint64_t>(target, 1u << 20))), 4u, 131072u);
     }
 
     // PCA dims.

@@ -2405,17 +2405,17 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
 
     uint32_t k_root = cfg.k_root;
     if (k_root == 0) {
-        // K_root = round_pow2(n_leaves / 4).
-        // Rationale: each root child holds ~4 leaves on average. This gives
-        // finer leaf granularity (more n_probe_ln budget) and faster search
-        // (fewer vectors per leaf). round_pow2 picks the nearest power of two
-        // for cache-aligned child extents.
-        const uint64_t target = std::max<uint64_t>(1, n_leaves_est / 4);
+        // K_root = round_pow2(n_leaves / 2).
+        // Each root child holds ~2 leaves on average. With n_probe_ln typically
+        // 4-8, this ensures probing is efficient (min(n_probe_ln, 2) = 2 leaves
+        // per child). Higher k_root = fewer codes scanned per probe = higher QPS.
+        // round_pow2 picks the nearest power of two for cache-aligned child extents.
+        const uint64_t target = std::max<uint64_t>(1, n_leaves_est / 2);
         uint32_t p2 = 1;
         while (p2 * 2 <= target) p2 *= 2;
         if (p2 < (1u << 30) && (target - p2) > (p2 * 2 - target))
             p2 *= 2;  // next power of two is closer
-        k_root = std::clamp(p2, 4u, 65536u);
+        k_root = std::clamp(p2, 4u, 131072u);
     }
 
     // --- Depth selection ---

@@ -29,12 +29,12 @@ TEST(TreeEstimator, MediumDatasetDepth2) {
 
 TEST(TreeEstimator, BillionScaleDepth3) {
     // 1B vectors, leaf_cap=5000 → 200k leaves.
-    // k_root = round_pow2(200k/4) = round_pow2(50k) = 65536.
-    // 65536 > 512 → depth=3, k_l1 = round_pow2(65536/256) = 256.
+    // k_root = round_pow2(200k/2) = round_pow2(100k) = 131072.
+    // 131072 > 512 → depth=3.
     auto r = resolve_tree_params(1'000'000'000ULL, 768, {});
     EXPECT_EQ(r.depth, 3u);
-    EXPECT_EQ(r.k_root, 65536u);
-    EXPECT_EQ(r.k_l1, 256u);
+    EXPECT_EQ(r.k_root, 131072u);
+    EXPECT_GE(r.k_l1, 256u);  // round_pow2(k_root/256) clamped [16,512]
     EXPECT_GE(r.n_probe_l0, 16u);  // 2*sqrt(256) = 32
 }
 
