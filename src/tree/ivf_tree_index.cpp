@@ -2641,7 +2641,8 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
             }
             sum_gap += (d2 - d1);
         }
-        closure_epsilon = static_cast<float>(sum_gap / s * 0.25);
+        closure_epsilon = static_cast<float>(sum_gap / s *
+            (cfg.closure_multiplier > 0 ? cfg.closure_multiplier : 0.25f));
     }
     spdlog::info("[sextant] build_streaming_pca: closure_eps={:.4f}",
                  closure_epsilon);
