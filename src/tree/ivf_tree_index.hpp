@@ -65,7 +65,7 @@ public:
         uint16_t n_probe_l0 = 0;       // probe count at level 0 (0 = auto)
         uint16_t n_probe_ln = 0;       // probe count at deeper levels (0 = auto)
         ResolvedParams params;         // PQ/PRQ/RaBitQ config
-        float adaptive_probe_gap = 0.0f;
+        float adaptive_probe_gap = 1.5f;  // geometric gap pruning (1.0=off, >1=prune)
         float median_lid = 0.0f;
         uint32_t num_threads = 0;
         uint32_t pca_dims = 32;      // PCA dimensions for build_streaming_pca
