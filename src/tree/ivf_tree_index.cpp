@@ -2935,14 +2935,17 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     // centroid. This mirrors the root-level SPANN-style boundary replication at
     // the leaf granularity and is disabled entirely when
     // cfg.leaf_closure_multiplier <= 0 (the default).
-    struct LeafCarry {
-        std::vector<uint8_t> codes;       // code_size bytes per row
-        std::vector<RowId> row_ids;
-        std::vector<float16_t> fp16_vecs; // dim per row
-        std::vector<MemColumnData> filter_cols;  // only when has_filter
-        std::vector<uint32_t> payload_lens;      // only when has_payload
-        std::vector<const uint8_t*> payload_ptrs;
-    };
+     /// Maximum carry entries per root cluster (bounded to prevent OOM at scale).
+     static constexpr uint32_t kLeafCarryMax = 64;
+
+     struct LeafCarry {
+         std::vector<uint8_t> codes;       // code_size bytes per row
+         std::vector<RowId> row_ids;
+         std::vector<float16_t> fp16_vecs; // dim per row
+         std::vector<MemColumnData> filter_cols;  // only when has_filter
+         std::vector<uint32_t> payload_lens;      // only when has_payload
+         std::vector<const uint8_t*> payload_ptrs;
+     };
     std::vector<LeafCarry> carry(k_root);
     // Per-root-cluster previous leaf centroid (FP16) for calibrating the leaf
     // closure epsilon from observed leaf-centroid gaps.
@@ -3096,14 +3099,31 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
         // before std::move-ing buf into leaf (after the move, buf's vectors
         // are empty). Uses the original row count `cnt` (excludes carry-IN
         // rows, which are themselves boundary vectors already replicated here).
+        // Capped at LeafCarry::MAX_CARRY to bound memory at scale (1024 root
+        // clusters × 64 carry × 768d FP16 = ~96MB worst case).
         if (leaf_closure_on) {
             const float eps_c = leaf_closure_eps[c];
-            LeafCarry next_carry;
-            const uint32_t code_size_local = code_size;
+            // Collect (distance, index) for boundary vectors, then keep the
+            // MAX_CARRY closest. This bounds carry memory regardless of leaf size.
+            std::vector<std::pair<float, uint32_t>> boundary;
             for (uint32_t i = 0; i < cnt; ++i) {
                 const float16_t* v = &buf.fp16_vecs[i * dim];
-                if (simd::dist_f16(metric, v, leaf_centroid_tmp.data(), dim) > eps_c)
-                    continue;
+                const float d = simd::dist_f16(metric, v, leaf_centroid_tmp.data(), dim);
+                if (d <= eps_c)
+                    boundary.emplace_back(d, i);
+            }
+            // Sort by distance (ascending) and keep the closest MAX_CARRY.
+            if (boundary.size() > kLeafCarryMax) {
+                std::partial_sort(boundary.begin(),
+                                   boundary.begin() + kLeafCarryMax,
+                                   boundary.end());
+                boundary.resize(kLeafCarryMax);
+            }
+            // Build the carry from the selected boundary vectors.
+            LeafCarry next_carry;
+            const uint32_t code_size_local = code_size;
+            for (const auto& [d, i] : boundary) {
+                const float16_t* v = &buf.fp16_vecs[i * dim];
                 next_carry.codes.insert(next_carry.codes.end(),
                                         buf.codes.begin() + i * code_size_local,
                                         buf.codes.begin() + (i + 1) * code_size_local);
