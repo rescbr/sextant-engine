@@ -16,7 +16,6 @@ test_sources = [
     'test_pq_fastscan.cpp',
     'test_pq4_kernel.cpp',
     'test_pq4_encoding.cpp',
-    'test_ivf_scan_search.cpp',
     'test_vamana_core.cpp',
     'test_fbin_source.cpp',
     'test_engine.cpp',
@@ -30,6 +29,7 @@ test_sources = [
     'test_tree_estimator.cpp',
     'test_tree_filter.cpp',
     'test_fsck.cpp',
+    'test_tree_insert_delete.cpp',
 ]
 
 foreach src : test_sources

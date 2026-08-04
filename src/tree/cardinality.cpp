@@ -1,6 +1,7 @@
 #include "cardinality.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace sextant::tree {
@@ -128,10 +129,56 @@ float CardinalityTable::selectivity_numeric(uint32_t col_idx,
     return static_cast<float>(matching) / static_cast<float>(n_vectors_);
 }
 
+float CardinalityTable::selectivity_geo(uint32_t lat_col, uint32_t lng_col,
+                                          const Predicate& pred) const {
+    // Determine the query bounding box [lat_lo, lat_hi] × [lng_lo, lng_hi].
+    double lat_lo, lat_hi, lng_lo, lng_hi;
+    constexpr double kKmPerDegLat = 111.0;
+    constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+    if (pred.op == PredicateOp::GeoBox) {
+        lat_lo = pred.value;   lat_hi = pred.value3;
+        lng_lo = pred.value2;  lng_hi = pred.value4;
+    } else {
+        // GeoRadius: bounding box of the circle.
+        const double dlat = pred.radius_km / kKmPerDegLat;
+        const double cos_lat = std::cos(pred.value * kDegToRad);
+        const double dlng = (std::fabs(cos_lat) < 1e-6)
+            ? 180.0
+            : pred.radius_km / (kKmPerDegLat * cos_lat);
+        lat_lo = pred.value  - dlat;  lat_hi = pred.value  + dlat;
+        lng_lo = pred.value2 - dlng;  lng_hi = pred.value2 + dlng;
+    }
+
+    // Helper: fraction of [lo, hi] overlapping the observed [col_min, col_max].
+    auto overlap_frac = [&](uint32_t col_idx, double lo, double hi) -> float {
+        if (col_idx >= col_to_idx_.size()) return 1.0f;
+        const uint32_t ci = col_to_idx_[col_idx];
+        if (ci == UINT32_MAX) return 1.0f;  // no data → conservative
+        const auto& hist = columns_[ci].numeric_hist;
+        if (hist.empty()) return 1.0f;
+        const double col_min = hist.begin()->first;
+        const double col_max = hist.rbegin()->first;
+        const double span = col_max - col_min;
+        if (span <= 0.0) {
+            // Degenerate column (single value): match iff that value is in range.
+            return (col_min >= lo && col_min <= hi) ? 1.0f : 0.0f;
+        }
+        const double lo_c = std::max(lo, col_min);
+        const double hi_c = std::min(hi, col_max);
+        if (hi_c < lo_c) return 0.0f;
+        return static_cast<float>((hi_c - lo_c) / span);
+    };
+
+    const float f_lat = overlap_frac(lat_col, lat_lo, lat_hi);
+    const float f_lng = overlap_frac(lng_col, lng_lo, lng_hi);
+    return std::min(f_lat * f_lng, 1.0f);
+}
+
 float CardinalityTable::selectivity_combined(
     const Schema& schema,
     const std::vector<struct Predicate>& preds,
-    const std::vector<uint32_t>& pred_col_indices) const {
+    const std::vector<uint32_t>& pred_col_indices,
+    const std::vector<uint32_t>& geo_lng_col_indices) const {
     if (preds.empty()) return 1.0f;
     float sel = 1.0f;
     for (uint32_t p = 0; p < preds.size(); ++p) {
@@ -140,7 +187,11 @@ float CardinalityTable::selectivity_combined(
         const auto& col = schema.columns[col_idx];
 
         float s = 1.0f;
-        if (col.type == ColumnType::Int32 || col.type == ColumnType::Int64 ||
+        if (pred.op == PredicateOp::GeoBox || pred.op == PredicateOp::GeoRadius) {
+            const uint32_t lng_col = (p < geo_lng_col_indices.size())
+                ? geo_lng_col_indices[p] : UINT32_MAX;
+            s = selectivity_geo(col_idx, lng_col, pred);
+        } else if (col.type == ColumnType::Int32 || col.type == ColumnType::Int64 ||
             col.type == ColumnType::Float) {
             s = selectivity_numeric(col_idx, pred);
         } else if (col.type == ColumnType::String) {

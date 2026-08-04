@@ -341,13 +341,39 @@ bool eval_predicate(const ColumnView& col, uint32_t idx, const Predicate& pred) 
 }
 
 // ===========================================================================
+// Geo predicate evaluation (GeoBox, GeoRadius)
+// ===========================================================================
+
+bool eval_predicate_geo(const ColumnView& lat_col, const ColumnView& lng_col,
+                         uint32_t idx, const Predicate& pred) {
+    // Geo columns are stored as Float (latitude, longitude). Read both values.
+    const double lat = read_fixed_as_double(lat_col, idx);
+    const double lng = read_fixed_as_double(lng_col, idx);
+
+    switch (pred.op) {
+        case PredicateOp::GeoBox: {
+            // value=min_lat, value2=min_lng, value3=max_lat, value4=max_lng.
+            return lat >= pred.value  && lat <= pred.value3 &&
+                   lng >= pred.value2 && lng <= pred.value4;
+        }
+        case PredicateOp::GeoRadius: {
+            // value=center_lat, value2=center_lng, radius_km=radius.
+            return haversine_km(pred.value, pred.value2, lat, lng) <= pred.radius_km;
+        }
+        default:
+            return true;  // not a geo op
+    }
+}
+
+// ===========================================================================
 // Summary-based leaf pruning
 // ===========================================================================
 
 bool summary_may_match(const uint8_t* summary, uint32_t summary_size,
                         const Schema& schema,
                         const std::vector<Predicate>& preds,
-                        const std::vector<uint32_t>& pred_col_indices) {
+                        const std::vector<uint32_t>& pred_col_indices,
+                        const std::vector<uint32_t>& geo_lng_col_indices) {
     if (summary_size == 0 || preds.empty()) return true;
 
     const uint8_t* p = summary;
@@ -398,6 +424,44 @@ bool summary_may_match(const uint8_t* summary, uint32_t summary_size,
         const auto& pred = preds[pi];
         const uint32_t col_idx = pred_col_indices[pi];
         const auto& col = schema.columns[col_idx];
+
+        // --- Geo predicates span two columns (lat + lng) ---
+        if (pred.op == PredicateOp::GeoBox || pred.op == PredicateOp::GeoRadius) {
+            double lat_lo, lat_hi, lng_lo, lng_hi;
+            if (pred.op == PredicateOp::GeoBox) {
+                // value=min_lat, value2=min_lng, value3=max_lat, value4=max_lng.
+                lat_lo = pred.value;   lat_hi = pred.value3;
+                lng_lo = pred.value2;  lng_hi = pred.value4;
+            } else {
+                // GeoRadius: derive a bounding box of the circle.
+                // 1° latitude ≈ 111.0 km (varies slightly; this is a pre-filter,
+                // so a slight over-estimate is safe/conservative).
+                constexpr double kKmPerDegLat = 111.0;
+                constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+                const double dlat = pred.radius_km / kKmPerDegLat;
+                const double cos_lat = std::cos(pred.value * kDegToRad);
+                // Guard against division by zero near the poles.
+                const double dlng = (std::fabs(cos_lat) < 1e-6)
+                    ? 180.0
+                    : pred.radius_km / (kKmPerDegLat * cos_lat);
+                lat_lo = pred.value  - dlat;  lat_hi = pred.value  + dlat;
+                lng_lo = pred.value2 - dlng;  lng_hi = pred.value2 + dlng;
+            }
+
+            // Latitude column summary (col_idx).
+            if (num_ranges[col_idx].present) {
+                const auto& r = num_ranges[col_idx];
+                if (lat_lo > r.max || lat_hi < r.min) return false;
+            }
+            // Longitude column summary (from geo_lng_col_indices).
+            const uint32_t lng_col = (pi < geo_lng_col_indices.size())
+                ? geo_lng_col_indices[pi] : UINT32_MAX;
+            if (lng_col < 256 && num_ranges[lng_col].present) {
+                const auto& r = num_ranges[lng_col];
+                if (lng_lo > r.max || lng_hi < r.min) return false;
+            }
+            continue;  // geo handled; skip the single-column switch below.
+        }
 
         switch (col.type) {
             case ColumnType::Int32:

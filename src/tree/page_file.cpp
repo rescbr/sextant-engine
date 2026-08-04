@@ -49,6 +49,19 @@ PageFile& PageFile::operator=(PageFile&& other) noexcept {
 
 void PageFile::read_pages(PageId page, uint32_t n_pages, void* buf) const {
     if (n_pages == 0) return;
+
+    // Debug bounds check: catch garbage page IDs early with a useful trace
+    // instead of a cryptic EOF error hundreds of frames away.
+#ifndef NDEBUG
+    const uint64_t np = num_pages();
+    if (page >= np || page + n_pages > np) {
+        throw Error(ErrorCode::CorruptIndex,
+            "PageFile::read_pages: page " + std::to_string(page) +
+            " + " + std::to_string(n_pages) + " out of bounds (file has " +
+            std::to_string(np) + " pages) on '" + path_ + "'");
+    }
+#endif
+
     const uint64_t offset = static_cast<uint64_t>(page) * kPageSize;
     const size_t count = static_cast<size_t>(n_pages) * kPageSize;
 

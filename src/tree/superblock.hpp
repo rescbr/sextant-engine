@@ -76,8 +76,14 @@ struct SuperblockDisk {
     PageId   cardinality_page;       // per-value frequency blob (selectivity estimation)
     uint32_t cardinality_pages;      // cardinality extent length
 
+    // Leaf extent table (indirection: leaf_id → page+pages).
+    // Enables O(1) leaf growth without parent pointer fixup.
+    // 0 pages = no leaf table (legacy: child_page is direct page pointer).
+    PageId   leaf_table_page;        // leaf table blob start
+    uint32_t leaf_table_pages;       // leaf table extent length
+
     // Reserved for future use.
-    uint8_t  reserved2[4096 - 124 - 16];  // -16 for compiler alignment padding
+    uint8_t  reserved2[3940];  // fill to exactly kPageSize
 };
 static_assert(sizeof(SuperblockDisk) == kPageSize,
               "SuperblockDisk must be exactly one page");
@@ -153,6 +159,13 @@ public:
     void set_cardinality(PageId page, uint32_t pages) {
         disk_.cardinality_page = page;
         disk_.cardinality_pages = pages;
+    }
+
+    PageId leaf_table_page() const { return disk_.leaf_table_page; }
+    uint32_t leaf_table_pages() const { return disk_.leaf_table_pages; }
+    void set_leaf_table(PageId page, uint32_t pages) {
+        disk_.leaf_table_page = page;
+        disk_.leaf_table_pages = pages;
     }
 
 private:

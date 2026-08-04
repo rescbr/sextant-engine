@@ -47,9 +47,10 @@ struct LeafCandidate {
 
 /// The hierarchical IVF tree index.
 ///
-/// Built via `build()` (bottom-up bulk build), searched via `search()`.
-/// On open, the entire file is mmap'd read-only; routing reads internal nodes
-/// and leaf headers from the mmap; leaf code scanning reads from the mmap too.
+/// Built via `build_streaming_pca()` (streaming Lloyd build), searched via
+/// `search()`. On open, the entire file is mmap'd read-only; routing reads
+/// internal nodes and leaf headers from the mmap; leaf code scanning reads
+/// from the mmap too.
 class IVFTreeIndex {
 public:
     IVFTreeIndex() = default;
@@ -97,32 +98,15 @@ public:
         const uint32_t* payload_offsets = nullptr;  // N+1 entries
     };
 
-    /// Build a tree index from a flat fbin file.
-    /// Writes the tree to `output_path` (a single file).
-    static BuildResult build(const std::string& base_path,
-                             const std::string& output_path,
-                             const BuildConfig& cfg);
-
-    /// Streaming build: sample k-means for root centroids, then stream all
-    /// vectors through the tree (route by FP16 distance, append to leaf,
-    /// split on overflow). O(1) RAM regardless of N. No global k-means.
-    static BuildResult build_streaming(const std::string& base_path,
-                                        const std::string& output_path,
-                                        const BuildConfig& cfg);
-
-    /// Two-phase streaming build: greedy stream (phase 1) + one refinement
-    /// pass that re-assigns each vector to its nearest leaf centroid (phase 2).
-    /// Combines streaming speed with k-means-quality assignment.
-    static BuildResult build_streaming_refined(const std::string& base_path,
-                                                const std::string& output_path,
-                                                const BuildConfig& cfg);
-
     /// PCA-preconditioned streaming build: project vectors onto top-k PCs
     /// before routing. On high-LID data (d_eff≈2), this exposes the manifold
     /// structure so k-means converges. Scan codes stay in original space.
+    /// Handles all depths: depth=1 (n_leaves ≤ k_root, root → leaves
+    /// directly), depth=2 (root → L2 internal nodes → leaves), and depth=3
+    /// (root → L1 → L2 → leaves when k_root exceeds k_root_max_depth2).
     static BuildResult build_streaming_pca(const std::string& base_path,
-                                            const std::string& output_path,
-                                            const BuildConfig& cfg);
+                                             const std::string& output_path,
+                                             const BuildConfig& cfg);
 
     /// Open an existing tree index for searching. Mmaps the file.
     static std::unique_ptr<IVFTreeIndex> open(const std::string& path);
@@ -167,6 +151,37 @@ public:
     /// present at build time. Used for predicate selectivity estimation.
     const CardinalityTable& cardinality() const { return card_table_; }
 
+    // --- Dynamic insert/delete (single-writer, multi-reader) ---
+
+    /// A single point to insert: vector + row_id + optional filter column
+    /// values + optional payload. filter_values must match the index's schema
+    /// (one MemColumnData per column, each with exactly 1 row). payload may be
+    /// empty.
+    struct InsertPoint {
+        const float* vector;
+        RowId row_id;
+        std::vector<MemColumnData> filter_values;  // empty = no filter cols
+        std::string_view payload;                   // empty = no payload
+    };
+
+    /// Insert a batch of points. Routes each to its nearest leaf, groups by
+    /// leaf, grows each affected leaf once, appends codes/row_ids/filter
+    /// values/payloads, updates summaries (eager), and commits. Leaves that
+    /// exceed 2×leaf_capacity after insertion are split.
+    ///
+    /// Single-writer: no concurrent inserts/deletes. Readers see the old mmap
+    /// until remap_after_commit() (called automatically).
+    void insert_batch(const std::vector<InsertPoint>& points);
+
+    /// Delete a batch of row_ids. Routes each to its leaf, finds the slot by
+    /// scanning row_ids, swap-removes (last slot → deleted slot), decrements
+    /// count, marks summary_dirty. Commits once at the end.
+    void delete_batch(const std::vector<RowId>& row_ids);
+
+    /// Returns the number of live vectors across all leaves (sum of leaf
+    /// counts). Requires a mutable open (reads leaf headers via file_).
+    uint64_t live_count() const;
+
 private:
     // --- Open state ---
     std::string path_;
@@ -179,6 +194,12 @@ private:
     TreeManifest manifest_;
     CardinalityTable card_table_;  // per-value frequencies for selectivity (Phase D)
     std::unique_ptr<PqQuantizer> quantizer_;
+
+    // --- Leaf extent table (indirection: leaf_id → page+pages) ---
+    // Loaded at open() from the leaf_table blob. Empty when the tree was
+    // built without a leaf table (legacy format). When non-empty, ChildEntry
+    // child_page for is_leaf=1 children is a leaf_id index into this table.
+    std::vector<LeafTableEntry> leaf_table_;
 
     // Root node (parsed from mmap at open time; points into mmap_base_).
     const TreeNodeHeader* root_header_ = nullptr;
@@ -222,8 +243,65 @@ private:
     std::vector<Candidate> search_brute_force_filtered(
         const float* query, uint32_t k, const SearchConfig& config,
         const std::vector<uint32_t>& pred_col_indices,
+        const std::vector<uint32_t>& geo_lng_col_indices = {},
         std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs
             = nullptr) const;
+
+    // --- Mutable-state private helpers ---
+
+    /// Route a single vector to its nearest leaf_id. Uses the same PCA/FP16
+    /// routing as search, but n_probe=1 at every level (greedy descent).
+    /// For depth=1: root → leaf directly. For depth≥2: root → L1 → leaf.
+    /// Returns the leaf_id (index into leaf_table_).
+    uint32_t route_to_leaf_id_(const float* query) const;
+
+    /// Route a vector to its nearest leaf_id for depth=2 PCA trees.
+    /// Separated because it uses pca_leaf_centroids_ directly.
+    uint32_t route_to_leaf_id_depth2_pca_(const float* query,
+                                           const float* query_pca) const;
+
+    /// Read a leaf extent into a buffer. Returns the buffer (sized to pages).
+    std::vector<uint8_t> read_leaf_(uint32_t leaf_id) const;
+
+    /// Write a leaf buffer back to the file, updating the leaf table entry.
+    /// If new_pages differs from the current entry, allocates a new extent
+    /// and frees the old one.
+    void write_leaf_(uint32_t leaf_id, std::vector<uint8_t>& buf,
+                     uint32_t new_pages, PageAllocator& alloc);
+
+    /// Remap the read-only mmap after a mutation commit. Search uses the mmap;
+    /// after writes through file_, the mmap is stale until remapped.
+    void remap_();
+
+    /// Flush the leaf table blob + superblock commit. Called after any
+    /// mutation that changes leaf_table_ or n_pages.
+    void commit_mutable_(PageAllocator& alloc);
+
+    /// Split a leaf that exceeds 2×leaf_capacity into two leaves via k-means
+    /// (K=2) on PQ codes. Writes two new leaf extents, decodes medoid
+    /// centroids → FP16 for the parent node, updates the parent node's child
+    /// list (adds a sibling), grows the leaf table by one entry, frees the
+    /// old leaf extent. Returns the new leaf_id of the sibling.
+    /// Caller must commit_mutable_ after all splits.
+    uint32_t split_leaf_(uint32_t leaf_id, PageAllocator& alloc);
+
+    /// Update the parent node of a leaf to add a new child entry (the sibling
+    /// from a split). For depth=1, the parent is the root node. For depth≥2,
+    /// the parent is the L2 internal node containing the leaf. Reads the
+    /// parent from disk, appends the child entry, grows the extent if needed,
+    /// writes back. Returns the new (page, pages) of the parent.
+    void add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
+                               const std::vector<float16_t>& cent0_fp16,
+                               const std::vector<float16_t>& cent1_fp16,
+                               uint32_t new_leaf_pages,
+                               PageAllocator& alloc);
+
+    /// Rebuild pca_leaf_centroids_ and pca_leaf_base_ from the current on-disk
+    /// tree structure. Called by remap_() after every structural change
+    /// (insert, delete, split). Derives PCA centroids by projecting the inline
+    /// FP16 leaf centroids through pca_proj_, so new leaves from splits get
+    /// correct routing centroids without rewriting the PCA blob on disk.
+    void rebuild_pca_leaf_centroids_();
 };
 
 }  // namespace sextant::tree

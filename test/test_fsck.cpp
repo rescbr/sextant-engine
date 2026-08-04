@@ -68,7 +68,7 @@ std::string build_small_tree(const std::string& tree_path) {
     cfg.leaf_capacity = 500;
     cfg.num_threads = 4;
 
-    auto result = IVFTreeIndex::build(base_path, tree_path, cfg);
+    auto result = IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
     EXPECT_EQ(result.n_vectors, n);
     EXPECT_TRUE(std::filesystem::exists(tree_path));
     return tree_path;

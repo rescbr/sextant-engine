@@ -151,14 +151,22 @@ struct Predicate {
     // Value variants. Which is active depends on the column type + op.
     // For Between: value = low, value2 = high.
     // For In/NotIn: values is the set.
-    // For GeoRadius: value = lat, value2 = lng, radius_km = radius.
-    // For GeoBox: value = min_lat, value2 = min_lng, value3 = max_lat,
-    //             value4 = max_lng.
+    // For GeoRadius: value = center_lat, value2 = center_lng, radius_km = radius.
+    //                `column` names the latitude column, geo_lng_column names
+    //                the longitude column.
+    // For GeoBox: value = min_lat, value2 = min_lng,
+    //             value3 = max_lat, value4 = max_lng.
+    //             `column` names the latitude column, geo_lng_column names
+    //             the longitude column.
     double value = 0.0;
     double value2 = 0.0;
     double value3 = 0.0;
     double value4 = 0.0;
     double radius_km = 0.0;
+    // For geo predicates (GeoBox, GeoRadius): name of the longitude column.
+    // `column` names the latitude column. Empty = unset.
+    // Resolved to a numeric index at search time alongside `column`.
+    std::string geo_lng_column;
     std::string str_value;             // for Eq/NotEq/Prefix on string columns
     std::vector<std::string> values;   // for In/NotIn (string or numeric-as-string)
 };

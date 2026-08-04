@@ -4,6 +4,7 @@
 #include "tree/tree_nodes.hpp"
 #include "tree/page_file.hpp"
 #include "tree/superblock.hpp"
+#include "tree/filter_scan.hpp"  // eval_predicate_geo, haversine_km, summary_may_match
 #include "engine/mem_source.hpp"  // MemColumnData, MemSourceBuilder
 #include "sextant/config.hpp"
 #include "sextant/schema.hpp"
@@ -1005,6 +1006,163 @@ TEST(TreeFilterColumns, PayloadAbsentReturnsEmpty) {
 
     std::filesystem::remove(base_path);
     std::filesystem::remove(tree_path);
+}
+
+// ---------------------------------------------------------------------------
+// Geo predicate unit tests (GeoBox, GeoRadius)
+// ---------------------------------------------------------------------------
+// These exercise eval_predicate_geo, haversine_km, and summary_may_match
+// directly, without building a full index.
+
+/// Build a Float ColumnView over a small lat/lng array.
+ColumnView make_float_view(const std::vector<float>& vals) {
+    ColumnView v;
+    v.type = ColumnType::Float;
+    v.fixed_width = 4;
+    // Persist the data: leak intentionally (test-only, process-exit reclaims).
+    auto* buf = new float[vals.size()];
+    std::memcpy(buf, vals.data(), vals.size() * sizeof(float));
+    v.fixed_base = reinterpret_cast<const uint8_t*>(buf);
+    return v;
+}
+
+TEST(GeoPredicate, HaversineSanity) {
+    // NYC → London is ~5570 km.
+    const double d = haversine_km(40.7128, -74.0060, 51.5074, -0.1278);
+    EXPECT_NEAR(d, 5570.0, 50.0);
+    // Zero distance to self.
+    EXPECT_NEAR(haversine_km(37.0, -122.0, 37.0, -122.0), 0.0, 1e-6);
+    // 1° latitude ≈ 111 km.
+    EXPECT_NEAR(haversine_km(0.0, 0.0, 1.0, 0.0), 111.0, 1.0);
+}
+
+TEST(GeoPredicate, EvalGeoBox) {
+    // lat in [37.0, 38.0], lng in [-123.0, -121.0].
+    Predicate pred;
+    pred.op = PredicateOp::GeoBox;
+    pred.value = 37.0;   pred.value2 = -123.0;  // min_lat, min_lng
+    pred.value3 = 38.0;  pred.value4 = -121.0;  // max_lat, max_lng
+    pred.geo_lng_column = "lng";
+
+    std::vector<float> lats = {37.5f, 38.5f, 37.5f, 37.5f};
+    std::vector<float> lngs = {-122.0f, -122.0f, -124.0f, -122.0f};
+    ColumnView lat_col = make_float_view(lats);
+    ColumnView lng_col = make_float_view(lngs);
+
+    EXPECT_TRUE (eval_predicate_geo(lat_col, lng_col, 0, pred));  // inside
+    EXPECT_FALSE(eval_predicate_geo(lat_col, lng_col, 1, pred));  // lat too high
+    EXPECT_FALSE(eval_predicate_geo(lat_col, lng_col, 2, pred));  // lng too low
+    EXPECT_TRUE (eval_predicate_geo(lat_col, lng_col, 3, pred));  // inside
+}
+
+TEST(GeoPredicate, EvalGeoRadius) {
+    // Center at (37.0, -122.0), radius 10 km.
+    Predicate pred;
+    pred.op = PredicateOp::GeoRadius;
+    pred.value = 37.0;     // center lat
+    pred.value2 = -122.0;  // center lng
+    pred.radius_km = 10.0;
+    pred.geo_lng_column = "lng";
+
+    // ~0.05° lat ≈ 5.5 km (inside). ~0.2° ≈ 22 km (outside).
+    std::vector<float> lats = {37.05f, 37.2f};
+    std::vector<float> lngs = {-122.0f, -122.0f};
+    ColumnView lat_col = make_float_view(lats);
+    ColumnView lng_col = make_float_view(lngs);
+
+    EXPECT_TRUE (eval_predicate_geo(lat_col, lng_col, 0, pred));  // ~5.5 km
+    EXPECT_FALSE(eval_predicate_geo(lat_col, lng_col, 1, pred));  // ~22 km
+}
+
+TEST(GeoPredicate, SummaryMayMatchGeoBox) {
+    // Build a summary with two numeric columns: lat (col 0), lng (col 1).
+    // Summary format: [n_numeric][col_id, min f64, max f64]... then n_string(0),
+    // n_set(0).
+    std::vector<uint8_t> sum;
+    auto push_u8 = [&](uint8_t x) { sum.push_back(x); };
+    auto push_f64 = [&](double x) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&x);
+        sum.insert(sum.end(), p, p + 8);
+    };
+    push_u8(2);                 // 2 numeric entries
+    push_u8(0); push_f64(36.0); push_f64(39.0);  // col 0 (lat): [36, 39]
+    push_u8(1); push_f64(-124.0); push_f64(-120.0);  // col 1 (lng): [-124, -120]
+    push_u8(0);  // n_string
+    push_u8(0);  // n_set
+
+    Schema schema;
+    schema.columns.push_back({"lat", ColumnType::Float});
+    schema.columns.push_back({"lng", ColumnType::Float});
+
+    // Box overlapping both ranges → may match.
+    Predicate overlap;
+    overlap.column = "lat";
+    overlap.op = PredicateOp::GeoBox;
+    overlap.value = 37.0; overlap.value2 = -123.0;
+    overlap.value3 = 38.0; overlap.value4 = -121.0;
+    overlap.geo_lng_column = "lng";
+
+    // Box completely north of lat range → no match.
+    Predicate north;
+    north.column = "lat";
+    north.op = PredicateOp::GeoBox;
+    north.value = 40.0; north.value2 = -123.0;
+    north.value3 = 41.0; north.value4 = -121.0;
+    north.geo_lng_column = "lng";
+
+    // Box lat-ok but east of lng range → no match.
+    Predicate east;
+    east.column = "lat";
+    east.op = PredicateOp::GeoBox;
+    east.value = 37.0; east.value2 = -119.0;
+    east.value3 = 38.0; east.value4 = -118.0;
+    east.geo_lng_column = "lng";
+
+    EXPECT_TRUE (summary_may_match(sum.data(), sum.size(), schema,
+                                    {overlap}, {0}, {1}));
+    EXPECT_FALSE(summary_may_match(sum.data(), sum.size(), schema,
+                                    {north}, {0}, {1}));
+    EXPECT_FALSE(summary_may_match(sum.data(), sum.size(), schema,
+                                    {east}, {0}, {1}));
+}
+
+TEST(GeoPredicate, SummaryMayMatchGeoRadius) {
+    // Same summary as above: lat [36,39], lng [-124,-120].
+    std::vector<uint8_t> sum;
+    auto push_u8 = [&](uint8_t x) { sum.push_back(x); };
+    auto push_f64 = [&](double x) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&x);
+        sum.insert(sum.end(), p, p + 8);
+    };
+    push_u8(2);
+    push_u8(0); push_f64(36.0); push_f64(39.0);
+    push_u8(1); push_f64(-124.0); push_f64(-120.0);
+    push_u8(0); push_u8(0);
+
+    Schema schema;
+    schema.columns.push_back({"lat", ColumnType::Float});
+    schema.columns.push_back({"lng", ColumnType::Float});
+
+    // Center inside, radius 100 km → bounding box overlaps → may match.
+    Predicate inside;
+    inside.column = "lat";
+    inside.op = PredicateOp::GeoRadius;
+    inside.value = 37.5; inside.value2 = -122.0;
+    inside.radius_km = 100.0;
+    inside.geo_lng_column = "lng";
+
+    // Center far away (Alaska), radius 10 km → no overlap → prune.
+    Predicate far;
+    far.column = "lat";
+    far.op = PredicateOp::GeoRadius;
+    far.value = 65.0; far.value2 = -150.0;
+    far.radius_km = 10.0;
+    far.geo_lng_column = "lng";
+
+    EXPECT_TRUE (summary_may_match(sum.data(), sum.size(), schema,
+                                    {inside}, {0}, {1}));
+    EXPECT_FALSE(summary_may_match(sum.data(), sum.size(), schema,
+                                    {far}, {0}, {1}));
 }
 
 }  // namespace

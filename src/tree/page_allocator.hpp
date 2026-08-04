@@ -63,6 +63,13 @@ public:
     /// Free a contiguous extent of `count` pages.
     void free_extent(PageFile& file, PageId start, uint32_t count);
 
+    /// Clear the free list. The pages it referenced remain marked free in the
+    /// bitmap (the source of truth), so they can still be found via bitmap
+    /// scan. This is used when the free list contains stale entries — e.g.
+    /// after `alloc_extent` reuses free-listed pages for a new extent,
+    /// overwriting the free-list "next" pointers with data.
+    void clear_free_list();
+
     /// Extend the file by `extra_pages` pages and mark them free. Called when
     /// alloc_page/alloc_extent return kInvalidPage. Updates the bitmap to
     /// cover the new pages.

@@ -200,13 +200,6 @@ struct BuildConfig {
     /// See docs/closure_factor_derivation.md.
     float closure_epsilon = -1.0f;
 
-    /// Sub-shard threshold: max vectors per sub-shard before splitting.
-    /// 0 = no sub-sharding (flat shards). >0 = split shards exceeding this
-    /// into sub-shards via local k-means. See docs/sub_shard_design.md.
-    uint32_t sub_shard_threshold = 0;
-    /// How many sub-shards to probe per coarse shard at search time.
-    /// 0 or 1 = scan all sub-shards (flat). >1 = two-level routing.
-    uint32_t sub_shard_n_probe = 1;
     /// Adaptive probe gap (0 = auto, derived from LID by the estimator).
     float adaptive_probe_gap = 0.0f;
     /// Median LID (0 = unmeasured; set by the estimator).
@@ -274,10 +267,6 @@ struct SearchConfig {
     /// for graph-mode indexes.
     uint32_t fastscan_W = 0;
 
-    /// Sub-shard probe override. 0 = use the index's built-in sub_shard_n_probe
-    /// (from manifest). >0 = override at search time.
-    uint32_t sub_shard_n_probe_override = 0;
-
     /// Adaptive probe early-exit (B): after scanning each shard, check if the
     /// next shard's centroid distance is significantly farther than the current.
     /// If cent_dist[p+1] / cent_dist[p] > adaptive_probe_gap, stop scanning.
@@ -328,8 +317,6 @@ struct ResolvedParams {
     uint32_t partition_count = 1; ///< Partition count (>1 → partitioned build)
     float closure_factor = 1.033f;  ///< Shard overlap radius ratio
     float closure_epsilon = 0.0f;  ///< Absolute margin for SPANN-style boundary posting. 0 = ratio-based.
-    uint32_t sub_shard_threshold = 0;  ///< Max vectors per sub-shard (0 = off).
-    uint32_t sub_shard_n_probe = 1;    ///< Sub-shards to probe per shard (0/1 = scan all).
     float adaptive_probe_gap = 1.5f;   ///< Geometric-gap early-exit (derived from LID).
     float median_lid = 0.0f;           ///< Median LID measured at build time (0 = unmeasured).
     uint16_t n_entry_points = 16;   ///< K-means centroid count for entry-point selection

@@ -424,7 +424,7 @@ B (gap) + D (budget) at every level. Filter pruning at every level.
 - Search: two-level routing + leaf scan (mmap). PCA routing at search time.
 - Three quantizers: PQ (4/8-bit), PRQ (4-bit), RaBitQ (4-bit + factors).
 - Multithreaded search (8 threads, 5.8× scaling).
-- CLI: build-tree, build-tree-streaming, build-tree-refined, build-tree-pca, tree-search.
+- CLI: build-tree, build-tree-pca, tree-search.
 - **Validation results (c4a, 8-core ARM, NVMe):**
   - Sphere-IP 10M: recall@10 = 0.839 @ 348 QPS (K=512 np=64)
   - MSMARCO 8.7M: recall@10 = 0.976 @ 720 QPS (K=1024 np=64)

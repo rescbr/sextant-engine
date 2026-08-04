@@ -318,7 +318,6 @@ TEST(TreeManifest, RoundTrip) {
     m.adaptive_probe_gap = 1.606f;
     m.median_lid = 13.21f;
     m.balance_factor = 4.0f;
-    m.sub_shard_probe_pct = 50;
 
     std::string toml = manifest_to_toml(m);
     TreeManifest m2 = manifest_from_toml(toml);
@@ -336,7 +335,6 @@ TEST(TreeManifest, RoundTrip) {
     EXPECT_FLOAT_EQ(m2.adaptive_probe_gap, 1.606f);
     EXPECT_FLOAT_EQ(m2.median_lid, 13.21f);
     EXPECT_FLOAT_EQ(m2.balance_factor, 4.0f);
-    EXPECT_EQ(m2.sub_shard_probe_pct, 50u);
 }
 
 TEST(TreeManifest, MissingFieldThrows) {

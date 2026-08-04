@@ -15,7 +15,6 @@
 
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace sextant {
 
@@ -32,67 +31,6 @@ struct GraphManifest {
 
 std::string graph_manifest_to_toml(const GraphManifest& m);
 GraphManifest graph_manifest_from_toml(const std::string& toml);
-
-// ===========================================================================
-// IVF graph manifest (shards_dir/manifest)
-// ===========================================================================
-
-struct IVFGraphManifest {
-    uint32_t K = 0;
-    uint32_t dim = 0;
-    uint32_t n_probe_default = 1;
-    float closure_factor = 1.0f;
-};
-
-std::string ivf_graph_manifest_to_toml(const IVFGraphManifest& m);
-IVFGraphManifest ivf_graph_manifest_from_toml(const std::string& toml);
-
-// ===========================================================================
-// IVF scan manifest (shards_dir/manifest)
-// ===========================================================================
-
-struct IVFScanManifest {
-    uint32_t K = 0;
-    uint32_t dim = 0;
-    uint32_t n_probe_default = 1;
-    uint16_t m4 = 0;
-    uint8_t  scan_pq_bits = 4;
-    std::string quantizer_type = "pq";
-    uint32_t prq_nsplits = 0;
-    uint32_t sub_shard_probe_pct = 0;
-    float adaptive_probe_gap = 0.0f;
-    float median_lid = 0.0f;
-};
-
-std::string ivf_scan_manifest_to_toml(const IVFScanManifest& m);
-IVFScanManifest ivf_scan_manifest_from_toml(const std::string& toml);
-
-// ===========================================================================
-// Per-shard manifest (scan: shard_dir/.manifest)
-// ===========================================================================
-
-struct ShardManifest {
-    uint32_t count = 0;
-    uint32_t dim = 0;
-    uint16_t m4 = 0;
-};
-
-std::string shard_manifest_to_toml(const ShardManifest& m);
-ShardManifest shard_manifest_from_toml(const std::string& toml);
-
-// ===========================================================================
-// Sub-shard centroid offsets (shard_dir/shard.manifest)
-// ===========================================================================
-
-/// TOML format:
-///   ready = true
-///   n_subs = 3
-///   offsets = [10, 50, 120]
-std::string shard_offsets_to_toml(uint32_t n_subs,
-                                  const std::vector<uint32_t>& offsets);
-/// Returns (n_subs, offsets). Throws on parse error.
-std::pair<uint32_t, std::vector<uint32_t>>
-shard_offsets_from_toml(const std::string& toml);
 
 // ===========================================================================
 // I/O helpers: atomic write + read

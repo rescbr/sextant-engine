@@ -139,31 +139,16 @@ inline void add_common_flags(cmdline::parser& p) {
     p.add<std::string>("log-level", 0,
         "Log level: debug, info, warn, error", false, "info");
 
-    // K-driving params (build-ram, graph, ivf, partition-count) are common to
-    // all modes — build needs them to actually partition, analyze previews
-    // them, autobuild threads them through. The K heuristic lives in
-    // resolve_params (scan path: target ~200k vectors/shard, clamped
-    // [16, 8192]; graph-inside-shard: target ~64k, clamped [2, 256]);
-    // explicit --partition-count wins.
+    // K-driving params (build-ram, partition-count) are common to all modes —
+    // build needs them to actually partition, analyze previews them, autobuild
+    // threads them through. The K heuristic lives in resolve_params
+    // (target ~200k vectors/shard, clamped [16, 8192]); explicit
+    // --partition-count wins.
     p.add<uint64_t>("build-ram", 0,
         "Build RAM budget in bytes (forces partitioning if small). "
         "0 = auto (50% of physical RAM). Affects K (partition count) "
         "resolution.",
         false, 0);
-    p.add("merged-graph", 0,
-        "Build a merged-graph index (Vamana) instead of the default "
-        "IVF-list-scan + 4-bit PQ FastScan index. The merged-graph path "
-        "wins at low recall / high QPS (recall < 0.88); the default scan "
-        "path wins at recall >= 0.94. K=1 produces a single monolithic "
-        "graph; --partition-count > 1 produces a partition+merge graph. "
-        "See ~/.local/state/maki/plans/sharing-eternal-louse.md.");
-    p.add("sharded-graph", 0,
-        "Build in graph-inside-shard IVF mode: K independent shard graph "
-        "indices + FP16 routing centroids (the PRIOR default, before the "
-        "scan path). Retained for the low-recall tier and back-compat with "
-        "existing build scripts. Prefer the default (no flag) for recall >= "
-        "0.94, or --merged-graph for K=1 merged-graph. See "
-        "docs/ivf_probe_design.md.");
     p.add<uint32_t>("partition-count", 0,
         "Partition count (K) override. 0 = auto (RAM-driven, plus the "
         "shard-size heuristic for the chosen build path).",
@@ -190,17 +175,6 @@ inline void add_common_flags(cmdline::parser& p) {
         "= better boundary recall, more storage. Only affects ratio-based "
         "closure (when closure-epsilon=0).",
         false, 0.0f);
-    p.add<uint32_t>("sub-shard-threshold", 0,
-        "Max vectors per sub-shard before splitting. 0 = no sub-sharding. "
-        ">0 = shards exceeding this are split into sub-shards via local "
-        "k-means, enabling two-level routing (fewer codes scanned per query). "
-        "See docs/sub_shard_design.md.",
-        false, 0);
-    p.add<uint32_t>("sub-shard-n-probe", 0,
-        "Number of sub-shards to probe per coarse shard during search. "
-        "0 or 1 = scan all sub-shards (flat). >1 = two-level routing "
-        "(scan only the nearest sub-shards). Default 1.",
-        false, 1);
 }
 
 /// Add mode-specific extras. Call after add_common_flags.
@@ -232,19 +206,7 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             "Multi-start: number of entry points to seed each search from "
             "(top-M closest to the query). 0 = default (4).",
             false, 0);
-        // (build-ram, ivf, partition-count are in add_common_flags now.)
-    }
-    if (mode == Mode::Autobuild) {
-        p.add<uint32_t>("sharded-graph-n-probe", 0,
-            "sharded-graph default n_probe (shards probed per query) for the "
-            "--sharded-graph path. 0 = auto (max(1, K/4)). Only "
-            "meaningful with --sharded-graph.",
-            false, 0);
-        p.add<uint32_t>("scan-n-probe", 0,
-            "IVF-scan default n_probe (shards probed per query) for the "
-            "default scan path. 0 = auto (max(1, K/4)). Ignored when "
-            "--merged-graph or --sharded-graph is set.",
-            false, 0);
+        // (build-ram, partition-count are in add_common_flags now.)
     }
 }
 
@@ -323,36 +285,7 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
             cfg.closure_f_target = p.get<float>("closure-f-target");
         }
     } catch (...) {}
-    try {
-        if (p.exist("sub-shard-threshold")) {
-            cfg.sub_shard_threshold = p.get<uint32_t>("sub-shard-threshold");
-        }
-    } catch (...) {}
-    try {
-        if (p.exist("sub-shard-n-probe")) {
-            cfg.sub_shard_n_probe = p.get<uint32_t>("sub-shard-n-probe");
-        }
-    } catch (...) {}
 
-    // Build-path selection: --merged-graph, --sharded-graph, or default
-    // (IVF-list-scan).
-    //   --merged-graph  : merged-graph (K=1 or partition+merge). cfg.merged_graph=true.
-    //   --sharded-graph : graph-inside-shard (the PRIOR default). cfg.sharded_graph=true.
-    //   (neither)       : IVF-list-scan + 4-bit PQ FastScan (the new default).
-    // Both flags set is contradictory — the three paths are mutually exclusive.
-    // We check via p.exist() (registered in add_common_flags for all modes).
-    {
-        const bool want_graph = p.exist("merged-graph");
-        const bool want_ivf   = p.exist("sharded-graph");
-        if (want_graph && want_ivf) {
-            throw std::runtime_error(
-                "--merged-graph and --sharded-graph are mutually exclusive; "
-                "pick one build path (default = IVF-list-scan, --merged-graph "
-                "= merged-graph, --sharded-graph = graph-inside-shard)");
-        }
-        cfg.merged_graph = want_graph;
-        cfg.sharded_graph   = want_ivf;
-    }
     return cfg;
 }
 

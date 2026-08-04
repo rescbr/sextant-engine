@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <limits>
 #include <string_view>
 
@@ -99,18 +100,59 @@ std::vector<ColumnView> parse_filter_columns(const uint8_t* filter_base,
 /// `col` is the ColumnView for the predicate's column. `idx` is the local
 /// vector index within the leaf.
 /// Returns true if the candidate passes the predicate.
+///
+/// NOTE: This overload CANNOT evaluate geo predicates (GeoBox, GeoRadius),
+/// which span two columns (latitude + longitude). For geo ops use
+/// eval_predicate_geo(), which has access to all column views. When called
+/// with a geo op this returns true (no-op) — callers that support geo must
+/// route through eval_predicate_geo instead.
 bool eval_predicate(const ColumnView& col, uint32_t idx, const Predicate& pred);
+
+/// Evaluate a geo predicate (GeoBox, GeoRadius) against a candidate.
+/// `lat_col` / `lng_col` are the ColumnViews for the latitude and longitude
+/// columns respectively. `idx` is the local vector index within the leaf.
+/// Returns true if the candidate passes.
+bool eval_predicate_geo(const ColumnView& lat_col, const ColumnView& lng_col,
+                         uint32_t idx, const Predicate& pred);
+
+/// Great-circle distance between two lat/lng points (degrees) in kilometers.
+/// Uses the haversine formula. Scalar (NEON has no native trig).
+inline double haversine_km(double lat1, double lng1,
+                            double lat2, double lng2) {
+    constexpr double kEarthRadiusKm = 6371.0;
+    constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+    const double dlat = (lat2 - lat1) * kDegToRad;
+    const double dlng = (lng2 - lng1) * kDegToRad;
+    const double a = std::sin(dlat / 2.0) * std::sin(dlat / 2.0) +
+        std::cos(lat1 * kDegToRad) * std::cos(lat2 * kDegToRad) *
+        std::sin(dlng / 2.0) * std::sin(dlng / 2.0);
+    return kEarthRadiusKm * 2.0 * std::atan2(std::sqrt(a), std::sqrt(1.0 - a));
+}
 
 /// Evaluate ALL predicates against a candidate. Returns true only if ALL pass.
 /// `cols` has one ColumnView per schema column; predicates reference columns
-/// by name (resolved to index via schema).
+/// by name (resolved to index via schema). Geo predicates (GeoBox, GeoRadius)
+/// reference two columns: the latitude column (pred_col_indices[p]) and the
+/// longitude column (geo_lng_col_indices[p]).
 inline bool eval_all_predicates(const std::vector<ColumnView>& cols,
                                  const Schema& schema, uint32_t idx,
                                  const std::vector<Predicate>& preds,
-                                 const std::vector<uint32_t>& pred_col_indices) {
+                                 const std::vector<uint32_t>& pred_col_indices,
+                                 const std::vector<uint32_t>& geo_lng_col_indices = {}) {
     for (uint32_t p = 0; p < preds.size(); ++p) {
-        if (!eval_predicate(cols[pred_col_indices[p]], idx, preds[p]))
-            return false;
+        const auto& pred = preds[p];
+        if (pred.op == PredicateOp::GeoBox ||
+            pred.op == PredicateOp::GeoRadius) {
+            const uint32_t lng_col = (p < geo_lng_col_indices.size())
+                ? geo_lng_col_indices[p] : UINT32_MAX;
+            if (lng_col >= cols.size()) return false;  // misconfigured
+            if (!eval_predicate_geo(cols[pred_col_indices[p]],
+                                    cols[lng_col], idx, pred))
+                return false;
+        } else {
+            if (!eval_predicate(cols[pred_col_indices[p]], idx, pred))
+                return false;
+        }
     }
     return true;
 }
@@ -211,11 +253,31 @@ inline uint32_t eval_all_predicates_batch4(
     const std::vector<ColumnView>& cols, const Schema& schema,
     uint32_t start_idx,
     const std::vector<Predicate>& preds,
-    const std::vector<uint32_t>& pred_col_indices) {
+    const std::vector<uint32_t>& pred_col_indices,
+    const std::vector<uint32_t>& geo_lng_col_indices = {}) {
     // Start with all candidates passing; AND out failures.
     uint32_t mask = 0xF;
     for (uint32_t p = 0; p < preds.size() && mask; ++p) {
-        mask &= eval_predicate_batch4(cols[pred_col_indices[p]], start_idx, preds[p]);
+        const auto& pred = preds[p];
+        if (pred.op == PredicateOp::GeoBox ||
+            pred.op == PredicateOp::GeoRadius) {
+            // Geo predicates span two columns and use scalar trig; evaluate
+            // per-candidate (haversine is the documented scalar exception).
+            const uint32_t lng_col = (p < geo_lng_col_indices.size())
+                ? geo_lng_col_indices[p] : UINT32_MAX;
+            if (lng_col >= cols.size()) { mask = 0; break; }
+            uint32_t gmask = 0;
+            for (uint32_t j = 0; j < 4; ++j) {
+                if (eval_predicate_geo(cols[pred_col_indices[p]],
+                                       cols[lng_col],
+                                       start_idx + j, pred))
+                    gmask |= (1u << j);
+            }
+            mask &= gmask;
+        } else {
+            mask &= eval_predicate_batch4(cols[pred_col_indices[p]],
+                                          start_idx, pred);
+        }
     }
     return mask;
 }
@@ -229,7 +291,8 @@ inline uint32_t eval_all_predicates_batch4(
 bool summary_may_match(const uint8_t* summary, uint32_t summary_size,
                         const Schema& schema,
                         const std::vector<Predicate>& preds,
-                        const std::vector<uint32_t>& pred_col_indices);
+                        const std::vector<uint32_t>& pred_col_indices,
+                        const std::vector<uint32_t>& geo_lng_col_indices = {});
 
 /// Check a bloom filter for a hash. Returns true if the hash MAY be present
 /// (bloom positive or empty bloom). False = definitely absent.

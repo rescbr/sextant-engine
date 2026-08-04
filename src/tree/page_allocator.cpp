@@ -87,6 +87,14 @@ void PageAllocator::load(PageFile& file, PageId bitmap_page,
 
     // Load the bitmap from disk into memory.
     grow_bitmap(n_pages_);
+    // The on-disk bitmap occupies bitmap_pages_ × kPageSize bytes, but
+    // grow_bitmap sizes to just n_pages_ bits. Grow to hold the full on-disk
+    // copy so read_pages doesn't overflow.
+    const size_t on_disk_bytes =
+        static_cast<size_t>(bitmap_pages_) * kPageSize;
+    if (bitmap_.size() < on_disk_bytes)
+        bitmap_.resize(on_disk_bytes, 0);
+    bitmap_capacity_bits_ = static_cast<uint64_t>(bitmap_.size()) * 8;
     if (bitmap_pages_ > 0) {
         file.read_pages(bitmap_page_, bitmap_pages_, bitmap_.data());
     }
@@ -184,6 +192,14 @@ void PageAllocator::free_extent(PageFile& file, PageId start, uint32_t count) {
             ++n_free_pages_;
         }
     }
+}
+
+void PageAllocator::clear_free_list() {
+    free_list_head_ = kInvalidPage;
+    // Recount free pages from the bitmap (source of truth).
+    n_free_pages_ = 0;
+    for (uint64_t i = 0; i < n_pages_; ++i)
+        if (!bit_get(bitmap_, i)) ++n_free_pages_;
 }
 
 void PageAllocator::grow(PageFile& file, uint64_t extra_pages) {

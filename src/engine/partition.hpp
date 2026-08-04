@@ -1,16 +1,18 @@
 #pragma once
 
 /// @file partition.hpp
-/// PartitionInfo: k-means partitioning on PQ codes (Step 11).
+/// K-means partitioning on PQ codes, used by the graph builder (shard
+/// partitioning) and the tree index (leaf split).
 ///
-/// Partitions the dataset into K shards by running k-means on the PQ codes
-/// using PQ code distance (symmetric distance via the quantizer's cross-distance table).
-/// Each vector is assigned to its nearest centroid, plus any centroid within
-/// `closure_factor × d_best` — this creates ~15% overlap so boundary nodes
-/// appear in multiple shards, keeping the merged graph connected.
+/// The pipeline has two stages:
+/// 1. **kmeans_pq**: core k-means loop (centroid init → assignment → medoid
+///    update → convergence). Returns medoid centroids (PQ codes) + assignment.
+/// 2. **assign_with_closure**: builds the final shards with closure overlap,
+///    balance capping, and RNG redundancy pruning (SPANN-style).
 ///
-/// The centroids are PQ codes (not raw float vectors), so both k-means and
-/// assignment use code-to-code distances exclusively.
+/// partition_codes chains the two stages for the graph builder's use case.
+/// Leaf split calls kmeans_pq directly (no closure — the split produces two
+/// disjoint leaves).
 
 #include <sextant/types.hpp>
 #include <cstdint>
@@ -19,6 +21,19 @@
 namespace sextant {
 
 class PqQuantizer;
+
+/// Result of the core k-means loop.
+struct KMeansResult {
+    /// centroids[k] = PQ code of cluster k's medoid (code_size bytes).
+    /// Padded to a multiple of 4 (K_padded) for batch4 SIMD.
+    std::vector<std::vector<uint8_t>> centroids;
+
+    /// assign[i] = cluster index of vector i (nearest centroid).
+    std::vector<uint32_t> assign;
+
+    /// Number of real (non-padding) clusters.
+    uint32_t K = 0;
+};
 
 /// Result of partitioning: for each shard, the list of global vector IDs
 /// assigned to it (in the order they were assigned — shard-local index = the
@@ -39,7 +54,50 @@ struct PartitionAssignment {
     float closure_epsilon = 0.0f;
 };
 
+/// Core k-means on PQ codes. Runs centroid init → assignment → medoid update
+/// for `iterations` iterations (with early convergence at <1% change).
+///
+/// Centroids are medoids (actual data points selected as the best central
+/// representative). Distances use the quantizer's PQ code_distance (symmetric
+/// via the cross-distance table, batch4 SIMD).
+///
+/// @param quantizer   Trained PQ quantizer (provides code_distance, batch4).
+/// @param codes       Flat PQ codes buffer (n × code_size).
+/// @param n           Number of vectors.
+/// @param code_size   Bytes per PQ code.
+/// @param K           Number of clusters.
+/// @param iterations  Max k-means iterations.
+/// @param num_threads Parallelism (0 = hardware_concurrency).
+/// @param seed        RNG seed for initial centroid selection.
+KMeansResult kmeans_pq(const PqQuantizer& quantizer,
+                       const uint8_t* codes, uint32_t n,
+                       uint32_t code_size, uint32_t K,
+                       uint32_t iterations = 10,
+                       uint32_t num_threads = 0,
+                       uint64_t seed = 0xC0DE1234ULL);
+
+/// Build the final shard assignment with closure overlap, balance capping,
+/// and RNG redundancy pruning. Takes the k-means output and replicates
+/// boundary vectors into multiple shards.
+///
+/// @param km               Output of kmeans_pq.
+/// @param closure_factor   Ratio threshold for multi-shard assignment.
+/// @param closure_epsilon  Absolute margin (SPANN-style). Sentinel -1.0 =
+///                         auto-compute from mean NN distance. 0 = ratio only.
+/// @param balance_factor   Size-balancing strength (0 = off). Caps max_shard
+///                         at roughly (1 + 1/balance_factor) × mean_size.
+/// @param num_threads      Parallelism (0 = hardware_concurrency).
+PartitionAssignment assign_with_closure(
+    const PqQuantizer& quantizer,
+    const uint8_t* codes, uint32_t n, uint32_t code_size,
+    const KMeansResult& km,
+    float closure_factor,
+    float closure_epsilon = 0.0f,
+    float balance_factor = 0.0f,
+    uint32_t num_threads = 0);
+
 /// Run k-means on PQ codes and assign vectors to shards with closure overlap.
+/// Convenience wrapper: kmeans_pq → assign_with_closure.
 ///
 /// @param quantizer   Trained PQ quantizer (provides PQ code_distance).
 /// @param codes       Flat PQ codes buffer (n × code_size), indexed by global ID.

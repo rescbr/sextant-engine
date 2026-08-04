@@ -67,7 +67,6 @@ std::string manifest_to_toml(const TreeManifest& m) {
     // [partition]
     auto partition = cpptoml::make_table();
     partition->insert("balance_factor", static_cast<double>(m.balance_factor));
-    partition->insert("sub_shard_probe_pct", m.sub_shard_probe_pct);
     root->insert("partition", partition);
 
     // [schema]  (only when non-empty)
@@ -158,9 +157,6 @@ TreeManifest manifest_from_toml(const std::string& toml) {
     if (partition) {
         if (auto bf = partition->get_as<double>("balance_factor")) {
             m.balance_factor = static_cast<float>(*bf);
-        }
-        if (auto ssp = partition->get_as<int64_t>("sub_shard_probe_pct")) {
-            m.sub_shard_probe_pct = static_cast<uint32_t>(*ssp);
         }
     }
 

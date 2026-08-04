@@ -26,8 +26,8 @@ pq_explore = executable('pq_explore',
     install: false,
 )
 
-route_quality = executable('route_quality',
-    'route_quality.cpp',
+sextant_filtered_gt = executable('sextant_filtered_gt',
+    'compute_filtered_gt.cpp',
     dependencies: sextant_dep,
     include_directories: [engine_inc, third_party_inc],
     install: false,

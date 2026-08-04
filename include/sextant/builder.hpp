@@ -89,74 +89,9 @@ public:
     /// Prepare codes only: run pass1 (reservoir + PQ train) and pass2
     /// (encode), leaving codes_buffer + raw_vecs_buffer populated on the
     /// Index without running the construct or flush pipeline. Used by
-    /// build_partitioned and build_ivf to share the global train+encode
-    /// step across all shards.
+    /// build_partitioned to share the global train+encode step across all
+    /// shards.
     void prepare_codes(VectorSource& source, const ResolvedParams& params);
-
-    /// Prepare routing codes only: pass1 (reservoir + PQ train) + pass2
-    /// (encode all N into codes_buffer). NO raw_vecs_buffer allocation —
-    /// the FP16 materialization (N × dim × 2 bytes = 13.4 GB at 100M/768-dim)
-    /// is graph-only. The IVF-list-scan path doesn't need it (it mmaps the
-    /// FP32 source directly for 4-bit encoding). Used by build_ivf_scan to
-    /// avoid the FP16 waste that blocks 100M+ builds on a 30 GB VM.
-    void prepare_routing_codes(VectorSource& source, const ResolvedParams& params);
-
-    /// IVF-probe build: train the quantizer ONCE globally, encode all N
-    /// vectors, partition into K shards, and flush each shard as a complete
-    /// production Index under `<index_path>.shards/shard_NNNN/`. Also writes
-    /// `centroids.bin` (K × dim × float16_t, decoded from the partition's PQ
-    /// centroid codes) and a line-oriented `manifest` (ready/K/dim/
-    /// n_probe_default/closure_factor). Each shard is openable unchanged via
-    /// `Index::read(shard_prefix)`; the whole IVF index via
-    /// `IVFIndex::read(<index_path>.shards)`.
-    ///
-    /// The quantizer is shared across all shards (never retrained per shard).
-    /// Each shard is built by a fresh Builder + Index pair at R_shard = 2R/3.
-    /// `n_probe_default` (0 → max(1, K/4)) is recorded in the manifest.
-    BuildResult build_ivf(VectorSource& source, const std::string& index_path,
-                          const ResolvedParams& params,
-                          uint32_t n_probe_default = 0);
-
-    /// BuildConfig overload: resolves params first (picks up the IVF K
-    /// heuristic when --partition-count is not explicit), then forwards to
-    /// the ResolvedParams overload. Mirrors Builder::build's two-overload
-    /// pattern.
-    BuildResult build_ivf(VectorSource& source, const std::string& index_path,
-                          const BuildConfig& config,
-                          uint32_t n_probe_default = 0) {
-        index_.count = source.count();
-        index_.dim = source.dim();
-        return build_ivf(source, index_path,
-                         resolve_params(index_.count, index_.dim, config),
-                         n_probe_default);
-    }
-
-    /// IVF-list-scan build (Option A — the DEFAULT when merged_graph=false).
-    /// Trains a 4-bit PQ codebook, partitions via k-means on the (separately
-    /// trained) 8-bit routing codes, then per shard: encodes each member at
-    /// 4-bit, packs into FastScan block layout, writes `.codes4` + `.rowids`
-    /// sidecars. NO graph, NO Vamana, NO BFS reorder — shards are pure code
-    /// containers. The 4-bit codebook is shared and written once at
-    /// `<index_path>.shards/codebook4.bin`. The result is openable via
-    /// `IVFScanIndex::read(<index_path>.shards)`.
-    ///
-    /// `pq4_m` is taken from `params.pq4_m` (auto-resolved to dim/4 if 0).
-    BuildResult build_ivf_scan(VectorSource& source,
-                                const std::string& index_path,
-                                const ResolvedParams& params,
-                                uint32_t n_probe_default = 0);
-
-    /// BuildConfig overload for build_ivf_scan (mirrors the build_ivf pattern).
-    BuildResult build_ivf_scan(VectorSource& source,
-                                const std::string& index_path,
-                                const BuildConfig& config,
-                                uint32_t n_probe_default = 0) {
-        index_.count = source.count();
-        index_.dim = source.dim();
-        return build_ivf_scan(source, index_path,
-                              resolve_params(index_.count, index_.dim, config),
-                              n_probe_default);
-    }
 
 private:
     Index& index_;
@@ -177,30 +112,6 @@ private:
                         const std::function<RowId(uint32_t)>& row_id_at,
                         uint32_t lut_sz, uint32_t nthreads, const char* label);
 
-    /// Build one IVF shard and flush it as a complete production Index to
-    /// `shard_prefix.*` (standard sidecars: .graph/.codes/.meta/
-    /// .manifest). The shard Index is fully populated by the caller:
-    ///   - a CLONE of the global quantizer (so write_meta_file can serialize
-    ///     it independently, and the reopened shard reconstructs its own
-    ///     VamanaCore at R_shard);
-    ///   - materialized shard-local codes/nodes/vecs buffers (local
-    ///     0..shard_n-1 ordering; each node's row_id = its global ID);
-    ///   - `count`/`dim`/`code_size`/`node_size` set (node_size = R_shard);
-    ///   - a fresh VamanaCore at R_shard wired to those buffers.
-    ///
-    /// `shard_params` carries R = R_shard (2R/3) so write_sidecars_ emits the
-    /// final layout at R_shard and Index::read reopens the shard with the
-    /// right node_size. This helper runs construct_into (on a fresh Builder
-    /// bound to `shard_index`) → snap_entry_points_ → compute_bfs_reorder_ →
-    /// write_sidecars_, reusing the entire flush pipeline unchanged. The
-    /// quantizer is NEVER retrained here — `members` is only used to remap
-    /// shard-local IDs → global row IDs during construct.
-    void build_shard_into_(Index& shard_index,
-                           const ResolvedParams& shard_params,
-                           const std::vector<uint32_t>& members,
-                           uint32_t shard_k, uint32_t K,
-                           const std::string& shard_prefix);
-
     /// Unified build (K==1 fast path + K>1 partitioned): partition →
     /// per-shard build → merge → flush.
     BuildResult build_partitioned(VectorSource& source,
@@ -217,19 +128,6 @@ private:
     /// Snap stored FP32 centroids to nearest data vectors (medoids) in
     /// index_.raw_vecs_buffer and set them as the core's entry points.
     void snap_entry_points_(const ResolvedParams& params);
-
-    /// IVF Workstream A1/A3: sub-clustered entry points for a shard.
-    /// Runs a small k-means (k' = n_sub) on the shard's PQ codes, snaps each
-    /// sub-centroid to its top-`medoids_per_cluster` members (nearest by FP16
-    /// L2sq), and sets the k'×M deduped medoid LOCAL IDs as the core's entry
-    /// points. Also populates index_.sub_centroids (k' × dim FP16) and
-    /// index_.sub_centroid_medoids (k' × M LOCAL IDs) so write_sidecars_ can
-    /// emit the `.epc` sidecar for A2/A3. Falls back to snap_entry_points_
-    /// (stride sampling) when the shard is too small. Returns k_sub used (0
-    /// on fallback).
-    uint32_t compute_sub_cluster_entry_points_(const ResolvedParams& params,
-                                                uint32_t n_sub,
-                                                uint32_t medoids_per_cluster);
 
     // --- Sidecar writers (shared by build + flush) ---
     void write_sidecars_(const std::string& index_path, const BfsReorder& bfs,

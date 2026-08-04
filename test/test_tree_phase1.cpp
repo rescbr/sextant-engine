@@ -105,7 +105,7 @@ TEST(IVFTreeIndex, BuildAndSearchPQ) {
     cfg.leaf_capacity = 500;
     cfg.num_threads = 4;
 
-    auto result = IVFTreeIndex::build(base_path, tree_path, cfg);
+    auto result = IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
     EXPECT_EQ(result.n_vectors, n);
     EXPECT_EQ(result.dim, dim);
     EXPECT_TRUE(std::filesystem::exists(tree_path));
@@ -178,18 +178,22 @@ TEST(IVFTreeIndex, TreeStructure) {
     cfg.params.scan_pq_bits = 4;
     cfg.params.partition_balance_factor = 4.0f;
     cfg.params.closure_epsilon = -1.0f;
-    cfg.k_root = 16;
-    cfg.leaf_capacity = 500;  // → n_leaves = 10
+    // k_root comfortably larger than the expected leaf count so the streaming
+    // build collapses to depth=1 (root children point directly to leaves).
+    // leaf_capacity >= N guarantees each cluster flushes at most one leaf,
+    // so n_leaves <= (non-empty clusters) <= k_root.
+    cfg.k_root = 32;
+    cfg.leaf_capacity = 5000;  // >= N → ≤ 1 leaf per cluster
     cfg.num_threads = 4;
+    cfg.closure_multiplier = 0.0f;  // no boundary replication → stable leaf count
 
-    IVFTreeIndex::build(base_path, tree_path, cfg);
+    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
     auto idx = IVFTreeIndex::open(tree_path);
 
-    // With n=5000, leaf_cap=500: n_leaves=10. k_root=16.
-    // depth=1 (n_leaves < k_root).
+    // n_leaves (≤ k_root) forces depth=1: root children are leaves.
     EXPECT_EQ(idx->depth(), 1u);
-    EXPECT_EQ(idx->k_root(), 16u);
-    EXPECT_EQ(idx->n_leaves(), 10u);
+    EXPECT_EQ(idx->k_root(), 32u);
+    EXPECT_LE(idx->n_leaves(), 32u);
 
     std::filesystem::remove(base_path);
     std::filesystem::remove(tree_path);
@@ -215,16 +219,17 @@ TEST(IVFTreeIndex, DepthTwoTree) {
     cfg.params.partition_balance_factor = 4.0f;
     cfg.params.closure_epsilon = -1.0f;
     cfg.k_root = 16;
-    cfg.leaf_capacity = 500;  // → n_leaves = 40
+    cfg.leaf_capacity = 500;  // n=20000 → many leaves (> k_root) → depth=2
     cfg.num_threads = 4;
+    cfg.closure_multiplier = 0.0f;  // no boundary replication → stable leaf count
 
-    IVFTreeIndex::build(base_path, tree_path, cfg);
+    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
     auto idx = IVFTreeIndex::open(tree_path);
 
-    // n_leaves=40 > k_root=16 → depth=2.
+    // n_leaves > k_root → depth=2 (root → L2 internal nodes → leaves).
     EXPECT_EQ(idx->depth(), 2u);
     EXPECT_EQ(idx->k_root(), 16u);
-    EXPECT_EQ(idx->n_leaves(), 40u);
+    EXPECT_GT(idx->n_leaves(), 16u);
 
     // Search should work on depth=2.
     SearchConfig sconfig;
@@ -265,7 +270,7 @@ TEST(IVFTreeIndex, RerankImprovesRecall) {
     cfg.leaf_capacity = 400;
     cfg.num_threads = 4;
 
-    IVFTreeIndex::build(base_path, tree_path, cfg);
+    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
     auto idx = IVFTreeIndex::open(tree_path);
 
     // Regenerate the cluster centers to build near-centroid queries.

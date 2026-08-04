@@ -45,7 +45,6 @@ struct TreeManifest {
 
     // [partition]
     float balance_factor = 4.0f;
-    uint32_t sub_shard_probe_pct = 0;  // 0 = disabled
 
     // [schema]  (Phase A; empty = no filter columns)
     Schema schema;                 // empty = no filter columns

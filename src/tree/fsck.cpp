@@ -46,20 +46,20 @@ std::vector<uint8_t> read_extent(const PageFile& file, PageId page,
 }
 
 /// Validate a leaf header's magic + CRC and accumulate its payload extent.
-void validate_leaf(const PageFile& file, const ChildEntry* ce,
-                   TreeWalkResult& result) {
-    result.leaf_ranges.push_back(
-        {ce->child_page, static_cast<uint32_t>(ce->child_pages)});
+/// `physical_page` / `physical_pages` are the resolved page location (from
+/// the leaf table if present, or the raw child_page for legacy trees).
+void validate_leaf(const PageFile& file, PageId physical_page,
+                   uint32_t physical_pages, TreeWalkResult& result) {
+    result.leaf_ranges.push_back({physical_page, physical_pages});
     ++result.n_leaves;
 
-    if (ce->child_page == kInvalidPage || ce->child_pages == 0) {
+    if (physical_page == kInvalidPage || physical_pages == 0) {
         ++result.magic_failures;
         result.pointers_ok = false;
         return;
     }
 
-    auto lbuf = read_extent(file, ce->child_page,
-                            static_cast<uint32_t>(ce->child_pages));
+    auto lbuf = read_extent(file, physical_page, physical_pages);
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(lbuf.data());
 
     if (lh->magic != kTreeLeafMagic) {
@@ -87,6 +87,20 @@ void validate_leaf(const PageFile& file, const ChildEntry* ce,
 TreeWalkResult walk_tree(const PageFile& file, const Superblock& sb,
                          const TreeManifest& manifest) {
     TreeWalkResult result;
+
+    // Load the leaf extent table (if present) for leaf_id → page resolution.
+    std::vector<LeafTableEntry> leaf_table;
+    if (sb.leaf_table_page() != kInvalidPage && sb.leaf_table_pages() > 0) {
+        std::vector<uint8_t> blob(
+            static_cast<size_t>(sb.leaf_table_pages()) * kPageSize);
+        file.read_pages(sb.leaf_table_page(), sb.leaf_table_pages(),
+                        blob.data());
+        uint64_t n_entries = 0;
+        std::memcpy(&n_entries, blob.data(), 8);
+        leaf_table.resize(n_entries);
+        std::memcpy(leaf_table.data(), blob.data() + 8,
+                    n_entries * sizeof(LeafTableEntry));
+    }
 
     struct StackEntry {
         PageId page;
@@ -140,7 +154,15 @@ TreeWalkResult walk_tree(const PageFile& file, const Superblock& sb,
             }
 
             if (ce->is_leaf) {
-                validate_leaf(file, ce, result);
+                // Resolve leaf_id → physical page via leaf table.
+                PageId leaf_id = ce->child_page;
+                PageId lpage = leaf_id;
+                uint32_t lpages = static_cast<uint32_t>(ce->child_pages);
+                if (!leaf_table.empty() && leaf_id < leaf_table.size()) {
+                    lpage = leaf_table[leaf_id].page;
+                    lpages = leaf_table[leaf_id].pages;
+                }
+                validate_leaf(file, lpage, lpages, result);
             } else {
                 stack.push_back(
                     {ce->child_page, static_cast<uint32_t>(ce->child_pages),
@@ -287,6 +309,9 @@ FsckResult fsck(const std::string& path, bool repair) {
     if (sb.cardinality_page() != kInvalidPage)
         all_allocated.push_back(
             {sb.cardinality_page(), sb.cardinality_pages()});
+    if (sb.leaf_table_page() != kInvalidPage)
+        all_allocated.push_back(
+            {sb.leaf_table_page(), sb.leaf_table_pages()});
 
     result.total_pages = file.num_pages();
     std::vector<bool> allocated(file.num_pages(), false);

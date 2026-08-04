@@ -209,4 +209,17 @@ inline uint64_t leaf_extent_pages(uint64_t count, uint16_t m4, uint8_t pq_bits,
          kPageSize - 1) / kPageSize);
 }
 
+// ===========================================================================
+// Leaf extent table (indirection for mutable leaf extents)
+// ===========================================================================
+
+/// One entry in the leaf extent table. Maps a leaf_id to its physical
+/// location in the page file. When a leaf grows (Phase H closure, Phase J
+/// insert), only this entry changes — no parent pointer fixup needed.
+struct LeafTableEntry {
+    PageId   page;    // starting page of this leaf's extent
+    uint32_t pages;   // extent length in pages
+} __attribute__((packed));
+static_assert(sizeof(LeafTableEntry) == 12);
+
 }  // namespace sextant::tree

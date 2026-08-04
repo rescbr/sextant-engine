@@ -63,12 +63,20 @@ public:
     /// Estimate selectivity for a numeric predicate (eq, gt, ge, lt, le, between).
     float selectivity_numeric(uint32_t col_idx, const Predicate& pred) const;
 
+    /// Estimate selectivity for a geo predicate (GeoBox, GeoRadius).
+    /// `lat_col` is the latitude column index; `lng_col` is the longitude
+    /// column index. Returns the area-overlap fraction of the query bounding
+    /// box within the columns' observed [min, max] ranges.
+    float selectivity_geo(uint32_t lat_col, uint32_t lng_col,
+                          const Predicate& pred) const;
+
     /// Combined selectivity for all predicates (product of individual
     /// selectivities, assuming independence). Clamped to [0, 1].
     float selectivity_combined(
         const Schema& schema,
         const std::vector<struct Predicate>& preds,
-        const std::vector<uint32_t>& pred_col_indices) const;
+        const std::vector<uint32_t>& pred_col_indices,
+        const std::vector<uint32_t>& geo_lng_col_indices = {}) const;
 
     bool empty() const { return columns_.empty(); }
     uint64_t n_vectors() const { return n_vectors_; }

@@ -249,9 +249,6 @@ ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
     if (overrides.closure_epsilon != 0.0f) {
         p.closure_epsilon = overrides.closure_epsilon;
     }
-    // Sub-shard settings (pass through from build config).
-    p.sub_shard_threshold = overrides.sub_shard_threshold;
-    p.sub_shard_n_probe = overrides.sub_shard_n_probe;
     p.adaptive_probe_gap = overrides.adaptive_probe_gap;
     p.median_lid = overrides.median_lid;
 

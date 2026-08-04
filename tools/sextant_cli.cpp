@@ -37,6 +37,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -46,6 +47,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <random>
 #include <sstream>
 #include <string>
@@ -88,25 +90,12 @@ int cmd_build(int argc, char* argv[]) {
     sextant::BuildConfig cfg = build_config_from_parser(p);
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
-    // (cfg.sharded_graph and cfg.merged_graph are set in build_config_from_parser
-    // from the --sharded-graph / --merged-graph flags, with mutual-exclusion
-    // validation.)
 
     sextant::Index idx;
     sextant::Builder builder(idx);
-    sextant::BuildResult result;
-    const char* path_label;
-    if (cfg.sharded_graph) {
-        result = builder.build_ivf(source, index_path, cfg);
-        path_label = "IVF (graph-inside-shard)";
-    } else if (cfg.merged_graph) {
-        result = builder.build(source, index_path, cfg);
-        path_label = "merged-graph";
-    } else {
-        result = builder.build_ivf_scan(source, index_path, cfg);
-        path_label = "IVF-list-scan";
-    }
-    std::cout << "built " << path_label << " index '" << index_path
+    const sextant::BuildResult result =
+        builder.build(source, index_path, cfg);
+    std::cout << "built index '" << index_path
               << "': n=" << result.n_vectors
               << " dim=" << result.dim
               << " R=" << result.R
@@ -146,7 +135,6 @@ int cmd_autobuild(int argc, char* argv[]) {
     cfg.recall_target    = p.get<float>("recall-target");
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
-    // (cfg.sharded_graph and cfg.merged_graph are set in build_config_from_parser.)
 
     sextant::Estimator estimator;
     // estimate_config handles all auto knobs; locked ones override.
@@ -155,46 +143,10 @@ int cmd_autobuild(int argc, char* argv[]) {
     // Print the analysis (shared pretty-print with analyze).
     print_analysis_(source, input, cfg, est.params, est.diag);
 
-    if (cfg.sharded_graph) {
-        const uint32_t n_probe_default = p.get<uint32_t>("sharded-graph-n-probe");
-        sextant::Index idx;
-        const sextant::BuildResult result =
-            sextant::Builder(idx).build_ivf(source, index_path, est.params,
-                                             n_probe_default);
-        std::cout << "\n═══ Build Result (IVF graph-inside-shard) ═══\n";
-        std::cout << "built IVF index '" << index_path << ".shards': n="
-                  << result.n_vectors << " dim=" << result.dim
-                  << " K=" << est.params.partition_count
-                  << " R=" << result.R
-                  << " L_build=" << result.L_build
-                  << " pq_m=" << static_cast<int>(result.pq_m)
-                  << " pq_bits=" << static_cast<int>(result.pq_bits)
-                  << " in " << result.build_time_sec << "s\n";
-        return 0;
-    }
-
-    if (!cfg.merged_graph) {
-        // Default: IVF-list-scan + 4-bit PQ FastScan.
-        const uint32_t n_probe_default = p.get<uint32_t>("scan-n-probe");
-        sextant::Index idx;
-        const sextant::BuildResult result =
-            sextant::Builder(idx).build_ivf_scan(source, index_path,
-                                                  est.params, n_probe_default);
-        std::cout << "\n═══ Build Result (IVF-list-scan) ═══\n";
-        std::cout << "built IVF-scan index '" << index_path << ".shards': n="
-                  << result.n_vectors << " dim=" << result.dim
-                  << " K=" << est.params.partition_count
-                  << " m4=" << static_cast<int>(est.params.pq4_m)
-                  << " pq_bits=4"
-                  << " in " << result.build_time_sec << "s\n";
-        return 0;
-    }
-
-    // --merged-graph: merged-graph (K=1 or partition+merge).
     sextant::Index idx;
     const sextant::BuildResult result =
         sextant::Builder(idx).build(source, index_path, est.params);
-    std::cout << "\n═══ Build Result (merged-graph) ═══\n";
+    std::cout << "\n═══ Build Result ═══\n";
     std::cout << "built index '" << index_path << "': n=" << result.n_vectors
               << " dim=" << result.dim
               << " R=" << result.R
@@ -452,100 +404,6 @@ int cmd_search(int argc, char* argv[]) {
 }
 
 // ---------------------------------------------------------------------------
-// build-tree-streaming: streaming build (sample k-means + dynamic leaf growth)
-// ---------------------------------------------------------------------------
-int cmd_build_tree_streaming(int argc, char* argv[]) {
-    using namespace sextant;
-
-    cmdline::parser p;
-    p.add<std::string>("input", 0, "Base vectors (.fbin)", true);
-    p.add<std::string>("index", 0, "Output tree file path", true);
-    p.add<uint32_t>("k-root", 0, "Root branching factor (0=auto)", false, 0);
-    p.add<uint32_t>("leaf-capacity", 0, "Max vectors per leaf", false, 5000);
-    p.add<uint16_t>("pq4-m", 0, "PQ subquantizers for 4-bit scan (0=dim/4)", false, 0);
-    p.add<uint32_t>("pq-bits", 0, "PQ bits (4 or 8)", false, 4);
-    p.add<std::string>("quantizer", 0, "pq / prq / rabitq", false, "pq");
-    p.add<std::string>("metric", 0, "l2sq / ip", false, "l2sq");
-    p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
-    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
-    p.parse_check(argc, argv);
-
-    {
-        const auto lvl = p.get<std::string>("log-level");
-        if (lvl == "debug") set_log_level(LogLevel::Debug);
-        else if (lvl == "warn") set_log_level(LogLevel::Warn);
-        else if (lvl == "error") set_log_level(LogLevel::Error);
-    }
-
-    tree::IVFTreeIndex::BuildConfig cfg;
-    cfg.k_root = p.get<uint32_t>("k-root");
-    cfg.leaf_capacity = p.get<uint32_t>("leaf-capacity");
-    cfg.num_threads = p.get<uint32_t>("threads");
-    cfg.params.pq4_m = p.get<uint16_t>("pq4-m");
-    cfg.params.scan_pq_bits = static_cast<uint8_t>(p.get<uint32_t>("pq-bits"));
-    cfg.params.quantizer_type = p.get<std::string>("quantizer");
-    const std::string metric = p.get<std::string>("metric");
-    cfg.params.metric = (metric == "ip") ? MetricKind::InnerProduct
-                                          : MetricKind::L2Sq;
-
-    auto result = tree::IVFTreeIndex::build_streaming(
-        p.get<std::string>("input"), p.get<std::string>("index"), cfg);
-    std::cout << "built tree index (streaming) '" << result.index_path
-              << "': n=" << result.n_vectors
-              << " dim=" << result.dim
-              << " m4=" << static_cast<int>(result.pq_m)
-              << " in " << result.build_time_sec << "s\n";
-     return 0;
- }
-
-// ---------------------------------------------------------------------------
-// build-tree-refined: two-phase streaming (greedy + refinement)
-// ---------------------------------------------------------------------------
-int cmd_build_tree_refined(int argc, char* argv[]) {
-    using namespace sextant;
-
-    cmdline::parser p;
-    p.add<std::string>("input", 0, "Base vectors (.fbin)", true);
-    p.add<std::string>("index", 0, "Output tree file path", true);
-    p.add<uint32_t>("k-root", 0, "Root branching factor (0=auto)", false, 0);
-    p.add<uint32_t>("leaf-capacity", 0, "Max vectors per leaf", false, 5000);
-    p.add<uint16_t>("pq4-m", 0, "PQ subquantizers (0=dim/4)", false, 0);
-    p.add<uint32_t>("pq-bits", 0, "PQ bits (4 or 8)", false, 4);
-    p.add<std::string>("quantizer", 0, "pq / prq / rabitq", false, "pq");
-    p.add<std::string>("metric", 0, "l2sq / ip", false, "l2sq");
-    p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
-    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
-    p.parse_check(argc, argv);
-
-    {
-        const auto lvl = p.get<std::string>("log-level");
-        if (lvl == "debug") set_log_level(LogLevel::Debug);
-        else if (lvl == "warn") set_log_level(LogLevel::Warn);
-        else if (lvl == "error") set_log_level(LogLevel::Error);
-    }
-
-    tree::IVFTreeIndex::BuildConfig cfg;
-    cfg.k_root = p.get<uint32_t>("k-root");
-    cfg.leaf_capacity = p.get<uint32_t>("leaf-capacity");
-    cfg.num_threads = p.get<uint32_t>("threads");
-    cfg.params.pq4_m = p.get<uint16_t>("pq4-m");
-    cfg.params.scan_pq_bits = static_cast<uint8_t>(p.get<uint32_t>("pq-bits"));
-    cfg.params.quantizer_type = p.get<std::string>("quantizer");
-    const std::string metric = p.get<std::string>("metric");
-    cfg.params.metric = (metric == "ip") ? MetricKind::InnerProduct
-                                          : MetricKind::L2Sq;
-
-    auto result = tree::IVFTreeIndex::build_streaming_refined(
-        p.get<std::string>("input"), p.get<std::string>("index"), cfg);
-    std::cout << "built tree index (refined) '" << result.index_path
-              << "': n=" << result.n_vectors
-              << " dim=" << result.dim
-              << " m4=" << static_cast<int>(result.pq_m)
-              << " in " << result.build_time_sec << "s\n";
-    return 0;
-}
-
-// ---------------------------------------------------------------------------
 // build-tree-pca: PCA-preconditioned streaming build
 // ---------------------------------------------------------------------------
 int cmd_build_tree_pca(int argc, char* argv[]) {
@@ -618,63 +476,140 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
 }
 
 // ---------------------------------------------------------------------------
-// build-tree: build a hierarchical IVF tree index
-// ---------------------------------------------------------------------------
-
-int cmd_build_tree(int argc, char* argv[]) {
-    using namespace sextant_cli;
-    using namespace sextant;
-
-    cmdline::parser p;
-    p.add<std::string>("input", 0, "Base vectors (.fbin)", true);
-    p.add<std::string>("index", 0, "Output tree file path", true);
-    p.add<uint32_t>("k-root", 0, "Root branching factor (0=auto)", false, 0);
-    p.add<uint32_t>("leaf-capacity", 0, "Max vectors per leaf", false, 5000);
-    p.add<uint16_t>("pq4-m", 0, "PQ subquantizers for 4-bit scan (0=dim/4)", false, 0);
-    p.add<uint32_t>("pq-bits", 0, "PQ bits (4 or 8)", false, 4);
-    p.add<std::string>("quantizer", 0, "pq / prq / rabitq", false, "pq");
-    p.add<std::string>("metric", 0, "l2sq / ip", false, "l2sq");
-    p.add<float>("closure-epsilon", 0, "Absolute margin for closure (-1=auto)", false, -1.0f);
-    p.add<float>("balance-factor", 0, "SPANN balance factor (0=off)", false, 4.0f);
-    p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
-    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
-    p.parse_check(argc, argv);
-
-    {
-        const auto lvl = p.get<std::string>("log-level");
-        if (lvl == "debug") set_log_level(LogLevel::Debug);
-        else if (lvl == "warn") set_log_level(LogLevel::Warn);
-        else if (lvl == "error") set_log_level(LogLevel::Error);
-    }
-
-    tree::IVFTreeIndex::BuildConfig cfg;
-    cfg.k_root = p.get<uint32_t>("k-root");
-    cfg.leaf_capacity = p.get<uint32_t>("leaf-capacity");
-    cfg.num_threads = p.get<uint32_t>("threads");
-    cfg.params.pq4_m = p.get<uint16_t>("pq4-m");
-    cfg.params.scan_pq_bits = static_cast<uint8_t>(p.get<uint32_t>("pq-bits"));
-    cfg.params.quantizer_type = p.get<std::string>("quantizer");
-    const std::string metric = p.get<std::string>("metric");
-    cfg.params.metric = (metric == "ip") ? MetricKind::InnerProduct
-                                          : MetricKind::L2Sq;
-    cfg.params.closure_epsilon = p.get<float>("closure-epsilon");
-    cfg.params.partition_balance_factor = p.get<float>("balance-factor");
-
-    const std::string input = p.get<std::string>("input");
-    const std::string index_path = p.get<std::string>("index");
-
-    auto result = tree::IVFTreeIndex::build(input, index_path, cfg);
-    std::cout << "built tree index '" << index_path
-              << "': n=" << result.n_vectors
-              << " dim=" << result.dim
-              << " m4=" << static_cast<int>(result.pq_m)
-              << " in " << result.build_time_sec << "s\n";
-    return 0;
-}
-
-// ---------------------------------------------------------------------------
 // tree-search: search a hierarchical IVF tree index
 // ---------------------------------------------------------------------------
+
+namespace {
+
+// Split a delimiter-separated string into a vector of non-empty tokens.
+std::vector<std::string> split_on(char delim, const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char ch : s) {
+        if (ch == delim) { out.push_back(cur); cur.clear(); }
+        else cur += ch;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+// Parse one "--filter" predicate string ("column:op:value[:value2...]") into a
+// Predicate. Returns false and prints to stderr on a malformed spec.
+bool parse_filter_predicate(const std::string& filter_str, sextant::Predicate& pred) {
+    using sextant::PredicateOp;
+    const std::vector<std::string> parts = split_on(':', filter_str);
+    if (parts.size() < 3) {
+        std::cerr << "malformed --filter (need column:op:value): " << filter_str << "\n";
+        return false;
+    }
+
+    pred = sextant::Predicate{};
+    pred.column = parts[0];
+    const std::string& op_str = parts[1];
+    const std::string& val_str = parts[2];
+
+    if      (op_str == "eq")            pred.op = PredicateOp::Eq;
+    else if (op_str == "ne")            pred.op = PredicateOp::NotEq;
+    else if (op_str == "lt")            pred.op = PredicateOp::Lt;
+    else if (op_str == "le")            pred.op = PredicateOp::Le;
+    else if (op_str == "gt")            pred.op = PredicateOp::Gt;
+    else if (op_str == "ge")            pred.op = PredicateOp::Ge;
+    else if (op_str == "between")       pred.op = PredicateOp::Between;
+    else if (op_str == "prefix")        pred.op = PredicateOp::Prefix;
+    else if (op_str == "in")            pred.op = PredicateOp::In;
+    else if (op_str == "not_in")        pred.op = PredicateOp::NotIn;
+    else if (op_str == "contains")      pred.op = PredicateOp::Contains;
+    else if (op_str == "contains_any")  pred.op = PredicateOp::ContainsAny;
+    else if (op_str == "contains_all")  pred.op = PredicateOp::ContainsAll;
+    else if (op_str == "geo_radius")    pred.op = PredicateOp::GeoRadius;
+    else if (op_str == "geo_box")       pred.op = PredicateOp::GeoBox;
+    else {
+        std::cerr << "unknown filter op: " << op_str << "\n";
+        return false;
+    }
+
+    // Populate value fields based on the op semantics.
+    //   value/value2/value3/value4 (double): Between(low,high),
+    //     GeoRadius(lat,lng) + radius_km, GeoBox(min_lat,min_lng,max_lat,max_lng).
+    //   str_value (string): Eq/NotEq/Prefix on string columns, Contains element.
+    //   values (vector<string>): In/NotIn membership, ContainsAny/ContainsAll sets.
+    switch (pred.op) {
+        case PredicateOp::Between:
+            if (parts.size() < 4) {
+                std::cerr << "between needs low:high: " << filter_str << "\n";
+                return false;
+            }
+            pred.value  = std::stod(val_str);
+            pred.value2 = std::stod(parts[3]);
+            break;
+        case PredicateOp::GeoRadius:
+            // lat_col:lng_col:geo_radius:lat:lng:radius_km
+            if (parts.size() < 6) {
+                std::cerr << "geo_radius needs lat_col:lng_col:geo_radius:lat:lng:radius_km: "
+                          << filter_str << "\n";
+                return false;
+            }
+            pred.geo_lng_column = parts[1];               // lng column name
+            pred.value     = std::stod(parts[3]);          // center lat
+            pred.value2    = std::stod(parts[4]);          // center lng
+            pred.radius_km = std::stod(parts[5]);          // radius km
+            break;
+        case PredicateOp::GeoBox:
+            // lat_col:lng_col:geo_box:lat_min:lat_max:lng_min:lng_max
+            // schema.hpp: value=min_lat, value2=min_lng, value3=max_lat, value4=max_lng
+            if (parts.size() < 7) {
+                std::cerr << "geo_box needs lat_col:lng_col:geo_box:lat_min:lat_max:lng_min:lng_max: "
+                          << filter_str << "\n";
+                return false;
+            }
+            pred.geo_lng_column = parts[1];               // lng column name
+            pred.value  = std::stod(parts[3]);            // lat_min
+            pred.value3 = std::stod(parts[4]);            // lat_max
+            pred.value2 = std::stod(parts[5]);            // lng_min
+            pred.value4 = std::stod(parts[6]);            // lng_max
+            break;
+        case PredicateOp::In:
+        case PredicateOp::NotIn:
+            pred.values = split_on(',', val_str);
+            break;
+        case PredicateOp::Contains:
+            pred.str_value = val_str;
+            break;
+        case PredicateOp::ContainsAny:
+        case PredicateOp::ContainsAll:
+            // Comma-separated set elements. The engine folds str_value + values
+            // together, so stash the first element in str_value and the rest in
+            // values to mirror how the other set ops are populated.
+            {
+                auto elems = split_on(',', val_str);
+                if (!elems.empty()) {
+                    pred.str_value = std::move(elems.front());
+                    pred.values.assign(std::make_move_iterator(elems.begin() + 1),
+                                       std::make_move_iterator(elems.end()));
+                }
+            }
+            break;
+        case PredicateOp::Prefix:
+        case PredicateOp::Eq:
+        case PredicateOp::NotEq:
+            // Could be string or numeric. Try numeric first; fall back to string.
+            try { pred.value = std::stod(val_str); }
+            catch (...) { pred.str_value = val_str; }
+            break;
+        default:
+            // Lt/Le/Gt/Ge: numeric comparison.
+            try { pred.value = std::stod(val_str); }
+            catch (...) {
+                std::cerr << "non-numeric value for numeric op '" << op_str
+                          << "': " << val_str << "\n";
+                return false;
+            }
+            break;
+    }
+    return true;
+}
+
+}  // namespace
 
 int cmd_tree_search(int argc, char* argv[]) {
     using namespace sextant;
@@ -691,14 +626,34 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
     p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
     p.add<std::string>("filter", 0,
-        "Filter predicate (repeatable via multiple --filter). "
-        "Format: column:op:value[:value2]. Ops: eq,ne,lt,le,gt,ge,between,prefix,in,contains. "
+        "Filter predicate (repeatable: pass --filter multiple times for AND). "
+        "Format: column:op:value[:value2...]. "
+        "Ops: eq,ne,lt,le,gt,ge,between,prefix,in,not_in,contains,"
+        "contains_any,contains_all,geo_radius,geo_box. "
         "Numeric: year:eq:2020 year:between:2010:2020 "
         "String: category:eq:cs.AI category:prefix:cs. "
-        "Set: tags:contains:ml", false, "");
+        "Set: tags:contains:ml tags:contains_any:ml,ai tags:contains_all:ml,ai. "
+        "Multi-value: cat:in:a,b cat:not_in:x,y. "
+        "Geo: lat_col:lng_col:geo_radius:lat:lng:radius_km lat_col:lng_col:geo_box:lat_min:lat_max:lng_min:lng_max.",
+        false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
     p.add("with-payload", 0,
           "Fetch + print opaque payload blobs with results");
+    // The cmdline library only keeps the LAST value of a repeated option, so
+    // collect every --filter occurrence from argv ourselves (supports AND of
+    // multiple predicates). Both "--filter X" and "--filter=X" forms are
+    // handled; cmdline still sees the flags (harmlessly overwriting its single
+    // "filter" slot) — we ignore its parsed value and use this vector instead.
+    std::vector<std::string> filter_strings;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--filter") {
+            if (i + 1 < argc) filter_strings.emplace_back(argv[++i]);
+        } else if (arg.rfind("--filter=", 0) == 0) {
+            filter_strings.emplace_back(arg.substr(9));
+        }
+    }
+
     p.parse_check(argc, argv);
 
     {
@@ -733,80 +688,13 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
 
-    // Parse --filter predicates.
-    {
-        const std::string filter_str = p.get<std::string>("filter");
-        if (!filter_str.empty()) {
-            // Split by ':' — format is column:op:value[:value2].
-            // For 'in' op, value can be comma-separated.
-            std::vector<std::string> parts;
-            std::string cur;
-            for (char ch : filter_str) {
-                if (ch == ':') { parts.push_back(cur); cur.clear(); }
-                else cur += ch;
-            }
-            if (!cur.empty()) parts.push_back(cur);
-
-            if (parts.size() >= 3) {
-                Predicate pred;
-                pred.column = parts[0];
-                const std::string& op_str = parts[1];
-                const std::string& val_str = parts[2];
-
-                if (op_str == "eq")       pred.op = PredicateOp::Eq;
-                else if (op_str == "ne")  pred.op = PredicateOp::NotEq;
-                else if (op_str == "lt")  pred.op = PredicateOp::Lt;
-                else if (op_str == "le")  pred.op = PredicateOp::Le;
-                else if (op_str == "gt")  pred.op = PredicateOp::Gt;
-                else if (op_str == "ge")  pred.op = PredicateOp::Ge;
-                else if (op_str == "between") {
-                    pred.op = PredicateOp::Between;
-                    if (parts.size() >= 4) {
-                        pred.value = std::stod(val_str);
-                        pred.value2 = std::stod(parts[3]);
-                    }
-                }
-                else if (op_str == "prefix") pred.op = PredicateOp::Prefix;
-                else if (op_str == "in")     pred.op = PredicateOp::In;
-                else if (op_str == "contains") pred.op = PredicateOp::Contains;
-                else {
-                    std::cerr << "Unknown filter op: " << op_str << "\n";
-                    return 1;
-                }
-
-                // Set value based on op type.
-                if (pred.op == PredicateOp::Between) {
-                    // already set above
-                } else if (pred.op == PredicateOp::Prefix ||
-                           pred.op == PredicateOp::Eq ||
-                           pred.op == PredicateOp::NotEq) {
-                    // These could be string or numeric. Try numeric first.
-                    try { pred.value = std::stod(val_str); }
-                    catch (...) { pred.str_value = val_str; }
-                } else if (pred.op == PredicateOp::In) {
-                    // Comma-separated values.
-                    std::string s;
-                    for (char ch : val_str) {
-                        if (ch == ',') { pred.values.push_back(s); s.clear(); }
-                        else s += ch;
-                    }
-                    if (!s.empty()) pred.values.push_back(s);
-                } else if (pred.op == PredicateOp::Contains) {
-                    pred.str_value = val_str;
-                } else {
-                    // Numeric comparison ops.
-                    try { pred.value = std::stod(val_str); }
-                    catch (...) {
-                        std::cerr << "Non-numeric value for numeric op: " << val_str << "\n";
-                        return 1;
-                    }
-                }
-
-                scfg.predicates.push_back(std::move(pred));
-                std::cerr << "filter: " << pred.column << " " << op_str
-                          << " " << val_str << "\n";
-            }
-        }
+    // Parse every collected --filter predicate (AND-composed).
+    for (const std::string& fs : filter_strings) {
+        Predicate pred;
+        if (!parse_filter_predicate(fs, pred))
+            return 1;
+        std::cerr << "filter: " << pred.column << " " << fs << "\n";
+        scfg.predicates.push_back(std::move(pred));
     }
 
     std::ifstream qf(p.get<std::string>("query"), std::ios::binary);
@@ -986,6 +874,154 @@ int cmd_insert(int argc, char* argv[]) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// tree-insert: batch-insert vectors from a .fbin into an existing tree index.
+// Row IDs are assigned sequentially starting from --start-row-id (default:
+// current live_count).
+// ---------------------------------------------------------------------------
+
+int cmd_tree_insert(int argc, char* argv[]) {
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("index", 0, "Tree index file", true);
+    p.add<std::string>("vectors", 0, "Vectors to insert (.fbin)", true);
+    p.add<int64_t>("start-row-id", 0,
+        "Starting row ID for inserted vectors (default: current live count)",
+        false, -1);
+    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.parse_check(argc, argv);
+
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") set_log_level(LogLevel::Debug);
+        else if (lvl == "warn") set_log_level(LogLevel::Warn);
+        else if (lvl == "error") set_log_level(LogLevel::Error);
+    }
+
+    const std::string index_path = p.get<std::string>("index");
+    const std::string vec_path = p.get<std::string>("vectors");
+
+    // Read the vector file.
+    FbinHeader vh;
+    if (!read_fbin_header(vec_path, vh)) {
+        std::cerr << "tree-insert: cannot read " << vec_path << "\n";
+        return 1;
+    }
+
+    auto idx = tree::IVFTreeIndex::open(index_path);
+    if (vh.dim != idx->dim()) {
+        std::cerr << "tree-insert: dim mismatch (file=" << vh.dim
+                  << ", index=" << idx->dim() << ")\n";
+        return 1;
+    }
+
+    // Determine starting row_id.
+    int64_t start_rid = p.get<int64_t>("start-row-id");
+    if (start_rid < 0)
+        start_rid = static_cast<int64_t>(idx->live_count());
+
+    // Read all vectors and build InsertPoints.
+    const uint32_t dim = vh.dim;
+    std::vector<float> storage(static_cast<size_t>(vh.n) * dim);
+    {
+        std::ifstream f(vec_path, std::ios::binary);
+        f.seekg(8);  // skip header
+        f.read(reinterpret_cast<char*>(storage.data()),
+               static_cast<std::streamsize>(storage.size() * sizeof(float)));
+        if (!f.good()) {
+            std::cerr << "tree-insert: failed to read vectors\n";
+            return 1;
+        }
+    }
+
+    std::vector<tree::IVFTreeIndex::InsertPoint> points;
+    points.reserve(vh.n);
+    for (uint32_t i = 0; i < vh.n; ++i) {
+        points.push_back({&storage[static_cast<size_t>(i) * dim],
+                          static_cast<RowId>(start_rid + i), {}, {}});
+    }
+
+    const uint64_t before = idx->live_count();
+    idx->insert_batch(points);
+    const uint64_t after = idx->live_count();
+
+    std::cout << "inserted " << (after - before) << " vectors into " << index_path
+              << " (count: " << before << " → " << after
+              << ", leaves: " << idx->n_leaves() << ")\n";
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// tree-delete: delete vectors by row ID from an existing tree index.
+// Row IDs are read from a text file (one per line) or a binary .uids file
+// (uint64, little-endian).
+// ---------------------------------------------------------------------------
+
+int cmd_tree_delete(int argc, char* argv[]) {
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("index", 0, "Tree index file", true);
+    p.add<std::string>("row-ids", 0,
+        "Row IDs to delete. Text file (one per line) or binary .uids "
+        "(uint64 LE)", true);
+    p.add<std::string>("format", 0, "text or binary", false, "text");
+    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.parse_check(argc, argv);
+
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") set_log_level(LogLevel::Debug);
+        else if (lvl == "warn") set_log_level(LogLevel::Warn);
+        else if (lvl == "error") set_log_level(LogLevel::Error);
+    }
+
+    const std::string index_path = p.get<std::string>("index");
+    const std::string rids_path = p.get<std::string>("row-ids");
+    const std::string fmt = p.get<std::string>("format");
+
+    // Read row IDs.
+    std::vector<RowId> row_ids;
+    if (fmt == "binary") {
+        std::ifstream f(rids_path, std::ios::binary);
+        if (!f) {
+            std::cerr << "tree-delete: cannot open " << rids_path << "\n";
+            return 1;
+        }
+        uint64_t rid;
+        while (f.read(reinterpret_cast<char*>(&rid), sizeof(rid)))
+            row_ids.push_back(static_cast<RowId>(rid));
+    } else {
+        std::ifstream f(rids_path);
+        if (!f) {
+            std::cerr << "tree-delete: cannot open " << rids_path << "\n";
+            return 1;
+        }
+        std::string line;
+        while (std::getline(f, line)) {
+            // Trim whitespace.
+            line.erase(0, line.find_first_not_of(" \t\r\n"));
+            if (line.empty()) continue;
+            try {
+                row_ids.push_back(static_cast<RowId>(std::stoll(line)));
+            } catch (...) {
+                std::cerr << "tree-delete: skipping invalid row ID: " << line << "\n";
+            }
+        }
+    }
+
+    auto idx = tree::IVFTreeIndex::open(index_path);
+    const uint64_t before = idx->live_count();
+    idx->delete_batch(row_ids);
+    const uint64_t after = idx->live_count();
+
+    std::cout << "deleted " << (before - after) << " of " << row_ids.size()
+              << " row IDs from " << index_path
+              << " (count: " << before << " → " << after << ")\n";
+    return 0;
+}
+
 int cmd_fsck(int argc, char* argv[]) {
     cmdline::parser p;
     p.add<std::string>("file", 0, "Tree index file", true);
@@ -1011,17 +1047,11 @@ void print_usage() {
               << "Usage: sextant <command> [options]\n"
               << "Commands:\n"
               << "  build-tree  Build a hierarchical IVF tree index (single file).\n"
-              << "              --input --index --k-root --leaf-capacity --pq4-m\n"
-              << "              --pq-bits --quantizer (pq/prq/rabitq) --metric\n"
-              << "              --closure-epsilon --balance-factor --threads\n"
+              << "              (alias for build-tree-pca, the PCA streaming build)\n"
               << "  tree-search Search a tree index. Computes recall if --ground-truth.\n"
               << "              --index --query --topk --n-probe --fastscan-w\n"
               << "              --adaptive-probe-gap --ground-truth --threads\n"
               << "  build      Build an index from a .fbin file (explicit params).\n"
-              << "             Build path selection (mutually exclusive):\n"
-              << "               (default)  IVF-list-scan + 4-bit PQ FastScan\n"
-              << "               --merged-graph  merged-graph (Vamana; K=1 or partition+merge)\n"
-              << "               --sharded-graph graph-inside-shard IVF (prior default)\n"
               << "             Common flags: --input --index --max-node-neighbors (R)\n"
               << "             --beam-width-ceiling (L) --prune-threshold (alpha)\n"
               << "             --pq-segments (m) --pq-bits --threads --metric\n"
@@ -1030,7 +1060,6 @@ void print_usage() {
               << "  autobuild  Estimate config (analyze) then build, in-process.\n"
               << "             Accepts all build flags plus estimate knobs:\n"
               << "             --proximity-target --recall-target\n"
-              << "             --scan-n-probe (default path) --sharded-graph-n-probe (--sharded-graph)\n"
               << "  analyze    Read-only dataset-adaptive parameter advisory.\n"
               << "             Flags: --input --metric --proximity-target\n"
               << "             --recall-target --max-node-neighbors --prune-threshold\n"
@@ -1038,6 +1067,10 @@ void print_usage() {
               << "             --log-level\n"
               << "  search     Search an index with query vectors\n"
               << "  insert     Insert a single vector into an index\n"
+              << "  tree-insert  Batch-insert vectors (.fbin) into a tree index.\n"
+              << "              --index --vectors --start-row-id\n"
+              << "  tree-delete  Delete vectors by row ID from a tree index.\n"
+              << "              --index --row-ids --format (text|binary)\n"
               << "  fsck       Check a tree index file. --repair rebuilds the bitmap/free-list.\n";
 }
 
@@ -1066,13 +1099,7 @@ int main(int argc, char* argv[]) {
     try {
         if (cmd == "build") {
             return cmd_build(sub_argc, sub_argv.data());
-        } else         if (cmd == "build-tree") {
-            return cmd_build_tree(sub_argc, sub_argv.data());
-        } else if (cmd == "build-tree-streaming") {
-            return cmd_build_tree_streaming(sub_argc, sub_argv.data());
-        } else if (cmd == "build-tree-refined") {
-            return cmd_build_tree_refined(sub_argc, sub_argv.data());
-        } else if (cmd == "build-tree-pca") {
+        } else if (cmd == "build-tree" || cmd == "build-tree-pca") {
             return cmd_build_tree_pca(sub_argc, sub_argv.data());
         } else if (cmd == "autobuild") {
             return cmd_autobuild(sub_argc, sub_argv.data());
@@ -1082,6 +1109,10 @@ int main(int argc, char* argv[]) {
             return cmd_tree_search(sub_argc, sub_argv.data());
         } else if (cmd == "insert") {
             return cmd_insert(sub_argc, sub_argv.data());
+        } else if (cmd == "tree-insert") {
+            return cmd_tree_insert(sub_argc, sub_argv.data());
+        } else if (cmd == "tree-delete") {
+            return cmd_tree_delete(sub_argc, sub_argv.data());
         } else if (cmd == "fsck") {
             return cmd_fsck(sub_argc, sub_argv.data());
         } else if (cmd == "analyze") {
@@ -1097,11 +1128,13 @@ int main(int argc, char* argv[]) {
             print_usage();
             return 1;
         }
-    } catch (const sextant::Error& e) {
-        std::cerr << "sextant " << cmd << ": " << e.what() << "\n";
-        return 1;
     } catch (const std::exception& e) {
         std::cerr << "sextant " << cmd << ": " << e.what() << "\n";
-        return 1;
+        if (sextant::last_throw_trace()) {
+            std::cerr << "Throw-site trace:\n"
+                      << sextant::last_throw_trace()->to_string() << "\n";
+        }
+        std::cerr << "(trapping for debugger/core dump)\n";
+        __builtin_trap();
     }
 }
