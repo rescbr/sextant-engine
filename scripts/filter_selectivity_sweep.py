@@ -229,17 +229,9 @@ def main() -> int:
                            capture_output=True, text=True)
         out = r.stdout
 
-        # Parse results and compute recall against the filtered GT.
-        # For filtered recall, we need the GT restricted to matching vectors.
-        # Since we can't easily compute filtered GT here, we measure the
-        # number of results returned (should be > 0 if selectivity > 0).
-        lines = out.strip().split("\n")
-        n_results = sum(1 for l in lines if len(l.split()) >= 3 and l.split()[0].isdigit())
-
-        # Compute recall against the ORIGINAL gt (loose measure: how many
-        # of the true top-10 are returned, regardless of filter).
+        # Parse search results: query_idx → set of row_ids.
         result_ids = {}
-        for line in lines:
+        for line in out.strip().split("\n"):
             parts = line.split()
             if len(parts) >= 3:
                 try:
@@ -248,13 +240,25 @@ def main() -> int:
                 except ValueError:
                     pass
 
+        # Compute filtered GT: for each query, brute-force the top-10
+        # among ONLY the matching vectors (category == 1).
+        matching = [i for i, v in enumerate(filter_values) if v == 1]
         hits = 0
         total = 0
+        k = 10
         for qi in range(min(nq, gtn)):
-            gt_set = set(gt[qi][:10])
+            qvec = query_vecs[qi]
+            # Brute-force distance to all matching vectors.
+            dists = []
+            for mid in matching:
+                bvec = base_vecs[mid]
+                d = sum((a - b) ** 2 for a, b in zip(qvec, bvec))
+                dists.append((d, mid))
+            dists.sort()
+            filtered_gt = set(mid for _, mid in dists[:k])
             res_set = result_ids.get(qi, set())
-            hits += len(gt_set & res_set)
-            total += 10
+            hits += len(filtered_gt & res_set)
+            total += k
         recall = hits / total if total > 0 else 0.0
 
         delta = recall - baseline_recall
