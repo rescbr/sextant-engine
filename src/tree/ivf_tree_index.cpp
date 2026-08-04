@@ -7,8 +7,9 @@
 #include "quant/rabitq_quantizer.hpp"
 #include "util/fp16.hpp"
 #include "simd_kernels.hpp"
-#include "tree/filter_column_write.hpp"  // Phase C: filter column write path
-#include "tree/filter_scan.hpp"         // Phase D: filter predicate evaluation
+#include "tree/filter_column_write.hpp"  // filter column write path
+#include "tree/filter_column_read.hpp"   // filter column read path (mutable ops)
+#include "tree/filter_scan.hpp"         // filter predicate evaluation
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
 
@@ -24,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <numeric>
 #include <sys/mman.h>
 #include <thread>
 #include <unordered_map>
@@ -3939,6 +3941,17 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
         old_factors.assign(fp, fp + static_cast<size_t>(count) * n_factors);
     }
 
+    // 5b. Read old filter column data (if present).
+    const bool has_filter = manifest_.schema.n_filter_columns() > 0;
+    std::vector<MemColumnData> old_filter_cols;
+    if (has_filter) {
+        const uint64_t old_filter_off = leaf_factors_offset(
+            summary_size, old_nb, bb, count) +
+            static_cast<uint64_t>(count) * n_factors * sizeof(float);
+        read_filter_columns(old_buf.data() + old_filter_off, count,
+                            manifest_.schema, old_filter_cols);
+    }
+
     // 6. Decode medoid centroids → FP16.
     auto decode_centroid_fp16 = [&](uint32_t k) -> std::vector<float16_t> {
         std::vector<float> f32(dim);
@@ -3955,10 +3968,16 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
                                       const std::vector<float16_t>& centroid)
         -> LeafTableEntry {
         const uint32_t gc = static_cast<uint32_t>(group.size());
+
         // Compute filter_cols_bytes for the new leaf.
-        // TODO: proper filter column split. For now, assume no filter columns
-        // (filter data is not carried during split — vacuum rebuilds it).
-        const uint64_t fcb = 0;
+        uint64_t fcb = 0;
+        std::vector<MemColumnData> group_filter_cols;
+        if (has_filter) {
+            group_filter_cols = select_filter_rows(old_filter_cols,
+                                                   manifest_.schema, group);
+            fcb = filter_columns_bytes(gc, manifest_.schema, group_filter_cols);
+        }
+
         const uint32_t npg = leaf_extent_pages(
             gc, m4, pq_bits, n_factors, summary_size, fcb);
         std::vector<uint8_t> nb(static_cast<size_t>(npg) * kPageSize, 0);
@@ -4010,11 +4029,26 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
             }
         }
 
+        // Write filter column data (if present).
+        if (has_filter && fcb > 0) {
+            const uint64_t filter_off = leaf_factors_offset(
+                summary_size, new_nb, bb, gc) +
+                static_cast<uint64_t>(gc) * n_factors * sizeof(float);
+            write_filter_columns(nb.data() + filter_off, gc,
+                                 manifest_.schema, group_filter_cols);
+        }
+
         // Update header.
         auto* lh = reinterpret_cast<TreeLeafHeader*>(nb.data());
         lh->count = gc;
         lh->extent_pages = npg;
-        lh->filter_columns_offset = 0;  // filter data not carried during split
+        if (has_filter && fcb > 0) {
+            lh->filter_columns_offset = leaf_factors_offset(
+                summary_size, new_nb, bb, gc) +
+                static_cast<uint64_t>(gc) * n_factors * sizeof(float);
+        } else {
+            lh->filter_columns_offset = 0;
+        }
         lh->header_crc = header_crc(lh, offsetof(TreeLeafHeader, header_crc));
 
         const PageId page = alloc.alloc_extent(file_, npg);
@@ -4362,128 +4396,83 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
 
         // --- Rebuild filter column data ---
         if (has_filter) {
-            // Copy old filter data.
             const uint64_t filter_off = leaf_factors_offset(
                 summary_size, new_nb, bb, new_count) +
                 static_cast<uint64_t>(new_count) * n_factors * sizeof(float);
-            if (old_filter_bytes > 0) {
+
+            // Read existing filter data from the old buffer (if any).
+            std::vector<MemColumnData> all_cols;
+            if (old_count > 0 && old_filter_bytes > 0) {
                 const uint64_t old_filter_off = leaf_factors_offset(
                     summary_size, old_nb, bb, old_count) +
                     static_cast<uint64_t>(old_count) * n_factors * sizeof(float);
-                std::memcpy(nb.data() + filter_off,
-                            buf.data() + old_filter_off,
-                            old_filter_bytes);
+                read_filter_columns(buf.data() + old_filter_off, old_count,
+                                    manifest_.schema, all_cols);
+            } else {
+                all_cols.assign(manifest_.schema.columns.size(), MemColumnData{});
+                for (uint32_t c = 0; c < manifest_.schema.columns.size(); ++c)
+                    all_cols[c].type = manifest_.schema.columns[c].type;
             }
 
-            // Append new filter values. We need to rebuild the columnar layout
-            // by appending to each column's region. The on-disk layout has
-            // fixed-width columns first, then string, then set — all packed.
-            // Since appending to packed variable-length columns in the middle
-            // is complex, we take a simpler approach: extract old per-column
-            // data into MemColumnData, append new, then re-write with
-            // write_filter_columns.
-            //
-            // For now, we use a direct append strategy that works
-            // for the columnar layout: the filter region is [fixed][string][set],
-            // and within each column, data is contiguous. We append to the END
-            // of each column's region, which requires shifting subsequent
-            // columns. To avoid that complexity, we rebuild the entire filter
-            // region from scratch using old+new data.
-
-            // Collect all filter values for this leaf (old + new).
-            // For old values, we read from the old buffer. For new, from points.
-            // We build MemColumnData per column with new_count rows.
-            std::vector<MemColumnData> all_cols(manifest_.schema.columns.size());
-
-            // Extract old filter column data from the old buffer.
-            // This requires parsing the on-disk layout. Rather than duplicating
-            // the read path, we use a helper that reads filter columns into
-            // MemColumnData. For now, we handle the common case: if old_count
-            // is 0, there's nothing to copy. Otherwise, we read the old data.
-            //
-            // TODO: implement read_filter_columns (the inverse of
-            // write_filter_columns). For now, insert into empty leaves works
-            // correctly; insert into non-empty leaves with filter columns
-            // requires the read path. This is acceptable for the initial
-            // delivery — the insert test uses leaves without filter
-            // columns (the default build path).
-
-            // Write the new filter data using write_filter_columns.
-            // We only have the NEW points' filter values in MemColumnData;
-            // old values are in the old buffer. For correctness when old_count
-            // > 0 and has_filter, we need to merge. For now, only write if
-            // old_count == 0 (empty leaf).
-            if (old_count == 0) {
-                // All rows are new — build MemColumnData from the insert points.
-                for (uint32_t c = 0; c < manifest_.schema.columns.size(); ++c) {
-                    const auto& col = manifest_.schema.columns[c];
-                    auto& fc = all_cols[c];
-                    fc.type = col.type;
-                    for (uint32_t ai = 0; ai < indices.size(); ++ai) {
-                        const auto& pfc = points[indices[ai]].filter_values[c];
-                        switch (col.type) {
-                            case ColumnType::Int32:
-                            case ColumnType::Int64:
-                            case ColumnType::Float:
-                            case ColumnType::Bool: {
-                                const uint8_t w = column_type_width(col.type);
-                                const size_t pos = fc.fixed_data.size();
-                                fc.fixed_data.resize(pos + w);
-                                std::memcpy(fc.fixed_data.data() + pos,
-                                            pfc.fixed_data.data(), w);
-                                break;
+            // Append new filter values from the insert points.
+            std::vector<uint32_t> new_indices(indices.size());
+            std::iota(new_indices.begin(), new_indices.end(), 0);
+            // Build a temporary MemColumnData vector from the insert points.
+            std::vector<MemColumnData> new_cols(manifest_.schema.columns.size());
+            for (uint32_t c = 0; c < manifest_.schema.columns.size(); ++c) {
+                const auto& col = manifest_.schema.columns[c];
+                new_cols[c].type = col.type;
+                for (uint32_t ai = 0; ai < indices.size(); ++ai) {
+                    const auto& pfc = points[indices[ai]].filter_values[c];
+                    switch (col.type) {
+                        case ColumnType::Int32:
+                        case ColumnType::Int64:
+                        case ColumnType::Float:
+                        case ColumnType::Bool: {
+                            const uint8_t w = column_type_width(col.type);
+                            const size_t pos = new_cols[c].fixed_data.size();
+                            new_cols[c].fixed_data.resize(pos + w);
+                            std::memcpy(new_cols[c].fixed_data.data() + pos,
+                                        pfc.fixed_data.data(), w);
+                            break;
+                        }
+                        case ColumnType::String: {
+                            const uint16_t len = pfc.str_lengths[0];
+                            new_cols[c].str_offsets.push_back(
+                                static_cast<uint32_t>(new_cols[c].str_data.size()));
+                            new_cols[c].str_lengths.push_back(len);
+                            const char* s = pfc.str_data.data() + pfc.str_offsets[0];
+                            new_cols[c].str_data.insert(new_cols[c].str_data.end(),
+                                                        s, s + len);
+                            break;
+                        }
+                        case ColumnType::Set: {
+                            const uint8_t ec = pfc.set_counts[0];
+                            new_cols[c].set_counts.push_back(ec);
+                            new_cols[c].set_offsets.push_back(
+                                static_cast<uint32_t>(new_cols[c].set_elem_lengths.size()));
+                            const uint32_t off = pfc.set_offsets[0];
+                            for (uint8_t e = 0; e < ec; ++e)
+                                new_cols[c].set_elem_lengths.push_back(pfc.set_elem_lengths[off + e]);
+                            uint32_t src_byte_off = 0;
+                            for (uint32_t k = 0; k < off; ++k)
+                                src_byte_off += pfc.set_elem_lengths[k];
+                            for (uint8_t e = 0; e < ec; ++e) {
+                                const uint16_t elen = pfc.set_elem_lengths[off + e];
+                                const char* edata = pfc.set_elem_data.data() + src_byte_off;
+                                new_cols[c].set_elem_data.insert(
+                                    new_cols[c].set_elem_data.end(), edata, edata + elen);
+                                src_byte_off += elen;
                             }
-                            case ColumnType::String: {
-                                const uint16_t len = pfc.str_lengths[0];
-                                fc.str_offsets.push_back(
-                                    static_cast<uint32_t>(fc.str_data.size()));
-                                fc.str_lengths.push_back(len);
-                                fc.str_data.insert(fc.str_data.end(),
-                                    pfc.str_data.begin() + pfc.str_offsets[0],
-                                    pfc.str_data.begin() + pfc.str_offsets[0] + len);
-                                break;
-                            }
-                            case ColumnType::Set: {
-                                const uint8_t ec = pfc.set_counts[0];
-                                fc.set_counts.push_back(ec);
-                                fc.set_offsets.push_back(
-                                    static_cast<uint32_t>(fc.set_elem_lengths.size()));
-                                const uint32_t off = pfc.set_offsets[0];
-                                // Compute byte offsets for the source set elements.
-                                uint32_t src_off = 0;
-                                for (uint32_t e2 = 0; e2 < off; ++e2)
-                                    src_off += pfc.set_elem_lengths[e2];
-                                for (uint8_t e = 0; e < ec; ++e) {
-                                    fc.set_elem_lengths.push_back(pfc.set_elem_lengths[off + e]);
-                                }
-                                uint32_t copy_bytes = 0;
-                                for (uint8_t e = 0; e < ec; ++e)
-                                    copy_bytes += pfc.set_elem_lengths[off + e];
-                                fc.set_elem_data.insert(fc.set_elem_data.end(),
-                                    pfc.set_elem_data.begin() + src_off,
-                                    pfc.set_elem_data.begin() + src_off + copy_bytes);
-                                break;
-                            }
+                            break;
                         }
                     }
                 }
-                write_filter_columns(nb.data() + filter_off, new_count,
-                                     manifest_.schema, all_cols);
-            } else {
-                // Non-empty leaf with filter columns: copy old filter data as-is,
-                // then append new per-column data. This is a simplification that
-                // works for fixed-width columns (contiguous append) but is
-                // incorrect for string/set columns (variable-length regions).
-                // Full correctness requires read_filter_columns.
-                std::memcpy(nb.data() + filter_off,
-                            buf.data() + leaf_factors_offset(
-                                summary_size, old_nb, bb, old_count) +
-                            static_cast<uint64_t>(old_count) * n_factors * sizeof(float),
-                            old_filter_bytes);
-                // Append fixed-width new values (after old fixed-width region).
-                // This is only correct if ALL columns are fixed-width.
-                // TODO: proper filter column merge for string/set types.
             }
+            append_filter_rows(all_cols, new_cols, manifest_.schema, new_indices);
+
+            write_filter_columns(nb.data() + filter_off, new_count,
+                                 manifest_.schema, all_cols);
         }
 
         // --- Handle payload ---
@@ -4601,14 +4590,32 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
                         }
                         case ColumnType::String: {
                             const uint16_t len = pfc.str_lengths[0];
-                            new_cols[c].str_offsets.push_back(0);
+                            new_cols[c].str_offsets.push_back(
+                                static_cast<uint32_t>(new_cols[c].str_data.size()));
                             new_cols[c].str_lengths.push_back(len);
+                            const char* s = pfc.str_data.data() + pfc.str_offsets[0];
+                            new_cols[c].str_data.insert(new_cols[c].str_data.end(),
+                                                        s, s + len);
                             break;
                         }
                         case ColumnType::Set: {
                             const uint8_t ec = pfc.set_counts[0];
                             new_cols[c].set_counts.push_back(ec);
-                            new_cols[c].set_offsets.push_back(0);
+                            new_cols[c].set_offsets.push_back(
+                                static_cast<uint32_t>(new_cols[c].set_elem_lengths.size()));
+                            const uint32_t off = pfc.set_offsets[0];
+                            for (uint8_t e = 0; e < ec; ++e)
+                                new_cols[c].set_elem_lengths.push_back(pfc.set_elem_lengths[off + e]);
+                            uint32_t src_byte_off = 0;
+                            for (uint32_t k = 0; k < off; ++k)
+                                src_byte_off += pfc.set_elem_lengths[k];
+                            for (uint8_t e = 0; e < ec; ++e) {
+                                const uint16_t elen = pfc.set_elem_lengths[off + e];
+                                const char* edata = pfc.set_elem_data.data() + src_byte_off;
+                                new_cols[c].set_elem_data.insert(
+                                    new_cols[c].set_elem_data.end(), edata, edata + elen);
+                                src_byte_off += elen;
+                            }
                             break;
                         }
                     }
@@ -4824,11 +4831,7 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
             }
         }
 
-        // --- Copy filter column data (compacted) ---
-        // TODO: proper filter column compaction (remove deleted rows).
-        // For now, copy the raw old bytes — this is incorrect for deleted
-        // rows (they'll still be in the filter data). The summary_dirty flag
-        // is set so vacuum will rebuild. This is a known limitation.
+        // --- Compact filter column data (remove deleted rows) ---
         if (old_filter_bytes > 0) {
             const uint64_t new_filter_off = leaf_factors_offset(
                 summary_size, new_nb, bb, new_count) +
@@ -4836,13 +4839,15 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
             const uint64_t old_filter_off = leaf_factors_offset(
                 summary_size, nb, bb, count) +
                 static_cast<uint64_t>(count) * n_factors * sizeof(float);
-            // Copy min(old, new) — the filter data is NOT compacted here.
-            // This is safe: search uses count to bound iteration, and the
-            // summary is marked dirty. Vacuum fixes it.
-            const uint64_t copy_bytes = std::min(old_filter_bytes,
-                static_cast<uint64_t>(new_npg) * kPageSize - new_filter_off);
-            std::memcpy(nb_buf.data() + new_filter_off,
-                        buf.data() + old_filter_off, copy_bytes);
+
+            // Read old filter data, select survivors, write back.
+            std::vector<MemColumnData> old_cols;
+            read_filter_columns(buf.data() + old_filter_off, count,
+                                manifest_.schema, old_cols);
+            auto new_cols = select_filter_rows(old_cols, manifest_.schema,
+                                               survivors);
+            write_filter_columns(nb_buf.data() + new_filter_off, new_count,
+                                 manifest_.schema, new_cols);
         }
 
         // --- Update header ---

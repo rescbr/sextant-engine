@@ -702,5 +702,132 @@ TEST(TreeInsertDelete, SiftSmallSplitDrift) {
     std::filesystem::remove(tree_path);
 }
 
+// ===========================================================================
+// Filter columns in mutable path: insert + filtered search + delete + split
+// with int32 and string filter columns.
+// ===========================================================================
+
+TEST(TreeInsertDelete, InsertWithFilterColumns) {
+    const uint32_t dim = 32;
+    const uint32_t n = 500;
+    const std::string base_path = "tree_filter_test.fbin";
+    const std::string tree_path = temp_path(".tree");
+    std::filesystem::remove(tree_path);
+
+    // Generate base vectors.
+    write_test_fbin(base_path, n, dim, /*n_clusters=*/10, /*seed=*/42);
+
+    // Build a tree with int32 + string filter columns.
+    Schema schema;
+    schema.columns.push_back({"year", ColumnType::Int32});
+    schema.columns.push_back({"category", ColumnType::String});
+
+    std::vector<MemColumnData> filter_data(2);
+    filter_data[0].type = ColumnType::Int32;
+    filter_data[1].type = ColumnType::String;
+    for (uint32_t i = 0; i < n; ++i) {
+        int32_t year = 2000 + static_cast<int32_t>(i % 25);
+        filter_data[0].fixed_data.resize(filter_data[0].fixed_data.size() + 4);
+        std::memcpy(&filter_data[0].fixed_data[i * 4], &year, 4);
+        std::string cat = "cat_" + std::to_string(i % 5);
+        filter_data[1].str_offsets.push_back(
+            static_cast<uint32_t>(filter_data[1].str_data.size()));
+        filter_data[1].str_lengths.push_back(static_cast<uint16_t>(cat.size()));
+        filter_data[1].str_data.insert(filter_data[1].str_data.end(),
+                                        cat.data(), cat.data() + cat.size());
+    }
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "pq";
+    cfg.params.pq4_m = 8;
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 4;
+    cfg.leaf_capacity = 200;
+    cfg.num_threads = 2;
+    cfg.adaptive_probe_gap = 0.0f;
+    cfg.filter_schema = schema;
+    cfg.filter_column_data = filter_data;
+
+    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    auto idx = IVFTreeIndex::open(tree_path);
+    EXPECT_EQ(idx->live_count(), n);
+
+    // Read base data for queries.
+    uint64_t fbin_n;
+    uint32_t fbin_dim;
+    auto base_data = read_fbin(base_path, fbin_n, fbin_dim);
+
+    // Insert 50 new vectors with year=2025, category="new".
+    const uint32_t n_insert = 50;
+    std::vector<IVFTreeIndex::InsertPoint> points;
+    std::vector<float> storage(n_insert * dim);
+    std::mt19937 rng(999);
+    for (uint32_t i = 0; i < n_insert; ++i) {
+        for (uint32_t d = 0; d < dim; ++d)
+            storage[i * dim + d] = std::uniform_real_distribution<float>(-10, 10)(rng);
+        std::vector<MemColumnData> fv(2);
+        fv[0].type = ColumnType::Int32;
+        int32_t year = 2025;
+        fv[0].fixed_data.resize(4);
+        std::memcpy(fv[0].fixed_data.data(), &year, 4);
+        fv[1].type = ColumnType::String;
+        fv[1].str_offsets = {0};
+        fv[1].str_lengths = {3};
+        fv[1].str_data = {'n','e','w'};
+        points.push_back({&storage[i * dim],
+                          static_cast<RowId>(n + i), std::move(fv), {}});
+    }
+    idx->insert_batch(points);
+    EXPECT_EQ(idx->live_count(), n + n_insert);
+
+    // Filtered search: year=2025 should find inserted vectors.
+    {
+        Predicate pred;
+        pred.column = "year";
+        pred.op = PredicateOp::Eq;
+        pred.value = 2025.0;
+        SearchConfig scfg;
+        scfg.k = 10;
+        scfg.n_probe = 4;
+        scfg.adaptive_probe_gap = 0.0f;
+        scfg.predicates = {pred};
+        auto results = idx->search(&base_data[0], 10, scfg);
+        EXPECT_GT(results.size(), 0u)
+            << "Filtered search found no year=2025 vectors after insert";
+        spdlog::info("InsertWithFilterColumns: year=2025 search returned {} results",
+                     results.size());
+    }
+
+    // Delete the inserted vectors.
+    std::vector<RowId> to_delete;
+    for (uint32_t i = 0; i < n_insert; ++i)
+        to_delete.push_back(static_cast<RowId>(n + i));
+    idx->delete_batch(to_delete);
+    EXPECT_EQ(idx->live_count(), n);
+
+    // Filtered search for year=2025 should now return 0 (or very few).
+    {
+        Predicate pred;
+        pred.column = "year";
+        pred.op = PredicateOp::Eq;
+        pred.value = 2025.0;
+        SearchConfig scfg;
+        scfg.k = 10;
+        scfg.n_probe = 4;
+        scfg.adaptive_probe_gap = 0.0f;
+        scfg.predicates = {pred};
+        auto results = idx->search(&base_data[0], 10, scfg);
+        spdlog::info("InsertWithFilterColumns: year=2025 search after delete "
+                     "returned {} results", results.size());
+        EXPECT_EQ(results.size(), 0u)
+            << "Filtered search still finds year=2025 after delete";
+    }
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
 }  // namespace
 }  // namespace sextant::tree
