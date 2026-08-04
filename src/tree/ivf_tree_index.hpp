@@ -73,13 +73,6 @@ public:
         uint32_t max_lloyd_passes = 10;  // max streaming Lloyd refinement passes
         uint32_t k_root_max_depth2 = 2048;  // k_root above this forces depth-3
         float closure_multiplier = 0.15f;  // closure epsilon = multiplier × mean_gap
-        // Phase H: leaf-level closure. When > 0, vectors near a leaf's centroid
-        // boundary are replicated into the *next* leaf of the same root cluster
-        // via a carry buffer, mirroring the root-level SPANN-style boundary
-        // replication. 0 = disabled (no leaf closure). The leaf closure epsilon
-        // is seeded as closure_epsilon × leaf_closure_multiplier and refined
-        // from observed leaf-centroid gaps as leaves flush.
-        float leaf_closure_multiplier = 0.0f;
         Schema filter_schema;        // empty = no filter columns (today's behavior)
 
         /// Filter column data (Phase C). When non-empty, filter column values

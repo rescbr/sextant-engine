@@ -4,9 +4,11 @@
 /// Error handling for the Sextant engine.
 ///
 /// The engine throws `sextant::Error` on unrecoverable failures. The CLI
-/// catches and prints; the Phase 2 DuckDB adapter maps to DuckDB exceptions.
-
-#include <cpptrace/cpptrace.hpp>
+/// catches and prints; a future DuckDB adapter maps to DuckDB exceptions.
+///
+/// Stack traces at the throw site are captured by the `__cxa_throw`
+/// interception in crash_handler.hpp (stored in thread-local
+/// `last_throw_trace()`), not by this class.
 
 #include <stdexcept>
 #include <string>
@@ -23,20 +25,15 @@ enum class ErrorCode : uint8_t {
 };
 
 /// Engine exception type. Inherits std::runtime_error for compatibility.
-/// Captures a stack trace at construction (throw) site so the caller can
-/// see exactly where the error originated, not just where it was caught.
 class Error : public std::runtime_error {
 public:
     Error(ErrorCode code, const std::string& msg)
-        : std::runtime_error(msg), code_(code),
-          trace_(cpptrace::generate_trace()) {}
+        : std::runtime_error(msg), code_(code) {}
 
     ErrorCode code() const noexcept { return code_; }
-    const cpptrace::stacktrace& trace() const noexcept { return trace_; }
 
 private:
     ErrorCode code_;
-    cpptrace::stacktrace trace_;
 };
 
 }  // namespace sextant

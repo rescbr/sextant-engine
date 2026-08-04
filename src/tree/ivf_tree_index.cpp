@@ -437,16 +437,6 @@ struct TreeBuildContext {
     std::vector<std::vector<uint8_t>> leaf_summaries;
     uint32_t n_leaves_total = 0;
 
-    // --- Phase H: post-hoc leaf closure appends ---
-    // After emission, a second pass identifies vectors near leaf boundaries.
-    // These are appended to the neighboring leaf via grow_leaf. Each entry
-    // is a (PQ code bytes, row_id) pair to append to the given leaf_id.
-    struct ClosureAppend {
-        std::vector<uint8_t> code;
-        RowId row_id;
-    };
-    std::vector<std::vector<ClosureAppend>> leaf_closure_appends;  // leaf_id → appends
-
     // --- Cardinality table (Phase D) ---
     CardinalityTable card_table;
 };
@@ -1117,9 +1107,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     // Phase I: per-cluster closure epsilon. Falls back to global if not
     // populated (e.g. if d_eff measurement was skipped).
     const auto& per_cluster_eps = ctx.cluster_closure_eps;
-    const float leaf_cmult = cfg.leaf_closure_multiplier;
-
-    // --- 6. Emission pass: assign + closure + encode + write leaves ---
+    // --- 6. Emission pass: assign + encode + write leaves ---
     const auto t_stream = std::chrono::steady_clock::now();
     const uint32_t code_size = ctx.quantizer->code_size();
     const bool has_filter = !cfg.filter_column_data.empty();
@@ -1146,34 +1134,9 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         // Payload info for the rows in this buffer (Phase E).
         std::vector<uint32_t> payload_lens;
         std::vector<const uint8_t*> payload_ptrs;
-        // Phase H: FP16 vectors for carry-out (leaf closure). Only the tail
-        // vectors (near the boundary) are kept, enabling carry into the next
-        // leaf for the same cluster. Sized to carry_count per cluster.
-        std::vector<float16_t> carry_fp16;  // carry_count × dim
     };
     std::vector<LeafBuffer> buffers(k_root);
     for (auto& b : buffers) b.centroid_sum.assign(dim, 0.0);
-
-    // Phase H: leaf-level closure carry counts per cluster.
-    // carry_count = ceil(leaf_cap × leaf_cmult × (d_eff_c / mean_d_eff))
-    // High-d_eff clusters get more carry (harder boundaries = more overlap).
-    // Low-d_eff clusters get less (clean boundaries). When leaf_cmult == 0,
-    // leaf closure is disabled (all carry counts = 0).
-    std::vector<uint32_t> carry_counts(k_root, 0);
-    if (leaf_cmult > 0.0f && !ctx.cluster_d_eff.empty()) {
-        double mean_d_eff = 0;
-        for (float d : ctx.cluster_d_eff) mean_d_eff += d;
-        mean_d_eff /= k_root;
-        for (uint32_t c = 0; c < k_root; ++c) {
-            // Ratio of this cluster's d_eff to the mean. Clamp to [0.5, 2.0].
-            float ratio = (mean_d_eff > 0)
-                ? static_cast<float>(ctx.cluster_d_eff[c] / mean_d_eff) : 1.0f;
-            ratio = std::clamp(ratio, 0.5f, 2.0f);
-            carry_counts[c] = std::min(
-                static_cast<uint32_t>(std::ceil(leaf_cap * leaf_cmult * ratio)),
-                leaf_cap / 4);  // cap at 25% of leaf
-        }
-    }
 
     if (has_filter) {
         for (auto& b : buffers) {
@@ -1404,82 +1367,17 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         leaf_metas.push_back(LeafMeta{page, npg, std::move(leaf_centroid)});
         leaf_summaries.push_back(std::move(leaf_summary));
 
-        // Phase H: leaf-level closure — carry tail vectors into the next leaf.
-        // The last carry_count vectors are the boundary region between this
-        // leaf and the next. They stay in the buffer (not cleared) and become
-        // the seed of the next leaf, so they appear in BOTH leaves.
-        const uint32_t carry = (c < carry_counts.size())
-            ? carry_counts[c] : 0;
-        const uint32_t total = static_cast<uint32_t>(buf.row_ids.size());
-        const uint32_t keep = std::min(carry, total);
-
-        if (keep > 0 && keep < total) {
-            // Keep the last `keep` entries: truncate codes, row_ids, etc.
-            // to preserve only the tail. The centroid_sum already includes
-            // all vectors; subtract the contribution of the head (flushed)
-            // vectors to get the carried centroid_sum.
-            const uint32_t flush_count = total - keep;
-
-            // Codes: keep last `keep` code blocks.
-            buf.codes.erase(buf.codes.begin(),
-                            buf.codes.begin() + flush_count * code_size);
-            // Row IDs: keep tail.
-            buf.row_ids.erase(buf.row_ids.begin(),
-                              buf.row_ids.begin() + flush_count);
-            // Centroid accumulator: subtract the head vectors' contributions.
-            // We don't have per-vector sums, so recompute: carry_sum =
-            // total_sum - head_sum. But we only stored the total. Instead,
-            // scale proportionally (carry_count / total of the centroid_sum).
-            // This is approximate but stable — the centroid direction is
-            // what matters, not the exact sum. Scale centroid_sum and count.
-            const float carry_frac = static_cast<float>(keep) / total;
-            for (uint16_t d = 0; d < dim; ++d)
-                buf.centroid_sum[d] *= carry_frac;
-            buf.centroid_count = keep;
-
-            // Payload: keep tail.
-            if (has_payload) {
-                buf.payload_lens.erase(buf.payload_lens.begin(),
-                                       buf.payload_lens.begin() + flush_count);
-                buf.payload_ptrs.erase(buf.payload_ptrs.begin(),
-                                       buf.payload_ptrs.begin() + flush_count);
-            }
-            // Filter columns: keep tail. MemColumnData stores per-column
-            // arrays — we can't easily erase by row. For simplicity, when
-            // leaf closure is enabled with filter columns, we carry ALL
-            // filter data (slight overscan — the carried rows from the
-            // previous leaf already had their filter data, and the new
-            // leaf will append more). This is correct but means the
-            // filter column data for carried rows appears once in the
-            // new leaf. The old leaf already has it.
-            // TODO: proper tail-truncate for filter columns per type.
-            // For now, keep filter_cols as-is (all rows). The new leaf
-            // will have the carried rows' filter data + new rows.
-            // Actually this is WRONG — the filter_cols now has `total`
-            // entries but row_ids has `keep`. We must truncate.
-            if (has_filter) {
-                // Truncate filter_cols to keep only the last `keep` rows.
-                // This is type-specific. For fixed-width: erase head.
-                // For string/set: rebuild from carry row_ids.
-                // Simplest correct approach: rebuild from source.
-                buf.filter_cols.assign(n_schema_cols, MemColumnData{});
-                for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
-                    buf.filter_cols[cc].type = cfg.filter_schema.columns[cc].type;
-                for (uint32_t j = 0; j < keep; ++j)
-                    append_filter_row(buf.filter_cols, buf.row_ids[j]);
-            }
-        } else {
-            // Reset the buffer for the next leaf in this cluster.
-            buf.codes.clear();
-            buf.row_ids.clear();
-            std::fill(buf.centroid_sum.begin(), buf.centroid_sum.end(), 0.0);
-            buf.centroid_count = 0;
-            buf.payload_lens.clear();
-            buf.payload_ptrs.clear();
-            if (has_filter) buf.filter_cols.assign(n_schema_cols, MemColumnData{});
-            if (has_filter)
-                for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
-                    buf.filter_cols[cc].type = cfg.filter_schema.columns[cc].type;
+        // Reset the buffer for the next leaf in this cluster.
+        buf.codes.clear();
+        buf.row_ids.clear();
+        std::fill(buf.centroid_sum.begin(), buf.centroid_sum.end(), 0.0);
+        buf.centroid_count = 0;
+        buf.payload_lens.clear();
+        buf.payload_ptrs.clear();
+        if (has_filter) {
+            buf.filter_cols.assign(n_schema_cols, MemColumnData{});
+            for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
+                buf.filter_cols[cc].type = cfg.filter_schema.columns[cc].type;
         }
     };
 
@@ -1687,277 +1585,6 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t_stream).count());
 }
-
-// ---------------------------------------------------------------------------
-// Phase 4b: post-hoc leaf-level closure (Phase H).
-// After emission, all leaf extents + centroids are known. This pass re-reads
-// the base fbin, finds vectors near leaf boundaries (within leaf_closure_eps
-// of a second leaf centroid in the same root cluster), and appends them to
-// the neighboring leaf via extent growth. O(1) RAM (streaming).
-// ---------------------------------------------------------------------------
-void run_leaf_closure(TreeBuildContext& ctx, PageFile& file,
-                       PageAllocator& alloc) {
-    const auto& cfg = ctx.cfg;
-    if (cfg.leaf_closure_multiplier <= 0.0f) return;
-    const auto t_lc = std::chrono::steady_clock::now();
-    const Dim dim = ctx.dim;
-    const uint32_t k_root = ctx.k_root;
-    const uint32_t pca_dims = ctx.pca_dims;
-    const auto& rotation = ctx.rotation;
-    const auto& mean_proj = ctx.mean_proj;
-    auto& leaf_metas = ctx.leaf_metas;
-    const auto& root_to_leaves = ctx.root_to_leaves;
-    const auto& root_centroids_pca = ctx.root_centroids_pca;
-    const uint32_t code_size = ctx.quantizer->code_size();
-
-    // Leaf closure epsilon per cluster. Measured from actual leaf-centroid
-    // gaps within each cluster (not root-level d_eff). For each cluster c,
-    // compute the mean gap between each leaf's centroid and its nearest
-    // sibling leaf centroid. Scale by leaf_closure_multiplier.
-    std::vector<float> leaf_eps(k_root, 0.0f);
-    const float lcm = cfg.leaf_closure_multiplier;
-    for (uint32_t c = 0; c < k_root; ++c) {
-        const auto& leaves = root_to_leaves[c];
-        if (leaves.size() <= 1) continue;
-        double sum_gap = 0.0;
-        uint32_t n_gap = 0;
-        for (uint32_t li : leaves) {
-            float nn_d = std::numeric_limits<float>::max();
-            for (uint32_t lj : leaves) {
-                if (lj == li) continue;
-                float d = 0.0f;
-                for (uint16_t dd = 0; dd < dim; ++dd) {
-                    const float diff =
-                        static_cast<float>(leaf_metas[li].centroid[dd]) -
-                        static_cast<float>(leaf_metas[lj].centroid[dd]);
-                    d += diff * diff;
-                }
-                if (d < nn_d) nn_d = d;
-            }
-            if (nn_d < std::numeric_limits<float>::max()) {
-                sum_gap += nn_d;
-                ++n_gap;
-            }
-        }
-        if (n_gap > 0)
-            leaf_eps[c] = static_cast<float>(sum_gap / n_gap * lcm);
-    }
-
-    // Leaf centroids as float32 (in original space).
-    std::vector<std::vector<float>> lc_f32(leaf_metas.size());
-    for (uint32_t li = 0; li < leaf_metas.size(); ++li) {
-        lc_f32[li].resize(dim);
-        for (uint16_t d = 0; d < dim; ++d)
-            lc_f32[li][d] = static_cast<float>(leaf_metas[li].centroid[d]);
-    }
-
-    ctx.leaf_closure_appends.resize(leaf_metas.size());
-
-    std::vector<float> cent_norms(k_root);
-    for (uint32_t c = 0; c < k_root; ++c)
-        cent_norms[c] = simd::dot_f32(root_centroids_pca[c].data(),
-                                       root_centroids_pca[c].data(), pca_dims);
-
-    FILE* f = std::fopen(ctx.base_path.c_str(), "rb");
-    if (!f) return;
-    std::fseek(f, 8, SEEK_SET);
-
-    const uint32_t chunk_n = 100'000;
-    std::vector<float> vec_buf(chunk_n * dim);
-    const uint32_t hw = cfg.num_threads > 0 ? cfg.num_threads
-        : std::max(1u, std::thread::hardware_concurrency());
-    uint64_t total_appends = 0;
-    uint64_t offset = 0;
-
-    while (offset < ctx.n) {
-        const uint32_t take = static_cast<uint32_t>(
-            std::min<uint64_t>(chunk_n, ctx.n - offset));
-        if (std::fread(vec_buf.data(), sizeof(float),
-                       static_cast<size_t>(take) * dim, f)
-            != static_cast<size_t>(take) * dim) break;
-
-        // Per-vector: which extra leaf to append to (UINT32_MAX = none).
-        std::vector<uint32_t> extra_leaf(take, UINT32_MAX);
-
-        std::vector<std::future<void>> futs;
-        const uint32_t n_threads = std::min(hw, take);
-        const uint32_t per = (take + n_threads - 1) / n_threads;
-        for (uint32_t t = 0; t < n_threads; ++t) {
-            const uint32_t start = t * per;
-            const uint32_t end = std::min(start + per, take);
-            if (start >= end) break;
-            futs.push_back(std::async(std::launch::async,
-                [&](uint32_t s, uint32_t e) {
-                    std::vector<float> proj(pca_dims);
-                    for (uint32_t i = s; i < e; ++i) {
-                        const float* xi = &vec_buf[i * dim];
-                        for (uint32_t k = 0; k < pca_dims; ++k)
-                            proj[k] = simd::dot_f32(
-                                &rotation[k * dim], xi, dim) - mean_proj[k];
-                        float min_d = std::numeric_limits<float>::max();
-                        uint32_t best_c = 0;
-                        for (uint32_t c = 0; c < k_root; ++c) {
-                            const float dot = simd::dot_f32(
-                                proj.data(),
-                                root_centroids_pca[c].data(), pca_dims);
-                            const float d = cent_norms[c] - 2.0f * dot;
-                            if (d < min_d) { min_d = d; best_c = c; }
-                        }
-                        const auto& leaves = root_to_leaves[best_c];
-                        if (leaves.size() <= 1) continue;
-
-                        // Find nearest + 2nd-nearest leaf centroid.
-                        float d1 = std::numeric_limits<float>::max();
-                        float d2 = d1;
-                        uint32_t l1 = leaves[0], l2 = leaves[0];
-                        for (uint32_t li : leaves) {
-                            float d = 0.0f;
-                            const auto* lc = lc_f32[li].data();
-                            for (uint16_t dd = 0; dd < dim; ++dd) {
-                                const float diff = xi[dd] - lc[dd];
-                                d += diff * diff;
-                            }
-                            if (d < d1) { d2 = d1; l2 = l1; d1 = d; l1 = li; }
-                            else if (d < d2) { d2 = d; l2 = li; }
-                        }
-                        if (l2 != l1 && (d2 - d1) <= leaf_eps[best_c])
-                            extra_leaf[i] = l2;
-                    }
-                }, start, end));
-        }
-        for (auto& fut : futs) fut.get();
-
-        // Collect appends (serial).
-        for (uint32_t i = 0; i < take; ++i) {
-            if (extra_leaf[i] == UINT32_MAX) continue;
-            std::vector<uint8_t> code(code_size);
-            ctx.quantizer->encode(&vec_buf[i * dim], code.data());
-            ctx.leaf_closure_appends[extra_leaf[i]].push_back({
-                std::move(code), static_cast<RowId>(offset + i)});
-            ++total_appends;
-        }
-        offset += take;
-    }
-    std::fclose(f);
-
-    if (total_appends == 0) {
-        spdlog::info("[sextant] leaf closure: 0 boundary vectors");
-        return;
-    }
-
-    // Grow affected leaves and append closure vectors.
-    const uint32_t cpb = (ctx.scan_bits == 4) ? 32 : 16;
-    const uint32_t bb = ctx.m4 * 16;
-    const uint32_t ss = ctx.summary_size;
-    uint32_t n_grown = 0;
-    for (uint32_t li = 0; li < leaf_metas.size(); ++li) {
-        auto& appends = ctx.leaf_closure_appends[li];
-        if (appends.empty()) continue;
-
-        const PageId old_page = leaf_metas[li].page;
-        const uint32_t old_pages = leaf_metas[li].pages;
-        std::vector<uint8_t> old_buf(static_cast<size_t>(old_pages) * kPageSize);
-        file.read_pages(old_page, old_pages, old_buf.data());
-        const auto* old_lh = reinterpret_cast<const TreeLeafHeader*>(
-            old_buf.data());
-        const uint32_t old_count = static_cast<uint32_t>(old_lh->count);
-        const uint32_t new_count = old_count +
-            static_cast<uint32_t>(appends.size());
-
-        const uint32_t new_npg = leaf_extent_pages(
-            new_count, ctx.m4, ctx.scan_bits, ctx.n_factors, ss, 0);
-        const PageId new_page = alloc.alloc_extent(file, new_npg);
-        std::vector<uint8_t> nb(static_cast<size_t>(new_npg) * kPageSize, 0);
-
-        // Copy header + summary.
-        std::memcpy(nb.data(), old_buf.data(),
-                    sizeof(TreeLeafHeader) + ss);
-
-        // Rebuild code blocks.
-        const uint32_t old_nb = (old_count + cpb - 1) / cpb;
-        const uint32_t new_nb = (new_count + cpb - 1) / cpb;
-        uint8_t* ncb = nb.data() + leaf_codes_offset(ss);
-        std::memcpy(ncb, old_buf.data() + leaf_codes_offset(ss),
-                    static_cast<size_t>(old_nb) * bb);
-        for (uint32_t ai = 0; ai < appends.size(); ++ai) {
-            const uint32_t gi = old_count + ai;
-            const uint32_t b = gi / cpb;
-            const uint32_t j = gi % cpb;
-            uint8_t* blk = ncb + static_cast<uint64_t>(b) * bb;
-            const uint8_t* code = appends[ai].code.data();
-            if (ctx.scan_bits == 4) {
-                const uint8_t nbi = j % 16;
-                const bool hi = (j >= 16);
-                for (uint16_t s = 0; s < ctx.m4; ++s) {
-                    uint8_t nib = (s / 2 < code_size)
-                        ? ((s % 2 == 0) ? (code[s / 2] & 0x0F)
-                                          : (code[s / 2] >> 4)) : 0;
-                    if (hi) blk[s * 16 + nbi] |= (nib << 4);
-                    else    blk[s * 16 + nbi] |= nib;
-                }
-            } else {
-                for (uint16_t s = 0; s < ctx.m4; ++s)
-                    blk[s * 16 + j] = (s < code_size) ? code[s] : 0;
-            }
-        }
-
-        // Copy + append row_ids.
-        RowId* nrid = reinterpret_cast<RowId*>(
-            nb.data() + leaf_rowids_offset(ss, new_nb, bb));
-        std::memcpy(nrid, old_buf.data() +
-            leaf_rowids_offset(ss, old_nb, bb),
-            old_count * sizeof(RowId));
-        for (uint32_t ai = 0; ai < appends.size(); ++ai)
-            nrid[old_count + ai] = appends[ai].row_id;
-
-        // Copy factors (RaBitQ) — closure vectors get zero factors.
-        if (ctx.n_factors > 0) {
-            std::memcpy(nb.data() +
-                leaf_factors_offset(ss, new_nb, bb, new_count),
-                old_buf.data() +
-                leaf_factors_offset(ss, old_nb, bb, old_count),
-                static_cast<size_t>(old_count) * ctx.n_factors * sizeof(float));
-        }
-
-        // Update header.
-        auto* nlh = reinterpret_cast<TreeLeafHeader*>(nb.data());
-        nlh->count = new_count;
-        nlh->extent_pages = new_npg;
-        nlh->filter_columns_offset = 0;  // filter data not carried for closure
-        nlh->header_crc = header_crc(nlh,
-            offsetof(TreeLeafHeader, header_crc));
-        file.write_pages(new_page, new_npg, nb.data());
-        alloc.free_extent(file, old_page, old_pages);
-
-        leaf_metas[li].page = new_page;
-        leaf_metas[li].pages = new_npg;
-         ++n_grown;
-         appends.clear();
-     }
-
-    // After leaf closure, the free list may contain stale entries: freed
-    // old-leaf pages that were then reused by alloc_extent for new leaves.
-    // The "next" pointers in those pages were overwritten with leaf data.
-    // Clear the free list — the bitmap (source of truth) still marks the
-    // remaining freed pages as available for bitmap-scan allocation.
-    alloc.clear_free_list();
-
-     spdlog::info("[sextant] leaf closure: {} appends to {} leaves in {:.2f}s",
-                  total_appends, n_grown,
-                  std::chrono::duration<double>(
-                      std::chrono::steady_clock::now() - t_lc).count());
-
-    // Validate leaf_metas after closure (debug).
-    const uint64_t npages = file.num_pages();
-    for (uint32_t li = 0; li < leaf_metas.size(); ++li) {
-        if (leaf_metas[li].page >= npages) {
-            spdlog::error("leaf closure: leaf_metas[{}].page={} >= npages={}",
-                          li, leaf_metas[li].page, npages);
-            throw Error(ErrorCode::CorruptIndex,
-                "leaf closure produced invalid leaf page");
-        }
-    }
- }
 
 // ---------------------------------------------------------------------------
 // Phase 5: write the tree structure above the leaves. Writes the per-fine-
@@ -3386,7 +3013,6 @@ BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
     alloc.init(file, bitmap_page, bitmap_pages);
 
     run_emission_pass(ctx, file, alloc);
-    run_leaf_closure(ctx, file, alloc);
     BuildResult result = write_tree_structure(ctx, file, alloc);
 
     const double secs = std::chrono::duration<double>(
