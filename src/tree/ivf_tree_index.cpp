@@ -3808,15 +3808,32 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
     const uint32_t summary_size = manifest_.summary_size;
     const uint32_t cesize = child_entry_size(dim, summary_size);
 
-    // Find the parent node. For depth=1, it's the root. For depth≥2, scan.
+    // --- Find the parent node and the child slot pointing to leaf_id ---
+    //
+    // depth=1: parent is the root.
+    // depth=2: parent is an L2 node (root child). We scan root children.
+    // depth=3: parent is an L2 node under an L1 node. We descend root → L1 → L2.
+    //
+    // We also track the grandparent (the node pointing to the parent) so we
+    // can fix up the pointer if the parent node relocates (grows beyond its
+    // current page extent).
+
     PageId parent_page = kInvalidPage;
     uint32_t parent_pages = 0;
-    uint32_t child_slot = UINT32_MAX;  // which child entry points to leaf_id
+    uint32_t child_slot = UINT32_MAX;
+
+    // Grandparent info: the node whose child entry points to the parent.
+    // For depth=1: no grandparent (parent is root, root never relocates).
+    // For depth=2: grandparent is the root.
+    // For depth=3: grandparent is the L1 node; we also track the root child
+    // slot pointing to the L1 node so we can re-read it if the L1 relocates.
+    PageId grandparent_page = kInvalidPage;
+    uint32_t grandparent_pages = 0;
+    uint32_t grandparent_slot = UINT32_MAX;  // child slot in grandparent → parent
 
     if (manifest_.depth == 1) {
         parent_page = superblock_.root_node_page();
         parent_pages = superblock_.root_node_pages();
-        // Find the child slot in the root whose child_page == leaf_id.
         const uint8_t* root_ptr = mmap_base_ + parent_page * kPageSize;
         const auto* rh = reinterpret_cast<const TreeNodeHeader*>(root_ptr);
         const uint8_t* p = root_ptr + sizeof(TreeNodeHeader);
@@ -3828,15 +3845,10 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
             }
             p += cesize;
         }
-    } else {
-        // depth≥2: scan root children (L2 nodes for depth=2, L1 nodes for
-        // depth=3). For depth=3 we'd need to descend L1→L2, but splits at
-        // depth=3 are not yet supported (TODO).
-        if (manifest_.depth > 2) {
-            spdlog::warn("[sextant] add_child_to_parent_: depth={} not yet "
-                         "supported for split", manifest_.depth);
-            return;
-        }
+    } else if (manifest_.depth == 2) {
+        // Root → L2 nodes → leaves. Grandparent is the root.
+        grandparent_page = superblock_.root_node_page();
+        grandparent_pages = superblock_.root_node_pages();
         for (uint32_t c = 0; c < root_children_.size(); ++c) {
             const auto& rc = root_children_[c];
             if (rc.is_leaf || rc.page == kInvalidPage) continue;
@@ -3849,9 +3861,51 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
                     parent_page = rc.page;
                     parent_pages = static_cast<uint32_t>(rc.pages);
                     child_slot = j;
+                    grandparent_slot = c;  // root child c → this L2 node
                     break;
                 }
                 p += cesize;
+            }
+            if (parent_page != kInvalidPage) break;
+        }
+    } else {
+        // depth=3: Root → L1 nodes → L2 nodes → leaves.
+        // Scan root children (L1 nodes), descend into each L1 to find the L2
+        // that contains leaf_id.
+        for (uint32_t c = 0; c < root_children_.size(); ++c) {
+            const auto& rc = root_children_[c];
+            if (rc.is_leaf || rc.page == kInvalidPage) continue;
+            const uint8_t* l1_ptr = mmap_base_ + rc.page * kPageSize;
+            const auto* l1h = reinterpret_cast<const TreeNodeHeader*>(l1_ptr);
+            const uint8_t* lp = l1_ptr + sizeof(TreeNodeHeader);
+            for (uint32_t j = 0; j < l1h->n_children; ++j) {
+                const auto* l1ce = reinterpret_cast<const ChildEntry*>(lp);
+                if (l1ce->is_leaf || l1ce->child_page == kInvalidPage) {
+                    lp += cesize;
+                    continue;
+                }
+                // l1ce->child_page is an L2 node. Scan its children for leaf_id.
+                const uint8_t* l2_ptr =
+                    mmap_base_ + l1ce->child_page * kPageSize;
+                const auto* l2h =
+                    reinterpret_cast<const TreeNodeHeader*>(l2_ptr);
+                const uint8_t* p2 = l2_ptr + sizeof(TreeNodeHeader);
+                for (uint32_t k = 0; k < l2h->n_children; ++k) {
+                    const auto* ce = reinterpret_cast<const ChildEntry*>(p2);
+                    if (ce->is_leaf && ce->child_page == leaf_id) {
+                        parent_page = l1ce->child_page;
+                        parent_pages = static_cast<uint32_t>(l1ce->child_pages);
+                        child_slot = k;
+                        // Grandparent is the L1 node.
+                        grandparent_page = rc.page;
+                        grandparent_pages = static_cast<uint32_t>(rc.pages);
+                        grandparent_slot = j;  // L1 child j → this L2 node
+                        break;
+                    }
+                    p2 += cesize;
+                }
+                if (parent_page != kInvalidPage) break;
+                lp += cesize;
             }
             if (parent_page != kInvalidPage) break;
         }
@@ -3863,7 +3917,7 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
         return;
     }
 
-    // Read the parent node from disk.
+    // --- Read the parent node, update child entry, append new child ---
     std::vector<uint8_t> buf(static_cast<size_t>(parent_pages) * kPageSize);
     file_.read_pages(parent_page, parent_pages, buf.data());
     auto* nh = reinterpret_cast<TreeNodeHeader*>(buf.data());
@@ -3875,15 +3929,12 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
         uint8_t* p = buf.data() + sizeof(TreeNodeHeader) + child_slot * cesize;
         auto* ce = reinterpret_cast<ChildEntry*>(p);
         ce->child_pages = leaf_table_[leaf_id].pages;
-        // Update the centroid to the post-split medoid for group0.
         float16_t* cent = reinterpret_cast<float16_t*>(p + sizeof(ChildEntry));
         std::memcpy(cent, cent0_fp16.data(), dim * sizeof(float16_t));
     }
 
-    // Compute new parent extent size.
     const uint32_t new_npg = node_extent_pages(dim, new_n_children, summary_size);
 
-    // Allocate new buffer, copy old data, append new child entry.
     std::vector<uint8_t> nb(static_cast<size_t>(new_npg) * kPageSize, 0);
     std::memcpy(nb.data(), buf.data(),
                 sizeof(TreeNodeHeader) + old_n_children * cesize);
@@ -3898,39 +3949,72 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
         ce->is_leaf = 1;
         float16_t* cent = reinterpret_cast<float16_t*>(p + sizeof(ChildEntry));
         std::memcpy(cent, cent1_fp16.data(), dim * sizeof(float16_t));
-        // Summary: copy from the old leaf's slot in the parent (the split
-        // hasn't changed filter data — summary stays approximately correct).
-        // A proper summary update requires rescanning; vacuum handles it.
     }
 
-    // Update header.
     auto* new_nh = reinterpret_cast<TreeNodeHeader*>(nb.data());
     new_nh->n_children = new_n_children;
     new_nh->extent_pages = new_npg;
     new_nh->header_crc = header_crc(new_nh, offsetof(TreeNodeHeader, header_crc));
 
-    // Write: if new_npg > parent_pages, allocate new extent + free old.
-    if (new_npg > parent_pages) {
+    // --- Write the parent node. If it grew beyond its extent, relocate ---
+    if (new_npg <= parent_pages) {
+        // Fits in-place.
+        file_.write_pages(parent_page, new_npg, nb.data());
+    } else {
+        // Parent needs a new (larger) extent. Allocate, write, free old.
         const PageId new_page = alloc.alloc_extent(file_, new_npg);
         file_.write_pages(new_page, new_npg, nb.data());
         alloc.free_extent(file_, parent_page, parent_pages);
-        // Update root_children_ if the parent is the root.
+
+        // Fix up the grandparent's child pointer to the new page.
         if (manifest_.depth == 1) {
+            // Parent is the root itself.
             superblock_.set_root(new_page, new_npg);
         } else {
-            // For depth≥2: update the root child entry that points to this
-            // parent node. The root node itself needs updating.
-            // TODO: update root child for depth≥2 parent node relocation.
-            // For now, this is a known limitation — the root child's page
-            // pointer becomes stale. The remap_() after commit will reload
-            // root_children_ from the root node, which still has the old page.
-            // This is safe as long as the parent node didn't actually move
-            // (new_npg == parent_pages in most cases — adding one child entry
-            // rarely crosses a page boundary).
+            // Update the grandparent node's child entry: change child_page
+            // from parent_page → new_page, child_pages → new_npg.
+            update_internal_child_(grandparent_page, grandparent_pages,
+                                   grandparent_slot, new_page, new_npg, alloc);
         }
-    } else {
-        file_.write_pages(parent_page, new_npg, nb.data());
     }
+}
+
+// ===========================================================================
+// update_internal_child_: update one child entry in an internal node.
+//
+// Used by add_child_to_parent_ when the parent node relocates (grows beyond
+// its current extent). Reads the grandparent node, updates the child_page and
+// child_pages fields of the specified slot, and writes it back. If the
+// grandparent itself needs to grow (extremely unlikely from a single pointer
+// width change — child_pages is the same width), it relocates too.
+//
+// For depth=2: grandparent is the root node.
+// For depth=3: grandparent is the L1 node.
+// ===========================================================================
+
+void IVFTreeIndex::update_internal_child_(PageId node_page, uint32_t node_pages,
+                                            uint32_t slot,
+                                            PageId new_child_page,
+                                            uint32_t new_child_pages,
+                                            PageAllocator& alloc) {
+    const uint16_t dim = manifest_.dim;
+    const uint32_t summary_size = manifest_.summary_size;
+    const uint32_t cesize = child_entry_size(dim, summary_size);
+
+    std::vector<uint8_t> buf(static_cast<size_t>(node_pages) * kPageSize);
+    file_.read_pages(node_page, node_pages, buf.data());
+
+    uint8_t* p = buf.data() + sizeof(TreeNodeHeader) + slot * cesize;
+    auto* ce = reinterpret_cast<ChildEntry*>(p);
+    ce->child_page = new_child_page;
+    ce->child_pages = new_child_pages;
+
+    // Recompute header CRC (n_children unchanged, but CRC covers the child area
+    // only when summary_size > 0; safe to always recompute).
+    auto* nh = reinterpret_cast<TreeNodeHeader*>(buf.data());
+    nh->header_crc = header_crc(nh, offsetof(TreeNodeHeader, header_crc));
+
+    file_.write_pages(node_page, node_pages, buf.data());
 }
 
 // ===========================================================================

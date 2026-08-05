@@ -290,6 +290,15 @@ private:
                                uint32_t new_leaf_pages,
                                PageAllocator& alloc);
 
+    /// Update one child entry in an internal node (used when a child node
+    /// relocates during split). Reads the node at node_page, updates the
+    /// child_page/child_pages of the given slot, writes back.
+    void update_internal_child_(PageId node_page, uint32_t node_pages,
+                                 uint32_t slot,
+                                 PageId new_child_page,
+                                 uint32_t new_child_pages,
+                                 PageAllocator& alloc);
+
     /// Rebuild pca_leaf_centroids_ and pca_leaf_base_ from the current on-disk
     /// tree structure. Called by remap_() after every structural change
     /// (insert, delete, split). Derives PCA centroids by projecting the inline
