@@ -632,6 +632,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("n-probe", 0, "Root probe count (0=manifest default)", false, 0);
     p.add<uint32_t>("n-probe-ln", 0, "Leaf probe count per root child (0=manifest)", false, 0);
     p.add<uint32_t>("fastscan-w", 0, "Rerank shortlist per shard (0=300)", false, 0);
+    p.add<bool>("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)", false, false);
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
     p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
@@ -696,6 +697,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.n_probe = p.get<uint32_t>("n-probe");
     scfg.n_probe_ln = p.get<uint32_t>("n-probe-ln");
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
+    scfg.rerank = !p.get<bool>("no-rerank");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
 
     // Parse every collected --filter predicate (AND-composed).
