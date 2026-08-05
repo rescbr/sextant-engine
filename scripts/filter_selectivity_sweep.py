@@ -240,12 +240,15 @@ def main() -> int:
                 except ValueError:
                     pass
 
-        # Compute filtered GT: for each query, brute-force the top-10
+        # Compute filtered GT: for each query, brute-force the top-k
         # among ONLY the matching vectors (category == 1).
+        # Match the engine's recall computation: the GT set includes all
+        # gt_k entries (not just top-k), and recall = hits / (n_queries * k).
         matching = [i for i, v in enumerate(filter_values) if v == 1]
         hits = 0
         total = 0
         k = 10
+        gt_k = min(gtk, len(matching))  # use same gt_k as the GT file
         for qi in range(min(nq, gtn)):
             qvec = query_vecs[qi]
             # Brute-force distance to all matching vectors.
@@ -255,7 +258,8 @@ def main() -> int:
                 d = sum((a - b) ** 2 for a, b in zip(qvec, bvec))
                 dists.append((d, mid))
             dists.sort()
-            filtered_gt = set(mid for _, mid in dists[:k])
+            # Use top-gt_k as the GT set (matches engine's gt_set behavior).
+            filtered_gt = set(mid for _, mid in dists[:gt_k])
             res_set = result_ids.get(qi, set())
             hits += len(filtered_gt & res_set)
             total += k
