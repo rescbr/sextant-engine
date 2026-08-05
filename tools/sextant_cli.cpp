@@ -632,7 +632,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("n-probe", 0, "Root probe count (0=manifest default)", false, 0);
     p.add<uint32_t>("n-probe-ln", 0, "Leaf probe count per root child (0=manifest)", false, 0);
     p.add<uint32_t>("fastscan-w", 0, "Rerank shortlist per shard (0=300)", false, 0);
-    p.add<bool>("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)", false, false);
+    p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
     p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
@@ -697,7 +697,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.n_probe = p.get<uint32_t>("n-probe");
     scfg.n_probe_ln = p.get<uint32_t>("n-probe-ln");
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
-    scfg.rerank = !p.get<bool>("no-rerank");
+    scfg.rerank = !p.exist("no-rerank");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
 
     // Parse every collected --filter predicate (AND-composed).
@@ -1043,8 +1043,8 @@ int cmd_tree_vacuum(int argc, char* argv[]) {
 
     cmdline::parser p;
     p.add<std::string>("index", 0, "Tree index file", true);
-    p.add<bool>("rebuild-cardinality", 0,
-        "Rebuild cardinality table (re-scans all filter columns)", false, false);
+    p.add("rebuild-cardinality", 0,
+        "Rebuild cardinality table (re-scans all filter columns)");
     p.add<uint32_t>("batch-size", 0, "Leaves per commit batch", false, 256);
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
     p.parse_check(argc, argv);
@@ -1060,7 +1060,7 @@ int cmd_tree_vacuum(int argc, char* argv[]) {
 
     auto idx = tree::IVFTreeIndex::open(index_path);
     tree::IVFTreeIndex::VacuumConfig cfg;
-    cfg.rebuild_cardinality = p.get<bool>("rebuild-cardinality");
+    cfg.rebuild_cardinality = p.exist("rebuild-cardinality");
     cfg.batch_size = p.get<uint32_t>("batch-size");
     auto result = idx->vacuum(cfg);
 
@@ -1084,7 +1084,7 @@ int cmd_tree_defrag(int argc, char* argv[]) {
 
     cmdline::parser p;
     p.add<std::string>("index", 0, "Tree index file", true);
-    p.add<bool>("no-shrink", 0, "Skip file truncation", false, false);
+    p.add("no-shrink", 0, "Skip file truncation");
     p.add<uint32_t>("batch-size", 0, "Leaves per commit batch", false, 256);
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
     p.parse_check(argc, argv);
@@ -1100,7 +1100,7 @@ int cmd_tree_defrag(int argc, char* argv[]) {
 
     auto idx = tree::IVFTreeIndex::open(index_path);
     tree::IVFTreeIndex::DefragConfig cfg;
-    cfg.shrink_file = !p.get<bool>("no-shrink");
+    cfg.shrink_file = !p.exist("no-shrink");
     cfg.batch_size = p.get<uint32_t>("batch-size");
     auto result = idx->defrag(cfg);
 
