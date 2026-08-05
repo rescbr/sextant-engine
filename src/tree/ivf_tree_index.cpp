@@ -546,8 +546,21 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     std::vector<float> sample = std::move(sample_buf);
 
     if (params.quantizer_type == "prq") {
-        const uint32_t nsplits = (params.prq_nsplits > 0)
+        uint32_t nsplits = (params.prq_nsplits > 0)
             ? params.prq_nsplits : static_cast<uint32_t>(dim) / 8;
+        // PRQ requires m % nsplits == 0 and dim % nsplits == 0. If the
+        // requested nsplits doesn't divide m, clamp to the largest divisor
+        // of m that also divides dim (at least 1). nsplits=1 degenerates
+        // to pure RQ, which is still valid.
+        if (ctx.m4 % nsplits != 0 || dim % nsplits != 0) {
+            uint32_t best = 1;
+            for (uint32_t ns = nsplits; ns >= 1; --ns) {
+                if (ctx.m4 % ns == 0 && dim % ns == 0) { best = ns; break; }
+            }
+            spdlog::warn("[sextant] PRQ: nsplits {} incompatible with m={} dim={}, "
+                         "clamped to {}", nsplits, ctx.m4, dim, best);
+            nsplits = best;
+        }
         ctx.quantizer = std::make_unique<ProductResidualQuantizer>(
             params.metric, dim, ctx.m4, ctx.scan_bits, nsplits,
             params.prq_beam_size, 42);
