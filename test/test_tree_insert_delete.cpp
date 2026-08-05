@@ -1,8 +1,9 @@
 #include <gtest/gtest.h>
-
+#include "fbin_source.hpp"
 #include "test_data.hpp"
 #include "tree/ivf_tree_index.hpp"
-#include "engine/mem_source.hpp"
+#include "mem_source.hpp"  // MemSourceBuilder
+#include <sextant/column_data.hpp>
 #include "sextant/config.hpp"
 #include "sextant/types.hpp"
 
@@ -99,7 +100,7 @@ TEST(TreeInsertDelete, InsertIncreasesLiveCount) {
     cfg.num_threads = 4;
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
     EXPECT_EQ(idx->live_count(), n);
 
@@ -141,7 +142,7 @@ TEST(TreeInsertDelete, InsertedVectorsAreSearchable) {
     cfg.num_threads = 4;
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // Read the fbin data for query vectors.
@@ -219,7 +220,7 @@ TEST(TreeInsertDelete, DeleteDecreasesLiveCount) {
     cfg.num_threads = 4;
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
     EXPECT_EQ(idx->live_count(), n);
 
@@ -255,7 +256,7 @@ TEST(TreeInsertDelete, DeletedVectorsAreNotSearchable) {
     cfg.num_threads = 4;
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // Delete row_id 42.
@@ -305,7 +306,7 @@ TEST(TreeInsertDelete, InsertThenDeleteRestoresCount) {
     cfg.num_threads = 4;
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
     EXPECT_EQ(idx->live_count(), n);
 
@@ -358,7 +359,7 @@ TEST(TreeInsertDelete, MutationsPersistAfterReopen) {
     cfg.num_threads = 4;
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
 
     // Insert, then close.
     {
@@ -420,7 +421,7 @@ TEST(TreeInsertDelete, InsertTriggersLeafSplit) {
     cfg.num_threads = 4;
     cfg.adaptive_probe_gap = 0.0f;
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
     const uint32_t n_leaves_before = idx->n_leaves();
     EXPECT_EQ(idx->live_count(), n);
@@ -629,7 +630,7 @@ TEST(TreeInsertDelete, SiftSmallSplitDrift) {
     cfg.num_threads = 4;
     cfg.adaptive_probe_gap = 0.0f;
 
-    IVFTreeIndex::build_streaming_pca(test::siftsmall_base(), tree_path, cfg);
+    ([&]{ FbinSource s(test::siftsmall_base()); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     SearchConfig scfg;
@@ -722,7 +723,7 @@ TEST(TreeInsertDelete, InsertWithFilterColumns) {
     schema.columns.push_back({"year", ColumnType::Int32});
     schema.columns.push_back({"category", ColumnType::String});
 
-    std::vector<MemColumnData> filter_data(2);
+    std::vector<ColumnData> filter_data(2);
     filter_data[0].type = ColumnType::Int32;
     filter_data[1].type = ColumnType::String;
     for (uint32_t i = 0; i < n; ++i) {
@@ -750,7 +751,7 @@ TEST(TreeInsertDelete, InsertWithFilterColumns) {
     cfg.filter_schema = schema;
     cfg.filter_column_data = filter_data;
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
     EXPECT_EQ(idx->live_count(), n);
 
@@ -767,7 +768,7 @@ TEST(TreeInsertDelete, InsertWithFilterColumns) {
     for (uint32_t i = 0; i < n_insert; ++i) {
         for (uint32_t d = 0; d < dim; ++d)
             storage[i * dim + d] = std::uniform_real_distribution<float>(-10, 10)(rng);
-        std::vector<MemColumnData> fv(2);
+        std::vector<ColumnData> fv(2);
         fv[0].type = ColumnType::Int32;
         int32_t year = 2025;
         fv[0].fixed_data.resize(4);

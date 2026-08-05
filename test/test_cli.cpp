@@ -11,7 +11,7 @@
 // a query equal to an anchor must return that anchor as the top hit.
 
 #include <gtest/gtest.h>
-#include "engine/fbin_source.hpp"
+#include "fbin_source.hpp"
 #include "sextant/config.hpp"
 #include "sextant/builder.hpp"
 #include "sextant/estimator.hpp"

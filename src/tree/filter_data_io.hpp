@@ -20,7 +20,7 @@
 /// The file is read at build time and passed to BuildConfig::filter_column_data.
 
 #include "sextant/schema.hpp"
-#include "engine/mem_source.hpp"  // MemColumnData
+#include <sextant/column_data.hpp>
 
 #include <cstdint>
 #include <fstream>
@@ -37,7 +37,7 @@ inline constexpr uint32_t kFilterDataMagic = 0x46444154u;  // "FDAT" LE
 /// `payload_data` / `payload_offsets` = optional payload (empty = no payload).
 void write_filter_data(const std::string& path,
                         const Schema& schema,
-                        const std::vector<MemColumnData>& cols,
+                        const std::vector<ColumnData>& cols,
                         const std::vector<uint8_t>& payload_data = {},
                         const std::vector<uint32_t>& payload_offsets = {});
 
@@ -45,7 +45,7 @@ void write_filter_data(const std::string& path,
 /// Returns (schema, cols, payload_data, payload_offsets).
 struct FilterDataFile {
     Schema schema;
-    std::vector<MemColumnData> cols;
+    std::vector<ColumnData> cols;
     std::vector<uint8_t> payload_data;
     std::vector<uint32_t> payload_offsets;
     uint64_t n_rows = 0;

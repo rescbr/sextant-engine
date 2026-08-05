@@ -15,7 +15,7 @@
 /// during the emission pass.
 
 #include "sextant/schema.hpp"
-#include "engine/mem_source.hpp"  // MemColumnData
+#include <sextant/column_data.hpp>
 #include "filter_hash.hpp"
 
 #include <algorithm>
@@ -39,7 +39,7 @@ inline constexpr uint32_t kBloomThreshold = 150;
 /// `count` = number of vectors in this leaf. `filter_cols` = per-column data
 /// scoped to this leaf's rows. `schema` determines column types/order.
 inline uint64_t filter_columns_bytes(uint32_t count, const Schema& schema,
-                                     const std::vector<MemColumnData>& filter_cols) {
+                                     const std::vector<ColumnData>& filter_cols) {
     if (schema.columns.empty() || filter_cols.empty()) return 0;
     uint64_t total = 0;
     for (uint32_t c = 0; c < schema.columns.size(); ++c) {
@@ -97,7 +97,7 @@ inline uint64_t filter_columns_bytes(uint32_t count, const Schema& schema,
 /// Returns bytes written.
 inline uint64_t write_filter_columns(uint8_t* buf, uint32_t count,
                                      const Schema& schema,
-                                     const std::vector<MemColumnData>& filter_cols) {
+                                     const std::vector<ColumnData>& filter_cols) {
     if (schema.columns.empty() || filter_cols.empty()) return 0;
     uint8_t* p = buf;
 
@@ -196,7 +196,7 @@ inline uint64_t write_filter_columns(uint8_t* buf, uint32_t count,
 namespace detail {
 
 /// Read a numeric column value as a double (for min/max).
-inline double read_numeric(const MemColumnData& col, uint32_t i) {
+inline double read_numeric(const ColumnData& col, uint32_t i) {
     switch (col.type) {
         case ColumnType::Int32: {
             int32_t v;
@@ -219,7 +219,7 @@ inline double read_numeric(const MemColumnData& col, uint32_t i) {
 }
 
 /// Collect distinct hash values in a string column.
-inline std::vector<uint32_t> distinct_hashes_string(const MemColumnData& col,
+inline std::vector<uint32_t> distinct_hashes_string(const ColumnData& col,
                                                     uint32_t count) {
     std::unordered_set<uint32_t> seen;
     seen.reserve(count);
@@ -234,7 +234,7 @@ inline std::vector<uint32_t> distinct_hashes_string(const MemColumnData& col,
 }
 
 /// Collect distinct hash values in a set column (across all rows + elements).
-inline std::vector<uint32_t> distinct_hashes_set(const MemColumnData& col,
+inline std::vector<uint32_t> distinct_hashes_set(const ColumnData& col,
                                                  uint32_t count) {
     // Build element byte offsets.
     std::vector<uint32_t> elem_byte_off(col.set_elem_lengths.size() + 1, 0);
@@ -275,7 +275,7 @@ inline std::vector<uint32_t> distinct_hashes_set(const MemColumnData& col,
 /// path compares as double. (int64 values up to 2^53 are exact as double.)
 inline void write_filter_summary(uint8_t* buf, uint32_t summary_size,
                                  const Schema& schema, uint32_t count,
-                                 const std::vector<MemColumnData>& filter_cols) {
+                                 const std::vector<ColumnData>& filter_cols) {
     if (summary_size == 0) return;
     // buf is pre-zeroed by the caller; we only write the fields we set.
 

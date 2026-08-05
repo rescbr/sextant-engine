@@ -22,10 +22,11 @@
 #include "tree/tree_manifest.hpp"
 #include "tree/tree_nodes.hpp"
 #include "tree/cardinality.hpp"  // CardinalityTable (Phase D selectivity estimation)
-#include "engine/mem_source.hpp"  // MemColumnData (filter column write path, Phase C)
+#include <sextant/column_data.hpp>
 #include "sextant/config.hpp"
 #include "sextant/types.hpp"
 #include "sextant/schema.hpp"
+#include <sextant/vector_source.hpp>
 
 #include <memory>
 #include <string>
@@ -79,7 +80,7 @@ public:
         /// are written to leaf extents during build. Indexed by row_id
         /// (0..N-1). Must match filter_schema column count and types. Only
         /// build_streaming_pca consumes this; the other build paths ignore it.
-        std::vector<MemColumnData> filter_column_data;
+        std::vector<ColumnData> filter_column_data;
 
         /// Payload data (Phase E). When non-empty, per-vector opaque payload
         /// blobs are written to per-leaf payload extents. payload_offsets[i]
@@ -97,7 +98,7 @@ public:
     /// Handles all depths: depth=1 (n_leaves ≤ k_root, root → leaves
     /// directly), depth=2 (root → L2 internal nodes → leaves), and depth=3
     /// (root → L1 → L2 → leaves when k_root exceeds k_root_max_depth2).
-    static BuildResult build_streaming_pca(const std::string& base_path,
+    static BuildResult build_streaming_pca(VectorSource& source,
                                              const std::string& output_path,
                                              const BuildConfig& cfg);
 
@@ -148,12 +149,12 @@ public:
 
     /// A single point to insert: vector + row_id + optional filter column
     /// values + optional payload. filter_values must match the index's schema
-    /// (one MemColumnData per column, each with exactly 1 row). payload may be
+    /// (one ColumnData per column, each with exactly 1 row). payload may be
     /// empty.
     struct InsertPoint {
         const float* vector;
         RowId row_id;
-        std::vector<MemColumnData> filter_values;  // empty = no filter cols
+        std::vector<ColumnData> filter_values;  // empty = no filter cols
         std::string_view payload;                   // empty = no payload
     };
 

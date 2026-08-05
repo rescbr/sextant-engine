@@ -21,6 +21,7 @@
 #include <sextant/schema.hpp>
 #include <sextant/types.hpp>
 #include <sextant/vector_source.hpp>
+#include <sextant/column_data.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -32,24 +33,7 @@
 
 namespace sextant {
 
-/// Per-column in-memory data storage (used by MemSourceBuilder + MemSource).
-struct MemColumnData {
-    ColumnType type = ColumnType::Int32;
 
-    // Fixed-width: raw bytes, width per row. width = column_type_width(type).
-    std::vector<uint8_t> fixed_data;
-
-    // String: per-row (offset, length) into str_data.
-    std::vector<uint32_t> str_offsets;
-    std::vector<uint16_t> str_lengths;
-    std::vector<char>     str_data;
-
-    // Set: per-row (count, offset into elem_lengths), plus element data.
-    std::vector<uint8_t>  set_counts;
-    std::vector<uint32_t> set_offsets;
-    std::vector<uint16_t> set_elem_lengths;
-    std::vector<char>     set_elem_data;
-};
 
 /// Builder for MemSource. Collects vectors + filter column values + payload,
 /// then produces a MemSource that owns all data.
@@ -171,7 +155,7 @@ private:
     Schema schema_;
     std::vector<float> vectors_;
     std::vector<RowId> row_ids_;
-    std::vector<MemColumnData> col_data_;
+    std::vector<ColumnData> col_data_;
     std::vector<uint8_t> payload_data_;
     std::vector<uint32_t> payload_offsets_;
 };
@@ -199,7 +183,7 @@ private:
     // Owned data.
     std::vector<float> vectors_;
     std::vector<RowId> row_ids_;
-    std::vector<MemColumnData> col_data_;
+    std::vector<ColumnData> col_data_;
     std::vector<uint8_t> payload_data_;
     std::vector<uint32_t> payload_offsets_;
 

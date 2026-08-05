@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "fbin_source.hpp"
 #include "tree/ivf_tree_index.hpp"
 #include "sextant/config.hpp"
 #include "sextant/types.hpp"
@@ -105,7 +106,7 @@ TEST(IVFTreeIndex, BuildAndSearchPQ) {
     cfg.leaf_capacity = 500;
     cfg.num_threads = 4;
 
-    auto result = IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    auto result = ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     EXPECT_EQ(result.n_vectors, n);
     EXPECT_EQ(result.dim, dim);
     EXPECT_TRUE(std::filesystem::exists(tree_path));
@@ -187,7 +188,7 @@ TEST(IVFTreeIndex, TreeStructure) {
     cfg.num_threads = 4;
     cfg.closure_multiplier = 0.0f;  // no boundary replication → stable leaf count
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // n_leaves (≤ k_root) forces depth=1: root children are leaves.
@@ -223,7 +224,7 @@ TEST(IVFTreeIndex, DepthTwoTree) {
     cfg.num_threads = 4;
     cfg.closure_multiplier = 0.0f;  // no boundary replication → stable leaf count
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // n_leaves > k_root → depth=2 (root → L2 internal nodes → leaves).
@@ -270,7 +271,7 @@ TEST(IVFTreeIndex, RerankImprovesRecall) {
     cfg.leaf_capacity = 400;
     cfg.num_threads = 4;
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // Regenerate the cluster centers to build near-centroid queries.
@@ -347,7 +348,7 @@ TEST(IVFTreeIndex, DepthThreeTreeStreamingPca) {
     cfg.max_lloyd_passes = 2;        // keep the test fast
     cfg.num_threads = 4;
 
-    auto result = IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    auto result = ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     EXPECT_EQ(result.n_vectors, n);
 
     auto idx = IVFTreeIndex::open(tree_path);
@@ -433,7 +434,7 @@ TEST(IVFTreeIndex, DepthThreeParityWithDepthTwo) {
         cfg.pca_dims = 16;
         cfg.max_lloyd_passes = 2;
         cfg.num_threads = 4;
-        IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+        ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
         auto idx = IVFTreeIndex::open(tree_path);
 
         std::mt19937 rng(321);

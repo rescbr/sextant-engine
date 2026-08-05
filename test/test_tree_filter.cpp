@@ -1,14 +1,16 @@
 #include <gtest/gtest.h>
-
+#include "fbin_source.hpp"
 #include "tree/ivf_tree_index.hpp"
 #include "tree/tree_nodes.hpp"
 #include "tree/page_file.hpp"
 #include "tree/superblock.hpp"
 #include "tree/filter_scan.hpp"  // eval_predicate_geo, haversine_km, summary_may_match
-#include "engine/mem_source.hpp"  // MemColumnData, MemSourceBuilder
+#include <sextant/column_data.hpp>
+#include <sextant/error.hpp>
 #include "sextant/config.hpp"
 #include "sextant/schema.hpp"
 #include "sextant/types.hpp"
+#include "mem_source.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -57,17 +59,17 @@ std::string write_test_fbin(const std::string& name, uint64_t n, uint32_t dim,
     return path;
 }
 
-/// Build a std::vector<MemColumnData> for a schema with:
+/// Build a std::vector<ColumnData> for a schema with:
 ///   col 0: int32  "year"
 ///   col 1: string "category"
 /// row_id i → year = 2000 + (i % 50), category = "cat_<i % 10>".
 /// These are global (indexed by row_id 0..N-1), matching the build's expectations.
-std::vector<MemColumnData> make_filter_data_int32_string(uint64_t n) {
+std::vector<ColumnData> make_filter_data_int32_string(uint64_t n) {
     Schema schema;
     schema.columns.push_back({"year", ColumnType::Int32});
     schema.columns.push_back({"category", ColumnType::String});
 
-    std::vector<MemColumnData> cols(2);
+    std::vector<ColumnData> cols(2);
     cols[0].type = ColumnType::Int32;
     cols[1].type = ColumnType::String;
 
@@ -151,7 +153,7 @@ TEST(TreeFilterColumns, BuildAndVerifyLeafLayout) {
     cfg.filter_schema = schema;
     cfg.filter_column_data = make_filter_data_int32_string(n);
 
-    auto result = IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    auto result = ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     EXPECT_EQ(result.n_vectors, n);
 
     auto idx = IVFTreeIndex::open(tree_path);
@@ -239,7 +241,7 @@ TEST(TreeFilterColumns, SearchUnaffectedByFilterColumns) {
     cfg.filter_schema = schema;
     cfg.filter_column_data = make_filter_data_int32_string(n);
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // Regenerate cluster centers (seed must match write_test_fbin).
@@ -298,7 +300,7 @@ TEST(TreeFilterColumns, NoFilterColumnsPreservesLayout) {
     cfg.num_threads = 4;
     // No filter_schema, no filter_column_data.
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     std::vector<uint8_t> leaf_buf;
@@ -332,7 +334,7 @@ TEST(TreeFilterColumns, AllNumericSummary) {
     schema.columns.push_back({"c", ColumnType::Float});
     schema.columns.push_back({"d", ColumnType::Bool});
 
-    std::vector<MemColumnData> cols(4);
+    std::vector<ColumnData> cols(4);
     cols[0].type = ColumnType::Int32;
     cols[1].type = ColumnType::Int64;
     cols[2].type = ColumnType::Float;
@@ -367,7 +369,7 @@ TEST(TreeFilterColumns, AllNumericSummary) {
     cfg.filter_schema = schema;
     cfg.filter_column_data = std::move(cols);
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     std::vector<uint8_t> leaf_buf;
@@ -465,7 +467,7 @@ TEST(TreeFilterColumns, FilteredSearchInt32Equality) {
     cfg.filter_schema = schema;
     cfg.filter_column_data = make_filter_data_int32_string(n);
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // Regenerate cluster centers (seed must match write_test_fbin).
@@ -554,7 +556,7 @@ TEST(TreeFilterColumns, FilteredSearchStringEquality) {
     cfg.filter_schema = schema;
     cfg.filter_column_data = make_filter_data_int32_string(n);
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // Regenerate cluster centers (seed must match write_test_fbin).
@@ -630,7 +632,7 @@ TEST(TreeFilterColumns, InternalNodeSummariesPopulated) {
     cfg.filter_schema = schema;
     cfg.filter_column_data = make_filter_data_int32_string(n);
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
 
     // Open the file directly to inspect the root node extent.
     PageFile file(tree_path);
@@ -751,7 +753,7 @@ TEST(TreeFilterColumns, CardinalityTableSerializedAndLoaded) {
     cfg.filter_schema = schema;
     cfg.filter_column_data = make_filter_data_int32_string(n);
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // The cardinality table must have been serialized and loaded.
@@ -822,7 +824,7 @@ TEST(TreeFilterColumns, NumericLowSelectivityBruteForceFallback) {
     Schema schema;
     schema.columns.push_back({"year", ColumnType::Int32});
 
-    std::vector<MemColumnData> cols(1);
+    std::vector<ColumnData> cols(1);
     cols[0].type = ColumnType::Int32;
     cols[0].fixed_data.resize(n * 4);
     for (uint64_t i = 0; i < n; ++i) {
@@ -843,7 +845,7 @@ TEST(TreeFilterColumns, NumericLowSelectivityBruteForceFallback) {
     cfg.filter_schema = schema;
     cfg.filter_column_data = std::move(cols);
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     // Predicate: year == 2099. Only i % 100 == 99 rows match (~1%).
@@ -921,7 +923,7 @@ TEST(TreeFilterColumns, PayloadRoundTrip) {
     cfg.payload_data = payload_data.data();
     cfg.payload_offsets = payload_offsets.data();
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
     EXPECT_GT(idx->n_leaves(), 0u);
 
@@ -991,7 +993,7 @@ TEST(TreeFilterColumns, PayloadAbsentReturnsEmpty) {
     cfg.num_threads = 4;
     // No payload.
 
-    IVFTreeIndex::build_streaming_pca(base_path, tree_path, cfg);
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
 
     SearchConfig sconfig;

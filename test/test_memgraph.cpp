@@ -10,7 +10,7 @@
 //      search recall matches the non-MemGraph (full-cache) path.
 
 #include <gtest/gtest.h>
-#include "engine/fbin_source.hpp"
+#include "fbin_source.hpp"
 #include "sextant/config.hpp"
 #include "sextant/builder.hpp"
 #include "sextant/estimator.hpp"

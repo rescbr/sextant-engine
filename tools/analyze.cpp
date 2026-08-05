@@ -11,7 +11,7 @@
 //
 // Shares the common flag parser with build/autobuild (tools/shared_cli.hpp).
 
-#include "engine/fbin_source.hpp"
+#include "fbin_source.hpp"
 #include "shared_cli.hpp"
 #include "sextant/config.hpp"
 #include "sextant/estimator.hpp"

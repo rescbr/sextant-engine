@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "engine/fbin_source.hpp"
+#include "fbin_source.hpp"
 #include "sextant/vector_source.hpp"
 
 #include <cstdio>

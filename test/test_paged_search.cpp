@@ -10,7 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "test_data.hpp"
-#include "engine/fbin_source.hpp"
+#include "fbin_source.hpp"
 #include "sextant/config.hpp"
 #include "sextant/builder.hpp"
 #include "sextant/estimator.hpp"

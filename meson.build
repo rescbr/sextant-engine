@@ -150,6 +150,10 @@ cpptoml_dep = cpptoml_proj.get_variable('cpptoml_dep')
 cpptrace_proj = subproject('cpptrace')
 cpptrace_dep = cpptrace_proj.get_variable('cpptrace_dep')
 
+# carquet: pure-C Parquet reader/writer (for ParquetSource).
+carquet_proj = subproject('carquet')
+carquet_dep = carquet_proj.get_variable('carquet_dep')
+
 # --- Engine library -----------------------------------------------------------
 engine_inc = include_directories('include')
 src_inc = include_directories('src')
@@ -174,8 +178,6 @@ engine_sources = [
     'src/engine/builder.cpp',
     'src/engine/searcher.cpp',
     'src/engine/estimator.cpp',
-    'src/engine/fbin_source.cpp',
-    'src/engine/mem_source.cpp',
     'src/engine/partition.cpp',
     'src/engine/manifest_io.cpp',
     # Hierarchical IVF tree (Phase 0: infrastructure)
@@ -204,6 +206,25 @@ sextant_dep = declare_dependency(
     link_with: sextant_lib,
     include_directories: [engine_inc, src_inc],
     dependencies: [nsync_dep, spdlog_dep, cpptoml_dep, cpptrace_dep],
+)
+
+# --- Source adapters (FbinSource, MemSource) ---------------------------------
+# These are NOT part of libsextant — they're file-format adapters used by the
+# CLI and tests. The engine depends only on the VectorSource interface.
+sources_inc = include_directories('sources')
+
+sextant_sources_lib = static_library('sextant_sources',
+    ['sources/fbin_source.cpp', 'sources/mem_source.cpp',
+     'sources/parquet_source.cpp'],
+    include_directories: [sources_inc, engine_inc, src_inc, third_party_inc],
+    dependencies: [sextant_dep, carquet_dep],
+    install: false,
+)
+
+sextant_sources_dep = declare_dependency(
+    link_with: sextant_sources_lib,
+    include_directories: sources_inc,
+    dependencies: [sextant_dep, carquet_dep],
 )
 
 # --- CLI tool -----------------------------------------------------------------

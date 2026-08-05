@@ -11,7 +11,6 @@
 
 #include "sextant/estimator.hpp"
 
-#include "fbin_source.hpp"
 #include "memory_source.hpp"
 #include "probe.hpp"
 #include "resolve_params.hpp"

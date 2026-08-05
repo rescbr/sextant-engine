@@ -11,7 +11,7 @@
 //      data).
 
 #include <gtest/gtest.h>
-#include "engine/fbin_source.hpp"
+#include "fbin_source.hpp"
 #include "sextant/builder.hpp"
 #include "sextant/estimator.hpp"
 #include "sextant/index.hpp"

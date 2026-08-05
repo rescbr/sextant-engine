@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file filter_column_read.hpp
-/// Read on-disk filter column data back into MemColumnData.
+/// Read on-disk filter column data back into ColumnData.
 ///
 /// This is the inverse of write_filter_columns (filter_column_write.hpp).
 /// Used by the mutable path (insert/delete/split) to read existing filter
@@ -15,7 +15,7 @@
 ///                [hashes: packed u32][data: [u16 len][bytes] per element]
 
 #include "sextant/schema.hpp"
-#include "engine/mem_source.hpp"  // MemColumnData
+#include <sextant/column_data.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -29,13 +29,13 @@ namespace sextant::tree {
 /// Returns bytes consumed (should match filter_columns_bytes for the same data).
 inline uint64_t read_filter_columns(const uint8_t* buf, uint32_t count,
                                      const Schema& schema,
-                                     std::vector<MemColumnData>& out_cols) {
+                                     std::vector<ColumnData>& out_cols) {
     if (schema.columns.empty()) {
         out_cols.clear();
         return 0;
     }
 
-    out_cols.assign(schema.columns.size(), MemColumnData{});
+    out_cols.assign(schema.columns.size(), ColumnData{});
     const uint8_t* p = buf;
 
     for (uint32_t c = 0; c < schema.columns.size(); ++c) {
@@ -120,13 +120,13 @@ inline uint64_t read_filter_columns(const uint8_t* buf, uint32_t count,
 
 /// Select a subset of rows from filter column data (used by delete compaction
 /// and split partitioning). `indices` are the row indices to keep, in order.
-/// Returns a new vector of MemColumnData with only the selected rows.
-inline std::vector<MemColumnData> select_filter_rows(
-    const std::vector<MemColumnData>& src,
+/// Returns a new vector of ColumnData with only the selected rows.
+inline std::vector<ColumnData> select_filter_rows(
+    const std::vector<ColumnData>& src,
     const Schema& schema,
     const std::vector<uint32_t>& indices) {
 
-    std::vector<MemColumnData> out(schema.columns.size());
+    std::vector<ColumnData> out(schema.columns.size());
     const uint32_t n = static_cast<uint32_t>(indices.size());
 
     for (uint32_t c = 0; c < schema.columns.size(); ++c) {
@@ -191,8 +191,8 @@ inline std::vector<MemColumnData> select_filter_rows(
 /// Append filter rows from `src` (at the given indices) to `dst`.
 /// Used by insert to add new rows to existing leaf filter data.
 inline void append_filter_rows(
-    std::vector<MemColumnData>& dst,
-    const std::vector<MemColumnData>& src,
+    std::vector<ColumnData>& dst,
+    const std::vector<ColumnData>& src,
     const Schema& schema,
     const std::vector<uint32_t>& indices) {
 

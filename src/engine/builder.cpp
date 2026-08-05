@@ -16,8 +16,6 @@
 
 #include "sextant/builder.hpp"
 
-#include "fbin_source.hpp"
-#include "memory_source.hpp"
 #include "partition.hpp"
 #include "probe.hpp"
 #include "manifest_io.hpp"

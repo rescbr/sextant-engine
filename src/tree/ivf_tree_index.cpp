@@ -12,6 +12,8 @@
 #include "tree/filter_scan.hpp"         // filter predicate evaluation
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
+#include "sextant/vector_source.hpp"
+#include "sextant/filter_column_data.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -371,13 +373,13 @@ struct LeafMeta {
 /// (which cannot be reassigned) and leaves every other field at its default.
 struct TreeBuildContext {
     // --- Inputs ---
-    const std::string& base_path;
+    VectorSource& source;
     const std::string& output_path;
     const IVFTreeIndex::BuildConfig& cfg;
 
-    TreeBuildContext(const std::string& bp, const std::string& op,
+    TreeBuildContext(VectorSource& src, const std::string& op,
                      const IVFTreeIndex::BuildConfig& c)
-        : base_path(bp), output_path(op), cfg(c) {}
+        : source(src), output_path(op), cfg(c) {}
 
     // --- Header / schema ---
     uint64_t n = 0;
@@ -398,9 +400,9 @@ struct TreeBuildContext {
     bool has_payload = false;
     uint32_t n_schema_cols = 0;
 
-    // --- Open fbin file (opened in resolve_build_params, closed at end of
-    //     run_emission_pass). Owned by the context. ---
-    FILE* f = nullptr;
+    // --- Vector source (replaces the FILE* f handle). The source is owned
+    //     by the caller; the context holds a reference. reset()/next() drive
+    //     all passes (train sample, Lloyd, emission). ---
 
     // --- Training sample (reused by Lloyd convergence checks) ---
     uint32_t train_n = 0;
@@ -442,24 +444,16 @@ struct TreeBuildContext {
 };
 
 // ---------------------------------------------------------------------------
-// Phase 1: open the fbin file, read the header, and resolve all build params
-// (m4, scan_bits, leaf_cap, k_root, depth, pca_dims). Leaves the file open on
-// ctx.f for the subsequent phases.
+// Phase 1: read the source header (count/dim) and resolve all build params
+// (m4, scan_bits, leaf_cap, k_root, depth, pca_dims). The source is kept open
+// on ctx.source for the subsequent phases.
 // ---------------------------------------------------------------------------
 void resolve_build_params(TreeBuildContext& ctx) {
     const auto& cfg = ctx.cfg;
 
-    ctx.f = std::fopen(ctx.base_path.c_str(), "rb");
-    if (!ctx.f) throw Error(ErrorCode::IoError, "build_streaming_pca: cannot open");
-    uint32_t header[2];
-    if (std::fread(header, sizeof(uint32_t), 2, ctx.f) != 2) {
-        std::fclose(ctx.f);
-        throw Error(ErrorCode::IoError, "build_streaming_pca: header");
-    }
-    ctx.n = header[0];
-    ctx.dim = header[1];
+    ctx.n = ctx.source.count();
+    ctx.dim = ctx.source.dim();
     if (ctx.n == 0 || ctx.dim == 0) {
-        std::fclose(ctx.f);
         throw Error(ErrorCode::InvalidParam, "build_streaming_pca: empty");
     }
     ctx.summary_size = cfg.filter_schema.summary_size();
@@ -542,15 +536,19 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
 
     // --- 1. Sample + train quantizer ---
     const auto t_sample = std::chrono::steady_clock::now();
-    const uint32_t train_n = std::min<uint64_t>(20'000, n);
-    std::vector<float> sample(static_cast<size_t>(train_n) * dim);
-    std::fseek(ctx.f, 8, SEEK_SET);
-    if (std::fread(sample.data(), sizeof(float),
-                   static_cast<size_t>(train_n) * dim, ctx.f)
-        != static_cast<size_t>(train_n) * dim) {
-        std::fclose(ctx.f);
-        throw Error(ErrorCode::IoError, "build_streaming_pca: sample read");
+    uint32_t train_n = std::min<uint64_t>(20'000, n);
+    ctx.source.reset();
+    Chunk chunk;
+    uint32_t collected = 0;
+    std::vector<float> sample_buf;
+    while (collected < train_n && ctx.source.next(chunk)) {
+        const uint32_t take = std::min<uint32_t>(chunk.count, train_n - collected);
+        sample_buf.insert(sample_buf.end(), chunk.vectors,
+                          chunk.vectors + static_cast<size_t>(take) * dim);
+        collected += take;
     }
+    train_n = collected;  // actual count
+    std::vector<float> sample = std::move(sample_buf);
 
     uint8_t n_factors = 0;
     if (params.quantizer_type == "prq") {
@@ -590,7 +588,6 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
         sample.data(), train_n, dim, &eigvals);
 
     if (rotation.empty()) {
-        std::fclose(ctx.f);
         throw Error(ErrorCode::InvalidParam,
                     "build_streaming_pca: degenerate covariance (no PCA)");
     }
@@ -755,8 +752,8 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
 // ---------------------------------------------------------------------------
 // Phase 3: multi-pass streaming Lloyd refinement of the root centroids, then
 // (for depth-3) super-clustering of the fine centroids into k_l1 groups.
-// Re-reads the fbin file from disk each pass; only centroids + accumulators
-// are kept in memory.
+// Re-reads the vector source from the start each pass; only centroids +
+// accumulators are kept in memory.
 // ---------------------------------------------------------------------------
 void run_lloyd_refinement(TreeBuildContext& ctx) {
     const auto& cfg = ctx.cfg;
@@ -794,9 +791,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
         }
 
         // Stream all vectors: project + assign + accumulate (parallel).
-        std::fseek(ctx.f, 8, SEEK_SET);
-        const uint32_t chunk_n = 100'000;
-        std::vector<float> vec_buf(chunk_n * dim);
+        ctx.source.reset();
         uint64_t vectors_done = 0;
 
         // Per-thread accumulators (avoid false sharing: pad to cache line).
@@ -808,14 +803,10 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
         std::vector<std::vector<uint64_t>> t_counts(hw, std::vector<uint64_t>(k_root, 0));
 
         while (vectors_done < n) {
-            const uint32_t take = static_cast<uint32_t>(
-                std::min<uint64_t>(chunk_n, n - vectors_done));
-            if (std::fread(vec_buf.data(), sizeof(float),
-                           static_cast<size_t>(take) * dim, ctx.f)
-                != static_cast<size_t>(take) * dim) {
-                std::fclose(ctx.f);
-                throw Error(ErrorCode::IoError, "Lloyd pass read failed");
-            }
+            Chunk chunk;
+            if (!ctx.source.next(chunk)) break;
+            const uint32_t take = chunk.count;
+            const float* vec_buf = chunk.vectors;  // valid until next next()
 
             // Parallel assign + accumulate.
             std::vector<std::future<void>> futs;
@@ -1084,7 +1075,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
 // back to FP16 original space, streams all vectors (project → route → encode →
 // buffer → flush on overflow), populates the cardinality table, and final-
 // flushes all buffers. Writes leaf extents directly to the file via the
-// allocator. Closes ctx.f at the end. Stores leaf_metas / root_to_leaves /
+// allocator. Stores leaf_metas / root_to_leaves /
 // leaf_summaries / n_leaves_total on the context.
 // ---------------------------------------------------------------------------
 void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& alloc) {
@@ -1110,9 +1101,12 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     // --- 6. Emission pass: assign + encode + write leaves ---
     const auto t_stream = std::chrono::steady_clock::now();
     const uint32_t code_size = ctx.quantizer->code_size();
-    const bool has_filter = !cfg.filter_column_data.empty();
+    // has_filter is driven by the schema, not the sidecar data. When the source
+    // provides filter columns per-chunk (e.g. ParquetSource), cfg.filter_column_data
+    // is empty but the schema still declares the columns.
+    const bool has_filter = cfg.filter_schema.n_filter_columns() > 0;
     const uint32_t n_schema_cols =
-        has_filter ? static_cast<uint32_t>(cfg.filter_schema.columns.size()) : 0;
+        static_cast<uint32_t>(cfg.filter_schema.columns.size());
     const bool has_payload =
         cfg.filter_schema.has_payload && cfg.payload_data && cfg.payload_offsets;
     ctx.has_filter = has_filter;
@@ -1130,7 +1124,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         std::vector<double> centroid_sum;
         uint32_t centroid_count = 0;
         // Filter column data for the rows in this buffer (Phase C).
-        std::vector<MemColumnData> filter_cols;
+        std::vector<ColumnData> filter_cols;
         // Payload info for the rows in this buffer (Phase E).
         std::vector<uint32_t> payload_lens;
         std::vector<const uint8_t*> payload_ptrs;
@@ -1146,13 +1140,21 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         }
     }
 
-    /// Append the filter column values for global row_id into a leaf's
-    /// per-column MemColumnData (Phase C). Mirrors MemSourceBuilder::add_vector
-    /// + the per-type setters, but reads from cfg.filter_column_data.
-    auto append_filter_row = [&](std::vector<MemColumnData>& dst, RowId row_id) {
+    // Per-chunk filter data state. Updated at the top of each chunk iteration
+    // in the streaming loop below; read by append_filter_row and the
+    // cardinality/payload dual-path logic.
+    bool chunk_has_filter = false;
+    const void* const* chunk_fcols = nullptr;
+
+    /// Append the filter column values for a row into a leaf's per-column
+    /// ColumnData (Phase C). `local_idx` is the row index within the current
+    /// chunk; `row_id` is the global row id. When the chunk provides per-chunk
+    /// filter data (chunk_has_filter), values are read from chunk_fcols by
+    /// local_idx; otherwise the global cfg.filter_column_data fallback is used
+    /// (indexed by the global row_id).
+    auto append_filter_row = [&](std::vector<ColumnData>& dst, RowId row_id, uint32_t local_idx) {
         const uint32_t r = static_cast<uint32_t>(row_id);
         for (uint32_t c = 0; c < n_schema_cols; ++c) {
-            const auto& src = cfg.filter_column_data[c];
             auto& d = dst[c];
             switch (d.type) {
                 case ColumnType::Int32:
@@ -1160,41 +1162,72 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                 case ColumnType::Float:
                 case ColumnType::Bool: {
                     const uint8_t w = column_type_width(d.type);
-                    const uint8_t* sp = src.fixed_data.data() +
-                                        static_cast<size_t>(r) * w;
+                    const uint8_t* sp;
+                    if (chunk_has_filter) {
+                        sp = static_cast<const uint8_t*>(chunk_fcols[c]) +
+                             static_cast<size_t>(local_idx) * w;
+                    } else {
+                        const auto& src = cfg.filter_column_data[c];
+                        sp = src.fixed_data.data() + static_cast<size_t>(r) * w;
+                    }
                     d.fixed_data.insert(d.fixed_data.end(), sp, sp + w);
                     break;
                 }
                 case ColumnType::String: {
                     // Validation happens in MemSourceBuilder (before uint16 truncation).
-                    const uint16_t len = src.str_lengths[r];
-                    const uint32_t off = src.str_offsets[r];
+                    const FilterStringColumn* sc;
+                    uint32_t off; uint16_t len;
+                    if (chunk_has_filter) {
+                        sc = static_cast<const FilterStringColumn*>(chunk_fcols[c]);
+                        off = sc->offsets[local_idx]; len = sc->lengths[local_idx];
+                    } else {
+                        const auto& src = cfg.filter_column_data[c];
+                        off = src.str_offsets[r]; len = src.str_lengths[r];
+                        sc = nullptr;  // not used for data ptr
+                    }
                     d.str_offsets.push_back(static_cast<uint32_t>(d.str_data.size()));
                     d.str_lengths.push_back(len);
-                    d.str_data.insert(d.str_data.end(),
-                                      src.str_data.data() + off,
-                                      src.str_data.data() + off + len);
+                    if (chunk_has_filter) {
+                        d.str_data.insert(d.str_data.end(),
+                                          sc->data + off, sc->data + off + len);
+                    } else {
+                        const auto& src = cfg.filter_column_data[c];
+                        d.str_data.insert(d.str_data.end(),
+                                          src.str_data.data() + off,
+                                          src.str_data.data() + off + len);
+                    }
                     break;
                 }
                 case ColumnType::Set: {
                     // Validation happens in MemSourceBuilder (before uint8/uint16 truncation).
-                    const uint8_t ec = src.set_counts[r];
-                    const uint32_t off = src.set_offsets[r];
+                    const FilterSetColumn* fsc;
+                    uint8_t ec; uint32_t off; const uint16_t* elem_lens; const char* elem_data;
+                    if (chunk_has_filter) {
+                        fsc = static_cast<const FilterSetColumn*>(chunk_fcols[c]);
+                        ec = fsc->counts[local_idx];
+                        off = fsc->offsets[local_idx];
+                        elem_lens = fsc->element_lengths;
+                        elem_data = fsc->element_data;
+                    } else {
+                        const auto& src = cfg.filter_column_data[c];
+                        fsc = nullptr;
+                        ec = src.set_counts[r];
+                        off = src.set_offsets[r];
+                        elem_lens = src.set_elem_lengths.data();
+                        elem_data = src.set_elem_data.data();
+                    }
                     d.set_counts.push_back(ec);
                     d.set_offsets.push_back(static_cast<uint32_t>(d.set_elem_lengths.size()));
-                    // Copy element lengths + data for this row's elements.
-                    // Need cumulative byte offsets into src.set_elem_data.
-                    // (Computed lazily via src.set_elem_lengths.)
-                    // Build element byte offsets for [off .. off+ec).
+                    // Cumulative byte offset into elem_data for element `off`.
                     uint32_t byte_off = 0;
                     for (uint32_t k = 0; k < off; ++k)
-                        byte_off += src.set_elem_lengths[k];
+                        byte_off += elem_lens[k];
                     for (uint32_t e = 0; e < ec; ++e) {
-                        const uint16_t elen = src.set_elem_lengths[off + e];
+                        const uint16_t elen = elem_lens[off + e];
                         d.set_elem_lengths.push_back(elen);
                         d.set_elem_data.insert(d.set_elem_data.end(),
-                            src.set_elem_data.data() + byte_off,
-                            src.set_elem_data.data() + byte_off + elen);
+                            elem_data + byte_off,
+                            elem_data + byte_off + elen);
                         byte_off += elen;
                     }
                     break;
@@ -1375,7 +1408,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         buf.payload_lens.clear();
         buf.payload_ptrs.clear();
         if (has_filter) {
-            buf.filter_cols.assign(n_schema_cols, MemColumnData{});
+            buf.filter_cols.assign(n_schema_cols, ColumnData{});
             for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
                 buf.filter_cols[cc].type = cfg.filter_schema.columns[cc].type;
         }
@@ -1416,12 +1449,10 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         }
     }
 
-    std::fseek(ctx.f, 8, SEEK_SET);
+    ctx.source.reset();
     {
-        const uint32_t chunk_n = 100'000;
-        std::vector<float> vec_buf(chunk_n * dim);
-        std::vector<float16_t> fp16_buf(chunk_n * dim);
-        std::vector<float> pca_buf(chunk_n * pca_dims);
+        std::vector<float16_t> fp16_buf;
+        std::vector<float> pca_buf;
 
         // Precompute centroid norms for SIMD distance (dot-product decomposition).
         std::vector<float> cent_norms(k_root);
@@ -1434,16 +1465,23 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             : std::max(1u, std::thread::hardware_concurrency());
 
         uint64_t offset = 0;
-        while (offset < n) {
-            const uint32_t take = static_cast<uint32_t>(
-                std::min<uint64_t>(chunk_n, n - offset));
-            if (std::fread(vec_buf.data(), sizeof(float),
-                           static_cast<size_t>(take) * dim, ctx.f)
-                != static_cast<size_t>(take) * dim) {
-                std::fclose(ctx.f);
-                throw Error(ErrorCode::IoError, "build_streaming_pca: stream read");
-            }
-            cast_fp32_to_fp16(vec_buf.data(), fp16_buf.data(),
+        uint64_t prev_million = 0;
+        while (true) {
+            Chunk chunk;
+            if (!ctx.source.next(chunk)) break;
+            const uint32_t take = chunk.count;
+            const float* vec_buf = chunk.vectors;  // NO copy
+            const RowId* chunk_row_ids = chunk.row_ids;  // source-assigned ids
+            // Capture whether this chunk carries per-chunk filter/payload data
+            // (e.g. from a ParquetSource). The lambdas below read these.
+            chunk_has_filter = (chunk.filter_columns != nullptr);
+            chunk_fcols = chunk.filter_columns;
+            const bool chunk_has_payload = (chunk.payload_data != nullptr);
+            const uint8_t* chunk_pdata = chunk.payload_data;
+            const uint32_t* chunk_poffsets = chunk.payload_offsets;
+            if (fp16_buf.size() < static_cast<size_t>(take) * dim)
+                fp16_buf.resize(static_cast<size_t>(take) * dim);
+            cast_fp32_to_fp16(vec_buf, fp16_buf.data(),
                               static_cast<size_t>(take) * dim);
 
             // Parallel: project + route + encode. Store (target_centroids, code)
@@ -1503,34 +1541,70 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             // Serial: append to shared buffers + flush on overflow.
             for (uint32_t i = 0; i < take; ++i) {
                 const float16_t* fvec = &fp16_buf[i * dim];
-                const RowId rid = static_cast<RowId>(offset + i);
+                const RowId rid = chunk_row_ids[i];
                 // Phase D: record this row's filter column values in the global
                 // cardinality table (once per row, not per closure target).
+                // Dual-path: read from chunk_fcols by local idx when the chunk
+                // provides filter data, else from cfg.filter_column_data by
+                // global row id.
                 if (!cfg.filter_schema.empty()) {
-                    const uint32_t r = offset + i;
+                    const uint32_t r = static_cast<uint32_t>(rid);
                     for (uint32_t c = 0; c < cfg.filter_schema.columns.size(); ++c) {
                         const auto& col = cfg.filter_schema.columns[c];
-                        const auto& src = cfg.filter_column_data[c];
                         if (col.type == ColumnType::String) {
-                            std::string_view sv(src.str_data.data() + src.str_offsets[r],
-                                                 src.str_lengths[r]);
+                            std::string_view sv;
+                            if (chunk_has_filter) {
+                                const auto* sc =
+                                    static_cast<const FilterStringColumn*>(chunk_fcols[c]);
+                                sv = std::string_view(sc->data + sc->offsets[i],
+                                                      sc->lengths[i]);
+                            } else {
+                                const auto& src = cfg.filter_column_data[c];
+                                sv = std::string_view(
+                                    src.str_data.data() + src.str_offsets[r],
+                                    src.str_lengths[r]);
+                            }
                             ctx.card_table.add_string(c, sv);
                         } else if (col.type == ColumnType::Set) {
-                            ctx.card_table.add_set(c, src.set_counts.data(),
-                                                src.set_offsets.data(),
-                                                src.set_elem_lengths.data(),
-                                                src.set_elem_data.data(), r);
+                            if (chunk_has_filter) {
+                                const auto* fsc =
+                                    static_cast<const FilterSetColumn*>(chunk_fcols[c]);
+                                ctx.card_table.add_set(c,
+                                    fsc->counts, fsc->offsets, fsc->element_lengths,
+                                    fsc->element_data, i);
+                            } else {
+                                const auto& src = cfg.filter_column_data[c];
+                                ctx.card_table.add_set(c, src.set_counts.data(),
+                                                    src.set_offsets.data(),
+                                                    src.set_elem_lengths.data(),
+                                                    src.set_elem_data.data(), r);
+                            }
                         } else if (col.type == ColumnType::Int32) {
                             int32_t v;
-                            std::memcpy(&v, src.fixed_data.data() + r * 4, 4);
+                            if (chunk_has_filter) {
+                                std::memcpy(&v, static_cast<const uint8_t*>(chunk_fcols[c]) + static_cast<size_t>(i) * 4, 4);
+                            } else {
+                                const auto& src = cfg.filter_column_data[c];
+                                std::memcpy(&v, src.fixed_data.data() + r * 4, 4);
+                            }
                             ctx.card_table.add_numeric(c, static_cast<double>(v));
                         } else if (col.type == ColumnType::Int64) {
                             int64_t v;
-                            std::memcpy(&v, src.fixed_data.data() + r * 8, 8);
+                            if (chunk_has_filter) {
+                                std::memcpy(&v, static_cast<const uint8_t*>(chunk_fcols[c]) + static_cast<size_t>(i) * 8, 8);
+                            } else {
+                                const auto& src = cfg.filter_column_data[c];
+                                std::memcpy(&v, src.fixed_data.data() + r * 8, 8);
+                            }
                             ctx.card_table.add_numeric(c, static_cast<double>(v));
                         } else if (col.type == ColumnType::Float) {
                             float v;
-                            std::memcpy(&v, src.fixed_data.data() + r * 4, 4);
+                            if (chunk_has_filter) {
+                                std::memcpy(&v, static_cast<const uint8_t*>(chunk_fcols[c]) + static_cast<size_t>(i) * 4, 4);
+                            } else {
+                                const auto& src = cfg.filter_column_data[c];
+                                std::memcpy(&v, src.fixed_data.data() + r * 4, 4);
+                            }
                             ctx.card_table.add_numeric(c, static_cast<double>(v));
                         }
                     }
@@ -1544,13 +1618,17 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                     for (uint16_t d = 0; d < dim; ++d)
                         buf.centroid_sum[d] += static_cast<float>(fvec[d]);
                     ++buf.centroid_count;
-                    if (has_filter) append_filter_row(buf.filter_cols, rid);
+                    if (has_filter) append_filter_row(buf.filter_cols, rid, i);
                     if (has_payload) {
-                        const uint32_t r = offset + i;
-                        const uint32_t plen =
-                            cfg.payload_offsets[r + 1] - cfg.payload_offsets[r];
-                        const uint8_t* pdata =
-                            cfg.payload_data + cfg.payload_offsets[r];
+                        uint32_t plen; const uint8_t* pdata;
+                        if (chunk_has_payload) {
+                            plen = chunk_poffsets[i + 1] - chunk_poffsets[i];
+                            pdata = chunk_pdata + chunk_poffsets[i];
+                        } else {
+                            const uint32_t r = static_cast<uint32_t>(rid);
+                            plen = cfg.payload_offsets[r + 1] - cfg.payload_offsets[r];
+                            pdata = cfg.payload_data + cfg.payload_offsets[r];
+                        }
                         buf.payload_lens.push_back(plen);
                         buf.payload_ptrs.push_back(pdata);
                     }
@@ -1559,17 +1637,18 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                 }
             }
             offset += take;
-            if (offset % 1'000'000 < chunk_n) {
+            const uint64_t million = offset / 1'000'000;
+            if (million != prev_million) {
+                prev_million = million;
                 uint64_t flushed = 0;
                 for (uint32_t c = 0; c < k_root; ++c)
                     flushed += n_leaves_in_cluster[c];
                 spdlog::info("[sextant] build_streaming_pca: {}M/{}M streamed, "
-                             "{} leaves", offset / 1'000'000, n / 1'000'000,
+                             "{} leaves", million, n / 1'000'000,
                              flushed);
             }
         }
     }
-    std::fclose(ctx.f);
     for (uint32_t c = 0; c < k_root; ++c) flush_buffer(c);
 
     ctx.n_leaves_total = static_cast<uint32_t>(leaf_metas.size());
@@ -2991,12 +3070,12 @@ std::vector<Candidate> IVFTreeIndex::search_rabitq(const float* query,
 // anonymous namespace above): resolve params -> train quantizer + PCA -> Lloyd
 // refinement -> emission pass -> tree write. This function is a thin orchestrator.
 
-BuildResult IVFTreeIndex::build_streaming_pca(const std::string& base_path,
+BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
                                                  const std::string& output_path,
                                                  const BuildConfig& cfg) {
     const auto t0 = std::chrono::steady_clock::now();
 
-    TreeBuildContext ctx(base_path, output_path, cfg);
+    TreeBuildContext ctx(source, output_path, cfg);
 
     resolve_build_params(ctx);
     train_quantizer_and_pca(ctx);
@@ -3569,7 +3648,7 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
 
     // 5b. Read old filter column data (if present).
     const bool has_filter = manifest_.schema.n_filter_columns() > 0;
-    std::vector<MemColumnData> old_filter_cols;
+    std::vector<ColumnData> old_filter_cols;
     if (has_filter) {
         const uint64_t old_filter_off = leaf_factors_offset(
             summary_size, old_nb, bb, count) +
@@ -3597,7 +3676,7 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
 
         // Compute filter_cols_bytes for the new leaf.
         uint64_t fcb = 0;
-        std::vector<MemColumnData> group_filter_cols;
+        std::vector<ColumnData> group_filter_cols;
         if (has_filter) {
             group_filter_cols = select_filter_rows(old_filter_cols,
                                                    manifest_.schema, group);
@@ -4027,7 +4106,7 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
                 static_cast<uint64_t>(new_count) * n_factors * sizeof(float);
 
             // Read existing filter data from the old buffer (if any).
-            std::vector<MemColumnData> all_cols;
+            std::vector<ColumnData> all_cols;
             if (old_count > 0 && old_filter_bytes > 0) {
                 const uint64_t old_filter_off = leaf_factors_offset(
                     summary_size, old_nb, bb, old_count) +
@@ -4035,7 +4114,7 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
                 read_filter_columns(buf.data() + old_filter_off, old_count,
                                     manifest_.schema, all_cols);
             } else {
-                all_cols.assign(manifest_.schema.columns.size(), MemColumnData{});
+                all_cols.assign(manifest_.schema.columns.size(), ColumnData{});
                 for (uint32_t c = 0; c < manifest_.schema.columns.size(); ++c)
                     all_cols[c].type = manifest_.schema.columns[c].type;
             }
@@ -4043,8 +4122,8 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
             // Append new filter values from the insert points.
             std::vector<uint32_t> new_indices(indices.size());
             std::iota(new_indices.begin(), new_indices.end(), 0);
-            // Build a temporary MemColumnData vector from the insert points.
-            std::vector<MemColumnData> new_cols(manifest_.schema.columns.size());
+            // Build a temporary ColumnData vector from the insert points.
+            std::vector<ColumnData> new_cols(manifest_.schema.columns.size());
             for (uint32_t c = 0; c < manifest_.schema.columns.size(); ++c) {
                 const auto& col = manifest_.schema.columns[c];
                 new_cols[c].type = col.type;
@@ -4195,10 +4274,10 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
         if (summary_size > 0 && has_filter) {
             // For each new point, update the summary: widen min/max, set bloom bits.
             uint8_t* summary = nb.data() + leaf_filter_offset();
-            // Build a single-point MemColumnData for merge.
+            // Build a single-point ColumnData for merge.
             // Actually, use merge_filter_summary: build a summary for the new
             // points and OR it in.
-            std::vector<MemColumnData> new_cols(manifest_.schema.columns.size());
+            std::vector<ColumnData> new_cols(manifest_.schema.columns.size());
             for (uint32_t c = 0; c < manifest_.schema.columns.size(); ++c) {
                 const auto& col = manifest_.schema.columns[c];
                 new_cols[c].type = col.type;
@@ -4467,7 +4546,7 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
                 static_cast<uint64_t>(count) * n_factors * sizeof(float);
 
             // Read old filter data, select survivors, write back.
-            std::vector<MemColumnData> old_cols;
+            std::vector<ColumnData> old_cols;
             read_filter_columns(buf.data() + old_filter_off, count,
                                 manifest_.schema, old_cols);
             auto new_cols = select_filter_rows(old_cols, manifest_.schema,

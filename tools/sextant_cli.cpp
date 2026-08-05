@@ -12,8 +12,9 @@
 //
 // The CLI catches all exceptions, prints to stderr, returns non-zero.
 
-#include "engine/fbin_source.hpp"
+#include "fbin_source.hpp"
 #include "fbin_io.hpp"
+#include "parquet_source.hpp"
 #include "shared_cli.hpp"
 #include "sextant_version.hpp"
 #include "sextant/builder.hpp"
@@ -463,8 +464,19 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
                   << (fdat.has_payload ? ", with payload" : "") << "\n";
     }
 
-    auto result = tree::IVFTreeIndex::build_streaming_pca(
-        p.get<std::string>("input"), p.get<std::string>("index"), cfg);
+    const std::string input_path = p.get<std::string>("input");
+    BuildResult result;
+    if (input_path.size() >= 8 &&
+        input_path.compare(input_path.size() - 8, 8, ".parquet") == 0) {
+        ParquetSource source(input_path);
+        cfg.filter_schema = source.schema();
+        result = tree::IVFTreeIndex::build_streaming_pca(
+            source, p.get<std::string>("index"), cfg);
+    } else {
+        FbinSource source(input_path);
+        result = tree::IVFTreeIndex::build_streaming_pca(
+            source, p.get<std::string>("index"), cfg);
+    }
     std::cout << "built tree index (pca) '" << result.index_path
               << "': n=" << result.n_vectors
               << " dim=" << result.dim

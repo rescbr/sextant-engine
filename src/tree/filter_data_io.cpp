@@ -7,7 +7,7 @@ namespace sextant::tree {
 
 void write_filter_data(const std::string& path,
                         const Schema& schema,
-                        const std::vector<MemColumnData>& cols,
+                        const std::vector<ColumnData>& cols,
                         const std::vector<uint8_t>& payload_data,
                         const std::vector<uint32_t>& payload_offsets) {
     std::ofstream f(path, std::ios::binary);

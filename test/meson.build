@@ -30,14 +30,15 @@ test_sources = [
     'test_tree_filter.cpp',
     'test_fsck.cpp',
     'test_tree_insert_delete.cpp',
+    'test_parquet_source.cpp',
 ]
 
 foreach src : test_sources
     name = src.split('.')[0]
     exe = executable(name,
         src,
-        dependencies: [sextant_dep, gtest_dep, gtest_main_dep],
-        include_directories: test_inc,
+        dependencies: [sextant_dep, sextant_sources_dep, gtest_dep, gtest_main_dep],
+        include_directories: [test_inc, sources_inc],
         cpp_args: ['-DSEXTANT_SOURCE_DIR="' + meson.source_root() + '"'],
     )
     test(name, exe, env: ['SEXTANT_TEST_DATA=' + meson.current_source_dir() / 'data'])
