@@ -30,6 +30,8 @@ test_sources = [
     'test_fsck.cpp',
     'test_tree_insert_delete.cpp',
     'test_parquet_source.cpp',
+    'test_vacuum_defrag.cpp',
+    
 ]
 
 foreach src : test_sources

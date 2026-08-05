@@ -136,6 +136,7 @@ public:
     uint16_t depth() const { return manifest_.depth; }
     uint32_t k_root() const { return manifest_.k_root; }
     uint32_t n_leaves() const { return manifest_.n_leaves; }
+    uint64_t n_pages() const { return superblock_.n_pages(); }
     uint32_t n_probe_l0_default() const { return manifest_.n_probe_l0; }
     uint32_t n_probe_ln_default() const { return manifest_.n_probe_ln; }
     const std::string& quantizer_type() const { return manifest_.quantizer_type; }
@@ -171,6 +172,54 @@ public:
     /// scanning row_ids, swap-removes (last slot → deleted slot), decrements
     /// count, marks summary_dirty. Commits once at the end.
     void delete_batch(const std::vector<RowId>& row_ids);
+
+    /// Vacuum result statistics.
+    struct VacuumResult {
+        uint64_t leaves_scanned = 0;
+        uint64_t summaries_repaired = 0;
+        uint64_t cardinality_entries_rebuilt = 0;
+        double   elapsed_sec = 0;
+    };
+
+    /// Vacuum configuration.
+    struct VacuumConfig {
+        /// Rebuild the cardinality table by re-scanning all filter columns.
+        /// Expensive (reads every leaf) but fixes selectivity drift from deletes.
+        bool rebuild_cardinality = false;
+        /// Number of leaves to process per commit batch.
+        uint32_t batch_size = 256;
+    };
+
+    /// Repair stale filter summaries on dirty leaves. After delete_batch marks
+    /// leaves as summary_dirty, vacuum recomputes their summaries from surviving
+    /// filter column data, restoring pruning effectiveness. Optionally rebuilds
+    /// the cardinality table.
+    ///
+    /// Single-writer: same contract as insert_batch / delete_batch.
+    VacuumResult vacuum() { return vacuum(VacuumConfig{}); }
+    VacuumResult vacuum(const VacuumConfig& config);
+
+    /// Defrag result statistics.
+    struct DefragResult {
+        uint64_t leaves_relocated = 0;
+        uint64_t pages_reclaimed = 0;
+        double   elapsed_sec = 0;
+    };
+
+    /// Defrag configuration.
+    struct DefragConfig {
+        /// Attempt to shrink the file by truncating trailing free pages.
+        bool shrink_file = true;
+        /// Number of leaves to process per commit batch.
+        uint32_t batch_size = 256;
+    };
+
+    /// Compact fragmented leaf extents into contiguous pages and optionally
+    /// shrink the file. Reclaims space wasted by delete/split churn.
+    ///
+    /// Single-writer: same contract as insert_batch / delete_batch.
+    DefragResult defrag() { return defrag(DefragConfig{}); }
+    DefragResult defrag(const DefragConfig& config);
 
     /// Returns the number of live vectors across all leaves (sum of leaf
     /// counts). Requires a mutable open (reads leaf headers via file_).

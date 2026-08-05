@@ -1032,6 +1032,83 @@ int cmd_tree_delete(int argc, char* argv[]) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// tree-vacuum: repair stale filter summaries after deletes.
+// ---------------------------------------------------------------------------
+
+int cmd_tree_vacuum(int argc, char* argv[]) {
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("index", 0, "Tree index file", true);
+    p.add<bool>("rebuild-cardinality", 0,
+        "Rebuild cardinality table (re-scans all filter columns)", false, false);
+    p.add<uint32_t>("batch-size", 0, "Leaves per commit batch", false, 256);
+    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.parse_check(argc, argv);
+
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") set_log_level(LogLevel::Debug);
+        else if (lvl == "warn") set_log_level(LogLevel::Warn);
+        else if (lvl == "error") set_log_level(LogLevel::Error);
+    }
+
+    const std::string index_path = p.get<std::string>("index");
+
+    auto idx = tree::IVFTreeIndex::open(index_path);
+    tree::IVFTreeIndex::VacuumConfig cfg;
+    cfg.rebuild_cardinality = p.get<bool>("rebuild-cardinality");
+    cfg.batch_size = p.get<uint32_t>("batch-size");
+    auto result = idx->vacuum(cfg);
+
+    std::cout << "vacuum: " << result.summaries_repaired
+              << " summaries repaired (" << result.leaves_scanned
+              << " leaves scanned)";
+    if (cfg.rebuild_cardinality)
+        std::cout << ", " << result.cardinality_entries_rebuilt
+                  << " cardinality entries rebuilt";
+    std::cout << " in " << std::fixed << std::setprecision(3)
+              << result.elapsed_sec << "s\n";
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// tree-defrag: compact fragmented leaf extents + shrink file.
+// ---------------------------------------------------------------------------
+
+int cmd_tree_defrag(int argc, char* argv[]) {
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("index", 0, "Tree index file", true);
+    p.add<bool>("no-shrink", 0, "Skip file truncation", false, false);
+    p.add<uint32_t>("batch-size", 0, "Leaves per commit batch", false, 256);
+    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.parse_check(argc, argv);
+
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") set_log_level(LogLevel::Debug);
+        else if (lvl == "warn") set_log_level(LogLevel::Warn);
+        else if (lvl == "error") set_log_level(LogLevel::Error);
+    }
+
+    const std::string index_path = p.get<std::string>("index");
+
+    auto idx = tree::IVFTreeIndex::open(index_path);
+    tree::IVFTreeIndex::DefragConfig cfg;
+    cfg.shrink_file = !p.get<bool>("no-shrink");
+    cfg.batch_size = p.get<uint32_t>("batch-size");
+    auto result = idx->defrag(cfg);
+
+    std::cout << "defrag: " << result.leaves_relocated
+              << " leaves relocated, " << result.pages_reclaimed
+              << " pages reclaimed in " << std::fixed << std::setprecision(3)
+              << result.elapsed_sec << "s\n";
+    return 0;
+}
+
 int cmd_fsck(int argc, char* argv[]) {
     cmdline::parser p;
     p.add<std::string>("file", 0, "Tree index file", true);
@@ -1081,6 +1158,10 @@ void print_usage() {
               << "              --index --vectors --start-row-id\n"
               << "  tree-delete  Delete vectors by row ID from a tree index.\n"
               << "              --index --row-ids --format (text|binary)\n"
+              << "  tree-vacuum Repair stale filter summaries after deletes.\n"
+              << "              --index --rebuild-cardinality --batch-size\n"
+              << "  tree-defrag Compact fragmented leaf extents + shrink file.\n"
+              << "              --index --no-shrink --batch-size\n"
               << "  fsck       Check a tree index file. --repair rebuilds the bitmap/free-list.\n";
 }
 
@@ -1123,6 +1204,10 @@ int main(int argc, char* argv[]) {
             return cmd_tree_insert(sub_argc, sub_argv.data());
         } else if (cmd == "tree-delete") {
             return cmd_tree_delete(sub_argc, sub_argv.data());
+        } else if (cmd == "tree-vacuum") {
+            return cmd_tree_vacuum(sub_argc, sub_argv.data());
+        } else if (cmd == "tree-defrag") {
+            return cmd_tree_defrag(sub_argc, sub_argv.data());
         } else if (cmd == "fsck") {
             return cmd_fsck(sub_argc, sub_argv.data());
         } else if (cmd == "analyze") {

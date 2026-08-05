@@ -4375,4 +4375,297 @@ uint64_t IVFTreeIndex::live_count() const {
     return total;
 }
 
+// ===========================================================================
+// vacuum(): repair stale filter summaries on dirty leaves.
+//
+// After delete_batch marks leaves as summary_dirty (swap-remove leaves the
+// summary out of date), vacuum recomputes their summaries from the surviving
+// filter column data, restoring pruning effectiveness. Optionally rebuilds the
+// global cardinality table by re-scanning every leaf's filter columns.
+//
+// Uses the same PageAllocator + commit_mutable_ + remap_ pattern as
+// delete_batch, committing in batches of `batch_size` to bound RAM.
+// ===========================================================================
+
+IVFTreeIndex::VacuumResult IVFTreeIndex::vacuum(const VacuumConfig& config) {
+    VacuumResult res;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    const uint16_t m4 = manifest_.m4;
+    const uint8_t pq_bits = manifest_.scan_pq_bits;
+    const uint32_t summary_size = manifest_.summary_size;
+    const bool has_filter = manifest_.schema.n_filter_columns() > 0;
+
+    PageAllocator alloc;
+    alloc.load(file_, superblock_.alloc_bitmap_page(),
+               superblock_.alloc_bitmap_pages(),
+               superblock_.n_pages(),
+               superblock_.free_list_head(),
+               superblock_.n_free_pages());
+
+    const uint32_t batch_size = config.batch_size > 0 ? config.batch_size : 1;
+    uint32_t batch_count = 0;
+
+    // --- Pass 1: repair summaries on dirty leaves ---
+    // A leaf is dirty when summary_dirty == 1. Deletes already physically
+    // compacted the leaf (swap-remove), so all remaining entries are live and
+    // the summary can be rebuilt from scratch from the surviving filter columns.
+    for (uint32_t lid = 0; lid < leaf_table_.size(); ++lid) {
+        ++res.leaves_scanned;
+        if (leaf_table_[lid].page == kInvalidPage) continue;
+
+        std::vector<uint8_t> buf = read_leaf_(lid);
+        auto* lh = reinterpret_cast<TreeLeafHeader*>(buf.data());
+        if (lh->summary_dirty != 1) continue;
+        // No summary to repair (e.g. no filter columns); just clear the flag.
+        if (summary_size == 0 || !has_filter || lh->count == 0) {
+            lh->summary_dirty = 0;
+            lh->next_dirty = kInvalidPage;
+            lh->header_crc = header_crc(
+                lh, offsetof(TreeLeafHeader, header_crc));
+            write_leaf_(lid, buf, static_cast<uint32_t>(lh->extent_pages), alloc);
+        } else {
+            const uint32_t count = static_cast<uint32_t>(lh->count);
+            auto layout = LeafFilterLayout::compute(buf.data(), m4, pq_bits,
+                                                    summary_size);
+            std::vector<ColumnData> cols;
+            read_filter_columns(layout.filter_base, count, manifest_.schema, cols);
+            // Recompute the summary from scratch (min/max + blooms).
+            write_filter_summary(buf.data() + leaf_filter_offset(),
+                                 summary_size, manifest_.schema, count, cols);
+            lh->summary_dirty = 0;
+            lh->next_dirty = kInvalidPage;
+            lh->header_crc = header_crc(
+                lh, offsetof(TreeLeafHeader, header_crc));
+            write_leaf_(lid, buf, static_cast<uint32_t>(lh->extent_pages), alloc);
+        }
+
+        ++res.summaries_repaired;
+        if (++batch_count >= batch_size) {
+            commit_mutable_(alloc);
+            batch_count = 0;
+            alloc.clear_free_list();
+        }
+    }
+    if (batch_count > 0) {
+        commit_mutable_(alloc);
+        alloc.clear_free_list();
+    }
+
+    // --- Pass 2 (optional): rebuild the cardinality table ---
+    if (config.rebuild_cardinality && has_filter) {
+        // First pass: count live vectors so the table can size its histograms.
+        uint64_t total_live = 0;
+        for (uint32_t lid = 0; lid < leaf_table_.size(); ++lid) {
+            if (leaf_table_[lid].page == kInvalidPage) continue;
+            std::vector<uint8_t> buf = read_leaf_(lid);
+            const auto* lh = reinterpret_cast<const TreeLeafHeader*>(buf.data());
+            total_live += lh->count;
+        }
+
+        CardinalityTable new_card;
+        new_card.init(manifest_.schema, total_live);
+
+        for (uint32_t lid = 0; lid < leaf_table_.size(); ++lid) {
+            if (leaf_table_[lid].page == kInvalidPage) continue;
+            std::vector<uint8_t> buf = read_leaf_(lid);
+            const auto* lh = reinterpret_cast<const TreeLeafHeader*>(buf.data());
+            const uint32_t count = static_cast<uint32_t>(lh->count);
+            if (count == 0) continue;
+            auto layout = LeafFilterLayout::compute(buf.data(), m4, pq_bits,
+                                                    summary_size);
+            std::vector<ColumnData> cols;
+            read_filter_columns(layout.filter_base, count, manifest_.schema, cols);
+
+            for (uint32_t i = 0; i < count; ++i) {
+                for (uint32_t c = 0; c < manifest_.schema.columns.size(); ++c) {
+                    const auto& col = manifest_.schema.columns[c];
+                    const auto& fc = cols[c];
+                    switch (col.type) {
+                        case ColumnType::String:
+                            new_card.add_string(c,
+                                std::string_view(fc.str_data.data() +
+                                                    fc.str_offsets[i],
+                                                  fc.str_lengths[i]));
+                            break;
+                        case ColumnType::Set:
+                            new_card.add_set(c, fc.set_counts.data(),
+                                             fc.set_offsets.data(),
+                                             fc.set_elem_lengths.data(),
+                                             fc.set_elem_data.data(), i);
+                            break;
+                        case ColumnType::Int32: {
+                            int32_t v;
+                            std::memcpy(&v, fc.fixed_data.data() +
+                                              static_cast<size_t>(i) * 4, 4);
+                            new_card.add_numeric(c, static_cast<double>(v));
+                            break;
+                        }
+                        case ColumnType::Int64: {
+                            int64_t v;
+                            std::memcpy(&v, fc.fixed_data.data() +
+                                              static_cast<size_t>(i) * 8, 8);
+                            new_card.add_numeric(c, static_cast<double>(v));
+                            break;
+                        }
+                        case ColumnType::Float: {
+                            float v;
+                            std::memcpy(&v, fc.fixed_data.data() +
+                                              static_cast<size_t>(i) * 4, 4);
+                            new_card.add_numeric(c, static_cast<double>(v));
+                            break;
+                        }
+                        default:
+                            break;
+                    }
+                    ++res.cardinality_entries_rebuilt;
+                }
+            }
+        }
+
+        // Serialize + write the new cardinality blob, then commit. The old blob
+        // is freed as part of commit_mutable_ (which rewrites the leaf table +
+        // flushes the bitmap). We allocate the new blob first, set the
+        // superblock pointer, then commit.
+        auto card_blob = new_card.serialize();
+        const uint64_t card_bytes = card_blob.size();
+        PageId card_page = kInvalidPage;
+        uint32_t card_npg = 0;
+        if (card_bytes > 0) {
+            card_npg = static_cast<uint32_t>(
+                (card_bytes + kPageSize - 1) / kPageSize);
+            card_page = alloc.alloc_extent(file_, card_npg);
+            std::vector<uint8_t> b(static_cast<size_t>(card_npg) * kPageSize, 0);
+            std::memcpy(b.data(), card_blob.data(), card_bytes);
+            file_.write_pages(card_page, card_npg, b.data());
+        }
+        // Free the old cardinality blob (if any) before swapping the pointer.
+        const PageId old_card_page = superblock_.cardinality_page();
+        const uint32_t old_card_pages = superblock_.cardinality_pages();
+        if (old_card_page != kInvalidPage && old_card_pages > 0)
+            alloc.free_extent(file_, old_card_page, old_card_pages);
+        superblock_.set_cardinality(card_page, card_npg);
+        // In-memory: adopt the rebuilt table immediately.
+        card_table_ = std::move(new_card);
+
+        commit_mutable_(alloc);
+        alloc.clear_free_list();
+    }
+
+    res.elapsed_sec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    spdlog::info("[sextant] vacuum: scanned {} leaves, repaired {} summaries"
+                 "{}, {:.3f}s",
+                 res.leaves_scanned, res.summaries_repaired,
+                 config.rebuild_cardinality
+                     ? (", rebuilt " + std::to_string(res.cardinality_entries_rebuilt)
+                        + " cardinality entries")
+                     : std::string(),
+                 res.elapsed_sec);
+    return res;
+}
+
+// ===========================================================================
+// defrag(): compact fragmented leaf extents into contiguous pages.
+//
+// Re-allocates each leaf extent freshly (alloc_extent returns the lowest
+// available contiguous range) and frees the old one, so repeated churn from
+// delete/split leaves the file with a compact set of live extents. Optionally
+// truncates trailing free pages to shrink the file. Best-effort: internal
+// fragmentation (free pages between live extents) cannot be reclaimed without a
+// full file rewrite.
+//
+// Same PageAllocator + commit_mutable_ + remap_ pattern as delete_batch.
+// ===========================================================================
+
+IVFTreeIndex::DefragResult IVFTreeIndex::defrag(const DefragConfig& config) {
+    DefragResult res;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    PageAllocator alloc;
+    alloc.load(file_, superblock_.alloc_bitmap_page(),
+               superblock_.alloc_bitmap_pages(),
+               superblock_.n_pages(),
+               superblock_.free_list_head(),
+               superblock_.n_free_pages());
+
+    const uint32_t batch_size = config.batch_size > 0 ? config.batch_size : 1;
+    uint32_t batch_count = 0;
+
+    const uint64_t pages_before = file_.num_pages();
+
+    // Re-allocate each leaf extent freshly, freeing the old one. alloc_extent
+    // reuses the lowest free pages, so after all leaves are relocated the live
+    // extents are packed toward the front of the file.
+    for (uint32_t lid = 0; lid < leaf_table_.size(); ++lid) {
+        const auto& entry = leaf_table_[lid];
+        if (entry.page == kInvalidPage) continue;
+        const uint32_t pages = static_cast<uint32_t>(entry.pages);
+        if (pages == 0) continue;
+
+        std::vector<uint8_t> buf = read_leaf_(lid);
+        const PageId new_page = alloc.alloc_extent(file_, pages);
+        file_.write_pages(new_page, pages, buf.data());
+        alloc.free_extent(file_, entry.page, pages);
+        leaf_table_[lid] = {new_page, pages};
+        ++res.leaves_relocated;
+
+        if (++batch_count >= batch_size) {
+            commit_mutable_(alloc);
+            batch_count = 0;
+            alloc.clear_free_list();
+        }
+    }
+    if (batch_count > 0) {
+        commit_mutable_(alloc);
+        alloc.clear_free_list();
+    }
+
+    // --- Optional file shrink ---
+    // Find the highest page referenced by any live extent (leaf table + all
+    // superblock-tracked blobs) and truncate trailing pages beyond it.
+    if (config.shrink_file) {
+        PageId max_end = 0;
+        auto consider = [&](PageId page, uint64_t pages) {
+            if (page != kInvalidPage && pages > 0)
+                max_end = std::max(max_end, page + pages);
+        };
+        for (const auto& e : leaf_table_) consider(e.page, e.pages);
+        consider(superblock_.alloc_bitmap_page(),
+                 superblock_.alloc_bitmap_pages());
+        consider(superblock_.root_node_page(), superblock_.root_node_pages());
+        consider(superblock_.codebook_page(), superblock_.codebook_pages());
+        consider(superblock_.config_page(), superblock_.config_pages());
+        consider(superblock_.pca_page(), superblock_.pca_pages());
+        consider(superblock_.cardinality_page(),
+                 superblock_.cardinality_pages());
+        consider(superblock_.leaf_table_page(),
+                 superblock_.leaf_table_pages());
+
+        const uint64_t new_n_pages = static_cast<uint64_t>(max_end);
+        const uint64_t old_n_pages = file_.num_pages();
+        if (new_n_pages < old_n_pages) {
+            file_.truncate(new_n_pages);
+            superblock_.set_n_pages(new_n_pages);
+            // Flush the (now authoritative) superblock + bitmap state. We don't
+            // touch the free list: the reclaimed trailing pages were already
+            // free (no live extent referenced them), so they aren't on it.
+            alloc.flush_bitmap(file_);
+            superblock_.commit(file_);
+            file_.sync();
+            remap_();
+            res.pages_reclaimed = old_n_pages - new_n_pages;
+        }
+    }
+
+    res.elapsed_sec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    const uint64_t pages_after = file_.num_pages();
+    spdlog::info("[sextant] defrag: relocated {} leaves, file {} → {} pages"
+                 " (reclaimed {}) in {:.3f}s",
+                 res.leaves_relocated, pages_before, pages_after,
+                 res.pages_reclaimed, res.elapsed_sec);
+    return res;
+}
+
 }  // namespace sextant::tree
