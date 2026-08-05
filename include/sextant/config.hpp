@@ -287,11 +287,14 @@ struct SearchConfig {
     /// Rerank top-W candidates by decoding PQ codes to FP32 and computing the
     /// exact distance to the query. The PQ-approximate distances used during
     /// the FastScan heap have non-trivial error (especially on high-LID data);
-    /// re-sorting the W≈300 candidates by exact FP32 distance dramatically
-    /// improves recall@k at ~W × (decode + one SIMD distance) overhead. When
-    /// false, the top-k are extracted using the raw PQ-approximate distances.
-    /// Default: true (almost always helps).
-    bool rerank = true;
+    /// PQ-decode rerank: decode each W≈300 heap survivor's PQ code back to FP32
+    /// and re-sort by exact decoded distance. Benchmarking on sift1m/arxiv/
+    /// msmarco/sphere showed <0.001 recall delta at all m values (2-192),
+    /// because PQ ADC ranking already matches decoded-FP32 ranking at high m,
+    /// and at low m the decoded vectors are too coarse to improve ranking.
+    /// Disabled by default — the QPS penalty (10-30%) is not justified.
+    /// A true rerank would use stored FP16 vectors, not PQ-decoded approximations.
+    bool rerank = false;
 
     /// Filter predicates (Phase D). Empty = no filtering (today's behavior).
     std::vector<Predicate> predicates;
