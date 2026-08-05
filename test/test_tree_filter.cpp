@@ -168,13 +168,13 @@ TEST(TreeFilterColumns, BuildAndVerifyLeafLayout) {
     EXPECT_EQ(lh->magic, kTreeLeafMagic);
     EXPECT_EQ(lh->n_filter_columns, 2u);
     EXPECT_GT(lh->summary_size, 0u);
-    // filter_columns_offset points past factors (factors = 0 for PQ).
+    // filter_columns_offset points past row_ids.
     const uint64_t fc_off_expected =
-        leaf_factors_offset(lh->summary_size,
+        leaf_rowids_offset(lh->summary_size,
                             (static_cast<uint32_t>(lh->count) +
                              lh->codes_per_block - 1) / lh->codes_per_block,
-                            lh->block_bytes,
-                            static_cast<uint32_t>(lh->count));
+                            lh->block_bytes) +
+        static_cast<uint64_t>(lh->count) * sizeof(RowId);
     EXPECT_EQ(lh->filter_columns_offset, fc_off_expected);
 
     // --- Verify the summary region: numeric min/max for "year" ---

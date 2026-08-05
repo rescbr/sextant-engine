@@ -5,14 +5,14 @@
 ///
 /// All structures are page-aligned and designed for mmap'd read-only access
 /// at search time. The layouts are quantizer-agnostic: the leaf stores raw
-/// FastScan code bytes + row IDs + optional per-vector factors (RaBitQ), and
-/// the codebook is stored separately (at codebook_page in the superblock).
+/// FastScan code bytes + row IDs, and the codebook is stored separately
+/// (at codebook_page in the superblock).
 ///
 /// ## Quantizer support
-/// The tree supports PQ (4-bit/8-bit), PRQ (4-bit), and RaBitQ (4-bit + factors).
-/// The leaf format is the same for all — the manifest's quantizer_type / m4 /
-/// scan_pq_bits / prq_nsplits fields tell the search path how to interpret the
-/// codes and rebuild the codebook.
+/// The tree supports PQ (4-bit/8-bit) and PRQ (4-bit). The leaf format is
+/// the same for both — the manifest's quantizer_type / m4 / scan_pq_bits /
+/// prq_nsplits fields tell the search path how to interpret the codes and
+/// rebuild the codebook.
 ///
 /// ## Internal node layout (multi-page extent)
 /// Each internal node stores its children inline:
@@ -27,7 +27,6 @@
 ///   [filter_summary: summary_size bytes]   (0 when no schema)
 ///   [FastScan code blocks: n_blocks × block_bytes]
 ///   [row_ids: count × sizeof(RowId)]
-///   [factors: count × n_factors × sizeof(float)]   (RaBitQ only)
 ///   [padding to page boundary]
 ///
 /// ## Integrity
@@ -143,7 +142,6 @@ struct TreeLeafHeader {
     uint64_t tombstone_count;        // deleted vector count (Phase 4; 0 now)
     uint16_t m4;                     // PQ subquantizers (block_bytes = m4 × 16)
     uint8_t  pq_bits;                // 4 or 8
-    uint8_t  n_factors;              // 0 for PQ/PRQ, 2 for RaBitQ
     uint32_t block_bytes;            // bytes per FastScan block
     uint32_t codes_per_block;        // 32 for 4-bit, 16 for 8-bit
     uint64_t extent_pages;           // total pages in this extent
@@ -176,35 +174,27 @@ inline uint64_t leaf_rowids_offset(uint32_t summary_size, uint64_t n_blocks,
            static_cast<uint64_t>(n_blocks) * block_bytes;
 }
 
-/// Byte offset of the factors array within a leaf (RaBitQ only).
-inline uint64_t leaf_factors_offset(uint32_t summary_size, uint64_t n_blocks,
-                                    uint32_t block_bytes, uint32_t count) {
-    return leaf_rowids_offset(summary_size, n_blocks, block_bytes) +
-           static_cast<uint64_t>(count) * sizeof(RowId);
-}
-
 /// Compute the total byte size of a leaf extent.
 /// `filter_cols_bytes` is the total bytes of the filter column region (after
-/// factors). Defaults to 0 — the layout is then identical to the pre-Phase-C
+/// row_ids). Defaults to 0 — the layout is then identical to the pre-Phase-C
 /// format (no filter columns).
 inline uint64_t leaf_extent_bytes(uint64_t count, uint16_t m4, uint8_t pq_bits,
-                                  uint8_t n_factors, uint32_t summary_size,
+                                  uint32_t summary_size,
                                   uint64_t filter_cols_bytes = 0) {
     const uint32_t cpb = (pq_bits == 4) ? 32 : 16;
     const uint32_t block_bytes = m4 * 16;  // [m][16] for both 4-bit and 8-bit
     const uint32_t n_blocks = (count + cpb - 1) / cpb;
     const uint64_t codes = static_cast<uint64_t>(n_blocks) * block_bytes;
     const uint64_t rowids = static_cast<uint64_t>(count) * sizeof(RowId);
-    const uint64_t factors = static_cast<uint64_t>(count) * n_factors * sizeof(float);
-    return leaf_codes_offset(summary_size) + codes + rowids + factors + filter_cols_bytes;
+    return leaf_codes_offset(summary_size) + codes + rowids + filter_cols_bytes;
 }
 
 /// Number of pages needed for a leaf.
 inline uint64_t leaf_extent_pages(uint64_t count, uint16_t m4, uint8_t pq_bits,
-                                  uint8_t n_factors, uint32_t summary_size,
+                                  uint32_t summary_size,
                                   uint64_t filter_cols_bytes = 0) {
     return static_cast<uint32_t>(
-        (leaf_extent_bytes(count, m4, pq_bits, n_factors, summary_size,
+        (leaf_extent_bytes(count, m4, pq_bits, summary_size,
                            filter_cols_bytes) +
          kPageSize - 1) / kPageSize);
 }

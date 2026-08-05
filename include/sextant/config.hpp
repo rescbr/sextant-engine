@@ -290,8 +290,7 @@ struct SearchConfig {
     /// re-sorting the W≈300 candidates by exact FP32 distance dramatically
     /// improves recall@k at ~W × (decode + one SIMD distance) overhead. When
     /// false, the top-k are extracted using the raw PQ-approximate distances.
-    /// Default: true (almost always helps). Ignored for the RaBitQ path, which
-    /// already finalizes in float precision.
+    /// Default: true (almost always helps).
     bool rerank = true;
 
     /// Filter predicates (Phase D). Empty = no filtering (today's behavior).

@@ -14,7 +14,7 @@
 /// 4. Scan leaves (FastScan), maintain top-W heap. Merge → rerank → return top-k.
 ///
 /// The index file is a single mmap'd page-based file (see superblock.hpp).
-/// Quantizer-agnostic: supports PQ (4/8-bit), PRQ (4-bit), RaBitQ (4-bit+factors).
+/// Quantizer-agnostic: supports PQ (4/8-bit) and PRQ (4-bit).
 
 #include "tree/page_file.hpp"
 #include "tree/page_allocator.hpp"
@@ -43,7 +43,7 @@ struct LeafCandidate {
     PageId   page;           // leaf extent start page
     uint64_t pages;          // leaf extent length
     float    centroid_dist;  // distance from query to the leaf's parent centroid
-    const float16_t* centroid;  // FP16 centroid of the leaf (for RaBitQ LUT rebuild)
+    const float16_t* centroid;  // FP16 centroid of the leaf
 };
 
 /// The hierarchical IVF tree index.
@@ -66,7 +66,7 @@ public:
         uint32_t leaf_capacity = 5000; // max vectors per leaf
         uint16_t n_probe_l0 = 0;       // probe count at level 0 (0 = auto)
         uint16_t n_probe_ln = 0;       // probe count at deeper levels (0 = auto)
-        ResolvedParams params;         // PQ/PRQ/RaBitQ config
+        ResolvedParams params;         // PQ/PRQ config
         float adaptive_probe_gap = 1.5f;  // geometric gap pruning (1.0=off, >1=prune)
         float median_lid = 0.0f;
         uint32_t num_threads = 0;
@@ -223,12 +223,6 @@ private:
 
     /// Close mmap + fd.
     void close();
-
-    /// RaBitQ-specific search (per-leaf LUT rebuild + factor finalization).
-    std::vector<Candidate> search_rabitq(const float* query, uint32_t k,
-                                          const SearchConfig& config,
-        std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs
-            = nullptr) const;
 
     /// Brute-force PQ-decode fallback for extreme low selectivity (<1%).
     /// Walks ALL leaves, checks summaries, scans filter columns for exact

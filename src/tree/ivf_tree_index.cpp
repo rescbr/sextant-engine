@@ -4,7 +4,6 @@
 #include "engine/partition.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "quant/product_residual_quantizer.hpp"
-#include "quant/rabitq_quantizer.hpp"
 #include "util/fp16.hpp"
 #include "simd_kernels.hpp"
 #include "tree/filter_column_write.hpp"  // filter column write path
@@ -138,9 +137,6 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
             idx->quantizer_ = std::make_unique<ProductResidualQuantizer>(
                 MetricKind::L2Sq, m.dim, m.m4, m.scan_pq_bits,
                 m.prq_nsplits, /*beam_size=*/1);
-        } else if (m.quantizer_type == "rabitq") {
-            idx->quantizer_ = std::make_unique<RaBitQQuantizer>(
-                MetricKind::L2Sq, m.dim);
         } else {
             idx->quantizer_ = std::make_unique<PqQuantizer>(
                 MetricKind::L2Sq, m.dim, m.m4, m.scan_pq_bits);
@@ -395,7 +391,6 @@ struct TreeBuildContext {
     uint32_t k_l1 = 0;
     uint32_t pca_dims = 0;
     MetricKind metric = MetricKind::L2Sq;
-    uint8_t n_factors = 0;  // 0 for PQ/PRQ, 2 for RaBitQ
     bool has_filter = false;
     bool has_payload = false;
     uint32_t n_schema_cols = 0;
@@ -550,16 +545,12 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     train_n = collected;  // actual count
     std::vector<float> sample = std::move(sample_buf);
 
-    uint8_t n_factors = 0;
     if (params.quantizer_type == "prq") {
         const uint32_t nsplits = (params.prq_nsplits > 0)
             ? params.prq_nsplits : static_cast<uint32_t>(dim) / 8;
         ctx.quantizer = std::make_unique<ProductResidualQuantizer>(
             params.metric, dim, ctx.m4, ctx.scan_bits, nsplits,
             params.prq_beam_size, 42);
-    } else if (params.quantizer_type == "rabitq") {
-        ctx.quantizer = std::make_unique<RaBitQQuantizer>(params.metric, dim, 42);
-        n_factors = 2;
     } else {
         ctx.quantizer = std::make_unique<PqQuantizer>(
             params.metric, dim, ctx.m4, ctx.scan_bits, 42);
@@ -745,7 +736,6 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     ctx.mean_proj = std::move(mean_proj);
     ctx.rotation = std::move(rotation);
     ctx.closure_epsilon = closure_epsilon;
-    ctx.n_factors = n_factors;
     ctx.root_centroids_pca = std::move(root_centroids_pca);
 }
 
@@ -1088,7 +1078,6 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     const uint16_t m4 = ctx.m4;
     const uint32_t leaf_cap = ctx.leaf_cap;
     const uint32_t summary_size = ctx.summary_size;
-    const uint8_t n_factors = ctx.n_factors;
     const MetricKind metric = ctx.metric;
     const auto& rotation = ctx.rotation;
     const auto& mean_proj = ctx.mean_proj;
@@ -1274,7 +1263,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         }
 
         const uint32_t npg = leaf_extent_pages(count, m4, scan_bits,
-                                               n_factors, summary_size, fcb);
+                                               summary_size, fcb);
         if (npg > 512) {
             spdlog::warn("[sextant] build_streaming_pca: leaf {} extent = {} "
                          "pages (> 512)", leaf_metas.size(), npg);
@@ -1285,7 +1274,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         auto* lh = reinterpret_cast<TreeLeafHeader*>(obuf.data());
         lh->magic = kTreeLeafMagic;
         lh->count = count; lh->tombstone_count = 0; lh->m4 = m4;
-        lh->pq_bits = scan_bits; lh->n_factors = n_factors;
+        lh->pq_bits = scan_bits;
         lh->block_bytes = bb; lh->codes_per_block = cpb; lh->extent_pages = npg;
         lh->summary_size = summary_size;
         lh->n_filter_columns = cfg.filter_schema.n_filter_columns();
@@ -1363,10 +1352,12 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             obuf.data() + leaf_rowids_offset(summary_size, n_blocks, bb));
         std::memcpy(rids, buf.row_ids.data(), count * sizeof(RowId));
 
-        // Phase C: filter column data region (after factors).
+        // Phase C: filter column data region (after row_ids). This must
+        // match LeafFilterLayout::compute's filter_base offset.
         if (fcb > 0) {
             const uint64_t fc_off =
-                leaf_factors_offset(summary_size, n_blocks, bb, count);
+                leaf_rowids_offset(summary_size, n_blocks, bb) +
+                static_cast<uint64_t>(count) * sizeof(RowId);
             lh->filter_columns_offset = fc_off;
             const uint64_t written = write_filter_columns(
                 obuf.data() + fc_off, count, cfg.filter_schema, buf.filter_cols);
@@ -2090,11 +2081,6 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
 std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                              const SearchConfig& config,
     std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs) const {
-    // RaBitQ needs per-leaf LUT rebuild + factor finalization — separate path.
-    if (manifest_.quantizer_type == "rabitq") {
-        return search_rabitq(query, k, config, payload_locs);
-    }
-
     // Build the FastScan LUT once per query.
     const bool scan_8bit = (manifest_.scan_pq_bits == 8);
     const uint32_t m = manifest_.m4;
@@ -2659,7 +2645,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 cur_leaf = entry.leaf_ptr;
                 const auto* lh = reinterpret_cast<const TreeLeafHeader*>(cur_leaf);
                 auto layout = LeafFilterLayout::compute(cur_leaf, manifest_.m4,
-                    manifest_.scan_pq_bits, lh->n_factors, manifest_.summary_size);
+                    manifest_.scan_pq_bits, manifest_.summary_size);
                 cols = parse_filter_columns(layout.filter_base, lh->count,
                                              manifest_.schema);
             }
@@ -2802,245 +2788,6 @@ std::string_view IVFTreeIndex::fetch_payload(const uint8_t* leaf_ptr,
 }
 
 // ===========================================================================
-// RaBitQ search (per-leaf LUT rebuild + factor finalization)
-// ===========================================================================
-
-std::vector<Candidate> IVFTreeIndex::search_rabitq(const float* query,
-                                                     uint32_t k,
-                                                     const SearchConfig& config,
-    std::vector<std::pair<const uint8_t*, uint32_t>>* /*payload_locs*/)
-    const {
-    auto& rabitq = static_cast<RaBitQQuantizer&>(*quantizer_);
-    const uint32_t m = manifest_.m4;
-    const uint32_t codes_per_block = 32;
-    const uint32_t block_bytes = m * 16;
-
-    std::vector<uint8_t> lut4(m * 16);
-    std::vector<float16_t> query_fp16(manifest_.dim);
-    cast_fp32_to_fp16(query, query_fp16.data(), manifest_.dim);
-    const MetricKind metric = rabitq.metric();
-
-    // RaBitQ query state (populated by build_lut4_with_state).
-    // We need thread-local storage for rabitq's internal state (c34_,
-    // qr_to_c_l2sqr_, rabitq_qs). Since search is const and single-threaded
-    // for now, we use mutable scratch. The rabitq object stores these as
-    // mutable members.
-
-    // --- Route at level 0 ---
-    const uint32_t k_root = root_header_->n_children;
-    std::vector<std::pair<float, uint32_t>> root_dists;
-    root_dists.reserve(k_root);
-    for (uint32_t c = 0; c < k_root; ++c) {
-        const float d = simd::dist_f16(metric, query_fp16.data(),
-                                        root_children_[c].centroid,
-                                        manifest_.dim);
-        root_dists.emplace_back(d, c);
-    }
-    std::sort(root_dists.begin(), root_dists.end());
-
-    uint32_t n_probe_l0 = config.n_probe > 0
-        ? config.n_probe
-        : manifest_.n_probe_l0;
-    n_probe_l0 = std::min(n_probe_l0, k_root);
-
-    // --- Collect leaf candidates (same routing as PQ path) ---
-    std::vector<LeafCandidate> candidates;
-    const float gap = (config.adaptive_probe_gap > 0)
-        ? config.adaptive_probe_gap
-        : manifest_.adaptive_probe_gap;
-
-    for (uint32_t i = 0; i < n_probe_l0; ++i) {
-        const auto& [dist, child_idx] = root_dists[i];
-        const auto& rc = root_children_[child_idx];
-
-        if (gap > 0 && i > 0) {
-            if (root_dists[i].first > root_dists[i - 1].first * gap) break;
-        }
-
-        if (rc.is_leaf) {
-            if (rc.page == kInvalidPage) continue;
-            candidates.push_back({rc.page, rc.pages, dist, rc.centroid});
-        } else {
-            const uint8_t* node_ptr = mmap_base_ +
-                static_cast<uint64_t>(rc.page) * kPageSize;
-            const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
-            const uint32_t cesize = child_entry_size(manifest_.dim,
-                                                      manifest_.summary_size);
-            const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
-
-            std::vector<std::pair<float, uint32_t>> child_dists;
-            child_dists.reserve(nh->n_children);
-            for (uint32_t j = 0; j < nh->n_children; ++j) {
-                const float16_t* cent = reinterpret_cast<const float16_t*>(
-                    p + sizeof(ChildEntry));
-                const float d = simd::dist_f16(metric, query_fp16.data(),
-                                                cent, manifest_.dim);
-                child_dists.emplace_back(d, j);
-                p += cesize;
-            }
-            std::sort(child_dists.begin(), child_dists.end());
-
-            uint32_t n_probe_ln = config.n_probe_ln > 0
-                ? config.n_probe_ln
-                : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4);
-            n_probe_ln = std::min(static_cast<uint64_t>(n_probe_ln), nh->n_children);
-
-            const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);
-            for (uint32_t j = 0; j < n_probe_ln; ++j) {
-                if (gap > 0 && j > 0) {
-                    if (child_dists[j].first >
-                        child_dists[j - 1].first * gap) break;
-                }
-                const uint32_t idx = child_dists[j].second;
-                const auto* ce = reinterpret_cast<const ChildEntry*>(
-                    p2 + idx * cesize);
-                if (ce->child_page == kInvalidPage) continue;
-                PageId bf_leaf_id = ce->child_page;
-                PageId bf_page = bf_leaf_id;
-                uint64_t bf_pages = ce->child_pages;
-                if (ce->is_leaf && !leaf_table_.empty() &&
-                    bf_leaf_id < leaf_table_.size()) {
-                    bf_page = leaf_table_[bf_leaf_id].page;
-                    bf_pages = leaf_table_[bf_leaf_id].pages;
-                }
-                const float16_t* leaf_cent = reinterpret_cast<const float16_t*>(
-                    reinterpret_cast<const uint8_t*>(ce) + sizeof(ChildEntry));
-                candidates.push_back({bf_page, bf_pages,
-                                      child_dists[j].first, leaf_cent});
-            }
-        }
-    }
-
-    if (candidates.empty()) return {};
-
-    // --- Per-leaf: rebuild LUT → scan → finalize → float heap ---
-    const uint32_t W = std::max(config.fastscan_W > 0 ? config.fastscan_W : 300u, k);
-
-    // Global float max-heap of (dist, row_id).
-    std::vector<std::pair<float, int64_t>> heap;
-    heap.reserve(W + 32);
-    const auto heap_less = [](const auto& a, const auto& b) {
-        return a.first < b.first;
-    };
-    auto heap_replace = [&](float new_d, int64_t new_id) {
-        heap[0] = {new_d, new_id};
-        uint32_t pos = 0;
-        const uint32_t n = heap.size();
-        while (true) {
-            const uint32_t left = 2 * pos + 1;
-            const uint32_t right = 2 * pos + 2;
-            uint32_t largest = pos;
-            if (left < n && heap[left].first > heap[largest].first)
-                largest = left;
-            if (right < n && heap[right].first > heap[largest].first)
-                largest = right;
-            if (largest == pos) break;
-            std::swap(heap[pos], heap[largest]);
-            pos = largest;
-        }
-    };
-
-    std::vector<float> centroid_f32(manifest_.dim);
-    RaBitQQuantizer::QueryState rabitq_qs;
-
-    for (const auto& cand : candidates) {
-        if (cand.page == kInvalidPage) continue;
-        const uint8_t* leaf_ptr = mmap_base_ +
-            static_cast<uint64_t>(cand.page) * kPageSize;
-        const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
-        const uint32_t count = lh->count;
-        if (count == 0) continue;
-
-        const uint32_t n_blocks = (count + codes_per_block - 1) / codes_per_block;
-        const uint8_t* codes = leaf_ptr + leaf_codes_offset(manifest_.summary_size);
-        const RowId* row_ids = reinterpret_cast<const RowId*>(
-            leaf_ptr + leaf_rowids_offset(manifest_.summary_size,
-                                          n_blocks, block_bytes));
-        const float* factors = reinterpret_cast<const float*>(
-            leaf_ptr + leaf_factors_offset(manifest_.summary_size,
-                                           n_blocks, block_bytes, count));
-
-        // Convert the leaf centroid FP16 → FP32.
-        for (uint32_t d = 0; d < manifest_.dim; ++d) {
-            centroid_f32[d] = static_cast<float>(cand.centroid[d]);
-        }
-
-        // Rebuild the FastScan LUT for THIS leaf (encodes query-centroid
-        // interaction). Also populates rabitq_qs and internal state.
-        rabitq.build_lut4_with_state(query, centroid_f32.data(),
-                                     lut4.data(), rabitq_qs);
-
-        // Compute valid_mask for the tail block.
-        const uint32_t full_blocks = count / codes_per_block;
-        const uint32_t tail_count = count - full_blocks * codes_per_block;
-        const uint32_t tail_mask = (tail_count == 0)
-            ? 0xFFFFFFFFu
-            : (tail_count >= 32 ? 0xFFFFFFFFu : (1u << tail_count) - 1u);
-
-        for (uint32_t b = 0; b < n_blocks; ++b) {
-            const uint8_t* blk = codes + static_cast<uint64_t>(b) * block_bytes;
-            const uint32_t valid_mask = (b + 1 < n_blocks)
-                ? 0xFFFFFFFFu
-                : tail_mask;
-
-            uint32_t out[32];
-            simd::pq4_block32(blk, lut4.data(), m, out);
-            const uint32_t base = b * 32;
-
-            for (uint32_t j = 0; j < 32; ++j) {
-                if (!((valid_mask >> j) & 1u)) continue;
-                const uint32_t local_idx = base + j;
-                if (local_idx >= count) continue;
-
-                const float* fac = factors + static_cast<size_t>(local_idx) * 2;
-                const float est = rabitq.dequant_and_finalize(out[j], fac,
-                                                               rabitq_qs);
-
-                if (heap.size() < W) {
-                    heap.emplace_back(est, row_ids[local_idx]);
-                    if (heap.size() == W) {
-                        std::make_heap(heap.begin(), heap.end(), heap_less);
-                    }
-                    continue;
-                }
-                // Lower-bound admission with error bound.
-                if (est >= heap[0].first) {
-                    const float err = rabitq.error_bound(fac, rabitq_qs);
-                    if (est - err >= heap[0].first) continue;
-                }
-                heap_replace(est, row_ids[local_idx]);
-            }
-        }
-    }
-
-    // --- Extract top-k (dedup by min distance) ---
-    std::unordered_map<int64_t, float> best;
-    best.reserve(heap.size());
-    for (const auto& [d, id] : heap) {
-        auto it = best.find(id);
-        if (it == best.end() || d < it->second) best[id] = d;
-    }
-
-    std::vector<Candidate> results;
-    results.reserve(best.size());
-    for (const auto& [id, d] : best) {
-        results.push_back({id, d});
-    }
-    if (results.size() > k) {
-        std::nth_element(results.begin(), results.begin() + k, results.end(),
-                         [](const Candidate& a, const Candidate& b) {
-                             return a.dist < b.dist;
-                         });
-        results.resize(k);
-    }
-    std::sort(results.begin(), results.end(),
-              [](const Candidate& a, const Candidate& b) {
-                  return a.dist < b.dist;
-              });
-    return results;
-}
-
-// ===========================================================================
 // PCA-preconditioned streaming build.
 //
 // Projects vectors onto top-k principal components before routing. On
@@ -3179,7 +2926,7 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
 
         // Parse filter columns for this leaf.
         auto layout = LeafFilterLayout::compute(leaf_ptr, m4, pq_bits,
-                                                  lh->n_factors, summary_size);
+                                                  summary_size);
         auto col_views = parse_filter_columns(layout.filter_base, count,
                                                 manifest_.schema);
 
@@ -3591,7 +3338,6 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
     const uint16_t dim = manifest_.dim;
     const uint16_t m4 = manifest_.m4;
     const uint8_t pq_bits = manifest_.scan_pq_bits;
-    const uint8_t n_factors = (manifest_.quantizer_type == "rabitq") ? 2 : 0;
     const uint32_t summary_size = manifest_.summary_size;
     const uint32_t cpb = (pq_bits == 4) ? 32 : 16;
     const uint32_t bb = m4 * 16;
@@ -3636,23 +3382,17 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
         }
     }
 
-    // 5. Read old row_ids and factors.
+    // 5. Read old row_ids.
     const RowId* old_rids = reinterpret_cast<const RowId*>(
         old_buf.data() + leaf_rowids_offset(summary_size, old_nb, bb));
-    std::vector<float> old_factors;
-    if (n_factors > 0) {
-        const float* fp = reinterpret_cast<const float*>(
-            old_buf.data() + leaf_factors_offset(summary_size, old_nb, bb, count));
-        old_factors.assign(fp, fp + static_cast<size_t>(count) * n_factors);
-    }
 
     // 5b. Read old filter column data (if present).
     const bool has_filter = manifest_.schema.n_filter_columns() > 0;
     std::vector<ColumnData> old_filter_cols;
     if (has_filter) {
-        const uint64_t old_filter_off = leaf_factors_offset(
-            summary_size, old_nb, bb, count) +
-            static_cast<uint64_t>(count) * n_factors * sizeof(float);
+        const uint64_t old_filter_off =
+            leaf_rowids_offset(summary_size, old_nb, bb) +
+            static_cast<uint64_t>(count) * sizeof(RowId);
         read_filter_columns(old_buf.data() + old_filter_off, count,
                             manifest_.schema, old_filter_cols);
     }
@@ -3684,7 +3424,7 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
         }
 
         const uint32_t npg = leaf_extent_pages(
-            gc, m4, pq_bits, n_factors, summary_size, fcb);
+            gc, m4, pq_bits, summary_size, fcb);
         std::vector<uint8_t> nb(static_cast<size_t>(npg) * kPageSize, 0);
 
         // Header + summary.
@@ -3723,22 +3463,11 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
         for (uint32_t i = 0; i < gc; ++i)
             nrid[i] = old_rids[group[i]];
 
-        // Factors (RaBitQ).
-        if (n_factors > 0) {
-            float* nf = reinterpret_cast<float*>(
-                nb.data() + leaf_factors_offset(summary_size, new_nb, bb, gc));
-            for (uint32_t i = 0; i < gc; ++i) {
-                for (uint8_t f = 0; f < n_factors; ++f)
-                    nf[i * n_factors + f] =
-                        old_factors[group[i] * n_factors + f];
-            }
-        }
-
         // Write filter column data (if present).
         if (has_filter && fcb > 0) {
-            const uint64_t filter_off = leaf_factors_offset(
-                summary_size, new_nb, bb, gc) +
-                static_cast<uint64_t>(gc) * n_factors * sizeof(float);
+            const uint64_t filter_off =
+                leaf_rowids_offset(summary_size, new_nb, bb) +
+                static_cast<uint64_t>(gc) * sizeof(RowId);
             write_filter_columns(nb.data() + filter_off, gc,
                                  manifest_.schema, group_filter_cols);
         }
@@ -3748,9 +3477,9 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
         lh->count = gc;
         lh->extent_pages = npg;
         if (has_filter && fcb > 0) {
-            lh->filter_columns_offset = leaf_factors_offset(
-                summary_size, new_nb, bb, gc) +
-                static_cast<uint64_t>(gc) * n_factors * sizeof(float);
+            lh->filter_columns_offset =
+                leaf_rowids_offset(summary_size, new_nb, bb) +
+                static_cast<uint64_t>(gc) * sizeof(RowId);
         } else {
             lh->filter_columns_offset = 0;
         }
@@ -4027,7 +3756,6 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
 
     const uint16_t m4 = manifest_.m4;
     const uint8_t pq_bits = manifest_.scan_pq_bits;
-    const uint8_t n_factors = (manifest_.quantizer_type == "rabitq") ? 2 : 0;
     const uint32_t summary_size = manifest_.summary_size;
     const uint32_t cpb = (pq_bits == 4) ? 32 : 16;
     const uint32_t bb = m4 * 16;
@@ -4077,7 +3805,7 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
         // Check if we need filter column bytes. Read old filter_cols_bytes.
         const uint64_t old_filter_bytes = lh->filter_columns_offset != 0
             ? (static_cast<uint64_t>(lh->extent_pages) * kPageSize
-               - leaf_extent_bytes(old_count, m4, pq_bits, n_factors,
+               - leaf_extent_bytes(old_count, m4, pq_bits,
                                    summary_size, 0))
             : 0;
 
@@ -4122,7 +3850,7 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
         }
 
         const uint32_t new_npg = leaf_extent_pages(
-            new_count, m4, pq_bits, n_factors, summary_size, new_filter_bytes);
+            new_count, m4, pq_bits, summary_size, new_filter_bytes);
 
         // Allocate the new buffer.
         std::vector<uint8_t> nb(static_cast<size_t>(new_npg) * kPageSize, 0);
@@ -4173,28 +3901,18 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
         for (uint32_t ai = 0; ai < indices.size(); ++ai)
             nrid[old_count + ai] = points[indices[ai]].row_id;
 
-        // --- Copy + zero-append factors (RaBitQ: inserted vectors get zero factors) ---
-        if (n_factors > 0) {
-            std::memcpy(nb.data() +
-                        leaf_factors_offset(summary_size, new_nb, bb, new_count),
-                        buf.data() +
-                        leaf_factors_offset(summary_size, old_nb, bb, old_count),
-                        static_cast<size_t>(old_count) * n_factors * sizeof(float));
-            // New factors are already zero (nb is zeroed).
-        }
-
         // --- Rebuild filter column data ---
         if (has_filter) {
-            const uint64_t filter_off = leaf_factors_offset(
-                summary_size, new_nb, bb, new_count) +
-                static_cast<uint64_t>(new_count) * n_factors * sizeof(float);
+            const uint64_t filter_off =
+                leaf_rowids_offset(summary_size, new_nb, bb) +
+                static_cast<uint64_t>(new_count) * sizeof(RowId);
 
             // Read existing filter data from the old buffer (if any).
             std::vector<ColumnData> all_cols;
             if (old_count > 0 && old_filter_bytes > 0) {
-                const uint64_t old_filter_off = leaf_factors_offset(
-                    summary_size, old_nb, bb, old_count) +
-                    static_cast<uint64_t>(old_count) * n_factors * sizeof(float);
+                const uint64_t old_filter_off =
+                    leaf_rowids_offset(summary_size, old_nb, bb) +
+                    static_cast<uint64_t>(old_count) * sizeof(RowId);
                 read_filter_columns(buf.data() + old_filter_off, old_count,
                                     manifest_.schema, all_cols);
             } else {
@@ -4349,8 +4067,8 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
         nlh->count = new_count;
         nlh->extent_pages = new_npg;
         nlh->filter_columns_offset = (has_filter && new_filter_bytes > 0)
-            ? (leaf_factors_offset(summary_size, new_nb, bb, new_count) +
-               static_cast<uint64_t>(new_count) * n_factors * sizeof(float))
+            ? (leaf_rowids_offset(summary_size, new_nb, bb) +
+               static_cast<uint64_t>(new_count) * sizeof(RowId))
             : 0;
         nlh->header_crc = header_crc(nlh, offsetof(TreeLeafHeader, header_crc));
 
@@ -4475,7 +4193,6 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
 
     const uint16_t m4 = manifest_.m4;
     const uint8_t pq_bits = manifest_.scan_pq_bits;
-    const uint8_t n_factors = (manifest_.quantizer_type == "rabitq") ? 2 : 0;
     const uint32_t summary_size = manifest_.summary_size;
     const uint32_t cpb = (pq_bits == 4) ? 32 : 16;
     const uint32_t bb = m4 * 16;
@@ -4554,11 +4271,11 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
         // Read old filter_cols_bytes for extent size computation.
         const uint64_t old_filter_bytes = lh->filter_columns_offset != 0
             ? (static_cast<uint64_t>(lh->extent_pages) * kPageSize
-               - leaf_extent_bytes(count, m4, pq_bits, n_factors, summary_size, 0))
+               - leaf_extent_bytes(count, m4, pq_bits, summary_size, 0))
             : 0;
 
         const uint32_t new_npg = leaf_extent_pages(
-            new_count, m4, pq_bits, n_factors, summary_size, old_filter_bytes);
+            new_count, m4, pq_bits, summary_size, old_filter_bytes);
         std::vector<uint8_t> nb_buf(static_cast<size_t>(new_npg) * kPageSize, 0);
 
         // Copy header + summary.
@@ -4607,27 +4324,14 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
                 buf.data() + leaf_rowids_offset(summary_size, nb, bb) +
                 survivors[i] * sizeof(RowId));
 
-        // --- Rebuild factors (RaBitQ) ---
-        if (n_factors > 0) {
-            float* nfactors = reinterpret_cast<float*>(
-                nb_buf.data() + leaf_factors_offset(summary_size, new_nb, bb, new_count));
-            const float* old_factors = reinterpret_cast<const float*>(
-                buf.data() + leaf_factors_offset(summary_size, nb, bb, count));
-            for (uint32_t i = 0; i < new_count; ++i) {
-                for (uint8_t f = 0; f < n_factors; ++f)
-                    nfactors[i * n_factors + f] =
-                        old_factors[survivors[i] * n_factors + f];
-            }
-        }
-
         // --- Compact filter column data (remove deleted rows) ---
         if (old_filter_bytes > 0) {
-            const uint64_t new_filter_off = leaf_factors_offset(
-                summary_size, new_nb, bb, new_count) +
-                static_cast<uint64_t>(new_count) * n_factors * sizeof(float);
-            const uint64_t old_filter_off = leaf_factors_offset(
-                summary_size, nb, bb, count) +
-                static_cast<uint64_t>(count) * n_factors * sizeof(float);
+            const uint64_t new_filter_off =
+                leaf_rowids_offset(summary_size, new_nb, bb) +
+                static_cast<uint64_t>(new_count) * sizeof(RowId);
+            const uint64_t old_filter_off =
+                leaf_rowids_offset(summary_size, nb, bb) +
+                static_cast<uint64_t>(count) * sizeof(RowId);
 
             // Read old filter data, select survivors, write back.
             std::vector<ColumnData> old_cols;

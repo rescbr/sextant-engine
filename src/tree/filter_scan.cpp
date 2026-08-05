@@ -11,7 +11,7 @@ namespace sextant::tree {
 // ===========================================================================
 
 LeafFilterLayout LeafFilterLayout::compute(const uint8_t* leaf_ptr, uint16_t m4,
-                                            uint8_t pq_bits, uint8_t n_factors,
+                                            uint8_t pq_bits,
                                             uint32_t summary_size) {
     LeafFilterLayout l;
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
@@ -23,9 +23,9 @@ LeafFilterLayout LeafFilterLayout::compute(const uint8_t* leaf_ptr, uint16_t m4,
     l.codes = leaf_ptr + leaf_codes_offset(summary_size);
     l.row_ids = reinterpret_cast<const RowId*>(
         leaf_ptr + leaf_rowids_offset(summary_size, l.n_blocks, l.block_bytes));
-    l.filter_base = leaf_ptr + leaf_factors_offset(summary_size, l.n_blocks,
-                                                     l.block_bytes, l.count)
-                     + static_cast<uint64_t>(l.count) * n_factors * sizeof(float);
+    l.filter_base = leaf_ptr + leaf_rowids_offset(summary_size, l.n_blocks,
+                                                     l.block_bytes)
+                     + static_cast<uint64_t>(l.count) * sizeof(RowId);
     return l;
 }
 

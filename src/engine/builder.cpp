@@ -27,7 +27,6 @@
 #include "quant/pq_quantizer.hpp"
 #include "quant/anisotropic_pq_quantizer.hpp"
 #include "quant/product_residual_quantizer.hpp"
-#include "quant/rabitq_quantizer.hpp"
 #include "storage/direct_io.hpp"
 #include "storage/memgraph.hpp"      // complete type for Index's unique_ptr<MemGraph>
 #include "storage/sidecar_header.hpp"

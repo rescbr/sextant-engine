@@ -49,12 +49,12 @@ struct LeafFilterLayout {
     // Pointers into the mmap'd leaf (all relative to leaf_ptr):
     const uint8_t* codes = nullptr;
     const RowId*   row_ids = nullptr;
-    // Filter column data starts after factors (or after row_ids if no factors).
+    // Filter column data starts after row_ids.
     const uint8_t* filter_base = nullptr;
 
     /// Compute the layout for a mmap'd leaf. leaf_ptr = start of leaf extent.
     static LeafFilterLayout compute(const uint8_t* leaf_ptr, uint16_t m4,
-                                     uint8_t pq_bits, uint8_t n_factors,
+                                     uint8_t pq_bits,
                                      uint32_t summary_size);
 };
 

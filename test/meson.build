@@ -12,7 +12,6 @@ test_sources = [
     'test_wtinylfu.cpp',
     'test_pq_quantizer.cpp',
     'test_prq_quantizer.cpp',
-    'test_rabitq_quantizer.cpp',
     'test_pq_fastscan.cpp',
     'test_pq4_kernel.cpp',
     'test_pq4_encoding.cpp',
