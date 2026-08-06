@@ -714,35 +714,129 @@ int cmd_tree_search(int argc, char* argv[]) {
     // (queries are read in bulk below for parallel processing)
 
     // Load ground truth if provided.
+    // Supports two formats:
+    //   .gt  — binary: [magic "GTMM"][n:u32][k:u32][metric:u8][ids][dists]
+    //          or legacy [n:u32][k:u32][ids][dists]
+    //   .parquet — carquet-read: requires "neighbors_id" column (int64 list).
+    //          Variable-length neighbor lists supported.
     std::vector<std::vector<RowId>> gt;
-    if (!p.get<std::string>("ground-truth").empty()) {
-        std::ifstream gtf(p.get<std::string>("ground-truth"), std::ios::binary);
-        if (gtf) {
-            // GT format: [magic "GTMM":4B][n:u32][k:u32][metric:u8][ids][dists]
-            // Legacy: [n:u32][k:u32][ids][dists] (no magic)
-            constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
-            uint32_t maybe_magic = 0;
-            gtf.read(reinterpret_cast<char*>(&maybe_magic), 4);
-            uint32_t gt_n = 0, gt_k = 0;
-            if (maybe_magic == kGtMagic) {
-                gtf.read(reinterpret_cast<char*>(&gt_n), 4);
-                gtf.read(reinterpret_cast<char*>(&gt_k), 4);
-                uint8_t metric_byte = 0;
-                gtf.read(reinterpret_cast<char*>(&metric_byte), 1);
-            } else {
-                // Legacy: first 4 bytes are n, not magic.
-                gt_n = maybe_magic;
-                gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+    const std::string gt_path = p.get<std::string>("ground-truth");
+    if (!gt_path.empty()) {
+        const bool is_parquet = gt_path.size() >= 8 &&
+            gt_path.compare(gt_path.size() - 8, 8, ".parquet") == 0;
+        if (is_parquet) {
+            // --- Parquet GT via carquet ---
+            carquet_error_t cerr = {};
+            carquet_reader_t* raw_reader =
+                carquet_reader_open(gt_path.c_str(), nullptr, &cerr);
+            if (!raw_reader) {
+                std::cerr << "tree-search: cannot open GT parquet '" << gt_path
+                          << "'\n";
+                return 1;
             }
-            gt.resize(gt_n);
-            std::vector<uint32_t> row(gt_k);
-            for (uint32_t i = 0; i < gt_n; ++i) {
-                gtf.read(reinterpret_cast<char*>(row.data()),
-                         gt_k * sizeof(uint32_t));
-                gt[i].assign(row.begin(), row.end());  // uint32 → int64
+            struct CarquetReaderCloser {
+                void operator()(carquet_reader_t* r) const {
+                    carquet_reader_close(r);
+                }
+            };
+            std::unique_ptr<carquet_reader_t, CarquetReaderCloser> reader(
+                raw_reader);
+
+            const carquet_schema_t* fs = carquet_reader_schema(reader.get());
+            const int32_t gt_col = carquet_schema_find_column(fs, "neighbors_id");
+            if (gt_col < 0) {
+                std::cerr << "tree-search: GT parquet has no 'neighbors_id' "
+                             "column\n";
+                return 1;
             }
-            std::cerr << "loaded ground truth: " << gt_n << " queries, k="
-                      << gt_k << "\n";
+            const int64_t total_rows = carquet_reader_num_rows(reader.get());
+
+            carquet_batch_reader_config_t bcfg;
+            carquet_batch_reader_config_init(&bcfg);
+            bcfg.batch_size = 10000;
+            carquet_batch_reader_t* raw_br = carquet_batch_reader_create(
+                reader.get(), &bcfg, &cerr);
+            if (!raw_br) {
+                std::cerr << "tree-search: GT batch reader failed\n";
+                return 1;
+            }
+            struct CarquetBRFree {
+                void operator()(carquet_batch_reader_t* r) const {
+                    carquet_batch_reader_free(r);
+                }
+            };
+            std::unique_ptr<carquet_batch_reader_t, CarquetBRFree> br(raw_br);
+
+            int64_t loaded = 0;
+            while (true) {
+                carquet_row_batch_t* batch = nullptr;
+                carquet_status_t s = carquet_batch_reader_next(br.get(), &batch);
+                if (s == CARQUET_ERROR_END_OF_DATA || !batch) break;
+                if (s != CARQUET_OK) {
+                    std::cerr << "tree-search: GT batch read error\n";
+                    return 1;
+                }
+                const int32_t* offsets = nullptr;
+                int64_t n_lists = 0;
+                const void* values = nullptr;
+                const uint8_t* val_valid = nullptr;
+                int64_t n_vals = 0;
+                const uint8_t* list_valid = nullptr;
+                s = carquet_row_batch_column_list(batch, gt_col, &offsets,
+                                                   &n_lists, &values,
+                                                   &val_valid, &n_vals,
+                                                   &list_valid);
+                if (s != CARQUET_OK) {
+                    std::cerr << "tree-search: GT list column read error\n";
+                    carquet_row_batch_free(batch);
+                    return 1;
+                }
+                const int64_t* vals64 = static_cast<const int64_t*>(values);
+                for (int64_t i = 0; i < n_lists; ++i) {
+                    const int32_t begin = offsets[i];
+                    const int32_t end = offsets[i + 1];
+                    std::vector<RowId> neighbors;
+                    neighbors.reserve(end - begin);
+                    for (int32_t j = begin; j < end; ++j)
+                        neighbors.push_back(
+                            static_cast<RowId>(vals64[j]));
+                    gt.push_back(std::move(neighbors));
+                }
+                loaded += n_lists;
+                carquet_row_batch_free(batch);
+            }
+            (void)total_rows;
+            std::cerr << "loaded parquet ground truth: " << loaded
+                      << " queries\n";
+        } else {
+            std::ifstream gtf(gt_path, std::ios::binary);
+            if (gtf) {
+                // GT format: [magic "GTMM":4B][n:u32][k:u32][metric:u8][ids][dists]
+                // Legacy: [n:u32][k:u32][ids][dists] (no magic)
+                constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
+                uint32_t maybe_magic = 0;
+                gtf.read(reinterpret_cast<char*>(&maybe_magic), 4);
+                uint32_t gt_n = 0, gt_k = 0;
+                if (maybe_magic == kGtMagic) {
+                    gtf.read(reinterpret_cast<char*>(&gt_n), 4);
+                    gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+                    uint8_t metric_byte = 0;
+                    gtf.read(reinterpret_cast<char*>(&metric_byte), 1);
+                } else {
+                    // Legacy: first 4 bytes are n, not magic.
+                    gt_n = maybe_magic;
+                    gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+                }
+                gt.resize(gt_n);
+                std::vector<uint32_t> row(gt_k);
+                for (uint32_t i = 0; i < gt_n; ++i) {
+                    gtf.read(reinterpret_cast<char*>(row.data()),
+                             gt_k * sizeof(uint32_t));
+                    gt[i].assign(row.begin(), row.end());  // uint32 → int64
+                }
+                std::cerr << "loaded ground truth: " << gt_n << " queries, k="
+                          << gt_k << "\n";
+            }
         }
     }
 
