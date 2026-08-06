@@ -411,7 +411,8 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     using namespace sextant;
 
     cmdline::parser p;
-    p.add<std::string>("input", 0, "Base vectors (.fbin)", true);
+    p.add<std::string>("input", 0, "Base vectors (.fbin/.parquet)", true);
+    p.add<std::string>("vector-col", 0, "Vector column name in parquet (default: embedding)", false, "embedding");
     p.add<std::string>("index", 0, "Output tree file path", true);
     p.add<uint32_t>("k-root", 0, "Root branching factor (0=auto)", false, 0);
     p.add<uint32_t>("leaf-capacity", 0, "Max vectors per leaf", false, 5000);
@@ -465,10 +466,14 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     }
 
     const std::string input_path = p.get<std::string>("input");
+    const std::string vector_col = p.exist("vector-col")
+        ? p.get<std::string>("vector-col") : "embedding";
     BuildResult result;
     if (input_path.size() >= 8 &&
         input_path.compare(input_path.size() - 8, 8, ".parquet") == 0) {
-        ParquetSource source(input_path);
+        ParquetSourceConfig pcfg;
+        pcfg.vector_col = vector_col;
+        ParquetSource source(input_path, pcfg);
         cfg.filter_schema = source.schema();
         result = tree::IVFTreeIndex::build_streaming_pca(
             source, p.get<std::string>("index"), cfg);
