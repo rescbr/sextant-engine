@@ -301,6 +301,15 @@ struct SearchConfig {
 
     /// Whether to return opaque payload blobs with results (Phase E).
     bool with_payload = false;
+
+    /// Within-query leaf-parallel scan thread count (scalar_lloydmax path).
+    /// 0 = serial within-query scan (default); >0 = parallelize the leaf scan
+    /// across this many threads for lower single-query latency. Orthogonal to
+    /// query-level parallelism: when there are many queries, query-level
+    /// parallelism already saturates cores, so leave this 0. This only helps
+    /// the latency regime (few queries, high n-probe → many candidate leaves).
+    /// The serial path (<=1) is byte-identical to the pre-option behavior.
+    uint32_t search_threads = 0;
 };
 
 /// Adaptive parameters resolved from dataset/machine properties (Issue 37).

@@ -701,6 +701,8 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
+    p.add<uint32_t>("search-threads", 0,
+        "Within-query leaf-parallel scan threads (0=serial; orthorgonal to --threads)", false, 0);
     p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
     p.add<std::string>("filter", 0,
         "Filter predicate (repeatable: pass --filter multiple times for AND). "
@@ -815,6 +817,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
     scfg.rerank = !p.exist("no-rerank");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
+    scfg.search_threads = p.get<uint32_t>("search-threads");
 
     // Parse every collected --filter predicate (AND-composed).
     for (const std::string& fs : filter_strings) {
@@ -1370,6 +1373,7 @@ void print_usage() {
               << "  tree-search Search a tree index. Computes recall if --ground-truth.\n"
               << "              --index --query --topk --n-probe --fastscan-w\n"
               << "              --adaptive-probe-gap --ground-truth --threads\n"
+              << "              --search-threads (within-query leaf-parallel scan)\n"
               << "  build      Build an index from a .fbin file (explicit params).\n"
               << "             Common flags: --input --index --max-node-neighbors (R)\n"
               << "             --beam-width-ceiling (L) --prune-threshold (alpha)\n"

@@ -2816,21 +2816,25 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         return a.pq_dist < b.pq_dist;
     };
 
-    auto heap_replace = [&](uint32_t new_d, int64_t new_id,
-                            const uint8_t* leaf_ptr, uint32_t local_idx) {
-        heap[0] = {new_d, new_id, leaf_ptr, local_idx};
+    // Sift-down replacement of the heap root (max-pq_dist). Used by the
+    // bounded top-W heap during the scalar_lloydmax scan. Parameterized on
+    // the heap so it can drive both the shared heap and per-thread heaps.
+    auto heap_replace = [](std::vector<HeapEntry>& h, uint32_t new_d,
+                           int64_t new_id, const uint8_t* leaf_ptr,
+                           uint32_t local_idx) {
+        h[0] = {new_d, new_id, leaf_ptr, local_idx};
         uint32_t pos = 0;
-        const uint32_t n = heap.size();
+        const uint32_t n = h.size();
         while (true) {
             const uint32_t left = 2 * pos + 1;
             const uint32_t right = 2 * pos + 2;
             uint32_t largest = pos;
-            if (left < n && heap[left].pq_dist > heap[largest].pq_dist)
+            if (left < n && h[left].pq_dist > h[largest].pq_dist)
                 largest = left;
-            if (right < n && heap[right].pq_dist > heap[largest].pq_dist)
+            if (right < n && h[right].pq_dist > h[largest].pq_dist)
                 largest = right;
             if (largest == pos) break;
-            std::swap(heap[pos], heap[largest]);
+            std::swap(h[pos], h[largest]);
             pos = largest;
         }
     };
@@ -2856,6 +2860,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const uint32_t K = scalar_lm_quantizer_->K();
         const uint32_t cs = scalar_lm_quantizer_->code_size();
         const uint32_t dim = manifest_.dim;
+        const float* levels = scalar_lm_quantizer_->levels();
+        const uint32_t d4 = dim / 4 * 4;  // dim rounded down to multiple of 4
 
         // Build int8 query for fast I8MM scan.
         std::vector<int8_t> query_i8(dim);
@@ -2866,13 +2872,20 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         // Scratch for full decode (L2sq rerank).
         std::vector<float> decoded(dim);
 
-        for (const auto& cand : candidates) {
-            if (cand.page == kInvalidPage) continue;
+        // Per-leaf scalar_lloydmax scan, decoded into a bounded top-W max-heap.
+        // Self-contained: only reads `query`/levels (read-only) and pushes into
+        // `h`. Shared by the serial path and each parallel worker so the scan
+        // logic exists in exactly one place. The heap maintenance (push-back
+        // until full, then make_heap, then sift-down replace) is identical to
+        // the original inline code.
+        auto scan_one_leaf = [&](const LeafCandidate& cand,
+                                 std::vector<HeapEntry>& h) {
+            if (cand.page == kInvalidPage) return;
             const uint8_t* leaf_ptr = mmap_base_ +
                 static_cast<uint64_t>(cand.page) * kPageSize;
             const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
             const uint32_t count = lh->count;
-            if (count == 0) continue;
+            if (count == 0) return;
 
             const uint8_t* codes = leaf_ptr +
                 leaf_codes_offset(manifest_.summary_size);
@@ -2883,8 +2896,6 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             // Use float decode-dot (NEON FMA) — faster than I8MM on this
             // data because the I8MM kernel has per-dim lookup overhead.
             // Batch 4 vectors to amortize query loads.
-            const float* levels = scalar_lm_quantizer_->levels();
-            const uint32_t d4 = dim / 4 * 4;  // dim rounded down to multiple of 4
             uint32_t i = 0;
             for (; i + 3 < count; i += 4) {
                 // Process 4 vectors, accumulating 4 float dots.
@@ -2920,12 +2931,12 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
                     uint32_t pq_dist = (dist_bits & 0x80000000u)
                         ? ~dist_bits : (dist_bits | 0x80000000u);
-                    if (heap.size() < W) {
-                        heap.push_back({pq_dist, row_ids[i+v], leaf_ptr, i+v});
-                        if (heap.size() == W)
-                            std::make_heap(heap.begin(), heap.end(), heap_less);
-                    } else if (pq_dist < heap[0].pq_dist) {
-                        heap_replace(pq_dist, row_ids[i+v], leaf_ptr, i+v);
+                    if (h.size() < W) {
+                        h.push_back({pq_dist, row_ids[i+v], leaf_ptr, i+v});
+                        if (h.size() == W)
+                            std::make_heap(h.begin(), h.end(), heap_less);
+                    } else if (pq_dist < h[0].pq_dist) {
+                        heap_replace(h, pq_dist, row_ids[i+v], leaf_ptr, i+v);
                     }
                 }
             }
@@ -2950,13 +2961,73 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
                 uint32_t pq_dist = (dist_bits & 0x80000000u)
                     ? ~dist_bits : (dist_bits | 0x80000000u);
-                if (heap.size() < W) {
-                    heap.push_back({pq_dist, row_ids[i], leaf_ptr, i});
-                    if (heap.size() == W)
-                        std::make_heap(heap.begin(), heap.end(), heap_less);
-                } else if (pq_dist < heap[0].pq_dist) {
-                    heap_replace(pq_dist, row_ids[i], leaf_ptr, i);
+                if (h.size() < W) {
+                    h.push_back({pq_dist, row_ids[i], leaf_ptr, i});
+                    if (h.size() == W)
+                        std::make_heap(h.begin(), h.end(), heap_less);
+                } else if (pq_dist < h[0].pq_dist) {
+                    heap_replace(h, pq_dist, row_ids[i], leaf_ptr, i);
                 }
+            }
+        };
+
+        // Within-query leaf-parallel scan. When search_threads <= 1 (default)
+        // or fewer than 2 candidate leaves, run the original serial loop into
+        // the shared heap — byte-identical to the pre-option behavior. When
+        // enabled, shard the candidates across T = min(search_threads,
+        // candidates.size()) threads, each scanning into its own private heap,
+        // then merge the T heaps into `heap` keeping the top-W by pq_dist.
+        const bool parallel_scan = config.search_threads > 1
+            && candidates.size() >= 2;
+        if (!parallel_scan) {
+            for (const auto& cand : candidates) {
+                scan_one_leaf(cand, heap);
+            }
+        } else {
+            const uint32_t T = std::min(config.search_threads,
+                                        static_cast<uint32_t>(candidates.size()));
+            std::vector<std::vector<HeapEntry>> th(T);
+            std::vector<std::future<void>> futs;
+            futs.reserve(T);
+            const uint32_t per = (static_cast<uint32_t>(candidates.size()) + T - 1) / T;
+            for (uint32_t t = 0; t < T; ++t) {
+                const uint32_t start = t * per;
+                const uint32_t end = std::min(start + per,
+                    static_cast<uint32_t>(candidates.size()));
+                if (start >= end) break;
+                futs.push_back(std::async(std::launch::async,
+                    [&](uint32_t s, uint32_t e, std::vector<HeapEntry>& my) {
+                        my.reserve(W + 32);
+                        for (uint32_t c = s; c < e; ++c) {
+                            scan_one_leaf(candidates[c], my);
+                        }
+                    }, start, end, std::ref(th[t])));
+            }
+            for (auto& f : futs) f.get();
+
+            // Deterministic merge: collect every entry from all per-thread
+            // heaps, then keep the top-W by (pq_dist asc, row_id asc). Sorting
+            // on row_id as the tiebreaker makes the merged heap bit-stable
+            // regardless of how candidates were sharded. Downstream rerank
+            // iterates `heap` linearly (no heap-order dependency), so a flat
+            // sorted vector is exactly what it wants.
+            size_t total = 0;
+            for (const auto& my : th) total += my.size();
+            heap.clear();
+            heap.reserve(total);
+            for (auto& my : th) {
+                heap.insert(heap.end(),
+                            std::make_move_iterator(my.begin()),
+                            std::make_move_iterator(my.end()));
+            }
+            if (heap.size() > W) {
+                std::sort(heap.begin(), heap.end(),
+                          [](const HeapEntry& a, const HeapEntry& b) {
+                              if (a.pq_dist != b.pq_dist)
+                                  return a.pq_dist < b.pq_dist;
+                              return a.row_id < b.row_id;
+                          });
+                heap.resize(W);
             }
         }
     } else {  // FastScan scan loop (pq / prq / local_pq)
@@ -3055,7 +3126,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 for (uint32_t j = 0; j < 16; ++j) {
                     if (out[j] == 0xFFFFFFFFu || out[j] >= heap[0].pq_dist)
                         continue;
-                    heap_replace(out[j], row_ids[base + j], leaf_ptr, base + j);
+                    heap_replace(heap, out[j], row_ids[base + j], leaf_ptr, base + j);
                 }
             } else {
                 uint32_t out[32];
@@ -3084,7 +3155,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 for (uint32_t j = 0; j < 32; ++j) {
                     if (!((valid_mask >> j) & 1u)) continue;
                     if (out[j] >= heap[0].pq_dist) continue;
-                    heap_replace(out[j], row_ids[base + j], leaf_ptr, base + j);
+                    heap_replace(heap, out[j], row_ids[base + j], leaf_ptr, base + j);
                 }
             }
         }
