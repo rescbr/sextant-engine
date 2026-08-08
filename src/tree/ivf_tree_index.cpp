@@ -1600,6 +1600,31 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             ? cfg.num_threads
             : std::max(1u, std::thread::hardware_concurrency());
 
+        // Per-thread sharded cluster buffer. Accumulates the encoded code (or
+        // raw FP16 for local_pq), row id, the raw FP16 vector (source for the
+        // incremental centroid during the serial merge), payload info, and the
+        // chunk-local row index needed to replay the filter-column append.
+        struct ThreadLeafBuffer {
+            std::vector<uint8_t> codes;        // non-local_pq
+            std::vector<float16_t> fp16_vecs;  // always (centroid source)
+            std::vector<RowId> row_ids;
+            std::vector<uint32_t> local_indices;
+            std::vector<uint32_t> payload_lens;
+            std::vector<const uint8_t*> payload_ptrs;
+            void clear() {
+                codes.clear(); fp16_vecs.clear(); row_ids.clear();
+                local_indices.clear(); payload_lens.clear(); payload_ptrs.clear();
+            }
+        };
+        // Hoisted outside the chunk loop so capacity is reused across chunks.
+        std::vector<std::vector<ThreadLeafBuffer>> thread_buffers(hw);
+        std::vector<CardinalityTable> thread_cards(hw);
+        for (uint32_t t = 0; t < hw; ++t) {
+            thread_buffers[t].resize(k_root);
+            if (has_filter)
+                thread_cards[t].init(cfg.filter_schema, ctx.n);
+        }
+
         uint64_t offset = 0;
         uint64_t prev_million = 0;
         while (true) {
@@ -1681,110 +1706,214 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             }
             for (auto& fut : futs) fut.get();
 
-            // Serial: append to shared buffers + flush on overflow.
-            for (uint32_t i = 0; i < take; ++i) {
-                const float16_t* fvec = &fp16_buf[i * dim];
-                const RowId rid = chunk_row_ids[i];
-                // Phase D: record this row's filter column values in the global
-                // cardinality table (once per row, not per closure target).
-                // Dual-path: read from chunk_fcols by local idx when the chunk
-                // provides filter data, else from cfg.filter_column_data by
-                // global row id.
-                if (!cfg.filter_schema.empty()) {
-                    const uint32_t r = static_cast<uint32_t>(rid);
-                    for (uint32_t c = 0; c < cfg.filter_schema.columns.size(); ++c) {
-                        const auto& col = cfg.filter_schema.columns[c];
-                        if (col.type == ColumnType::String) {
-                            std::string_view sv;
-                            if (chunk_has_filter) {
-                                const auto* sc =
-                                    static_cast<const FilterStringColumn*>(chunk_fcols[c]);
-                                sv = std::string_view(sc->data + sc->offsets[i],
-                                                      sc->lengths[i]);
-                            } else {
-                                const auto& src = cfg.filter_column_data[c];
-                                sv = std::string_view(
-                                    src.str_data.data() + src.str_offsets[r],
-                                    src.str_lengths[r]);
-                            }
-                            ctx.card_table.add_string(c, sv);
-                        } else if (col.type == ColumnType::Set) {
-                            if (chunk_has_filter) {
-                                const auto* fsc =
-                                    static_cast<const FilterSetColumn*>(chunk_fcols[c]);
-                                ctx.card_table.add_set(c,
-                                    fsc->counts, fsc->offsets, fsc->element_lengths,
-                                    fsc->element_data, i);
-                            } else {
-                                const auto& src = cfg.filter_column_data[c];
-                                ctx.card_table.add_set(c, src.set_counts.data(),
+            // Parallel append into per-thread sharded buffers + per-thread
+            // cardinality tables, followed by a serial merge-and-flush
+            // reduction. The serial merge replays each vector into the shared
+            // buffers in the original global order (thread 0's contiguous
+            // shard, then thread 1's, ...) and flushes at the exact same
+            // leaf_cap overflow points the serial loop would, so every leaf
+            // ends up with identical contents (same vectors + centroid).
+            //
+            // thread_buffers / thread_cards are hoisted outside the chunk
+            // loop; clear the active shards for this chunk.
+            for (uint32_t t = 0; t < n_threads; ++t) {
+                for (auto& tb : thread_buffers[t]) tb.clear();
+                if (has_filter) thread_cards[t].clear_stats();
+            }
+
+            {
+                std::vector<std::future<void>> afuts;
+                for (uint32_t t = 0; t < n_threads; ++t) {
+                    const uint32_t start = t * per;
+                    const uint32_t end = std::min(start + per, take);
+                    if (start >= end) break;
+                    afuts.push_back(std::async(std::launch::async,
+                        [&](uint32_t s, uint32_t e, uint32_t tid) {
+                            auto& tbufs = thread_buffers[tid];
+                            CardinalityTable* tcard = has_filter
+                                ? &thread_cards[tid] : nullptr;
+                            for (uint32_t i = s; i < e; ++i) {
+                                const float16_t* fvec = &fp16_buf[i * dim];
+                                const RowId rid = chunk_row_ids[i];
+                                // Phase D: record this row's filter column
+                                // values in the per-thread cardinality table
+                                // (once per row, not per closure target).
+                                if (tcard) {
+                                    const uint32_t r =
+                                        static_cast<uint32_t>(rid);
+                                    for (uint32_t c = 0;
+                                         c < cfg.filter_schema.columns.size();
+                                         ++c) {
+                                        const auto& col =
+                                            cfg.filter_schema.columns[c];
+                                        if (col.type == ColumnType::String) {
+                                            std::string_view sv;
+                                            if (chunk_has_filter) {
+                                                const auto* sc =
+                                                    static_cast<const FilterStringColumn*>(
+                                                        chunk_fcols[c]);
+                                                sv = std::string_view(
+                                                    sc->data + sc->offsets[i],
+                                                    sc->lengths[i]);
+                                            } else {
+                                                const auto& src =
+                                                    cfg.filter_column_data[c];
+                                                sv = std::string_view(
+                                                    src.str_data.data()
+                                                        + src.str_offsets[r],
+                                                    src.str_lengths[r]);
+                                            }
+                                            tcard->add_string(c, sv);
+                                        } else if (col.type == ColumnType::Set) {
+                                            if (chunk_has_filter) {
+                                                const auto* fsc =
+                                                    static_cast<const FilterSetColumn*>(
+                                                        chunk_fcols[c]);
+                                                tcard->add_set(c,
+                                                    fsc->counts, fsc->offsets,
+                                                    fsc->element_lengths,
+                                                    fsc->element_data, i);
+                                            } else {
+                                                const auto& src =
+                                                    cfg.filter_column_data[c];
+                                                tcard->add_set(c,
+                                                    src.set_counts.data(),
                                                     src.set_offsets.data(),
                                                     src.set_elem_lengths.data(),
                                                     src.set_elem_data.data(), r);
+                                            }
+                                        } else if (col.type == ColumnType::Int32) {
+                                            int32_t v;
+                                            if (chunk_has_filter) {
+                                                std::memcpy(&v,
+                                                    static_cast<const uint8_t*>(
+                                                        chunk_fcols[c])
+                                                        + static_cast<size_t>(i)*4, 4);
+                                            } else {
+                                                const auto& src =
+                                                    cfg.filter_column_data[c];
+                                                std::memcpy(&v,
+                                                    src.fixed_data.data() + r*4, 4);
+                                            }
+                                            tcard->add_numeric(c, static_cast<double>(v));
+                                        } else if (col.type == ColumnType::Int64) {
+                                            int64_t v;
+                                            if (chunk_has_filter) {
+                                                std::memcpy(&v,
+                                                    static_cast<const uint8_t*>(
+                                                        chunk_fcols[c])
+                                                        + static_cast<size_t>(i)*8, 8);
+                                            } else {
+                                                const auto& src =
+                                                    cfg.filter_column_data[c];
+                                                std::memcpy(&v,
+                                                    src.fixed_data.data() + r*8, 8);
+                                            }
+                                            tcard->add_numeric(c, static_cast<double>(v));
+                                        } else if (col.type == ColumnType::Float) {
+                                            float v;
+                                            if (chunk_has_filter) {
+                                                std::memcpy(&v,
+                                                    static_cast<const uint8_t*>(
+                                                        chunk_fcols[c])
+                                                        + static_cast<size_t>(i)*4, 4);
+                                            } else {
+                                                const auto& src =
+                                                    cfg.filter_column_data[c];
+                                                std::memcpy(&v,
+                                                    src.fixed_data.data() + r*4, 4);
+                                            }
+                                            tcard->add_numeric(c, static_cast<double>(v));
+                                        }
+                                    }
+                                }
+                                // Append to per-thread cluster buffers (no
+                                // flush — flushing stays serial in the merge).
+                                for (uint32_t c : chunk_targets[i]) {
+                                    auto& tb = tbufs[c];
+                                    if (!ctx.is_local_pq) {
+                                        tb.codes.insert(tb.codes.end(),
+                                                        chunk_codes[i].begin(),
+                                                        chunk_codes[i].end());
+                                    }
+                                    // Always store the raw FP16 vector: it is
+                                    // the source for the incremental centroid
+                                    // accumulated during the serial merge.
+                                    tb.fp16_vecs.insert(tb.fp16_vecs.end(),
+                                                        fvec, fvec + dim);
+                                    tb.row_ids.push_back(rid);
+                                    tb.local_indices.push_back(i);
+                                    if (has_payload) {
+                                        uint32_t plen; const uint8_t* pdata;
+                                        if (chunk_has_payload) {
+                                            plen = chunk_poffsets[i + 1]
+                                                 - chunk_poffsets[i];
+                                            pdata = chunk_pdata + chunk_poffsets[i];
+                                        } else {
+                                            const uint32_t r =
+                                                static_cast<uint32_t>(rid);
+                                            plen = cfg.payload_offsets[r + 1]
+                                                 - cfg.payload_offsets[r];
+                                            pdata = cfg.payload_data
+                                                  + cfg.payload_offsets[r];
+                                        }
+                                        tb.payload_lens.push_back(plen);
+                                        tb.payload_ptrs.push_back(pdata);
+                                    }
+                                }
                             }
-                        } else if (col.type == ColumnType::Int32) {
-                            int32_t v;
-                            if (chunk_has_filter) {
-                                std::memcpy(&v, static_cast<const uint8_t*>(chunk_fcols[c]) + static_cast<size_t>(i) * 4, 4);
-                            } else {
-                                const auto& src = cfg.filter_column_data[c];
-                                std::memcpy(&v, src.fixed_data.data() + r * 4, 4);
-                            }
-                            ctx.card_table.add_numeric(c, static_cast<double>(v));
-                        } else if (col.type == ColumnType::Int64) {
-                            int64_t v;
-                            if (chunk_has_filter) {
-                                std::memcpy(&v, static_cast<const uint8_t*>(chunk_fcols[c]) + static_cast<size_t>(i) * 8, 8);
-                            } else {
-                                const auto& src = cfg.filter_column_data[c];
-                                std::memcpy(&v, src.fixed_data.data() + r * 8, 8);
-                            }
-                            ctx.card_table.add_numeric(c, static_cast<double>(v));
-                        } else if (col.type == ColumnType::Float) {
-                            float v;
-                            if (chunk_has_filter) {
-                                std::memcpy(&v, static_cast<const uint8_t*>(chunk_fcols[c]) + static_cast<size_t>(i) * 4, 4);
-                            } else {
-                                const auto& src = cfg.filter_column_data[c];
-                                std::memcpy(&v, src.fixed_data.data() + r * 4, 4);
-                            }
-                            ctx.card_table.add_numeric(c, static_cast<double>(v));
-                        }
-                    }
+                        }, start, end, t));
                 }
-                for (uint32_t c : chunk_targets[i]) {
-                    auto& buf = buffers[c];
-                    if (ctx.is_local_pq) {
-                        // local_pq: keep raw FP16 vector for per-leaf codebook
-                        // training at flush time.
-                        buf.fp16_vecs.insert(buf.fp16_vecs.end(), fvec,
-                                             fvec + dim);
-                    } else {
-                        buf.codes.insert(buf.codes.end(),
-                                         chunk_codes[i].begin(), chunk_codes[i].end());
-                    }
-                    buf.row_ids.push_back(rid);
-                    // Incremental centroid accumulator (replaces fp16_vecs).
-                    for (uint16_t d = 0; d < dim; ++d)
-                        buf.centroid_sum[d] += static_cast<float>(fvec[d]);
-                    ++buf.centroid_count;
-                    if (has_filter) append_filter_row(buf.filter_cols, rid, i);
-                    if (has_payload) {
-                        uint32_t plen; const uint8_t* pdata;
-                        if (chunk_has_payload) {
-                            plen = chunk_poffsets[i + 1] - chunk_poffsets[i];
-                            pdata = chunk_pdata + chunk_poffsets[i];
+                for (auto& fut : afuts) fut.get();
+            }
+
+            // Serial merge + flush: for each cluster, replay the per-thread
+            // buffers into the shared buffers in global order and flush at
+            // leaf_cap overflow. Because sharding is contiguous, iterating
+            // thread 0..n_threads-1 reproduces the original global vector
+            // order, so every leaf gets identical contents. flush_buffer
+            // (disk + shared metadata) stays serial here.
+            for (uint32_t c = 0; c < k_root; ++c) {
+                for (uint32_t t = 0; t < n_threads; ++t) {
+                    const auto& tb = thread_buffers[t][c];
+                    const uint32_t m = static_cast<uint32_t>(tb.row_ids.size());
+                    if (m == 0) continue;
+                    for (uint32_t j = 0; j < m; ++j) {
+                        auto& buf = buffers[c];
+                        if (ctx.is_local_pq) {
+                            // local_pq: keep raw FP16 for per-leaf codebook
+                            // training at flush time.
+                            buf.fp16_vecs.insert(buf.fp16_vecs.end(),
+                                tb.fp16_vecs.data() + static_cast<size_t>(j) * dim,
+                                tb.fp16_vecs.data() + static_cast<size_t>(j + 1) * dim);
                         } else {
-                            const uint32_t r = static_cast<uint32_t>(rid);
-                            plen = cfg.payload_offsets[r + 1] - cfg.payload_offsets[r];
-                            pdata = cfg.payload_data + cfg.payload_offsets[r];
+                            buf.codes.insert(buf.codes.end(),
+                                tb.codes.data() + static_cast<size_t>(j) * code_size,
+                                tb.codes.data() + static_cast<size_t>(j + 1) * code_size);
                         }
-                        buf.payload_lens.push_back(plen);
-                        buf.payload_ptrs.push_back(pdata);
+                        buf.row_ids.push_back(tb.row_ids[j]);
+                        // Incremental centroid accumulator (from raw FP16).
+                        const float16_t* fv = tb.fp16_vecs.data()
+                            + static_cast<size_t>(j) * dim;
+                        for (uint16_t d = 0; d < dim; ++d)
+                            buf.centroid_sum[d] += static_cast<float>(fv[d]);
+                        ++buf.centroid_count;
+                        if (has_filter)
+                            append_filter_row(buf.filter_cols, tb.row_ids[j],
+                                              tb.local_indices[j]);
+                        if (has_payload) {
+                            buf.payload_lens.push_back(tb.payload_lens[j]);
+                            buf.payload_ptrs.push_back(tb.payload_ptrs[j]);
+                        }
+                        if (buf.row_ids.size() >= leaf_cap)
+                            flush_buffer(c);
                     }
-                    if (buf.row_ids.size() >= leaf_cap)
-                        flush_buffer(c);
                 }
+            }
+            // Fold the per-thread cardinality tables into the global table.
+            if (has_filter) {
+                for (uint32_t t = 0; t < n_threads; ++t)
+                    ctx.card_table.merge_from(thread_cards[t]);
             }
             offset += take;
             const uint64_t million = offset / 1'000'000;

@@ -54,6 +54,19 @@ public:
     /// Record a numeric value for a column.
     void add_numeric(uint32_t col_idx, double val);
 
+    /// Merge another table's per-column statistics into this one. Combines
+    /// frequency counters (string/set) and numeric histograms by summing
+    /// counts, so the result is equivalent to having added all rows serially.
+    /// Used to fold per-thread sharded cardinality tables back into the
+    /// global table after the parallel emission append phase.
+    /// `other` must share this table's schema (same col_to_idx_ layout).
+    void merge_from(const CardinalityTable& other);
+
+    /// Reset all per-column statistics to empty, keeping the schema layout
+    /// (col_to_idx_ / is_numeric flags). Used to reuse a sharded table across
+    /// chunks without reallocating its column structure.
+    void clear_stats();
+
     /// Estimate selectivity for a string equality predicate.
     float selectivity_string(uint32_t col_idx, std::string_view val) const;
 

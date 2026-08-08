@@ -63,6 +63,30 @@ void CardinalityTable::add_numeric(uint32_t col_idx, double val) {
     ++columns_[ci].numeric_hist[val];
 }
 
+void CardinalityTable::merge_from(const CardinalityTable& other) {
+    // The two tables share the same schema (col_to_idx_ layout), so column
+    // indices line up. Merge by summing per-column frequency counters and
+    // numeric histograms.
+    const uint32_t n = static_cast<uint32_t>(columns_.size());
+    const uint32_t no = static_cast<uint32_t>(other.columns_.size());
+    const uint32_t m = std::min(n, no);
+    for (uint32_t ci = 0; ci < m; ++ci) {
+        auto& dst = columns_[ci];
+        const auto& src = other.columns_[ci];
+        for (const auto& [hash, cnt] : src.freq)
+            dst.freq[hash] += cnt;
+        for (const auto& [val, cnt] : src.numeric_hist)
+            dst.numeric_hist[val] += cnt;
+    }
+}
+
+void CardinalityTable::clear_stats() {
+    for (auto& col : columns_) {
+        col.freq.clear();
+        col.numeric_hist.clear();
+    }
+}
+
 float CardinalityTable::selectivity_string(uint32_t col_idx,
                                              std::string_view val) const {
     if (col_idx >= col_to_idx_.size() || n_vectors_ == 0) return 0.0f;
