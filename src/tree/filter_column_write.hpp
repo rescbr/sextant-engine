@@ -61,8 +61,11 @@ inline uint64_t filter_columns_bytes(uint32_t count, const Schema& schema,
                 break;
             }
             case ColumnType::String: {
-                // offsets (u32) + lengths (u16) + hashes (u32) + packed data.
-                total += static_cast<uint64_t>(count) * (4 + 2 + 4);
+                // offsets (u32) + lengths (u16) + pad + hashes (u32) + packed data.
+                // Padding after the u16 array keeps the u32 hashes 4-aligned.
+                total += static_cast<uint64_t>(count) * (4 + 2);
+                total = align4(total);
+                total += static_cast<uint64_t>(count) * 4;  // hashes
                 const auto& fc = filter_cols[c];
                 // Sum of this leaf's string lengths.
                 uint64_t str_bytes = 0;
@@ -72,8 +75,11 @@ inline uint64_t filter_columns_bytes(uint32_t count, const Schema& schema,
                 break;
             }
             case ColumnType::Set: {
-                // counts (u8) + offsets (u32) + hashes (u32 × n_elem) + data.
-                total += static_cast<uint64_t>(count) * (1 + 4);
+                // counts (u8) + pad + offsets (u32) + hashes (u32 × n_elem) + data.
+                // Padding after the u8 array keeps the u32 offsets 4-aligned.
+                total += static_cast<uint64_t>(count) * 1;
+                total = align4(total);
+                total += static_cast<uint64_t>(count) * 4;  // offsets
                 const auto& fc = filter_cols[c];
                 uint64_t n_elem = 0;
                 uint64_t data_bytes = 0;
@@ -140,12 +146,14 @@ inline uint64_t write_filter_columns(uint8_t* buf, uint32_t count,
                 break;
             }
             case ColumnType::String: {
-                // [offsets: count × u32][lengths: count × u16]
+                // [offsets: count × u32][lengths: count × u16][pad]
                 // [hashes: count × u32][data: packed bytes]
                 auto* offsets = reinterpret_cast<uint32_t*>(p);
                 p += static_cast<uint64_t>(count) * 4;
                 auto* lengths = reinterpret_cast<uint16_t*>(p);
                 p += static_cast<uint64_t>(count) * 2;
+                // Align hashes to 4 bytes (u16 array may leave p 2-aligned).
+                p = buf + align4(static_cast<uint64_t>(p - buf));
                 auto* hashes = reinterpret_cast<uint32_t*>(p);
                 p += static_cast<uint64_t>(count) * 4;
                 uint32_t acc = 0;
@@ -162,10 +170,12 @@ inline uint64_t write_filter_columns(uint8_t* buf, uint32_t count,
                 break;
             }
             case ColumnType::Set: {
-                // [counts: count × u8][offsets: count × u32 (into hashes)]
+                // [counts: count × u8][pad][offsets: count × u32 (into hashes)]
                 // [hashes: packed u32][data: [u16 len][bytes] per element]
                 uint8_t* counts = p;
                 p += static_cast<uint64_t>(count) * 1;
+                // Align offsets to 4 bytes (u8 array may leave p misaligned).
+                p = buf + align4(static_cast<uint64_t>(p - buf));
                 auto* offsets = reinterpret_cast<uint32_t*>(p);
                 p += static_cast<uint64_t>(count) * 4;
                 // Total elements → determines hashes region size.

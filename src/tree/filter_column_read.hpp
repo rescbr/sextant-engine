@@ -59,11 +59,13 @@ inline uint64_t read_filter_columns(const uint8_t* buf, uint32_t count,
                 break;
             }
             case ColumnType::String: {
-                // [offsets: count × u32][lengths: count × u16]
+                // [offsets: count × u32][lengths: count × u16][pad]
                 // [hashes: count × u32][data: packed bytes]
                 p += static_cast<size_t>(count) * 4;  // skip offsets (recomputed)
                 const auto* lengths = reinterpret_cast<const uint16_t*>(p);
                 p += static_cast<size_t>(count) * 2;
+                // Align hashes to 4 bytes (u16 array may leave p 2-aligned).
+                p = buf + align4_fc(static_cast<uint64_t>(p - buf));
                 p += static_cast<size_t>(count) * 4;  // skip hashes (recomputed on write)
 
                 fc.str_offsets.resize(count);
@@ -81,10 +83,12 @@ inline uint64_t read_filter_columns(const uint8_t* buf, uint32_t count,
                 break;
             }
             case ColumnType::Set: {
-                // [counts: count × u8][offsets: count × u32]
+                // [counts: count × u8][pad][offsets: count × u32]
                 // [hashes: packed u32][data: [u16 len][bytes] per element]
                 const uint8_t* counts = p;
                 p += static_cast<size_t>(count) * 1;
+                // Align offsets to 4 bytes (u8 array may leave p misaligned).
+                p = buf + align4_fc(static_cast<uint64_t>(p - buf));
                 p += static_cast<size_t>(count) * 4;  // skip offsets (recomputed)
 
                 // Total elements.

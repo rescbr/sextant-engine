@@ -59,6 +59,8 @@ std::vector<ColumnView> parse_filter_columns(const uint8_t* filter_base,
         p += static_cast<uint64_t>(count) * 4;
         views[c].str_lengths = reinterpret_cast<const uint16_t*>(p);
         p += static_cast<uint64_t>(count) * 2;
+        // Align hashes to 4 bytes (u16 array may leave p 2-aligned).
+        p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
         views[c].str_hashes = reinterpret_cast<const uint32_t*>(p);
         p += static_cast<uint64_t>(count) * 4;
         views[c].str_data = reinterpret_cast<const char*>(p);
@@ -78,6 +80,8 @@ std::vector<ColumnView> parse_filter_columns(const uint8_t* filter_base,
         views[c].type = ColumnType::Set;
         views[c].set_counts = p;
         p += static_cast<uint64_t>(count) * 1;
+        // Align offsets to 4 bytes (u8 array may leave p misaligned).
+        p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
         views[c].set_offsets = reinterpret_cast<const uint32_t*>(p);
         p += static_cast<uint64_t>(count) * 4;
         // Total elements across all rows.

@@ -1123,15 +1123,17 @@ float PqQuantizer::code_distance(const uint8_t* code_a,
     if (cross_distance_table_.empty()) {
         // Fallback: compute from codebook directly. Reached by stub/untrained
         // quantizers (e.g. VamanaCore unit tests); train()/deserialize() build
-        // the table for production paths.
+        // the table for production paths. The codebook layout is
+        // [m][K][sub_dim] floats (see constructor / train()), NOT the
+        // [m][K][K] cross-distance table layout.
         float acc = 0.0f;
+        const float* book_base = codebook_.data();
         for (uint32_t s = 0; s < m_; s++) {
             const uint32_t ca = read_code(code_a, bits_, s);
             const uint32_t cb = read_code(code_b, bits_, s);
-            const float* book =
-                codebook_.data() + size_t(s) * K_ * K_ * sub_dim_;
-            const float* va = book + ca * sub_dim_;
-            const float* vb = book + cb * sub_dim_;
+            const float* seg = book_base + size_t(s) * K_ * sub_dim_;
+            const float* va = seg + ca * sub_dim_;
+            const float* vb = seg + cb * sub_dim_;
             switch (metric_) {
             case MetricKind::L2Sq:
                 acc += simd::l2sq_f32(va, vb, sub_dim_);

@@ -2419,8 +2419,14 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         }
         std::sort(child_dists.begin(), child_dists.end());
 
+        // n_probe_ln is bounded by child_dists.size(), not nh->n_children:
+        // summary-aware pruning above may have removed children that can't
+        // match the predicates, so child_dists can be smaller than
+        // n_children. Using n_children here causes an out-of-bounds access
+        // under heavy filtering.
         const uint32_t n_probe_ln = std::min(
-            static_cast<uint64_t>(n_probe_ln_cfg), nh->n_children);
+            static_cast<uint64_t>(n_probe_ln_cfg),
+            static_cast<uint64_t>(child_dists.size()));
         const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);
         for (uint32_t j = 0; j < n_probe_ln; ++j) {
             if (gap > 0 && j > 0 &&
