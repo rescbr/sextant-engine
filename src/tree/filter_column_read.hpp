@@ -22,6 +22,11 @@
 
 namespace sextant::tree {
 
+/// Round up to 4-byte alignment (must match filter_column_write.hpp).
+inline uint64_t align4_fc(uint64_t v) {
+    return (v + 3) & ~uint64_t(3);
+}
+
 /// Read filter column data from `buf` into `out_cols`.
 /// `buf` points to the start of the filter column region in the leaf extent.
 /// `count` = number of vectors (rows). `schema` determines column types/order.
@@ -113,6 +118,8 @@ inline uint64_t read_filter_columns(const uint8_t* buf, uint32_t count,
                 break;
             }
         }
+        // Skip alignment padding between columns (matches filter_column_write).
+        p = buf + align4_fc(static_cast<uint64_t>(p - buf));
     }
 
     return static_cast<uint64_t>(p - buf);

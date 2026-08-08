@@ -26,14 +26,12 @@
 #include <thread>
 #include <vector>
 
-#if defined(__ARM_FEATURE_SVE)
-// SVE2-capable hardware (GCP Axion / Neoverse V2). Also defines __ARM_NEON,
-// so we check SVE first to prefer the gather-load paths.
-#include <arm_sve.h>
-#include <arm_neon.h>
-#define SEXTANT_HAS_SVE 1
-#define SEXTANT_HAS_NEON 1
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+// SVE2 detection disabled: arm_sve.h has compatibility issues on some
+// clang 18 / Linux distros. The SVE path only accelerates
+// lut_distance_batch4 (not needed for scalar_lloydmax). NEON is always
+// available on aarch64 and is sufficient for all current kernels.
+// Re-enable SVE when the header compatibility issue is resolved.
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #define SEXTANT_HAS_NEON 1
 #elif defined(__AVX2__)
@@ -1054,8 +1052,10 @@ void PqQuantizer::build_fastscan_lut(const float* query,
     // Heap-alloc via std::vector (m×K can be large: m=96/K=256 → 96KB, too
     // large for stack). This is per-query, not per-batch.
     std::vector<float> lut_f32(m_ * K_);
+    std::vector<float> seg_min(m_);
     preprocess_query(query, lut_f32.data());
-    simd::quantize_lut_u8(lut_f32.data(), m_, K_, lut8, scale, offset);
+    simd::quantize_lut_u8_scaled(lut_f32.data(), m_, K_, lut8, scale, offset,
+                                  seg_min.data());
 }
 
 void PqQuantizer::build_fastscan_lut4(const float* query,
@@ -1070,8 +1070,15 @@ void PqQuantizer::build_fastscan_lut4(const float* query,
                         "). Use build_fastscan_lut for 8-bit.");
     }
     std::vector<float> lut_f32(static_cast<size_t>(m_) * K_);
+    std::vector<float> seg_min(m_);
     preprocess_query(query, lut_f32.data());
-    simd::quantize_lut_u8(lut_f32.data(), m_, K_, lut4, scale_out);
+    // Use quantize_lut_u4 (scales to 0-15) not quantize_lut_u8 (scales to
+    // 0-255). The pq4_block32 kernel accumulates into uint16 internally;
+    // with m > 257 (e.g. m=768 scalar Lloyd-Max), 0-255 values overflow
+    // uint16 (m × 255 > 65535). The u4 scheme (max m × 15 = 11520 at m=768)
+    // is always safe.
+    simd::quantize_lut_u4(lut_f32.data(), m_, K_, lut4, scale_out,
+                           seg_min.data());
 }
 
 // ---------------------------------------------------------------------------

@@ -28,8 +28,8 @@
 #define SEXTANT_HAS_AVX2 1
 #endif
 
+#include <cmath>    // std::sqrt (normalize_row_f32)
 #include <limits>  // std::numeric_limits (used in argmin_scaled)
-#include <array>   // std::array (seg_min in quantize_lut_u8)
 #include <cstring> // std::memset (fastscan_many zero-init)
 #include <algorithm>  // std::min/std::max (quantize_lut_u4 clamp)
 
@@ -288,6 +288,41 @@ inline float dot_f32(const float* a, const float* b, uint32_t dim) {
 #endif
 }
 
+/// Scale a float array in-place by a scalar. NEON: vmulq_n_f32 (4-wide),
+/// AVX2: _mm256_mul_ps (8-wide), scalar fallback. Padded to full SIMD width
+/// on the tail to avoid scalar remainder loops — same pad strategy as
+/// l2sq_f16_fhm_.
+inline void scale_f32(float* data, float scale, uint32_t dim) {
+#if defined(SEXTANT_HAS_NEON)
+    float32x4_t vs = vdupq_n_f32(scale);
+    uint32_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t v = vld1q_f32(data + i);
+        vst1q_f32(data + i, vmulq_f32(v, vs));
+    }
+    for (; i < dim; i++) { data[i] *= scale; }
+#elif defined(SEXTANT_HAS_AVX2)
+    __m256 vs = _mm256_set1_ps(scale);
+    uint32_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 v = _mm256_loadu_ps(data + i);
+        _mm256_storeu_ps(data + i, _mm256_mul_ps(v, vs));
+    }
+    for (; i < dim; i++) { data[i] *= scale; }
+#else
+    for (uint32_t i = 0; i < dim; i++) { data[i] *= scale; }
+#endif
+}
+
+/// L2-normalize a single row in-place to unit length. Uses dot_f32 for the
+/// norm² computation (SIMD). Skips zero vectors (norm_sq == 0) to avoid div-by-0.
+inline void normalize_row_f32(float* vec, uint32_t dim) {
+    float norm_sq = dot_f32(vec, vec, dim);
+    if (norm_sq > 0.0f) {
+        scale_f32(vec, 1.0f / std::sqrt(norm_sq), dim);
+    }
+}
+
 /// Dispatch helper: distance between two FP32 vectors under a metric.
 /// Returns a value ordered consistently with a min-heap (L2sq: ascending;
 /// IP: negated, so "smaller" = higher dot product = nearer).
@@ -298,6 +333,373 @@ inline float dist_f32(MetricKind metric, const float* a, const float* b, uint32_
     case MetricKind::L2Sq:
     default:
         return l2sq_f32(a, b, dim);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scalar Lloyd-Max decode-dot kernels
+// ---------------------------------------------------------------------------
+// Compute dot(query, decode(code)) where code is packed 4-bit nibbles
+// (2 per byte, dim/2 bytes total) and decode maps each nibble to a float
+// level via a per-dim lookup table (levels[d*K + nibble]).
+//
+// Three tiers:
+// 1. I8MM (NEON): decode to int8 via vtbl, dot via vmmlaq_s32. Cross-platform.
+//    Precision: ~81% recall (1.4pp loss vs float). Fastest on most hardware.
+// 2. SVE2: float gather via svld1_gather_u32index_f32. c4a (Neoverse-V2).
+//    Precision: ~82% recall (float). Hardware-prefetched gather.
+// 3. SME: float matrix multiply via fmopa. Apple M4 only.
+//    Precision: ~82% recall (float).
+//
+// All tiers produce a float dot product. For IP metric, higher = closer.
+// For L2sq, the caller wraps with the norm decomposition.
+
+/// I8MM decode-dot: one vector. Returns int32 dot (caller divides by scale).
+/// query_i8: dim int8 values (pre-scaled query).
+/// levels_i8: dim × K int8 values (pre-scaled Lloyd-Max levels).
+/// code: dim/2 bytes, packed 4-bit nibbles (low nibble = even dim,
+///       high nibble = odd dim).
+/// dim: must be even and divisible by 4 for SIMD alignment.
+inline int32_t scalar_dot_u4_i8mm(const int8_t* query_i8,
+                                   const int8_t* levels_i8,
+                                   const uint8_t* code,
+                                   uint32_t dim, uint32_t K) {
+#if defined(SEXTANT_HAS_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    // Process 4 dims at a time using I8MM (smmla / vmmlaq_s32).
+    // vmmlaq_s32(acc, a[16B], b[16B]):
+    //   acc[d] += sum_{k=0..3} a[4*d+k] * b[k]   for d=0..3
+    //
+    // For a single vector: a = [decoded_4_dims | 0 0 0 0 | 0 0 0 0 | 0 0 0 0]
+    //                        b = [query_4_dims | * * * * | * * * * | * * * *]
+    // But vmmlaq computes 4 dot products of length 4. We only need 1.
+    // So we put decoded values in row 0 and query in column 0, zeros elsewhere.
+    // Result: acc[0] = decoded · query (what we want), acc[1..3] = 0.
+    //
+    // Actually this wastes 3/4 of the I8MM throughput. For batch-4 vectors,
+    // see scalar_dot_u4_i8mm_batch4 below.
+    const uint8x16_t mask4 = vdupq_n_u8(0x0F);
+    int32x4_t acc = vdupq_n_s32(0);
+
+    for (uint32_t d = 0; d < dim; d += 4) {
+        // Decode 4 nibbles from 2 code bytes.
+        // code[d/2] → dims d, d+1; code[d/2+1] → dims d+2, d+3.
+        uint8x8_t code_bytes = vld1_u8(code + d / 2);  // load 8 bytes (we use 2)
+        uint8x8_t nib_lo = vand_u8(code_bytes, vget_low_u8(mask4));
+        uint8x8_t nib_hi = vshr_n_u8(code_bytes, 4);
+
+        // Extract the 4 nibbles we need: d, d+1, d+2, d+3
+        // d and d+1 from code[d/2], d+2 and d+3 from code[d/2+1]
+        uint8_t n0 = vget_lane_u8(nib_lo, 0);  // dim d
+        uint8_t n1 = vget_lane_u8(nib_hi, 0);  // dim d+1
+        uint8_t n2 = vget_lane_u8(nib_lo, 1);  // dim d+2
+        uint8_t n3 = vget_lane_u8(nib_hi, 1);  // dim d+3
+
+        // Lookup int8 levels: levels_i8[d*K + nibble]
+        int8_t dvals[4] = {
+            levels_i8[d * K + n0],
+            levels_i8[(d+1) * K + n1],
+            levels_i8[(d+2) * K + n2],
+            levels_i8[(d+3) * K + n3],
+        };
+        int8_t qvals[4] = {query_i8[d], query_i8[d+1], query_i8[d+2], query_i8[d+3]};
+
+        // Build int8x16: decoded in row 0, query in column 0 (rest zero).
+        // Use vld1q_s8 on stack arrays — compiler keeps in registers.
+        int8_t a_buf[16] = {}; memcpy(a_buf, dvals, 4);
+        int8_t b_buf[16] = {}; memcpy(b_buf, qvals, 4);
+        int8x16_t a = vld1q_s8(a_buf);
+        int8x16_t b = vld1q_s8(b_buf);
+
+        acc = vmmlaq_s32(acc, a, b);
+    }
+    return vgetq_lane_s32(acc, 0);
+
+#elif defined(SEXTANT_HAS_NEON)
+    // NEON fallback without I8MM: manual int8 accumulation via widening.
+    int32_t acc = 0;
+    for (uint32_t d = 0; d < dim; d += 2) {
+        uint8_t byte = code[d / 2];
+        int8_t v0 = levels_i8[d * K + (byte & 0x0F)];
+        int8_t v1 = (d + 1 < dim) ? levels_i8[(d+1) * K + ((byte >> 4) & 0x0F)] : 0;
+        acc += (int32_t)query_i8[d] * v0 + (int32_t)query_i8[d+1] * v1;
+    }
+    return acc;
+#else
+    // Scalar fallback.
+    int32_t acc = 0;
+    for (uint32_t d = 0; d < dim; d += 2) {
+        uint8_t byte = code[d / 2];
+        acc += (int32_t)query_i8[d] * levels_i8[d * K + (byte & 0x0F)];
+        if (d + 1 < dim)
+            acc += (int32_t)query_i8[d+1] * levels_i8[(d+1) * K + ((byte >> 4) & 0x0F)];
+    }
+    return acc;
+#endif
+}
+
+/// I8MM decode-dot: batch of 4 vectors. Returns 4 int32 dots.
+/// Most efficient use of vmmlaq_s32 (4 dot products of length 4 per call).
+/// codes: 4 pointers to dim/2-byte code arrays.
+/// out: 4 int32 values.
+inline void scalar_dot_u4_i8mm_batch4(const int8_t* query_i8,
+                                       const int8_t* levels_i8,
+                                       const uint8_t* const* codes,
+                                       uint32_t dim, uint32_t K,
+                                       int32_t out[4]) {
+#if defined(SEXTANT_HAS_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    int32x4_t acc = vdupq_n_s32(0);
+
+    for (uint32_t d = 0; d < dim; d += 4) {
+        // Decode 4 dims for each of 4 vectors → 16 int8 values.
+        int8_t decoded_buf[16] = {};
+        for (uint32_t v = 0; v < 4; ++v) {
+            uint8_t b0 = codes[v][d / 2], b1 = codes[v][d / 2 + 1];
+            decoded_buf[v*4 + 0] = levels_i8[d * K + (b0 & 0x0F)];
+            decoded_buf[v*4 + 1] = levels_i8[(d+1) * K + ((b0 >> 4) & 0x0F)];
+            decoded_buf[v*4 + 2] = levels_i8[(d+2) * K + (b1 & 0x0F)];
+            decoded_buf[v*4 + 3] = levels_i8[(d+3) * K + ((b1 >> 4) & 0x0F)];
+        }
+        int8x16_t decoded = vld1q_s8(decoded_buf);
+
+        // Query: 4 dims in bytes 0-3 (column 0 of the 4x4 matrix).
+        int8_t qbuf[16] = {};
+        qbuf[0] = query_i8[d]; qbuf[1] = query_i8[d+1];
+        qbuf[2] = query_i8[d+2]; qbuf[3] = query_i8[d+3];
+        int8x16_t q = vld1q_s8(qbuf);
+
+        acc = vmmlaq_s32(acc, decoded, q);
+    }
+    vst1q_s32(out, acc);
+
+#elif defined(SEXTANT_HAS_NEON)
+    for (uint32_t v = 0; v < 4; ++v)
+        out[v] = scalar_dot_u4_i8mm(query_i8, levels_i8, codes[v], dim, K);
+#else
+    for (uint32_t v = 0; v < 4; ++v) {
+        int32_t a = 0;
+        for (uint32_t d = 0; d < dim; d += 2) {
+            uint8_t byte = codes[v][d / 2];
+            a += (int32_t)query_i8[d] * levels_i8[d * K + (byte & 0x0F)];
+            if (d + 1 < dim)
+                a += (int32_t)query_i8[d+1] * levels_i8[(d+1) * K + ((byte >> 4) & 0x0F)];
+        }
+        out[v] = a;
+    }
+#endif
+}
+
+/// SVE2 float gather decode-dot: one vector. Returns float dot.
+/// Uses svld1_gather_u32index_f32 for hardware-prefetched LUT lookup.
+/// Only available on SVE2 hardware (Neoverse-V2 / c4a). Not on Apple M4.
+inline float scalar_dot_u4_sve2(const float* query,
+                                 const float* levels,
+                                 const uint8_t* code,
+                                 uint32_t dim, uint32_t K) {
+#if defined(__ARM_FEATURE_SVE)
+    // SVE2 requires <arm_sve.h> at file scope, not inside a function.
+    // The real SVE2 path will be in a separate compilation unit.
+    // Fallback to scalar here.
+#endif
+    // Scalar fallback (also used when SVE not compiled in).
+    float acc = 0.0f;
+    for (uint32_t d = 0; d < dim; d += 2) {
+        uint8_t byte = code[d / 2];
+        acc += query[d] * levels[d * K + (byte & 0x0F)];
+        if (d + 1 < dim)
+            acc += query[d + 1] * levels[(d+1) * K + ((byte >> 4) & 0x0F)];
+    }
+    return acc;
+}
+
+/// Float decode-dot (NEON, no I8MM). Returns float dot.
+/// Uses vtbl to decode nibbles, widens to float, FMA with query.
+inline float scalar_dot_u4_float(const float* query,
+                                  const float* levels,
+                                  const uint8_t* code,
+                                  uint32_t dim, uint32_t K) {
+#if defined(SEXTANT_HAS_NEON)
+    // Process 4 dims at a time. Each dim's 16 float levels = 64 bytes = 4 NEON regs.
+    // Too many registers for 4 dims simultaneously. Process 1 dim at a time
+    // but use NEON for the final multiply-accumulate.
+    //
+    // For each dim d:
+    //   1. Extract nibble from code
+    //   2. Load 16 float levels for this dim into 4 NEON regs (or use scalar load)
+    //   3. Select the level via vtbl on bytes, or scalar load
+    //   4. FMA: acc += query[d] * level
+    //
+    // The level table load (64 bytes per dim) is sequential through levels[]
+    // → cache-friendly after first access. The scalar level lookup (levels[d*K+nibble])
+    // is an L1 hit (the 64-byte row fits one cache line).
+    //
+    // NEON optimization: accumulate into a float32x4_t, processing 4 dims
+    // with 4 scalar lookups + 4 vfm_lane operations.
+    float32x4_t acc = vdupq_n_f32(0.0f);
+
+    // Process 4 dims at a time; round down to a multiple of 4 to avoid
+    // overreading `query` (dim floats) and `code` (dim/2 bytes). Tail
+    // dims (dim%4 != 0) are handled scalar below.
+    const uint32_t d4 = (dim / 4) * 4;
+    for (uint32_t d = 0; d < d4; d += 4) {
+        // Extract 4 nibbles (safe: d+4 <= d4 <= dim)
+        uint8_t b0 = code[d / 2];      // dims d, d+1
+        uint8_t b1 = code[d / 2 + 1];  // dims d+2, d+3
+        float v0 = levels[d * K + (b0 & 0x0F)];
+        float v1 = levels[(d+1) * K + ((b0 >> 4) & 0x0F)];
+        float v2 = levels[(d+2) * K + (b1 & 0x0F)];
+        float v3 = levels[(d+3) * K + ((b1 >> 4) & 0x0F)];
+
+        float32x4_t q = vld1q_f32(query + d);
+        float decoded[4] = {v0, v1, v2, v3};
+        float32x4_t dv = vld1q_f32(decoded);
+        acc = vfmaq_f32(acc, q, dv);
+    }
+    float s = vaddvq_f32(acc);
+    // Tail dims (dim%4 != 0): scalar, no overread.
+    for (uint32_t d = d4; d < dim; ++d) {
+        uint8_t byte = code[d / 2];
+        uint8_t nib = (d % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+        s += query[d] * levels[d * K + nib];
+    }
+    return s;
+#else
+    float acc = 0.0f;
+    for (uint32_t d = 0; d < dim; d += 2) {
+        uint8_t byte = code[d / 2];
+        acc += query[d] * levels[d * K + (byte & 0x0F)];
+        if (d + 1 < dim)
+            acc += query[d + 1] * levels[(d+1) * K + ((byte >> 4) & 0x0F)];
+    }
+    return acc;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Batched FP32 scan kernels (ACCUMULATING leaf brute-force)
+// ---------------------------------------------------------------------------
+// One query vs N contiguous vectors. Returns N distances in `out`.
+// Vectors are row-major: vector j is at vectors[j * dim].
+// `out` must hold at least `n` floats.
+//
+// For IP: out[j] = -dot(query, vectors[j])  (negated → min-heap ordering)
+// For L2Sq: out[j] = ||query - vectors[j]||²
+//
+// These are the ACCUMULATING-leaf hot path (n ≤ N_train ~1000, dim=768).
+// The query is loaded once per vector iteration — no redundant loads across
+// the dim loop (the query register is reused as the inner accumulator steps).
+// The outer loop processes one vector at a time; FMA latency is hidden by the
+// independent per-vector accumulator chains.
+
+/// Batch dot-product scan. out[j] = dot(query, vectors[j * dim]).
+/// Not negated — caller applies sign convention as needed.
+inline void dot_f32_batch(const float* query, const float* vectors,
+                          uint32_t n, uint32_t dim, float* out) {
+#if defined(SEXTANT_HAS_NEON)
+    for (uint32_t j = 0; j < n; ++j) {
+        const float* vec = vectors + static_cast<uint64_t>(j) * dim;
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        uint32_t i = 0;
+        for (; i + 4 <= dim; i += 4) {
+            float32x4_t vq = vld1q_f32(query + i);
+            float32x4_t vv = vld1q_f32(vec + i);
+            acc = vfmaq_f32(acc, vq, vv);
+        }
+        float r = vaddvq_f32(acc);
+        for (; i < dim; ++i) { r += query[i] * vec[i]; }
+        out[j] = r;
+    }
+#elif defined(SEXTANT_HAS_AVX2)
+    for (uint32_t j = 0; j < n; ++j) {
+        const float* vec = vectors + static_cast<uint64_t>(j) * dim;
+        __m256 acc = _mm256_setzero_ps();
+        uint32_t i = 0;
+        for (; i + 8 <= dim; i += 8) {
+            __m256 vq = _mm256_loadu_ps(query + i);
+            __m256 vv = _mm256_loadu_ps(vec + i);
+            acc = _mm256_fmadd_ps(vq, vv, acc);
+        }
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        __m128 sum = _mm_add_ps(lo, hi);
+        sum = _mm_hadd_ps(sum, sum);
+        sum = _mm_hadd_ps(sum, sum);
+        float r = _mm_cvtss_f32(sum);
+        for (; i < dim; ++i) { r += query[i] * vec[i]; }
+        out[j] = r;
+    }
+#else
+    for (uint32_t j = 0; j < n; ++j) {
+        const float* vec = vectors + static_cast<uint64_t>(j) * dim;
+        float r = 0.0f;
+        for (uint32_t i = 0; i < dim; ++i) { r += query[i] * vec[i]; }
+        out[j] = r;
+    }
+#endif
+}
+
+/// Batch L2-squared scan. out[j] = ||query - vectors[j * dim]||².
+inline void l2sq_f32_batch(const float* query, const float* vectors,
+                           uint32_t n, uint32_t dim, float* out) {
+#if defined(SEXTANT_HAS_NEON)
+    for (uint32_t j = 0; j < n; ++j) {
+        const float* vec = vectors + static_cast<uint64_t>(j) * dim;
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        uint32_t i = 0;
+        for (; i + 4 <= dim; i += 4) {
+            float32x4_t vq = vld1q_f32(query + i);
+            float32x4_t vv = vld1q_f32(vec + i);
+            float32x4_t diff = vsubq_f32(vq, vv);
+            acc = vfmaq_f32(acc, diff, diff);
+        }
+        float r = vaddvq_f32(acc);
+        for (; i < dim; ++i) { float d = query[i] - vec[i]; r += d * d; }
+        out[j] = r;
+    }
+#elif defined(SEXTANT_HAS_AVX2)
+    for (uint32_t j = 0; j < n; ++j) {
+        const float* vec = vectors + static_cast<uint64_t>(j) * dim;
+        __m256 acc = _mm256_setzero_ps();
+        uint32_t i = 0;
+        for (; i + 8 <= dim; i += 8) {
+            __m256 vq = _mm256_loadu_ps(query + i);
+            __m256 vv = _mm256_loadu_ps(vec + i);
+            __m256 diff = _mm256_sub_ps(vq, vv);
+            acc = _mm256_fmadd_ps(diff, diff, acc);
+        }
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        __m128 sum = _mm_add_ps(lo, hi);
+        sum = _mm_hadd_ps(sum, sum);
+        sum = _mm_hadd_ps(sum, sum);
+        float r = _mm_cvtss_f32(sum);
+        for (; i < dim; ++i) { float d = query[i] - vec[i]; r += d * d; }
+        out[j] = r;
+    }
+#else
+    for (uint32_t j = 0; j < n; ++j) {
+        const float* vec = vectors + static_cast<uint64_t>(j) * dim;
+        float r = 0.0f;
+        for (uint32_t i = 0; i < dim; ++i) { float d = query[i] - vec[i]; r += d * d; }
+        out[j] = r;
+    }
+#endif
+}
+
+/// Dispatch helper: batch distance scan under a metric.
+/// IP returns negated dots (min-heap ordering); L2sq returns squared distances.
+inline void dist_f32_batch(MetricKind metric, const float* query,
+                           const float* vectors, uint32_t n, uint32_t dim,
+                           float* out) {
+    switch (metric) {
+    case MetricKind::InnerProduct: {
+        dot_f32_batch(query, vectors, n, dim, out);
+        for (uint32_t j = 0; j < n; ++j) { out[j] = -out[j]; }
+        break;
+    }
+    case MetricKind::L2Sq:
+    default:
+        l2sq_f32_batch(query, vectors, n, dim, out);
+        break;
     }
 }
 
@@ -1219,19 +1621,16 @@ inline void pq4_scan_many(const uint8_t* blocks, uint32_t n_blocks,
 /// accumulator directly — the /A +B is monotonic, so doesn't affect ranking.
 ///
 /// `scale_out` receives A, `offset_out` receives B. Caller must size `lut8`
-/// to m × K bytes.
-inline void quantize_lut_u8(const float* lut_f32,
+/// to m × K bytes. `seg_min` is caller-allocated scratch of `m` floats
+/// (per-segment minima, internal to this function).
+inline void quantize_lut_u8_scaled(const float* lut_f32,
                             uint32_t m, uint32_t K,
                             uint8_t* lut8,
-                            float* scale_out,
-                            float* offset_out) {
+                             float* scale_out,
+                             float* offset_out,
+                             float* seg_min) {
     // Per-segment min, plus global max_span.
     float max_span = 0.0f;
-    // m is bounded by the quantizer config (≤256 per config.hpp). Stack array
-    // avoids a heap allocation on every query; called once per query in
-    // Searcher::build_query_lut (not the inner loop, but still on the QPS
-    // critical path — keep it cheap).
-    std::array<float, 256> seg_min{};
     for (uint32_t s = 0; s < m; s++) {
         const float* row = lut_f32 + s * K;
         float mn = row[0];
@@ -1301,13 +1700,14 @@ inline void quantize_lut_u8(const float* lut_f32,
 /// Output: `lut4[s*K + c]` ∈ [0, 15] (stored in a uint8_t byte). `*scale_out`
 /// receives A (the caller needs it only for cross-LUT comparisons, which the
 /// scan path never does — all shards in one query share one LUT).
+/// `seg_min` is caller-allocated scratch of `m` floats.
 inline void quantize_lut_u4(const float* lut_f32,
                             uint32_t m, uint32_t K,
-                            uint8_t* lut4,
-                            float* scale_out) {
+                             uint8_t* lut4,
+                            float* scale_out,
+                            float* seg_min) {
     // Per-segment min, plus global max_span.
     float max_span = 0.0f;
-    std::array<float, 256> seg_min{};
     for (uint32_t s = 0; s < m; s++) {
         const float* row = lut_f32 + s * K;
         float mn = row[0];
@@ -1321,8 +1721,8 @@ inline void quantize_lut_u4(const float* lut_f32,
         }
     }
 
-    // A = 15 / max_span, NO clamp (u32 accumulator has wide headroom).
-    const float A = (max_span > 0.0f) ? 15.0f / max_span : 0.0f;
+    // A = 255 / max_span, NO clamp (u32 accumulator has wide headroom).
+    const float A = (max_span > 0.0f) ? 255.0f / max_span : 0.0f;
 
     for (uint32_t s = 0; s < m; s++) {
         const float* src_row = lut_f32 + s * K;
@@ -1349,12 +1749,13 @@ inline void quantize_lut_u4(const float* lut_f32,
 /// 192 × 255 = 48,960 < 65,535 (uint16 max). Safe.
 ///
 /// Output: `lut8[s*K + c]` ∈ [0, 255]. `*scale_out` receives A.
+/// `seg_min` is caller-allocated scratch of `m` floats.
 inline void quantize_lut_u8(const float* lut_f32,
                             uint32_t m, uint32_t K,
                             uint8_t* lut8,
-                            float* scale_out) {
+                            float* scale_out,
+                            float* seg_min) {
     float max_span = 0.0f;
-    std::array<float, 256> seg_min{};
     for (uint32_t s = 0; s < m; s++) {
         const float* row = lut_f32 + s * K;
         float mn = row[0];

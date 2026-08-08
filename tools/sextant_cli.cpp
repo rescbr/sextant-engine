@@ -15,6 +15,7 @@
 #include "fbin_source.hpp"
 #include "fbin_io.hpp"
 #include "parquet_source.hpp"
+#include "parquet_glob_source.hpp"
 #include "shared_cli.hpp"
 #include "sextant_version.hpp"
 #include "sextant/builder.hpp"
@@ -31,6 +32,7 @@
 
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
+#include "simd_kernels.hpp"
 #include "storage/memgraph.hpp"
 #include "storage/node_store.hpp"
 
@@ -46,6 +48,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <glob.h>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -418,13 +421,14 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<uint32_t>("leaf-capacity", 0, "Max vectors per leaf", false, 5000);
     p.add<uint16_t>("pq4-m", 0, "PQ subquantizers (0=dim/4)", false, 0);
     p.add<uint32_t>("pq-bits", 0, "PQ bits (4 or 8)", false, 4);
-    p.add<std::string>("quantizer", 0, "pq / prq", false, "pq");
+    p.add<std::string>("quantizer", 0, "pq / prq / local_pq / scalar_lloydmax", false, "pq");
     p.add<std::string>("metric", 0, "l2sq / ip", false, "l2sq");
     p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
     p.add<uint32_t>("pca-dims", 0, "PCA dimensions (default 32)", false, 32);
     p.add<uint32_t>("max-lloyd-passes", 0, "Max streaming Lloyd passes (default 10)", false, 10);
     p.add<float>("closure-mult", 0, "Closure epsilon multiplier (default 0.15)", false, 0.15f);
     p.add<std::string>("filter-data", 0, "Filter column data sidecar (.fdat)", false, "");
+    p.add<std::string>("label-file", 0, "Parquet file with filter columns (joined by row position)", false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
     p.parse_check(argc, argv);
 
@@ -468,15 +472,72 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     const std::string input_path = p.get<std::string>("input");
     const std::string vector_col = p.exist("vector-col")
         ? p.get<std::string>("vector-col") : "embedding";
+    const std::string label_file = p.get<std::string>("label-file");
+    const bool need_normalize = (metric == "ip");
+
+    // Expand glob patterns (e.g., "train-*.parquet") into a list of paths.
+    auto expand_glob = [](const std::string& pattern) -> std::vector<std::string> {
+        std::vector<std::string> result;
+        // Simple glob using POSIX glob()
+        glob_t g;
+        memset(&g, 0, sizeof(g));
+        int rc = ::glob(pattern.c_str(), GLOB_TILDE | GLOB_BRACE, nullptr, &g);
+        if (rc == 0) {
+            for (size_t i = 0; i < g.gl_pathc; ++i) {
+                result.emplace_back(g.gl_pathv[i]);
+            }
+        }
+        globfree(&g);
+        if (result.empty()) {
+            // Not a glob or no matches — treat as literal path
+            result.push_back(pattern);
+        }
+        std::sort(result.begin(), result.end());
+        return result;
+    };
+
+    bool is_parquet = input_path.size() >= 8 &&
+        input_path.compare(input_path.size() - 8, 8, ".parquet") == 0;
+    // Also check if it's a glob that matches parquet files
+    if (!is_parquet && input_path.find('*') != std::string::npos) {
+        auto matches = expand_glob(input_path);
+        if (!matches.empty() && matches[0].size() >= 8 &&
+            matches[0].compare(matches[0].size() - 8, 8, ".parquet") == 0) {
+            is_parquet = true;
+        }
+    }
+
     BuildResult result;
-    if (input_path.size() >= 8 &&
-        input_path.compare(input_path.size() - 8, 8, ".parquet") == 0) {
-        ParquetSourceConfig pcfg;
-        pcfg.vector_col = vector_col;
-        ParquetSource source(input_path, pcfg);
-        cfg.filter_schema = source.schema();
-        result = tree::IVFTreeIndex::build_streaming_pca(
-            source, p.get<std::string>("index"), cfg);
+    if (is_parquet) {
+        auto shard_paths = expand_glob(input_path);
+        bool use_glob = shard_paths.size() > 1 || !label_file.empty();
+
+        if (use_glob) {
+            ParquetGlobSource::Config gcfg;
+            gcfg.vector_col = vector_col;
+            gcfg.normalize = need_normalize;
+            gcfg.label_file = label_file;
+            gcfg.batch_size = 8192;
+            // When --filter-data is provided, suppress shard-local filter columns
+            // (the builder uses the global cfg.filter_column_data from the fdat).
+            gcfg.vectors_only = !fdat_path.empty();
+            ParquetGlobSource source(shard_paths, gcfg);
+            if (fdat_path.empty()) {
+                cfg.filter_schema = source.schema();
+            }
+            result = tree::IVFTreeIndex::build_streaming_pca(
+                source, p.get<std::string>("index"), cfg);
+        } else {
+            ParquetSourceConfig pcfg;
+            pcfg.vector_col = vector_col;
+            pcfg.normalize = need_normalize;
+            ParquetSource source(shard_paths[0], pcfg);
+            if (fdat_path.empty()) {
+                cfg.filter_schema = source.schema();
+            }
+            result = tree::IVFTreeIndex::build_streaming_pca(
+                source, p.get<std::string>("index"), cfg);
+        }
     } else {
         FbinSource source(input_path);
         result = tree::IVFTreeIndex::build_streaming_pca(
@@ -631,7 +692,7 @@ int cmd_tree_search(int argc, char* argv[]) {
 
     cmdline::parser p;
     p.add<std::string>("index", 0, "Tree index file", true);
-    p.add<std::string>("query", 0, "Query vectors (.fbin)", true);
+    p.add<std::string>("query", 0, "Query vectors (.fbin or .parquet)", true);
     p.add<std::string>("ground-truth", 0, "Ground-truth .gt file", false, "");
     p.add<uint32_t>("topk", 0, "K nearest neighbors", false, 10);
     p.add<uint32_t>("n-probe", 0, "Root probe count (0=manifest default)", false, 0);
@@ -653,6 +714,7 @@ int cmd_tree_search(int argc, char* argv[]) {
         "Geo: lat_col:lng_col:geo_radius:lat:lng:radius_km lat_col:lng_col:geo_box:lat_min:lat_max:lng_min:lng_max.",
         false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.add<std::string>("vector-col", 0, "Vector column name for parquet queries (default: emb)", false, "emb");
     p.add("with-payload", 0,
           "Fetch + print opaque payload blobs with results");
     // The cmdline library only keeps the LAST value of a repeated option, so
@@ -683,12 +745,61 @@ int cmd_tree_search(int argc, char* argv[]) {
 
     auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"));
 
-    // Read query file.
-    FbinHeader qh;
-    if (!read_fbin_header(p.get<std::string>("query"), qh) ||
-        qh.dim != idx->dim()) {
-        std::cerr << "tree-search: invalid query file (dim=" << qh.dim
-                  << ", expected " << idx->dim() << ")\n";
+    // Read query file (.fbin or .parquet).
+    const std::string query_path = p.get<std::string>("query");
+    const bool query_is_parquet = query_path.size() >= 8 &&
+        query_path.compare(query_path.size() - 8, 8, ".parquet") == 0;
+
+    // Determine if queries need normalization (IP metric = cosine on unit vecs).
+    const bool need_normalize =
+        idx->metric() == sextant::MetricKind::InnerProduct;
+
+    uint32_t qdim = 0, qcount = 0;
+    std::vector<float> queries;
+
+    if (query_is_parquet) {
+        // Read queries from parquet (list<float> or FLBA).
+        ParquetSourceConfig pcfg;
+        pcfg.vector_col = p.exist("vector-col")
+            ? p.get<std::string>("vector-col") : "emb";
+        pcfg.normalize = need_normalize;
+        ParquetSource qsrc(query_path, pcfg);
+        qdim = qsrc.dim();
+        qcount = static_cast<uint32_t>(qsrc.count());
+        queries.resize(static_cast<size_t>(qcount) * qdim);
+        Chunk chunk;
+        size_t offset = 0;
+        while (qsrc.next(chunk)) {
+            std::memcpy(&queries[offset], chunk.vectors,
+                        static_cast<size_t>(chunk.count) * qdim * sizeof(float));
+            offset += static_cast<size_t>(chunk.count) * qdim;
+        }
+    } else {
+        FbinHeader qh;
+        if (!read_fbin_header(query_path, qh) ||
+            qh.dim != idx->dim()) {
+            std::cerr << "tree-search: invalid query file (dim=" << qh.dim
+                      << ", expected " << idx->dim() << ")\n";
+            return 1;
+        }
+        qdim = qh.dim;
+        qcount = qh.n;
+        queries.resize(static_cast<size_t>(qcount) * qdim);
+        std::ifstream qf(query_path, std::ios::binary);
+        qf.seekg(8);
+        qf.read(reinterpret_cast<char*>(queries.data()),
+                static_cast<std::streamsize>(qcount) * qdim * sizeof(float));
+        qf.close();
+        if (need_normalize) {
+            for (uint32_t i = 0; i < qcount; ++i) {
+                simd::normalize_row_f32(&queries[i * qdim], qdim);
+            }
+        }
+    }
+
+    if (qdim != idx->dim()) {
+        std::cerr << "tree-search: query dim " << qdim
+                  << " != index dim " << idx->dim() << "\n";
         return 1;
     }
 
@@ -748,7 +859,21 @@ int cmd_tree_search(int argc, char* argv[]) {
                 raw_reader);
 
             const carquet_schema_t* fs = carquet_reader_schema(reader.get());
-            const int32_t gt_col = carquet_schema_find_column(fs, "neighbors_id");
+            int32_t gt_col = carquet_schema_find_column(fs, "neighbors_id");
+            if (gt_col < 0) {
+                // For list columns, find_column matches the leaf name (e.g. "item"),
+                // not the parent field name. Fall back to path-prefix matching.
+                int32_t n_gt_cols = carquet_schema_num_columns(fs);
+                for (int32_t i = 0; i < n_gt_cols; ++i) {
+                    const char* path[8];
+                    int32_t depth = carquet_schema_column_path(fs, i, path, 8);
+                    if (depth > 0 && path[0] &&
+                        std::string("neighbors_id") == path[0]) {
+                        gt_col = i;
+                        break;
+                    }
+                }
+            }
             if (gt_col < 0) {
                 std::cerr << "tree-search: GT parquet has no 'neighbors_id' "
                              "column\n";
@@ -816,28 +941,29 @@ int cmd_tree_search(int argc, char* argv[]) {
         } else {
             std::ifstream gtf(gt_path, std::ios::binary);
             if (gtf) {
-                // GT format: [magic "GTMM":4B][n:u32][k:u32][metric:u8][ids][dists]
-                // Legacy: [n:u32][k:u32][ids][dists] (no magic)
+                // GTMM format: [magic "GTMM":4B][n:u32][k:u32][metric:u8]
+                //               [ids_q0 (k×u32)][dists_q0 (k×f32)]
+                //               [ids_q1]... per query (interleaved).
                 constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
-                uint32_t maybe_magic = 0;
-                gtf.read(reinterpret_cast<char*>(&maybe_magic), 4);
-                uint32_t gt_n = 0, gt_k = 0;
-                if (maybe_magic == kGtMagic) {
-                    gtf.read(reinterpret_cast<char*>(&gt_n), 4);
-                    gtf.read(reinterpret_cast<char*>(&gt_k), 4);
-                    uint8_t metric_byte = 0;
-                    gtf.read(reinterpret_cast<char*>(&metric_byte), 1);
-                } else {
-                    // Legacy: first 4 bytes are n, not magic.
-                    gt_n = maybe_magic;
-                    gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+                uint32_t magic = 0;
+                gtf.read(reinterpret_cast<char*>(&magic), 4);
+                if (magic != kGtMagic) {
+                    throw std::runtime_error(
+                        "Ground truth file missing GTMM magic. "
+                        "Legacy format removed — regenerate with GTMM header.");
                 }
+                uint32_t gt_n = 0, gt_k = 0;
+                gtf.read(reinterpret_cast<char*>(&gt_n), 4);
+                gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+                uint8_t metric_byte = 0;
+                gtf.read(reinterpret_cast<char*>(&metric_byte), 1);
                 gt.resize(gt_n);
                 std::vector<uint32_t> row(gt_k);
                 for (uint32_t i = 0; i < gt_n; ++i) {
                     gtf.read(reinterpret_cast<char*>(row.data()),
                              gt_k * sizeof(uint32_t));
-                    gt[i].assign(row.begin(), row.end());  // uint32 → int64
+                    gt[i].assign(row.begin(), row.end());
+                    gtf.seekg(gt_k * sizeof(float), std::ios::cur);
                 }
                 std::cerr << "loaded ground truth: " << gt_n << " queries, k="
                           << gt_k << "\n";
@@ -855,28 +981,24 @@ int cmd_tree_search(int argc, char* argv[]) {
     uint64_t total_hits = 0;
     uint64_t total_queries = 0;
 
-    // Read all queries into memory for parallel processing.
-    std::vector<float> queries(static_cast<size_t>(qh.n) * qh.dim);
-    qf.read(reinterpret_cast<char*>(queries.data()),
-            static_cast<std::streamsize>(qh.n * qh.dim * sizeof(float)));
-    qf.close();
+    // Queries are already loaded above (from .fbin or .parquet).
 
-    std::vector<std::vector<Candidate>> all_results(qh.n);
+    std::vector<std::vector<Candidate>> all_results(qcount);
     using PayloadLoc = std::pair<const uint8_t*, uint32_t>;
     std::vector<std::vector<PayloadLoc>> all_payload_locs;
-    if (with_payload) all_payload_locs.resize(qh.n);
+    if (with_payload) all_payload_locs.resize(qcount);
 
     const auto t0 = std::chrono::steady_clock::now();
 
     if (num_threads <= 1) {
-        for (uint32_t qi = 0; qi < qh.n; ++qi) {
+        for (uint32_t qi = 0; qi < qcount; ++qi) {
             if (with_payload) {
                 all_results[qi] = idx->search(
-                    &queries[static_cast<size_t>(qi) * qh.dim], k, scfg,
+                    &queries[static_cast<size_t>(qi) * qdim], k, scfg,
                     &all_payload_locs[qi]);
             } else {
                 all_results[qi] = idx->search(
-                    &queries[static_cast<size_t>(qi) * qh.dim], k, scfg);
+                    &queries[static_cast<size_t>(qi) * qdim], k, scfg);
             }
         }
     } else {
@@ -887,14 +1009,14 @@ int cmd_tree_search(int argc, char* argv[]) {
             futs.push_back(std::async(std::launch::async, [&]() {
                 while (true) {
                     const uint32_t qi = next_qi.fetch_add(1);
-                    if (qi >= qh.n) break;
+                    if (qi >= qcount) break;
                     if (with_payload) {
                         all_results[qi] = idx->search(
-                            &queries[static_cast<size_t>(qi) * qh.dim], k, scfg,
+                            &queries[static_cast<size_t>(qi) * qdim], k, scfg,
                             &all_payload_locs[qi]);
                     } else {
                         all_results[qi] = idx->search(
-                            &queries[static_cast<size_t>(qi) * qh.dim], k, scfg);
+                            &queries[static_cast<size_t>(qi) * qdim], k, scfg);
                     }
                 }
             }));
@@ -903,10 +1025,19 @@ int cmd_tree_search(int argc, char* argv[]) {
     }
 
     // Tally recall + emit results (serial — I/O bound).
-    for (uint32_t qi = 0; qi < qh.n; ++qi) {
+    // Recall metric: fraction of search top-k results that appear in the
+    // GT top-k (not the full GT list). This is the standard recall@k:
+    // "of the k results returned, how many are true top-k neighbors."
+    const uint32_t recall_k = std::min(static_cast<uint32_t>(
+        all_results.empty() ? 0 : all_results[0].size()),
+        gt.empty() ? 0 : static_cast<uint32_t>(gt[0].size()));
+    for (uint32_t qi = 0; qi < qcount; ++qi) {
         const auto& results = all_results[qi];
         if (!gt.empty() && qi < gt.size()) {
-            std::unordered_set<RowId> gt_set(gt[qi].begin(), gt[qi].end());
+            // Only check against the first recall_k GT entries (true top-k).
+            std::unordered_set<RowId> gt_set(
+                gt[qi].begin(),
+                gt[qi].begin() + std::min(recall_k, static_cast<uint32_t>(gt[qi].size())));
             for (const auto& c : results) {
                 if (gt_set.count(c.row_id)) ++total_hits;
             }
@@ -932,10 +1063,10 @@ int cmd_tree_search(int argc, char* argv[]) {
 
     const auto t1 = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(t1 - t0).count();
-    const double qps = (secs > 0) ? qh.n / secs : 0;
+    const double qps = (secs > 0) ? qcount / secs : 0;
 
     std::cerr << "\n═══ Tree Search Results ═══\n";
-    std::cerr << "queries: " << qh.n << "\n";
+    std::cerr << "queries: " << qcount << "\n";
     std::cerr << "k: " << k << "\n";
     std::cerr << "time: " << secs << "s (" << qps << " QPS)\n";
     if (total_queries > 0) {

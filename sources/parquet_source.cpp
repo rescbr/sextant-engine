@@ -1,6 +1,7 @@
 #include "parquet_source.hpp"
 
 #include <sextant/error.hpp>
+#include "../src/simd_kernels.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -94,8 +95,17 @@ ParquetSource::ParquetSource(const std::string& path,
     const carquet_schema_t* file_schema = carquet_reader_schema(reader_.get());
     carquet_physical_type_t vec_phys =
         carquet_schema_column_type(file_schema, vec_col_idx_);
+
+    // Detect list<float> (repeated FLOAT): physical type is FLOAT but the
+    // column has repetition level >= 1, meaning it's a list element.
     if (vec_phys == CARQUET_PHYSICAL_FLOAT) {
-        dim_ = 1;
+        int16_t max_rep = carquet_schema_max_rep_level(file_schema, vec_col_idx_);
+        if (max_rep >= 1) {
+            vec_is_list_ = true;
+            // dim_ deferred to detect_list_dim_() — needs to read one batch.
+        } else {
+            dim_ = 1;
+        }
     } else if (vec_phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY) {
         const int32_t n_elem = carquet_schema_num_elements(file_schema);
         int32_t vec_elem_idx = -1;
@@ -128,6 +138,12 @@ ParquetSource::ParquetSource(const std::string& path,
         dim_ = static_cast<Dim>(vec_type_len_ / sizeof(float));
     } else if (vec_phys == CARQUET_PHYSICAL_DOUBLE) {
         dim_ = 1;
+    } else if (vec_phys == CARQUET_PHYSICAL_INT64 ||
+               vec_phys == CARQUET_PHYSICAL_INT32 ||
+               vec_phys == CARQUET_PHYSICAL_BOOLEAN) {
+        // Non-vector column used as placeholder (e.g., label-file reader where
+        // all real columns are filters). dim_ = 0 means no vector data.
+        dim_ = 0;
     } else {
         throw Error(ErrorCode::InvalidParam,
                     "ParquetSource: vector column must be FLOAT, DOUBLE, or "
@@ -140,10 +156,14 @@ ParquetSource::ParquetSource(const std::string& path,
                     "ParquetSource: file '" + path_ + "' has 0 rows");
     }
 
+    if (vec_is_list_ && dim_ == 0) {
+        detect_list_dim_();
+    }
+
     spdlog::debug("ParquetSource: opened '{}' n={} dim={} vec_col={} "
-                  "filter_cols={}",
+                  "filter_cols={} list={} normalize={}",
                   path_, count_, dim_, vec_col_idx_,
-                  filter_col_indices_.size());
+                  filter_col_indices_.size(), vec_is_list_, config_.normalize);
 }
 
 void ParquetSource::init_schema_() {
@@ -152,6 +172,26 @@ void ParquetSource::init_schema_() {
 
     vec_col_idx_ = carquet_schema_find_column(file_schema,
                                                config_.vector_col.c_str());
+
+    // For list<float> columns, find_column matches the leaf name (e.g. "item"),
+    // not the parent field name (e.g. "emb"). Fall back to searching by
+    // path prefix: a leaf whose path starts with the vector column name
+    // and has repetition level >= 1.
+    if (vec_col_idx_ < 0) {
+        for (int32_t i = 0; i < n; ++i) {
+            const char* path[8];
+            int32_t depth = carquet_schema_column_path(
+                file_schema, i, path, 8);
+            if (depth > 0 && path[0] &&
+                config_.vector_col == path[0]) {
+                int16_t rep = carquet_schema_max_rep_level(file_schema, i);
+                if (rep >= 1) {
+                    vec_col_idx_ = i;
+                    break;
+                }
+            }
+        }
+    }
 
     for (int32_t i = 0; i < n; ++i) {
         if (i == vec_col_idx_) continue;
@@ -175,6 +215,42 @@ void ParquetSource::init_schema_() {
         schema_.columns.push_back(std::move(fc));
         filter_col_indices_.push_back(i);
     }
+}
+
+void ParquetSource::detect_list_dim_() {
+    reset();
+    carquet_row_batch_t* raw_batch = nullptr;
+    carquet_status_t status =
+        carquet_batch_reader_next(batch_reader_.get(), &raw_batch);
+    if (status != CARQUET_OK || !raw_batch) {
+        carquet_error_t err = {};
+        err.code = status;
+        throw_carquet_error(err, "ParquetSource: cannot read batch to detect list dim");
+    }
+
+    {
+        CarquetBatchPtr batch(raw_batch);
+        const int32_t* offsets = nullptr;
+        const void* values = nullptr;
+        int64_t nlists = 0, nvals = 0;
+        const uint8_t *vv = nullptr, *lv = nullptr;
+        carquet_status_t s = carquet_row_batch_column_list(
+            batch.get(), vec_col_idx_, &offsets, &nlists,
+            &values, &vv, &nvals, &lv);
+        if (s != CARQUET_OK || nlists == 0) {
+            throw Error(ErrorCode::InvalidParam,
+                        "ParquetSource: list column has no rows");
+        }
+        dim_ = static_cast<Dim>(offsets[1] - offsets[0]);
+        if (dim_ == 0) {
+            throw Error(ErrorCode::InvalidParam,
+                        "ParquetSource: list column has zero-length vectors");
+        }
+    }
+    // Release the batch (via CarquetBatchPtr destructor in the inner scope)
+    // before resetting the batch reader.
+    cursor_ = 0;
+    batch_reader_.reset();
 }
 
 void ParquetSource::reset() {
@@ -245,7 +321,37 @@ void ParquetSource::materialize_batch_(carquet_row_batch_t* batch) {
     const uint32_t n = static_cast<uint32_t>(n_rows);
 
     // --- Vectors ---
-    {
+    if (dim_ == 0) {
+        // No vector column (label-only reader). Just set vec_ptr_ to null.
+        vec_ptr_ = nullptr;
+    } else if (vec_is_list_) {
+        const int32_t* offsets = nullptr;
+        const void* values = nullptr;
+        int64_t nlists = 0, nvals = 0;
+        const uint8_t *vv = nullptr, *lv = nullptr;
+        carquet_status_t s = carquet_row_batch_column_list(
+            batch, vec_col_idx_, &offsets, &nlists,
+            &values, &vv, &nvals, &lv);
+        if (s != CARQUET_OK) {
+            carquet_error_t err = {};
+            err.code = s;
+            throw_carquet_error(err, "ParquetSource: read list vector column");
+        }
+        const float* fv = static_cast<const float*>(values);
+
+        if (config_.normalize) {
+            vec_buf_.resize(static_cast<size_t>(n) * dim_);
+            for (uint32_t i = 0; i < n; ++i) {
+                std::memcpy(&vec_buf_[i * dim_], fv + i * dim_,
+                            static_cast<size_t>(dim_) * sizeof(float));
+                simd::normalize_row_f32(&vec_buf_[i * dim_], dim_);
+            }
+            vec_ptr_ = vec_buf_.data();
+        } else {
+            // values is contiguous n×dim float — alias carquet's decoded buffer.
+            vec_ptr_ = fv;
+        }
+    } else {
         const void* data = nullptr;
         const uint8_t* nulls = nullptr;
         int64_t count = 0;

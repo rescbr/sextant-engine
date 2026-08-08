@@ -175,7 +175,9 @@ TEST(QuantizeLutU8, MaxEntryIs255AtMaxSpan) {
 
     std::vector<uint8_t> lut8(M * K);
     float A, B;
-    simd::quantize_lut_u8(lut_f32.data(), M, K, lut8.data(), &A, &B);
+    std::vector<float> seg_min(M);
+    simd::quantize_lut_u8_scaled(lut_f32.data(), M, K, lut8.data(), &A, &B,
+                                 seg_min.data());
     // Each segment's max entry (c=K-1) should round to 255.
     for (uint32_t s = 0; s < M; s++) {
         EXPECT_EQ(255, lut8[s * K + (K - 1)]) << "segment " << s;
@@ -195,7 +197,9 @@ TEST(QuantizeLutU8, BIsSumOfPerSegmentMins) {
             lut_f32[s * K + c] = seg_offset[s] + static_cast<float>(c);
     std::vector<uint8_t> lut8(M * K);
     float A, B;
-    simd::quantize_lut_u8(lut_f32.data(), M, K, lut8.data(), &A, &B);
+    std::vector<float> seg_min(M);
+    simd::quantize_lut_u8_scaled(lut_f32.data(), M, K, lut8.data(), &A, &B,
+                                 seg_min.data());
     // Each segment's min is at c=0; the per-segment spans are all 7 (K-1).
     // B = 10 + 20 + 30 = 60.
     EXPECT_FLOAT_EQ(60.0f, B);
@@ -218,7 +222,9 @@ TEST(QuantizeLutU8, PreserveArgminWithinSegment) {
     }
     std::vector<uint8_t> lut8(M * K);
     float A, B;
-    simd::quantize_lut_u8(lut_f32.data(), M, K, lut8.data(), &A, &B);
+    std::vector<float> seg_min(M);
+    simd::quantize_lut_u8_scaled(lut_f32.data(), M, K, lut8.data(), &A, &B,
+                                 seg_min.data());
     for (uint32_t s = 0; s < M; s++) {
         // uint8 min should also be at c=0.
         uint8_t mn = lut8[s * K];

@@ -4,6 +4,7 @@
 #include "engine/partition.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "quant/product_residual_quantizer.hpp"
+#include "quant/scalar_lloydmax_quantizer.hpp"
 #include "util/fp16.hpp"
 #include "simd_kernels.hpp"
 #include "tree/filter_column_write.hpp"  // filter column write path
@@ -115,7 +116,9 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
     idx->manifest_ = manifest_from_toml(cfg_buf);
 
     // Load the codebook from the codebook extent.
-    {
+    // local_pq stores no global codebook (each leaf has its own); quantizer_
+    // stays nullptr. The search path handles CodedLocal leaves separately.
+    if (idx->manifest_.quantizer_type != "local_pq") {
         const auto cb_page = idx->superblock_.codebook_page();
         const auto cb_pages = idx->superblock_.codebook_pages();
         if (cb_page == kInvalidPage || cb_pages == 0) {
@@ -137,11 +140,20 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
             idx->quantizer_ = std::make_unique<ProductResidualQuantizer>(
                 MetricKind::L2Sq, m.dim, m.m4, m.scan_pq_bits,
                 m.prq_nsplits, /*beam_size=*/1);
+        } else if (m.quantizer_type == "scalar_lloydmax") {
+            idx->scalar_lm_quantizer_ = std::make_unique<ScalarLloydMaxQuantizer>(
+                static_cast<MetricKind>(m.metric), m.dim, m.scan_pq_bits);
         } else {
             idx->quantizer_ = std::make_unique<PqQuantizer>(
                 MetricKind::L2Sq, m.dim, m.m4, m.scan_pq_bits);
         }
-        idx->quantizer_->deserialize(qblob_data, static_cast<size_t>(qblob_size));
+        if (idx->quantizer_) {
+            idx->quantizer_->deserialize(qblob_data,
+                                         static_cast<size_t>(qblob_size));
+        } else if (idx->scalar_lm_quantizer_) {
+            idx->scalar_lm_quantizer_->deserialize(qblob_data,
+                static_cast<size_t>(qblob_size));
+        }
     }
 
     // Load PCA routing data if present.
@@ -314,12 +326,15 @@ struct HeapEntry {
 /// hi nibble = odd segment for 4-bit; one byte per segment for 8-bit).
 /// `out` must hold at least `code_size` bytes.
 inline void extract_code_from_leaf(const uint8_t* leaf_ptr, uint32_t local_idx,
-                                   uint32_t summary_size, uint16_t m4,
-                                   uint8_t pq_bits, uint32_t codes_per_block,
-                                   uint32_t block_bytes, uint8_t* out) {
+                                    uint32_t summary_size, uint16_t m4,
+                                    uint8_t pq_bits, uint32_t codes_per_block,
+                                    uint32_t block_bytes, uint8_t* out,
+                                    uint64_t codes_base_offset = 0) {
     const uint32_t block = local_idx / codes_per_block;
     const uint32_t slot  = local_idx % codes_per_block;
-    const uint8_t* codes_base = leaf_ptr + leaf_codes_offset(summary_size);
+    const uint64_t base_off = (codes_base_offset > 0)
+        ? codes_base_offset : leaf_codes_offset(summary_size);
+    const uint8_t* codes_base = leaf_ptr + base_off;
     const uint8_t* blk = codes_base + static_cast<uint64_t>(block) * block_bytes;
 
     if (pq_bits == 8) {
@@ -424,6 +439,9 @@ struct TreeBuildContext {
 
     // --- Quantizer ---
     std::unique_ptr<PqQuantizer> quantizer;
+    bool is_local_pq = false;  // true when quantizer_type == "local_pq"
+    bool is_scalar_lm = false;  // true when quantizer_type == "scalar_lloydmax"
+    std::unique_ptr<ScalarLloydMaxQuantizer> scalar_lm_quantizer;
 
     // --- FP16 root centroids (original space, for tree storage) ---
     std::vector<std::vector<float16_t>> root_centroids_fp16;  // k_root × dim
@@ -513,6 +531,19 @@ void resolve_build_params(TreeBuildContext& ctx) {
     // for k-means to find structure). For d_eff≈2 data, even 8-16 PCs suffice.
     ctx.pca_dims = std::min(ctx.dim, cfg.pca_dims > 0 ? cfg.pca_dims : 32u);
     ctx.metric = params.metric;
+    ctx.is_local_pq = (params.quantizer_type == "local_pq");
+    ctx.is_scalar_lm = (params.quantizer_type == "scalar_lloydmax");
+    if (ctx.is_scalar_lm) {
+        // Scalar quantization is sub_dim=1: m = dim subquantizers.
+        ctx.m4 = static_cast<uint16_t>(ctx.dim);
+        // The scalar_lloydmax scan path only implements 4-bit nibble
+        // extraction. Reject 8-bit early with a clear error rather than
+        // silently producing garbage distances.
+        if (params.scan_pq_bits != 4) {
+            throw std::invalid_argument(
+                "scalar_lloydmax currently supports only --pq-bits 4");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -564,15 +595,36 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
         ctx.quantizer = std::make_unique<ProductResidualQuantizer>(
             params.metric, dim, ctx.m4, ctx.scan_bits, nsplits,
             params.prq_beam_size, 42);
+    } else if (ctx.is_local_pq) {
+        // local_pq: no global codebook. Each leaf trains its own codebook
+        // on residuals at flush time. Leave ctx.quantizer as nullptr.
+        ctx.quantizer = nullptr;
+    } else if (ctx.is_scalar_lm) {
+        // scalar_lloydmax: per-dim Lloyd-Max quantizer. No PqQuantizer;
+        // codes are flat packed nibbles (not FastScan blocks).
+        ctx.scalar_lm_quantizer = std::make_unique<ScalarLloydMaxQuantizer>(
+            params.metric, dim, ctx.scan_bits);
+        ctx.scalar_lm_quantizer->train(sample.data(), train_n);
+        ctx.quantizer = nullptr;
     } else {
         ctx.quantizer = std::make_unique<PqQuantizer>(
             params.metric, dim, ctx.m4, ctx.scan_bits, 42);
     }
-    ctx.quantizer->train(sample.data(), train_n);
-    spdlog::info("[sextant] build_streaming_pca: trained {} in {:.2f}s",
-                 params.quantizer_type,
-                 std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - t_sample).count());
+    if (ctx.quantizer) {
+        ctx.quantizer->train(sample.data(), train_n);
+        spdlog::info("[sextant] build_streaming_pca: trained {} in {:.2f}s",
+                     params.quantizer_type,
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t_sample).count());
+    } else if (ctx.scalar_lm_quantizer) {
+        spdlog::info("[sextant] build_streaming_pca: trained scalar_lloydmax "
+                     "in {:.2f}s",
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t_sample).count());
+    } else {
+        spdlog::info("[sextant] build_streaming_pca: local_pq mode, skipping "
+                     "global quantizer training");
+    }
 
     // --- 2. Compute PCA (reuse existing compute_pca_rotation_public) ---
     const auto t_pca = std::chrono::steady_clock::now();
@@ -1102,7 +1154,9 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     const auto& per_cluster_eps = ctx.cluster_closure_eps;
     // --- 6. Emission pass: assign + encode + write leaves ---
     const auto t_stream = std::chrono::steady_clock::now();
-    const uint32_t code_size = ctx.quantizer->code_size();
+    const uint32_t code_size = (ctx.is_local_pq || ctx.is_scalar_lm)
+        ? static_cast<uint32_t>((static_cast<uint32_t>(m4) * scan_bits + 7) / 8)
+        : ctx.quantizer->code_size();
     // has_filter is driven by the schema, not the sidecar data. When the source
     // provides filter columns per-chunk (e.g. ParquetSource), cfg.filter_column_data
     // is empty but the schema still declares the columns.
@@ -1130,6 +1184,9 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         // Payload info for the rows in this buffer (Phase E).
         std::vector<uint32_t> payload_lens;
         std::vector<const uint8_t*> payload_ptrs;
+        // For local_pq: raw FP16 vectors (for per-leaf codebook training at flush).
+        // Empty when not local_pq.
+        std::vector<float16_t> fp16_vecs;
     };
     std::vector<LeafBuffer> buffers(k_root);
     for (auto& b : buffers) b.centroid_sum.assign(dim, 0.0);
@@ -1275,8 +1332,26 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                          leaf_metas.size(), fcb, pq_code_bytes);
         }
 
-        const uint32_t npg = leaf_extent_pages(count, m4, scan_bits,
-                                               summary_size, fcb);
+        const uint32_t npg = [&]() -> uint32_t {
+            if (ctx.is_local_pq) {
+                return static_cast<uint32_t>(local_coded_extent_pages(
+                    count, static_cast<uint16_t>(dim), m4, scan_bits,
+                    summary_size, fcb));
+            }
+            if (ctx.is_scalar_lm) {
+                // Flat packed-nibble layout: [header][summary][codes][row_ids]
+                // codes = count * code_size (no FastScan block padding).
+                const uint64_t codes_bytes =
+                    static_cast<uint64_t>(count) * code_size;
+                const uint64_t rowids_bytes =
+                    static_cast<uint64_t>(count) * sizeof(RowId);
+                const uint64_t total = leaf_codes_offset(summary_size) +
+                                       codes_bytes + rowids_bytes + fcb;
+                return static_cast<uint32_t>(
+                    (total + kPageSize - 1) / kPageSize);
+            }
+            return leaf_extent_pages(count, m4, scan_bits, summary_size, fcb);
+        }();
         if (npg > 512) {
             spdlog::warn("[sextant] build_streaming_pca: leaf {} extent = {} "
                          "pages (> 512)", leaf_metas.size(), npg);
@@ -1337,40 +1412,96 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                         obuf.data() + leaf_filter_offset(), summary_size);
         }
 
+        // local_pq: train a per-leaf codebook on residuals (vec - centroid),
+        // encode all residuals, and lay out the leaf as CodedLocal
+        // ([header][summary][FP32 centroid][codebook][codes][row_ids][filters]).
+        if (ctx.is_local_pq) {
+            // For IP/cosine on normalized vectors, L2sq ranking == IP ranking
+            // (||q-v||² = 2-2<q,v> on the unit sphere). The residual
+            // decomposition ||q_res - res||² = ||q-v||² only holds for L2sq,
+            // so we always train local codebooks with L2sq regardless of the
+            // tree's configured metric.
+            PqQuantizer local_q(MetricKind::L2Sq, dim, m4, scan_bits, 42);
+            // Extract residuals from the raw FP16 vectors.
+            std::vector<float> residuals(static_cast<size_t>(count) * dim);
+            for (uint32_t i = 0; i < count; ++i) {
+                const float16_t* fvec = buf.fp16_vecs.data() + i * dim;
+                for (uint16_t d = 0; d < dim; ++d)
+                    residuals[i * dim + d] =
+                        static_cast<float>(fvec[d]) - centroid_f32[d];
+            }
+            local_q.train(residuals.data(), count);
+            // Encode all residuals into buf.codes.
+            buf.codes.assign(static_cast<size_t>(count) * code_size, 0);
+            for (uint32_t i = 0; i < count; ++i) {
+                local_q.encode(residuals.data() + i * dim,
+                               buf.codes.data() + i * code_size);
+            }
+            // Write the FP32 centroid + local codebook into the leaf.
+            lh->leaf_state = static_cast<uint8_t>(LeafState::CodedLocal);
+            lh->centroid_offset =
+                static_cast<uint32_t>(local_centroid_offset(summary_size));
+            lh->codebook_offset =
+                static_cast<uint32_t>(local_codebook_offset(summary_size, dim));
+            std::memcpy(obuf.data() + local_centroid_offset(summary_size),
+                        centroid_f32.data(), dim * sizeof(float));
+            const uint32_t K = local_q.K();
+            const uint32_t sub_dim = local_q.sub_dim();
+            const uint64_t cb_bytes =
+                static_cast<uint64_t>(m4) * K * sub_dim * sizeof(float);
+            std::memcpy(obuf.data() + local_codebook_offset(summary_size, dim),
+                        local_q.codebook(), cb_bytes);
+        }
+
         const uint32_t n_blocks = (count + cpb - 1) / cpb;
-        uint8_t* codes_out = obuf.data() + leaf_codes_offset(summary_size);
-        for (uint32_t b = 0; b < n_blocks; ++b) {
-            const uint32_t base = b * cpb;
-            uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
-            std::memset(blk, 0, bb);
-            for (uint32_t j = 0; j < cpb; ++j) {
-                const uint32_t gi = base + j;
-                if (gi >= count) break;
-                const uint8_t* code = buf.codes.data() + gi * code_size;
-                if (scan_bits == 4) {
-                    const uint8_t nbi = j % 16; const bool hi = (j >= 16);
-                    for (uint16_t s = 0; s < m4; ++s) {
-                        uint8_t nib = (s/2 < code_size)
-                            ? ((s%2==0) ? (code[s/2]&0x0F) : (code[s/2]>>4)) : 0;
-                        if (hi) blk[s*16+nbi] |= (nib<<4);
-                        else    blk[s*16+nbi] |= nib;
+        const uint64_t codes_off = ctx.is_local_pq
+            ? local_codes_offset(summary_size, dim, m4, scan_bits)
+            : leaf_codes_offset(summary_size);
+        uint8_t* codes_out = obuf.data() + codes_off;
+        uint64_t rowids_off;
+        if (ctx.is_scalar_lm) {
+            // Flat packed-nibble layout: codes are count × code_size bytes,
+            // stored sequentially (no FastScan block interleaving).
+            std::memcpy(codes_out, buf.codes.data(),
+                        static_cast<size_t>(count) * code_size);
+            rowids_off = codes_off +
+                         static_cast<uint64_t>(count) * code_size;
+        } else {
+            for (uint32_t b = 0; b < n_blocks; ++b) {
+                const uint32_t base = b * cpb;
+                uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
+                std::memset(blk, 0, bb);
+                for (uint32_t j = 0; j < cpb; ++j) {
+                    const uint32_t gi = base + j;
+                    if (gi >= count) break;
+                    const uint8_t* code = buf.codes.data() + gi * code_size;
+                    if (scan_bits == 4) {
+                        const uint8_t nbi = j % 16; const bool hi = (j >= 16);
+                        for (uint16_t s = 0; s < m4; ++s) {
+                            uint8_t nib = (s/2 < code_size)
+                                ? ((s%2==0) ? (code[s/2]&0x0F) : (code[s/2]>>4)) : 0;
+                            if (hi) blk[s*16+nbi] |= (nib<<4);
+                            else    blk[s*16+nbi] |= nib;
+                        }
+                    } else {
+                        for (uint16_t s = 0; s < m4; ++s)
+                            blk[s*16+j] = (s < code_size) ? code[s] : 0;
                     }
-                } else {
-                    for (uint16_t s = 0; s < m4; ++s)
-                        blk[s*16+j] = (s < code_size) ? code[s] : 0;
                 }
             }
+            rowids_off = ctx.is_local_pq
+                ? local_rowids_offset(summary_size, dim, m4, scan_bits,
+                                      n_blocks, bb)
+                : leaf_rowids_offset(summary_size, n_blocks, bb);
         }
-        RowId* rids = reinterpret_cast<RowId*>(
-            obuf.data() + leaf_rowids_offset(summary_size, n_blocks, bb));
+        RowId* rids = reinterpret_cast<RowId*>(obuf.data() + rowids_off);
         std::memcpy(rids, buf.row_ids.data(), count * sizeof(RowId));
 
         // Phase C: filter column data region (after row_ids). This must
         // match LeafFilterLayout::compute's filter_base offset.
         if (fcb > 0) {
             const uint64_t fc_off =
-                leaf_rowids_offset(summary_size, n_blocks, bb) +
-                static_cast<uint64_t>(count) * sizeof(RowId);
+                rowids_off + static_cast<uint64_t>(count) * sizeof(RowId);
             lh->filter_columns_offset = fc_off;
             const uint64_t written = write_filter_columns(
                 obuf.data() + fc_off, count, cfg.filter_schema, buf.filter_cols);
@@ -1407,6 +1538,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         // Reset the buffer for the next leaf in this cluster.
         buf.codes.clear();
         buf.row_ids.clear();
+        buf.fp16_vecs.clear();
         std::fill(buf.centroid_sum.begin(), buf.centroid_sum.end(), 0.0);
         buf.centroid_count = 0;
         buf.payload_lens.clear();
@@ -1504,7 +1636,6 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                 if (start >= end) break;
                 futs.push_back(std::async(std::launch::async,
                     [&](uint32_t s, uint32_t e) {
-                        std::vector<uint8_t> code(code_size);
                         std::vector<float> proj(pca_dims);
                         for (uint32_t i = s; i < e; ++i) {
                             const float* xi = &vec_buf[i * dim];
@@ -1520,9 +1651,17 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                                 const float d = cent_norms[c] - 2.0f * dot;
                                 if (d < min_d) min_d = d;
                             }
-                            // Encode scan code.
-                            ctx.quantizer->encode(xi, code.data());
-                            chunk_codes[i].assign(code.begin(), code.end());
+                            // Encode scan code (skipped for local_pq: raw
+                            // vectors are kept and encoded per-leaf at flush).
+                            if (ctx.is_scalar_lm) {
+                                std::vector<uint8_t> code(code_size);
+                                ctx.scalar_lm_quantizer->encode(xi, code.data());
+                                chunk_codes[i].assign(code.begin(), code.end());
+                            } else if (!ctx.is_local_pq) {
+                                std::vector<uint8_t> code(code_size);
+                                ctx.quantizer->encode(xi, code.data());
+                                chunk_codes[i].assign(code.begin(), code.end());
+                            }
                             // Find closure targets using per-cluster epsilon.
                             // Phase I: each cluster c has its own closure eps
                             // derived from its local d_eff. A vector is
@@ -1615,8 +1754,15 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                 }
                 for (uint32_t c : chunk_targets[i]) {
                     auto& buf = buffers[c];
-                    buf.codes.insert(buf.codes.end(),
-                                     chunk_codes[i].begin(), chunk_codes[i].end());
+                    if (ctx.is_local_pq) {
+                        // local_pq: keep raw FP16 vector for per-leaf codebook
+                        // training at flush time.
+                        buf.fp16_vecs.insert(buf.fp16_vecs.end(), fvec,
+                                             fvec + dim);
+                    } else {
+                        buf.codes.insert(buf.codes.end(),
+                                         chunk_codes[i].begin(), chunk_codes[i].end());
+                    }
                     buf.row_ids.push_back(rid);
                     // Incremental centroid accumulator (replaces fp16_vecs).
                     for (uint16_t d = 0; d < dim; ++d)
@@ -1941,22 +2087,42 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
         file.write_pages(root_page, root_npg, buf.data());
     }
 
-    std::vector<uint8_t> qblob;
-    quantizer->serialize(qblob);
-    const uint64_t qbsz = qblob.size();
-    std::vector<uint8_t> qbs(sizeof(qbsz) + qblob.size());
-    std::memcpy(qbs.data(), &qbsz, sizeof(qbsz));
-    std::memcpy(qbs.data() + sizeof(qbsz), qblob.data(), qblob.size());
-    const uint32_t cb_npg = static_cast<uint32_t>((qbs.size()+kPageSize-1)/kPageSize);
-    const PageId cb_page = alloc.alloc_extent(file, cb_npg);
-    { std::vector<uint8_t> b(cb_npg*kPageSize, 0); std::memcpy(b.data(),qbs.data(),qbs.size());
-      file.write_pages(cb_page, cb_npg, b.data()); }
+    // Serialize the global codebook. local_pq has no global codebook (each
+    // leaf carries its own); skip the extent entirely. scalar_lloydmax stores
+    // its levels table here (same size-prefixed format).
+    PageId cb_page = kInvalidPage;
+    uint32_t cb_npg = 0;
+    if (ctx.is_scalar_lm) {
+        std::vector<uint8_t> qblob;
+        ctx.scalar_lm_quantizer->serialize(qblob);
+        const uint64_t qbsz = qblob.size();
+        std::vector<uint8_t> qbs(sizeof(qbsz) + qblob.size());
+        std::memcpy(qbs.data(), &qbsz, sizeof(qbsz));
+        std::memcpy(qbs.data() + sizeof(qbsz), qblob.data(), qblob.size());
+        cb_npg = static_cast<uint32_t>((qbs.size()+kPageSize-1)/kPageSize);
+        cb_page = alloc.alloc_extent(file, cb_npg);
+        std::vector<uint8_t> b(cb_npg*kPageSize, 0);
+        std::memcpy(b.data(), qbs.data(), qbs.size());
+        file.write_pages(cb_page, cb_npg, b.data());
+    } else if (!ctx.is_local_pq) {
+        std::vector<uint8_t> qblob;
+        quantizer->serialize(qblob);
+        const uint64_t qbsz = qblob.size();
+        std::vector<uint8_t> qbs(sizeof(qbsz) + qblob.size());
+        std::memcpy(qbs.data(), &qbsz, sizeof(qbsz));
+        std::memcpy(qbs.data() + sizeof(qbsz), qblob.data(), qblob.size());
+        cb_npg = static_cast<uint32_t>((qbs.size()+kPageSize-1)/kPageSize);
+        cb_page = alloc.alloc_extent(file, cb_npg);
+        { std::vector<uint8_t> b(cb_npg*kPageSize, 0); std::memcpy(b.data(),qbs.data(),qbs.size());
+          file.write_pages(cb_page, cb_npg, b.data()); }
+    }
 
     TreeManifest manifest;
     manifest.dim = dim; manifest.m4 = m4; manifest.scan_pq_bits = scan_bits;
     manifest.quantizer_type = params.quantizer_type;
     manifest.prq_nsplits = (params.quantizer_type == "prq")
         ? static_cast<uint32_t>(static_cast<ProductResidualQuantizer&>(*quantizer).nsplits()) : 0;
+    manifest.metric = static_cast<uint8_t>(params.metric);
     manifest.depth = depth; manifest.k_root = k_root; manifest.k_l1 = k_l1;
     manifest.leaf_capacity = leaf_cap; manifest.n_leaves = n_leaves_total;
     manifest.n_probe_l0 = cfg.n_probe_l0 > 0 ? cfg.n_probe_l0
@@ -2094,28 +2260,37 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
 std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                              const SearchConfig& config,
     std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs) const {
-    // Build the FastScan LUT once per query.
+    // Build the FastScan LUT once per query (global codebook path).
+    // For local_pq, each leaf has its own codebook; the LUT is built per-leaf
+    // inside the scan loop.
     const bool scan_8bit = (manifest_.scan_pq_bits == 8);
     const uint32_t m = manifest_.m4;
     const uint32_t codes_per_block = scan_8bit ? 16 : 32;
     const uint32_t block_bytes = m * 16;  // [m][16] for both 4-bit and 8-bit
+    const bool is_local_pq = (manifest_.quantizer_type == "local_pq");
+    const bool is_scalar_lm =
+        (manifest_.quantizer_type == "scalar_lloydmax");
 
-    // LUT buffers.
-    std::vector<uint8_t> lut4(scan_8bit ? 0 : m * 16);
-    std::vector<uint8_t> lut8(scan_8bit ? m * 256 : 0);
+    // LUT buffers (global codebook path only).
+    std::vector<uint8_t> lut4(scan_8bit || is_local_pq || is_scalar_lm ? 0 : m * 16);
+    std::vector<uint8_t> lut8((!scan_8bit || is_local_pq || is_scalar_lm) ? 0 : m * 256);
     float lut_scale = 0, lut_offset = 0;
 
-    if (scan_8bit) {
-        quantizer_->build_fastscan_lut(query, lut8.data(), &lut_scale,
-                                        &lut_offset);
-    } else {
-        quantizer_->build_fastscan_lut4(query, lut4.data(), nullptr);
+    if (!is_local_pq && !is_scalar_lm) {
+        if (scan_8bit) {
+            quantizer_->build_fastscan_lut(query, lut8.data(), &lut_scale,
+                                            &lut_offset);
+        } else {
+            quantizer_->build_fastscan_lut4(query, lut4.data(), nullptr);
+        }
     }
 
     // Cast query to FP16 for routing (used for non-PCA path + leaf centroid reads).
     std::vector<float16_t> query_fp16(manifest_.dim);
     cast_fp32_to_fp16(query, query_fp16.data(), manifest_.dim);
-    const MetricKind metric = quantizer_->metric();
+    const MetricKind metric = (is_local_pq || is_scalar_lm)
+        ? static_cast<MetricKind>(manifest_.metric)
+        : quantizer_->metric();
 
     // --- Project query to PCA space if PCA routing is enabled ---
     std::vector<float> query_pca;
@@ -2525,6 +2700,131 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         }
     };
 
+    // Per-leaf LUT buffers (local_pq path). Allocated once, reused per leaf.
+    std::vector<uint8_t> local_lut4(is_local_pq && !scan_8bit ? m * 16 : 0);
+    std::vector<uint8_t> local_lut8(is_local_pq && scan_8bit ? m * 256 : 0);
+    float local_lut_scale = 0, local_lut_offset = 0;
+    // Reusable per-leaf quantizer wrapper for LUT building.
+    std::unique_ptr<PqQuantizer> leaf_quant;
+    if (is_local_pq) {
+        leaf_quant = std::make_unique<PqQuantizer>(
+            MetricKind::L2Sq, manifest_.dim, manifest_.m4, manifest_.scan_pq_bits);
+    }
+    // Scratch for query residual (local_pq).
+    std::vector<float> query_residual(is_local_pq ? manifest_.dim : 0);
+
+    // --- scalar_lloydmax scan: decode-dot over flat packed nibbles ---
+    // Separate from the FastScan loop: codes are count × code_size bytes laid
+    // out sequentially (no block interleaving). For each vector we decode and
+    // compute the exact quantized distance (no LUT approximation).
+    if (is_scalar_lm) {
+        const uint32_t K = scalar_lm_quantizer_->K();
+        const uint32_t cs = scalar_lm_quantizer_->code_size();
+        const uint32_t dim = manifest_.dim;
+
+        // Build int8 query for fast I8MM scan.
+        std::vector<int8_t> query_i8(dim);
+        float query_i8_scale;
+        scalar_lm_quantizer_->build_query_i8(query, query_i8.data(),
+                                              &query_i8_scale);
+
+        // Scratch for full decode (L2sq rerank).
+        std::vector<float> decoded(dim);
+
+        for (const auto& cand : candidates) {
+            if (cand.page == kInvalidPage) continue;
+            const uint8_t* leaf_ptr = mmap_base_ +
+                static_cast<uint64_t>(cand.page) * kPageSize;
+            const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+            const uint32_t count = lh->count;
+            if (count == 0) continue;
+
+            const uint8_t* codes = leaf_ptr +
+                leaf_codes_offset(manifest_.summary_size);
+            const RowId* row_ids = reinterpret_cast<const RowId*>(
+                codes + static_cast<uint64_t>(count) * cs);
+
+            // Scan: process vectors sequentially. For IP, higher dot = closer.
+            // Use float decode-dot (NEON FMA) — faster than I8MM on this
+            // data because the I8MM kernel has per-dim lookup overhead.
+            // Batch 4 vectors to amortize query loads.
+            const float* levels = scalar_lm_quantizer_->levels();
+            const uint32_t d4 = dim / 4 * 4;  // dim rounded down to multiple of 4
+            uint32_t i = 0;
+            for (; i + 3 < count; i += 4) {
+                // Process 4 vectors, accumulating 4 float dots.
+                float dots[4] = {0, 0, 0, 0};
+                const uint8_t* cp[4] = {
+                    codes + (uint64_t)(i)   * cs,
+                    codes + (uint64_t)(i+1) * cs,
+                    codes + (uint64_t)(i+2) * cs,
+                    codes + (uint64_t)(i+3) * cs,
+                };
+                for (uint32_t d = 0; d < d4; d += 4) {
+                    float q4[4] = {query[d], query[d+1], query[d+2], query[d+3]};
+                    for (uint32_t v = 0; v < 4; ++v) {
+                        uint8_t b0 = cp[v][d/2], b1 = cp[v][d/2+1];
+                        dots[v] += q4[0]*levels[d*K+(b0&0xF)]
+                                 + q4[1]*levels[(d+1)*K+((b0>>4)&0xF)]
+                                 + q4[2]*levels[(d+2)*K+(b1&0xF)]
+                                 + q4[3]*levels[(d+3)*K+((b1>>4)&0xF)];
+                    }
+                }
+                // Handle tail dims (dim not multiple of 4)
+                for (uint32_t d = d4; d < dim; ++d) {
+                    for (uint32_t v = 0; v < 4; ++v) {
+                        uint8_t byte = cp[v][d/2];
+                        uint8_t nib = (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+                        dots[v] += query[d] * levels[d*K + nib];
+                    }
+                }
+                // Heap push
+                for (uint32_t v = 0; v < 4; ++v) {
+                    float dist = -dots[v];
+                    uint32_t dist_bits;
+                    std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
+                    uint32_t pq_dist = (dist_bits & 0x80000000u)
+                        ? ~dist_bits : (dist_bits | 0x80000000u);
+                    if (heap.size() < W) {
+                        heap.push_back({pq_dist, row_ids[i+v], leaf_ptr, i+v});
+                        if (heap.size() == W)
+                            std::make_heap(heap.begin(), heap.end(), heap_less);
+                    } else if (pq_dist < heap[0].pq_dist) {
+                        heap_replace(pq_dist, row_ids[i+v], leaf_ptr, i+v);
+                    }
+                }
+            }
+            // Tail vector (count not multiple of 4)
+            for (; i < count; ++i) {
+                const uint8_t* code_ptr = codes + (uint64_t)i * cs;
+                float dot = 0;
+                for (uint32_t d = 0; d < d4; d += 4) {
+                    uint8_t b0 = code_ptr[d/2], b1 = code_ptr[d/2+1];
+                    dot += query[d]*levels[d*K+(b0&0xF)]
+                         + query[d+1]*levels[(d+1)*K+((b0>>4)&0xF)]
+                         + query[d+2]*levels[(d+2)*K+(b1&0xF)]
+                         + query[d+3]*levels[(d+3)*K+((b1>>4)&0xF)];
+                }
+                for (uint32_t d = d4; d < dim; ++d) {
+                    uint8_t byte = code_ptr[d/2];
+                    uint8_t nib = (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+                    dot += query[d] * levels[d*K + nib];
+                }
+                float dist = -dot;
+                uint32_t dist_bits;
+                std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
+                uint32_t pq_dist = (dist_bits & 0x80000000u)
+                    ? ~dist_bits : (dist_bits | 0x80000000u);
+                if (heap.size() < W) {
+                    heap.push_back({pq_dist, row_ids[i], leaf_ptr, i});
+                    if (heap.size() == W)
+                        std::make_heap(heap.begin(), heap.end(), heap_less);
+                } else if (pq_dist < heap[0].pq_dist) {
+                    heap_replace(pq_dist, row_ids[i], leaf_ptr, i);
+                }
+            }
+        }
+    } else {  // FastScan scan loop (pq / prq / local_pq)
     for (const auto& cand : candidates) {
         if (cand.page == kInvalidPage) continue;
         const uint8_t* leaf_ptr = mmap_base_ +
@@ -2534,10 +2834,48 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         if (count == 0) continue;
 
         const uint32_t n_blocks = (count + codes_per_block - 1) / codes_per_block;
-        const uint8_t* codes = leaf_ptr + leaf_codes_offset(manifest_.summary_size);
-        const RowId* row_ids = reinterpret_cast<const RowId*>(
-            leaf_ptr + leaf_rowids_offset(manifest_.summary_size,
-                                          n_blocks, block_bytes));
+
+        // Dispatch by leaf state.
+        const uint8_t leaf_state = lh->leaf_state;
+        const bool is_coded_local = (leaf_state ==
+            static_cast<uint8_t>(LeafState::CodedLocal));
+
+        const uint8_t* codes;
+        const RowId* row_ids;
+        const uint8_t* lut_ptr;  // which LUT to use for this leaf
+
+        if (is_coded_local) {
+            // Read FP32 centroid + local codebook, build per-leaf LUT.
+            const float* centroid = reinterpret_cast<const float*>(
+                leaf_ptr + lh->centroid_offset);
+            for (uint32_t d = 0; d < manifest_.dim; ++d)
+                query_residual[d] = query[d] - centroid[d];
+            const float* codebook = reinterpret_cast<const float*>(
+                leaf_ptr + lh->codebook_offset);
+            leaf_quant->set_codebook_data(codebook);
+            if (scan_8bit) {
+                leaf_quant->build_fastscan_lut(query_residual.data(),
+                    local_lut8.data(), &local_lut_scale, &local_lut_offset);
+                lut_ptr = local_lut8.data();
+            } else {
+                leaf_quant->build_fastscan_lut4(query_residual.data(),
+                    local_lut4.data(), nullptr);
+                lut_ptr = local_lut4.data();
+            }
+            codes = leaf_ptr + local_codes_offset(manifest_.summary_size,
+                manifest_.dim, manifest_.m4, manifest_.scan_pq_bits);
+            row_ids = reinterpret_cast<const RowId*>(
+                leaf_ptr + local_rowids_offset(manifest_.summary_size,
+                    manifest_.dim, manifest_.m4, manifest_.scan_pq_bits,
+                    n_blocks, block_bytes));
+        } else {
+            // Legacy global-PQ path.
+            codes = leaf_ptr + leaf_codes_offset(manifest_.summary_size);
+            row_ids = reinterpret_cast<const RowId*>(
+                leaf_ptr + leaf_rowids_offset(manifest_.summary_size,
+                                              n_blocks, block_bytes));
+            lut_ptr = scan_8bit ? lut8.data() : lut4.data();
+        }
 
         // Phase D: filter columns are evaluated AFTER heap selection, not during
         // scan. No col_views parsing needed here.
@@ -2560,7 +2898,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
             if (scan_8bit) {
                 uint32_t out[16];
-                simd::fastscan_block16(blk, lut8.data(), m,
+                simd::fastscan_block16(blk, lut_ptr, m,
                                         static_cast<uint16_t>(valid_mask), out);
                 const uint32_t base = b * 16;
                 if (heap.size() < W) {
@@ -2586,7 +2924,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 }
             } else {
                 uint32_t out[32];
-                simd::pq4_block32(blk, lut4.data(), m, out);
+                simd::pq4_block32(blk, lut_ptr, m, out);
                 const uint32_t base = b * 32;
 
                 if (heap.size() < W) {
@@ -2616,6 +2954,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             }
         }
     }
+    }  // end FastScan scan loop (else of is_scalar_lm)
 
     // --- Extract top-k from the heap ---
     std::vector<Candidate> results;
@@ -2675,23 +3014,78 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         // distance fixes the PQ-approximation error and substantially
         // improves recall@k. Per-query serial (W≈300 is cheap; the CLI
         // parallelizes across queries).
-        const uint32_t code_sz = quantizer_->code_size();
+        const uint32_t code_sz = (is_local_pq || is_scalar_lm)
+            ? (static_cast<uint32_t>(manifest_.m4) * manifest_.scan_pq_bits + 7) / 8
+            : quantizer_->code_size();
         std::vector<uint8_t> code_buf(code_sz);
         std::vector<float> decoded_vec(manifest_.dim);
+        // Cache the last leaf's local codebook to avoid re-reading per entry.
+        const uint8_t* rerank_last_leaf = nullptr;
+
+        // scalar_lloydmax rerank uses float-precision decode-dot (no full
+        // decode into a vector).
+        const float* slm_levels = is_scalar_lm
+            ? scalar_lm_quantizer_->levels() : nullptr;
+        const uint32_t slm_K = is_scalar_lm ? scalar_lm_quantizer_->K() : 0;
+        const uint32_t slm_cs = is_scalar_lm
+            ? scalar_lm_quantizer_->code_size() : 0;
 
         for (const auto& entry : heap) {
-            // extract_code_from_leaf fully writes every code byte for both
-            // 4-bit (both nibbles of each byte) and 8-bit (one byte/segment)
-            // layouts, so no prior zeroing of code_buf is needed.
-            extract_code_from_leaf(entry.leaf_ptr, entry.local_idx,
-                                   manifest_.summary_size, manifest_.m4,
-                                   manifest_.scan_pq_bits, codes_per_block,
-                                   block_bytes, code_buf.data());
-            quantizer_->decode_code(code_buf.data(), decoded_vec.data());
-            const float exact_dist =
-                (metric == MetricKind::InnerProduct)
-                    ? -simd::dot_f32(query, decoded_vec.data(), manifest_.dim)
-                    :  simd::l2sq_f32(query, decoded_vec.data(), manifest_.dim);
+            const auto* elh = reinterpret_cast<const TreeLeafHeader*>(entry.leaf_ptr);
+            const bool entry_local = (elh->leaf_state ==
+                static_cast<uint8_t>(LeafState::CodedLocal));
+
+            float exact_dist;
+            if (is_scalar_lm) {
+                // Flat packed-nibble layout: code at codes_off + idx * cs.
+                const uint8_t* code_ptr = entry.leaf_ptr +
+                    leaf_codes_offset(manifest_.summary_size) +
+                    static_cast<uint64_t>(entry.local_idx) * slm_cs;
+                if (metric == MetricKind::InnerProduct) {
+                    const float dot = simd::scalar_dot_u4_float(
+                        query, slm_levels, code_ptr, manifest_.dim, slm_K);
+                    exact_dist = -dot;
+                } else {
+                    scalar_lm_quantizer_->decode(code_ptr, decoded_vec.data());
+                    exact_dist = simd::l2sq_f32(query, decoded_vec.data(),
+                                                manifest_.dim);
+                }
+            } else if (entry_local) {
+                // Local-PQ rerank: load codebook once per leaf, decode
+                // residual, add centroid.
+                if (entry.leaf_ptr != rerank_last_leaf) {
+                    rerank_last_leaf = entry.leaf_ptr;
+                    const float* codebook = reinterpret_cast<const float*>(
+                        entry.leaf_ptr + elh->codebook_offset);
+                    leaf_quant->set_codebook_data(codebook);
+                }
+                const uint64_t codes_off = local_codes_offset(
+                    manifest_.summary_size, manifest_.dim,
+                    manifest_.m4, manifest_.scan_pq_bits);
+                extract_code_from_leaf(entry.leaf_ptr, entry.local_idx,
+                                       manifest_.summary_size, manifest_.m4,
+                                       manifest_.scan_pq_bits, codes_per_block,
+                                       block_bytes, code_buf.data(), codes_off);
+                leaf_quant->decode_code(code_buf.data(), decoded_vec.data());
+                // reconstruction = centroid + decoded_residual
+                const float* centroid = reinterpret_cast<const float*>(
+                    entry.leaf_ptr + elh->centroid_offset);
+                for (uint32_t d = 0; d < manifest_.dim; ++d)
+                    decoded_vec[d] += centroid[d];
+            } else {
+                // Global-PQ rerank (legacy path).
+                extract_code_from_leaf(entry.leaf_ptr, entry.local_idx,
+                                       manifest_.summary_size, manifest_.m4,
+                                       manifest_.scan_pq_bits, codes_per_block,
+                                       block_bytes, code_buf.data());
+                quantizer_->decode_code(code_buf.data(), decoded_vec.data());
+            }
+            if (!is_scalar_lm) {
+                exact_dist =
+                    (metric == MetricKind::InnerProduct)
+                        ? -simd::dot_f32(query, decoded_vec.data(), manifest_.dim)
+                        :  simd::l2sq_f32(query, decoded_vec.data(), manifest_.dim);
+            }
             if (want_locs) {
                 results_loc.push_back({{entry.row_id, exact_dist},
                                         entry.leaf_ptr, entry.local_idx});
@@ -2874,6 +3268,18 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
     const std::vector<uint32_t>& geo_lng_col_indices,
     std::vector<std::pair<const uint8_t*, uint32_t>>* /*payload_locs*/) const {
 
+    const bool is_local_pq = (manifest_.quantizer_type == "local_pq");
+    const bool is_scalar_lm =
+        (manifest_.quantizer_type == "scalar_lloydmax");
+    // Brute-force filtered search for local_pq / scalar_lloydmax is not yet
+    // implemented. This path is only triggered at extreme low selectivity
+    // (<1%) with filter columns — not needed for the initial benchmark.
+    if (is_local_pq || is_scalar_lm) {
+        spdlog::warn("[sextant] brute-force filtered search not yet supported "
+                     "for {}; returning empty results",
+                     manifest_.quantizer_type);
+        return {};
+    }
     const MetricKind metric = quantizer_->metric();
     const uint32_t code_sz = quantizer_->code_size();
     const uint32_t summary_size = manifest_.summary_size;
@@ -3348,6 +3754,11 @@ void IVFTreeIndex::commit_mutable_(PageAllocator& alloc) {
 // ===========================================================================
 
 uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
+    if (!quantizer_) {
+        throw Error(ErrorCode::NotImplemented,
+            "split_leaf_ not supported for quantizer '" +
+            manifest_.quantizer_type + "' (requires global PQ/PRQ codebook)");
+    }
     const uint16_t dim = manifest_.dim;
     const uint16_t m4 = manifest_.m4;
     const uint8_t pq_bits = manifest_.scan_pq_bits;
@@ -3767,6 +4178,11 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
     if (points.empty()) return;
     const auto t0 = std::chrono::steady_clock::now();
 
+    if (!quantizer_) {
+        throw Error(ErrorCode::NotImplemented,
+            "insert_batch not supported for quantizer '" +
+            manifest_.quantizer_type + "' (requires global PQ/PRQ codebook)");
+    }
     const uint16_t m4 = manifest_.m4;
     const uint8_t pq_bits = manifest_.scan_pq_bits;
     const uint32_t summary_size = manifest_.summary_size;
@@ -4204,6 +4620,11 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
     if (row_ids.empty()) return;
     const auto t0 = std::chrono::steady_clock::now();
 
+    if (!quantizer_) {
+        throw Error(ErrorCode::NotImplemented,
+            "delete_batch not supported for quantizer '" +
+            manifest_.quantizer_type + "' (requires global PQ/PRQ codebook)");
+    }
     const uint16_t m4 = manifest_.m4;
     const uint8_t pq_bits = manifest_.scan_pq_bits;
     const uint32_t summary_size = manifest_.summary_size;

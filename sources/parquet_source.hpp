@@ -30,6 +30,7 @@ struct ParquetSourceConfig {
     bool use_mmap = true;
     bool verify_checksums = false;  // off by default — CRC is pure waste for builds
     int32_t num_threads = 0;
+    bool normalize = false;         // L2-normalize each vector row (for cosine/IP)
 };
 
 /// RAII wrappers for carquet C handles.
@@ -80,6 +81,7 @@ public:
 
 private:
     void init_schema_();
+    void detect_list_dim_();
     void materialize_batch_(carquet_row_batch_t* batch);
 
     std::string path_;
@@ -93,6 +95,7 @@ private:
     uint64_t count_ = 0;
     int32_t num_file_cols_ = 0;
     uint64_t cursor_ = 0;
+    bool vec_is_list_ = false;  // vector column is list<float> (repeated FLOAT)
 
     Schema schema_;
     int32_t vec_col_idx_ = -1;

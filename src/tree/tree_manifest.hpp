@@ -27,6 +27,7 @@ struct TreeManifest {
     uint8_t  scan_pq_bits = 4;   // bits per PQ code (4 or 8)
     std::string quantizer_type = "pq";
     uint32_t prq_nsplits = 0;
+    uint8_t  metric = 0;           // MetricKind as uint8_t (0=L2Sq, 1=InnerProduct)
 
     // [tree]
     uint16_t depth = 0;

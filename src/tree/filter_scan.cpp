@@ -47,6 +47,7 @@ std::vector<ColumnView> parse_filter_columns(const uint8_t* filter_base,
         views[c].fixed_width = column_type_width(col.type);
         views[c].fixed_base = p;
         p += static_cast<uint64_t>(count) * views[c].fixed_width;
+        p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
     }
 
     // Pass 2: string columns (in schema order).
@@ -67,6 +68,7 @@ std::vector<ColumnView> parse_filter_columns(const uint8_t* filter_base,
             const uint16_t last_len = views[c].str_lengths[count - 1];
             p += last_off + last_len;
         }
+        p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
     }
 
     // Pass 3: set columns (in schema order).
@@ -105,6 +107,7 @@ std::vector<ColumnView> parse_filter_columns(const uint8_t* filter_base,
             }
             p += data_bytes;
         }
+        p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
     }
 
     return views;

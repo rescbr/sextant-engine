@@ -35,6 +35,7 @@
 #include <vector>
 
 namespace sextant { class PqQuantizer; }
+namespace sextant { class ScalarLloydMaxQuantizer; }
 
 namespace sextant::tree {
 
@@ -142,6 +143,15 @@ public:
     const std::string& quantizer_type() const { return manifest_.quantizer_type; }
     const PqQuantizer& quantizer() const { return *quantizer_; }
 
+    /// Safe metric accessor: works even when quantizer_ is null (local_pq).
+    /// Uses the manifest's metric field (stored for all trees).
+    MetricKind metric() const {
+        return static_cast<MetricKind>(manifest_.metric);
+    }
+
+    /// True when this index uses per-leaf codebooks (no global codebook).
+    bool is_local_pq() const { return manifest_.quantizer_type == "local_pq"; }
+
     /// Global cardinality table (Phase D). Empty when no filter columns were
     /// present at build time. Used for predicate selectivity estimation.
     const CardinalityTable& cardinality() const { return card_table_; }
@@ -237,6 +247,7 @@ private:
     TreeManifest manifest_;
     CardinalityTable card_table_;  // per-value frequencies for selectivity (Phase D)
     std::unique_ptr<PqQuantizer> quantizer_;
+    std::unique_ptr<ScalarLloydMaxQuantizer> scalar_lm_quantizer_;
 
     // --- Leaf extent table (indirection: leaf_id → page+pages) ---
     // Loaded at open() from the leaf_table blob. Empty when the tree was

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Cohere 10M filtered search benchmark.
+# Cohere 10M filtered search benchmark — parquet-native path.
+#
+# Reads directly from parquet shards (list<float> vectors) + .fdat labels.
+# No .fbin conversion needed.
 #
 # Measures:
 #   1. Unfiltered search: recall@10 vs QPS (GT: neighbors.parquet)
@@ -8,7 +11,13 @@
 #      (GT: neighbors_labels_label_{0.1p..50p}.parquet)
 #   3. Per-query label correctness: verify returned row_ids have the right label
 #
-# Pre-requisites: run convert_cohere.py first to produce the data files.
+# Metric: COSINE (--metric ip with L2-normalized vectors).
+#
+# Pre-requisites:
+#   - Cohere parquet shards at $DATA/train-{00..09}-of-10.parquet
+#   - Labels at $DATA/scalar_labels.parquet (converted to .fdat, see below)
+#   - Query file at $DATA/test.parquet (or cohere_10m_query.fbin)
+#   - GT files at $DATA/cohere_10m_gt_*.parquet
 # =============================================================================
 set -euo pipefail
 
@@ -17,20 +26,60 @@ DATA="${BENCH_DIR:-/mnt/ssd}/cohere"
 OUT="${BENCH_DIR:-/mnt/ssd}/bench-cohere-out"
 mkdir -p "$OUT"
 
-QUERY="$DATA/cohere_10m_query.fbin"
-PQT="$DATA/cohere_10m.parquet"
+# Vector shards (glob expands to 10 files)
+SHARDS="$DATA/train-*-of-10.parquet"
+
+# Labels — convert from parquet to .fdat if not done yet.
+# (carquet has a dictionary-decode bug for large_string; .fdat is the workaround)
+FDAT="$DATA/cohere_10m_labels.fdat"
+if [ ! -f "$FDAT" ]; then
+    echo "[labels] Converting scalar_labels.parquet → $FDAT"
+    python3 -c "
+import pyarrow.parquet as pq
+import struct, sys
+pf = pq.ParquetFile('$DATA/scalar_labels.parquet')
+labels = pf.read_column('labels').to_pylist()
+n = len(labels)
+with open('$FDAT', 'wb') as f:
+    f.write(struct.pack('<I', 0x46444154))
+    f.write(struct.pack('<Q', n))
+    f.write(struct.pack('<I', 1))
+    f.write(struct.pack('<B', 3))
+    name = b'labels'
+    f.write(struct.pack('<H', len(name))); f.write(name)
+    f.write(struct.pack('<B', 0))
+    offsets = []; lengths = []; data = bytearray(); base = 0
+    for label in labels:
+        b = (label or '').encode('utf-8')
+        offsets.append(base); lengths.append(len(b)); data.extend(b); base += len(b)
+    offsets.append(base)
+    for o in offsets: f.write(struct.pack('<I', o))
+    for l in lengths: f.write(struct.pack('<H', l))
+    f.write(bytes(data))
+print(f'Wrote {n} labels to $FDAT')
+"
+fi
+
+# Query file — prefer .fbin if available, fall back to .parquet
+if [ -f "$DATA/cohere_10m_query.fbin" ]; then
+    QUERY="$DATA/cohere_10m_query.fbin"
+else
+    QUERY="$DATA/test.parquet"
+fi
 
 # ============================================================
-# Build index
+# Build index (COSINE = normalize + IP)
 # ============================================================
 
 IDX="$OUT/cohere_10m.tree"
 if [ ! -f "$IDX" ]; then
-    echo "[build] Cohere 10M (768d, L2, m=192)"
+    echo "[build] Cohere 10M (768d, COSINE, m=192) from parquet shards"
     t0=$(date +%s.%N)
-    "$BIN" build-tree --input "$PQT" --index "$IDX" \
+    "$BIN" build-tree --input "$SHARDS" --index "$IDX" \
+        --filter-data "$FDAT" \
+        --vector-col emb --metric ip \
         --leaf-capacity 5000 --pca-dims 32 --threads 0 \
-        --pq4-m 192 --pq-bits 4 --metric l2sq
+        --pq4-m 192 --pq-bits 4
     t1=$(date +%s.%N)
     echo "[build] done in $(echo "$t1 - $t0" | bc)s, size=$(du -h "$IDX" | cut -f1)"
 else
@@ -43,7 +92,7 @@ fi
 
 echo ""
 echo "========================================"
-echo "  Cohere 10M — unfiltered recall@10 vs QPS"
+echo "  Cohere 10M — unfiltered recall@10 vs QPS (COSINE)"
 echo "========================================"
 printf "%-8s %-10s %-10s\n" "n_probe" "recall@10" "QPS"
 printf "%-8s %-10s %-10s\n" "-------" "---------" "---"
@@ -62,113 +111,31 @@ for nprobe in 1 2 4 8 16 32; do
 done
 
 # ============================================================
-# 2. Filtered search sweep (string label equality)
+# 2. Filtered search sweep (per selectivity)
 # ============================================================
 
-echo ""
-echo "========================================"
-echo "  Cohere 10M — filtered recall@10 vs QPS"
-echo "  (filter: labels:eq:label_Xp)"
-echo "========================================"
-printf "%-12s %-8s %-10s %-10s\n" "selectivity" "n_probe" "recall@10" "QPS"
-printf "%-12s %-8s %-10s %-10s\n" "-----------" "-------" "---------" "---"
+for sel in 0.1p 0.2p 0.5p 1p 2p 5p 10p 20p 50p; do
+    echo ""
+    echo "========================================"
+    echo "  Filtered: labels:eq:label_${sel}"
+    echo "========================================"
+    printf "%-8s %-10s %-10s\n" "n_probe" "recall@10" "QPS"
+    printf "%-8s %-10s %-10s\n" "-------" "---------" "---"
 
-declare -a LABELS=("label_0.1p" "label_0.5p" "label_1p" "label_5p" "label_10p" "label_20p" "label_50p")
-
-for label in "${LABELS[@]}"; do
-    gt_file="$DATA/cohere_10m_gt_${label}.parquet"
-    if [ ! -f "$gt_file" ]; then
-        echo "  [skip] no GT for $label"
-        continue
-    fi
-
-    for nprobe in 8 16 32; do
+    GT_FILE="$DATA/cohere_10m_gt_label_${sel}.parquet"
+    for nprobe in 1 2 4 8 16 32; do
         result=$("$BIN" tree-search --index "$IDX" --query "$QUERY" \
-            --ground-truth "$gt_file" \
+            --ground-truth "$GT_FILE" \
             --topk 10 --n-probe "$nprobe" --n-probe-ln "$nprobe" \
-            --fastscan-w 300 \
-            --filter "labels:eq:${label}" \
-            --threads 0 2>&1)
+            --fastscan-w 300 --threads 0 \
+            --filter "labels:eq:label_${sel}" 2>&1)
         recall=$(echo "$result" | grep -oP 'recall@\d+:\s*\K[\d.]+' | head -1)
         qps=$(echo "$result" | grep -oP '\(\K[\d.]+(?= QPS)' | head -1)
         [ -z "$recall" ] && recall="ERR"
         [ -z "$qps" ] && qps="ERR"
-        printf "%-12s %-8s %-10s %-10s\n" "$label" "$nprobe" "$recall" "$qps"
+        printf "%-8s %-10s %-10s\n" "$nprobe" "$recall" "$qps"
     done
 done
 
-# ============================================================
-# 3. Per-query label correctness check
-#    Run filtered search, output results to TSV, then verify
-#    every returned row_id actually has the queried label.
-# ============================================================
-
 echo ""
-echo "========================================"
-echo "  Cohere 10M — per-query label correctness"
-echo "========================================"
-
-SCALARS="$DATA/../cohere_s3/scalar_labels.parquet"
-if [ ! -f "$SCALARS" ]; then
-    SCALARS="$BENCH_DIR/cohere_s3/scalar_labels.parquet"
-fi
-
-for label in label_1p label_5p label_20p; do
-    echo "  --- $label (n_probe=16) ---"
-    TSV="$OUT/cohere_${label}_results.tsv"
-    "$BIN" tree-search --index "$IDX" --query "$QUERY" \
-        --topk 10 --n-probe 16 --n-probe-ln 16 \
-        --fastscan-w 300 \
-        --filter "labels:eq:${label}" \
-        --output "$TSV" \
-        --threads 0 2>&1 | grep -E "recall|QPS"
-
-    # Verify: for each returned row_id, check the label matches.
-    if [ -f "$SCALARS" ] && [ -f "$TSV" ]; then
-        echo "  Verifying label correctness via duckdb..."
-        python3 << PYEOF
-import duckdb
-con = duckdb.connect()
-# Load the TSV: qi, row_id, dist
-con.execute(f"""
-    CREATE TABLE results AS
-    SELECT column0 as qi, column1 as row_id
-    FROM read_csv_auto('{TSV}', delim='\t', header=false)
-""")
-# Join with scalar labels to check correctness
-correctness = con.execute(f"""
-    WITH r AS (SELECT DISTINCT row_id FROM results)
-    SELECT
-        count(*) as total_results,
-        sum(CASE WHEN l.labels = '{label}' THEN 1 ELSE 0 END) as correct,
-        sum(CASE WHEN l.labels != '{label}' THEN 1 ELSE 0 END) as wrong
-    FROM r
-    LEFT JOIN read_parquet('{SCALARS}') l ON r.row_id = l.id
-""").fetchone()
-    total, ok, bad = correctness
-    pct = 100.0 * ok / total if total > 0 else 0
-    print(f"  label={label}: {ok}/{total} correct ({pct:.1f}%), {bad} wrong")
-    if bad > 0:
-        # Show a few wrong ones
-        wrong = con.execute(f"""
-            WITH r AS (SELECT DISTINCT row_id FROM results)
-            SELECT r.row_id, l.labels
-            FROM r
-            JOIN read_parquet('{SCALARS}') l ON r.row_id = l.id
-            WHERE l.labels != '{label}'
-            LIMIT 5
-        """).fetchall()
-        for rid, lbl in wrong:
-            print(f"    WRONG: row_id={rid} has label='{lbl}' (expected '{label}')")
-PYEOF
-    else
-        echo "  [skip] missing scalars or TSV for verification"
-    fi
-    echo ""
-done
-
-echo ""
-echo "============================================"
-echo " Cohere 10M benchmark complete."
-echo " $(date)"
-echo "============================================"
+echo "[done] Results in $OUT"

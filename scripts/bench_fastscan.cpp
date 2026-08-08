@@ -51,7 +51,9 @@ int main() {
     // real production quantization, not random bytes.
     std::vector<uint8_t> lut_u8((size_t)M * K);
     float A, B;
-    simd::quantize_lut_u8(lut_f32.data(), M, K, lut_u8.data(), &A, &B);
+    std::vector<float> seg_min(M);
+    simd::quantize_lut_u8_scaled(lut_f32.data(), M, K, lut_u8.data(), &A, &B,
+                                  seg_min.data());
 
     // Codes in three layouts:
     //   - contiguous [N][m]   for (A) batch4 and (B) batch16 (scalar gather).

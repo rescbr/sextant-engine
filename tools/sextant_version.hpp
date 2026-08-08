@@ -22,6 +22,8 @@ inline std::string version_string(std::string_view prog) {
     if (SEXTANT_GIT_DIRTY) {
         s += ", dirty";
     }
+    s += ", ";
+    s += SEXTANT_SIMD_TARGET;
     s += ')';
     return s;
 }

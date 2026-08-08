@@ -44,6 +44,7 @@ std::string manifest_to_toml(const TreeManifest& m) {
     index->insert("scan_pq_bits", static_cast<uint64_t>(m.scan_pq_bits));
     index->insert("quantizer_type", m.quantizer_type);
     index->insert("prq_nsplits", m.prq_nsplits);
+    index->insert("metric", static_cast<int64_t>(m.metric));
     root->insert("index", index);
 
     // [tree]
@@ -120,6 +121,9 @@ TreeManifest manifest_from_toml(const std::string& toml) {
     }
     if (auto ns = index->get_as<int64_t>("prq_nsplits")) {
         m.prq_nsplits = static_cast<uint32_t>(*ns);
+    }
+    if (auto mt = index->get_as<int64_t>("metric")) {
+        m.metric = static_cast<uint8_t>(*mt);
     }
 
     // [tree]

@@ -38,10 +38,37 @@ else
     git_sha = 'unknown'
     git_dirty = '0'
 endif
+
+# --- SIMD target detection ---------------------------------------------------
+# Determines which scalar-dot kernel tier is compiled in. Stored as
+# SEXTANT_SIMD_TARGET in version.h alongside the git SHA.
+# Based on compiler-predefined __ARM_FEATURE_* macros (set by -march).
+# On M4: -march=native → neon+i8mm (+ sme via __ARM_FEATURE_SME).
+# On c4a: -march=armv8-a+sve2 → sve2.
+if cpp.compiles('''
+    #ifndef __ARM_FEATURE_SVE
+    #error no sve
+    #endif
+    int main() { return 0; }
+''', args: ['-march=native'])
+    simd_target = 'sve2'
+elif cpp.compiles('''
+    #ifndef __ARM_FEATURE_MATMUL_INT8
+    #error no i8mm
+    #endif
+    int main() { return 0; }
+''', args: ['-march=native'])
+    simd_target = 'neon+i8mm'
+else
+    simd_target = 'neon'
+endif
+message('SIMD target: ' + simd_target)
+
 version_data = configuration_data()
 version_data.set('SEXTANT_VERSION', meson.project_version())
 version_data.set('SEXTANT_GIT_SHA', git_sha)
 version_data.set('SEXTANT_GIT_DIRTY', git_dirty)
+version_data.set('SEXTANT_SIMD_TARGET', simd_target)
 # Generated into the build dir (not committed); included via version_inc below.
 version_h = configure_file(
     input: 'version.h.in',
@@ -169,6 +196,7 @@ engine_sources = [
     'src/quant/pq_quantizer.cpp',
     'src/quant/anisotropic_pq_quantizer.cpp',
     'src/quant/product_residual_quantizer.cpp',
+    'src/quant/scalar_lloydmax_quantizer.cpp',
     'src/algo/vamana_core.cpp',
     'src/engine/resolve_params.cpp',
     'src/engine/index.cpp',
@@ -214,7 +242,8 @@ sources_inc = include_directories('sources')
 
 sextant_sources_lib = static_library('sextant_sources',
     ['sources/fbin_source.cpp', 'sources/mem_source.cpp',
-     'sources/parquet_source.cpp'],
+     'sources/parquet_source.cpp',
+     'sources/parquet_glob_source.cpp'],
     include_directories: [sources_inc, engine_inc, src_inc, third_party_inc],
     dependencies: [sextant_dep, carquet_dep],
     install: false,

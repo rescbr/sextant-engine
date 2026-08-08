@@ -139,8 +139,126 @@ std::string write_test_parquet(const std::string& path, uint32_t n_rows,
 }  // namespace
 
 // ---------------------------------------------------------------------------
+// Helper: write a parquet with list<float> vector column
+// ---------------------------------------------------------------------------
+
+std::string write_list_float_parquet(const std::string& path, uint32_t n_rows,
+                                      uint32_t dim) {
+    carquet_error_t err = {};
+
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    if (!schema) throw sextant::Error(sextant::ErrorCode::IoError, "schema create");
+
+    // emb: list<float> (OPTIONAL container, OPTIONAL element)
+    if (carquet_schema_add_list(schema, "emb", CARQUET_PHYSICAL_FLOAT,
+                                nullptr, CARQUET_REPETITION_OPTIONAL, 0, 0) < 0) {
+        carquet_schema_free(schema);
+        throw sextant::Error(sextant::ErrorCode::IoError, "add list col failed");
+    }
+
+    carquet_writer_options_t wopts;
+    carquet_writer_options_init(&wopts);
+    wopts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
+
+    carquet_writer_t* writer =
+        carquet_writer_create(path.c_str(), schema, &wopts, &err);
+    if (!writer) {
+        carquet_schema_free(schema);
+        throw sextant::Error(sextant::ErrorCode::IoError, "writer create");
+    }
+
+    // Generate vector data: each row is dim floats.
+    std::vector<float> vecs(n_rows * dim);
+    for (uint32_t i = 0; i < n_rows; ++i)
+        for (uint32_t d = 0; d < dim; ++d)
+            vecs[i * dim + d] = static_cast<float>(i * 100 + d);
+
+    // Offsets: n_rows+1 entries, each list has exactly dim elements.
+    std::vector<int32_t> offsets(n_rows + 1);
+    for (uint32_t i = 0; i <= n_rows; ++i)
+        offsets[i] = static_cast<int32_t>(i * dim);
+
+    // The leaf column index is 0 (first and only leaf).
+    carquet_status_t ws = carquet_writer_write_list_column(writer, 0,
+            static_cast<int64_t>(n_rows), offsets.data(),
+            nullptr,  // list_validity: all present
+            vecs.data(), nullptr,  // values + value_validity: all present
+            &err);
+    if (ws != CARQUET_OK) {
+        (void)carquet_writer_close(writer);
+        carquet_schema_free(schema);
+        throw sextant::Error(sextant::ErrorCode::IoError,
+                             std::string("write list col: ") + carquet_status_string(ws));
+    }
+
+    carquet_status_t status = carquet_writer_close(writer);
+    carquet_schema_free(schema);
+    if (status != CARQUET_OK) {
+        throw sextant::Error(sextant::ErrorCode::IoError,
+                             "writer close failed");
+    }
+    return path;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+TEST(ParquetSourceTest, ReadsListFloatVectors) {
+    TempFile tmp(".parquet");
+    constexpr uint32_t kN = 100;
+    constexpr uint32_t kDim = 16;
+    write_list_float_parquet(tmp.path(), kN, kDim);
+
+    sextant::ParquetSourceConfig cfg;
+    cfg.vector_col = "emb";
+    sextant::ParquetSource src(tmp.path(), cfg);
+    EXPECT_EQ(src.dim(), kDim);
+    EXPECT_EQ(src.count(), kN);
+
+    // Read all vectors
+    src.reset();
+    sextant::Chunk chunk;
+    uint32_t total = 0;
+    while (src.next(chunk)) {
+        for (uint32_t i = 0; i < chunk.count; ++i) {
+            for (uint32_t d = 0; d < kDim; ++d) {
+                float expected = static_cast<float>(
+                    (total + i) * 100 + d);
+                EXPECT_FLOAT_EQ(chunk.vectors[i * kDim + d], expected);
+            }
+        }
+        total += chunk.count;
+    }
+    EXPECT_EQ(total, kN);
+}
+
+TEST(ParquetSourceTest, NormalizeFlagProducesUnitVectors) {
+    TempFile tmp(".parquet");
+    constexpr uint32_t kN = 50;
+    constexpr uint32_t kDim = 8;
+    write_list_float_parquet(tmp.path(), kN, kDim);
+
+    sextant::ParquetSourceConfig cfg;
+    cfg.vector_col = "emb";
+    cfg.normalize = true;
+    sextant::ParquetSource src(tmp.path(), cfg);
+
+    src.reset();
+    sextant::Chunk chunk;
+    ASSERT_TRUE(src.next(chunk));
+    ASSERT_GT(chunk.count, 0u);
+
+    // Each vector should have norm ≈ 1.0
+    for (uint32_t i = 0; i < chunk.count; ++i) {
+        float norm_sq = 0.0f;
+        for (uint32_t d = 0; d < kDim; ++d) {
+            float v = chunk.vectors[i * kDim + d];
+            norm_sq += v * v;
+        }
+        EXPECT_NEAR(norm_sq, 1.0f, 1e-4f);
+    }
+}
 
 TEST(ParquetSourceTest, OpensAndReadsBasicMetadata) {
     TempFile tmp(".parquet");

@@ -79,6 +79,18 @@ public:
     float anisotropy_lambda() const { return anisotropy_lambda_; }
     bool anisotropic() const { return anisotropic_; }
 
+    /// Set the codebook directly from raw data (bypasses train()).
+    /// Used by the local-PQ search path: each leaf stores its own codebook,
+    /// and the search creates a lightweight PqQuantizer per probed leaf to
+    /// build the FastScan LUT from the leaf's codebook + a query residual.
+    /// `cb_data` is m × K × sub_dim floats (row-major), same layout as
+    /// codebook(). Recomputes centroid_sqnorms_ internally.
+    void set_codebook_data(const float* cb_data) {
+        const size_t total = static_cast<size_t>(m_) * K_ * sub_dim_;
+        codebook_.assign(cb_data, cb_data + total);
+        compute_centroid_sqnorms_();
+    }
+
     /// Request OPQ (PCA rotation) training. Must be called BEFORE train():
     /// train() computes the d×d PCA rotation from the training-sample
     /// covariance and applies it to the sample before PQ k-means. The
@@ -127,7 +139,7 @@ public:
     /// Build the uint8-quantized FastScan LUT for a query. Same per-segment
     /// distances as `preprocess_query` (under the configured metric_), but
     /// quantized to uint8 with a per-query-global (A, B) scale
-    /// (`simd::quantize_lut_u8` — FAISS `NormTableScaler` approach).
+    /// (`simd::quantize_lut_u8_scaled` — FAISS `NormTableScaler` approach).
     ///
     /// Caller buffers (must be sized before the call):
     ///   - `lut8`: m × K bytes (use `fastscan_lut_bytes()`).

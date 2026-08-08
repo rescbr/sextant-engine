@@ -111,8 +111,14 @@ struct ChildEntry {
 static_assert(sizeof(ChildEntry) == 24);
 
 /// Compute the byte size of a child entry (including inline centroid + summary).
+/// Rounded up to 8-byte alignment so that every ChildEntry in the packed array
+/// starts at an address that satisfies alignof(ChildEntry). Without this,
+/// variable-length summaries (e.g. bloom filters with odd byte counts) would
+/// misalign subsequent entries, causing UB on reinterpret_cast access.
 inline uint32_t child_entry_size(uint16_t dim, uint32_t summary_size) {
-    return sizeof(ChildEntry) + dim * sizeof(float16_t) + summary_size;
+    const uint32_t raw = sizeof(ChildEntry) + dim * sizeof(float16_t) + summary_size;
+    constexpr uint32_t align = alignof(ChildEntry);  // 8
+    return (raw + align - 1) & ~(align - 1);
 }
 
 /// Compute the total byte size of an internal node extent.
@@ -153,9 +159,24 @@ struct TreeLeafHeader {
     uint32_t payload_extent_pages;   // 0 if no payload
     uint8_t  summary_dirty;          // 1 = summary needs repair
     PageId   next_dirty;             // next dirty leaf (kInvalidPage = none)
+    // --- Per-leaf residual PQ additions ---
+    /// Leaf state: 0 = CODED (global PQ, legacy), 1 = ACCUMULATING (raw FP32),
+    /// 2 = CODED_LOCAL (local per-leaf codebook).
+    uint8_t  leaf_state = 0;
+    /// Padding to align the following u32 fields.
+    uint8_t  pad1 = 0;
+    uint16_t pad2 = 0;
+    /// Byte offset of the FP32 centroid within the leaf extent (0 = none).
+    /// For CODED_LOCAL leaves: dim × 4 bytes at this offset.
+    uint32_t centroid_offset = 0;
+    /// Byte offset of the local codebook within the leaf extent (0 = none).
+    /// For CODED_LOCAL leaves: m4 × K × sub_dim × 4 bytes at this offset.
+    uint32_t codebook_offset = 0;
+    /// Reserved for future use.
+    uint32_t reserved2 = 0;
     uint32_t header_crc;             // CRC32 of bytes [0 .. offsetof(header_crc))
 };
-static_assert(sizeof(TreeLeafHeader) == 96);
+static_assert(sizeof(TreeLeafHeader) == 112);
 
 /// Byte offset of the filter summary within a leaf (right after the header).
 inline uint32_t leaf_filter_offset() {
@@ -163,8 +184,12 @@ inline uint32_t leaf_filter_offset() {
 }
 
 /// Byte offset of the first FastScan code block within a leaf.
+/// Aligned to 8 bytes so that subsequent row_ids and filter column arrays
+/// (which use reinterpret_cast<const RowId*> etc.) are naturally aligned.
 inline uint64_t leaf_codes_offset(uint32_t summary_size) {
-    return sizeof(TreeLeafHeader) + summary_size;
+    constexpr uint64_t align = 8;
+    const uint64_t raw = sizeof(TreeLeafHeader) + summary_size;
+    return (raw + align - 1) & ~(align - 1);
 }
 
 /// Byte offset of the row_ids array within a leaf.
@@ -191,12 +216,128 @@ inline uint64_t leaf_extent_bytes(uint64_t count, uint16_t m4, uint8_t pq_bits,
 
 /// Number of pages needed for a leaf.
 inline uint64_t leaf_extent_pages(uint64_t count, uint16_t m4, uint8_t pq_bits,
-                                  uint32_t summary_size,
-                                  uint64_t filter_cols_bytes = 0) {
+                                   uint32_t summary_size,
+                                   uint64_t filter_cols_bytes = 0) {
     return static_cast<uint32_t>(
         (leaf_extent_bytes(count, m4, pq_bits, summary_size,
                            filter_cols_bytes) +
          kPageSize - 1) / kPageSize);
+}
+
+// ===========================================================================
+// Per-leaf residual PQ layout (LocalPqTreeIndex)
+// ===========================================================================
+
+/// Leaf state for per-leaf residual PQ trees.
+enum class LeafState : uint8_t {
+    /// Legacy: codes quantized against a global codebook. Used by IVFTreeIndex.
+    Coded = 0,
+    /// Accumulating raw FP32 vectors (count < n_train). Searched by brute force.
+    Accumulating = 1,
+    /// Coded with a local per-leaf codebook + FP32 centroid. Searched via
+    /// FastScan with a per-leaf LUT built from query_residual = query - centroid.
+    CodedLocal = 2,
+};
+
+/// Local-PQ codebook size in bytes: m4 × K × sub_dim × 4.
+/// For PQ4 (K=16, dim=768, m4=192, sub_dim=4): 192 × 16 × 4 × 4 = 49152 bytes.
+inline uint64_t local_codebook_bytes(uint16_t m4, uint16_t dim, uint8_t pq_bits) {
+    const uint32_t K = (pq_bits == 4) ? 16 : 256;
+    const uint32_t sub_dim = dim / m4;
+    return static_cast<uint64_t>(m4) * K * sub_dim * sizeof(float);
+}
+
+/// FP32 centroid size in bytes: dim × 4.
+inline uint64_t local_centroid_bytes(uint16_t dim) {
+    return static_cast<uint64_t>(dim) * sizeof(float);
+}
+
+/// Byte offset of the FP32 centroid in a CodedLocal leaf.
+/// Layout: [header][summary]→[centroid]. Aligned to 16 for NEON.
+inline uint64_t local_centroid_offset(uint32_t summary_size) {
+    constexpr uint64_t align = 16;
+    const uint64_t raw = sizeof(TreeLeafHeader) + summary_size;
+    return (raw + align - 1) & ~(align - 1);
+}
+
+/// Byte offset of the local codebook in a CodedLocal leaf.
+/// Right after the FP32 centroid. Aligned to 16.
+inline uint64_t local_codebook_offset(uint32_t summary_size, uint16_t dim) {
+    constexpr uint64_t align = 16;
+    const uint64_t raw = local_centroid_offset(summary_size) + local_centroid_bytes(dim);
+    return (raw + align - 1) & ~(align - 1);
+}
+
+/// Byte offset of the first FastScan code block in a CodedLocal leaf.
+/// Right after the codebook. Aligned to 8.
+inline uint64_t local_codes_offset(uint32_t summary_size, uint16_t dim,
+                                    uint16_t m4, uint8_t pq_bits) {
+    constexpr uint64_t align = 8;
+    const uint64_t raw = local_codebook_offset(summary_size, dim) +
+                         local_codebook_bytes(m4, dim, pq_bits);
+    return (raw + align - 1) & ~(align - 1);
+}
+
+/// Byte offset of the row_ids array in a CodedLocal leaf.
+inline uint64_t local_rowids_offset(uint32_t summary_size, uint16_t dim,
+                                     uint16_t m4, uint8_t pq_bits,
+                                     uint64_t n_blocks, uint32_t block_bytes) {
+    return local_codes_offset(summary_size, dim, m4, pq_bits) +
+           n_blocks * block_bytes;
+}
+
+/// Total byte size of a CodedLocal leaf extent.
+inline uint64_t local_coded_extent_bytes(uint64_t count, uint16_t dim,
+                                          uint16_t m4, uint8_t pq_bits,
+                                          uint32_t summary_size,
+                                          uint64_t filter_cols_bytes = 0) {
+    const uint32_t cpb = (pq_bits == 4) ? 32 : 16;
+    const uint32_t block_bytes = m4 * 16;
+    const uint32_t n_blocks = (count + cpb - 1) / cpb;
+    const uint64_t codes = static_cast<uint64_t>(n_blocks) * block_bytes;
+    const uint64_t rowids = count * sizeof(RowId);
+    return local_codes_offset(summary_size, dim, m4, pq_bits) +
+           codes + rowids + filter_cols_bytes;
+}
+
+/// Pages needed for a CodedLocal leaf.
+inline uint64_t local_coded_extent_pages(uint64_t count, uint16_t dim,
+                                          uint16_t m4, uint8_t pq_bits,
+                                          uint32_t summary_size,
+                                          uint64_t filter_cols_bytes = 0) {
+    return (local_coded_extent_bytes(count, dim, m4, pq_bits,
+                                     summary_size, filter_cols_bytes) +
+            kPageSize - 1) / kPageSize;
+}
+
+/// Byte offset of raw FP32 vectors in an Accumulating leaf.
+/// Layout: [header][summary]→[raw vectors]. Aligned to 16 for NEON.
+inline uint64_t accum_vectors_offset(uint32_t summary_size) {
+    constexpr uint64_t align = 16;
+    const uint64_t raw = sizeof(TreeLeafHeader) + summary_size;
+    return (raw + align - 1) & ~(align - 1);
+}
+
+/// Byte offset of row_ids in an Accumulating leaf.
+inline uint64_t accum_rowids_offset(uint32_t summary_size, uint16_t dim,
+                                     uint64_t count) {
+    return accum_vectors_offset(summary_size) + count * dim * sizeof(float);
+}
+
+/// Total byte size of an Accumulating leaf extent.
+inline uint64_t accum_extent_bytes(uint64_t count, uint16_t dim,
+                                    uint32_t summary_size,
+                                    uint64_t filter_cols_bytes = 0) {
+    return accum_rowids_offset(summary_size, dim, count) +
+           count * sizeof(RowId) + filter_cols_bytes;
+}
+
+/// Pages needed for an Accumulating leaf.
+inline uint64_t accum_extent_pages(uint64_t count, uint16_t dim,
+                                    uint32_t summary_size,
+                                    uint64_t filter_cols_bytes = 0) {
+    return (accum_extent_bytes(count, dim, summary_size, filter_cols_bytes) +
+            kPageSize - 1) / kPageSize;
 }
 
 // ===========================================================================

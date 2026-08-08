@@ -31,6 +31,14 @@ namespace sextant::tree {
 inline constexpr uint32_t kBloomThreshold = 150;
 // kBloomK is defined in filter_hash.hpp (shared by write + read paths).
 
+/// Round a byte offset up to 4-byte alignment. Used between filter columns
+/// so that uint32_t* / uint16_t* casts on the packed layout are always safe.
+/// The filter region starts at an 8-aligned offset (leaf_codes_offset is
+/// aligned), and every column boundary is rounded to 4.
+inline uint64_t align4(uint64_t v) {
+    return (v + 3) & ~uint64_t(3);
+}
+
 // ===========================================================================
 // Size computation
 // ===========================================================================
@@ -82,6 +90,9 @@ inline uint64_t filter_columns_bytes(uint32_t count, const Schema& schema,
                 break;
             }
         }
+        // Align to 4 bytes after each column so the next column's typed
+        // arrays (uint32_t*, uint16_t*) are naturally aligned.
+        total = align4(total);
     }
     return total;
 }
@@ -185,6 +196,9 @@ inline uint64_t write_filter_columns(uint8_t* buf, uint32_t count,
                 break;
             }
         }
+        // Align the write pointer to 4 bytes after each column, matching
+        // filter_columns_bytes (which adds the same padding).
+        p = buf + align4(static_cast<uint64_t>(p - buf));
     }
     return static_cast<uint64_t>(p - buf);
 }
