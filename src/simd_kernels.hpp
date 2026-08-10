@@ -568,15 +568,125 @@ inline float scalar_dot_u4_float(const float* query,
 /// calls scalar_dot_u4_sve2_impl (src/simd/sve2_kernels.cpp). Otherwise
 /// falls back to the NEON kernel above. No indirect call.
 inline float scalar_dot_u4_sve2(const float* query,
-                                 const float* levels,
-                                 const uint8_t* code,
-                                 uint32_t dim, uint32_t K) {
+                                  const float* levels,
+                                  const uint8_t* code,
+                                  uint32_t dim, uint32_t K) {
 #if defined(SEXTANT_HAS_SVE2_KERNEL)
     return scalar_dot_u4_sve2_impl(query, levels, code, dim, K);
 #else
     // No SVE2 TU compiled in (non-SVE2 hardware, e.g. Apple M4). Use the
     // NEON decode-dot, which is available on all AArch64.
     return scalar_dot_u4_float(query, levels, code, dim, K);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Batched decode-dot for scalar_lloydmax main scan.
+// ---------------------------------------------------------------------------
+// dot(query, decode(code[i])) for i in [0, count). `codes` is row-major:
+// vector i at codes + i*code_size bytes. `code` is packed 4-bit nibbles
+// (2 dims/byte). `out` must hold `count` floats.
+//
+// SVE2 path: per-vector gather-FMA (svld1_gather_u32index_f32), fast on
+// Neoverse-V2. NEON path: per-vector scalar_dot_u4_float — guarantees
+// bit-identical dots to the original hand-unrolled scan (same d4-loop +
+// tail structure), so the heap contents are byte-identical on M4.
+
+/// NEON batch decode-dot: out[i] = dot(query, decode(codes + i*code_size)).
+///
+/// Processes 4 vectors concurrently, sharing the per-tile query load across
+/// them (4 independent float32x4_t accumulators). Each vector's accumulation
+/// order is identical to scalar_dot_u4_float (lane-wise NEON FMA across the
+/// d4 tiles, then vaddvq, then scalar tail), so the output is bit-identical to
+/// a per-vector scalar_dot_u4_float loop — and to the original hand-unrolled
+/// scan on M4. The only shared work is reloading query[d..d+3] once per tile
+/// instead of once per vector, which recovers the query-load amortization.
+inline void scalar_dot_u4_float_batch(const float* query,
+                                       const float* levels,
+                                       const uint8_t* codes, uint32_t count,
+                                       uint32_t dim, uint32_t K,
+                                       uint32_t code_size, float* out) {
+#if defined(SEXTANT_HAS_NEON)
+    const uint32_t d4 = (dim / 4) * 4;
+    uint32_t i = 0;
+    // Full batches of 4 vectors: 4 independent accumulators, shared query load.
+    for (; i + 3 < count; i += 4) {
+        const uint8_t* cp[4] = {
+            codes + static_cast<uint64_t>(i)     * code_size,
+            codes + static_cast<uint64_t>(i + 1) * code_size,
+            codes + static_cast<uint64_t>(i + 2) * code_size,
+            codes + static_cast<uint64_t>(i + 3) * code_size,
+        };
+        float32x4_t a0 = vdupq_n_f32(0.0f);
+        float32x4_t a1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f);
+        float32x4_t a3 = vdupq_n_f32(0.0f);
+        for (uint32_t d = 0; d < d4; d += 4) {
+            const float32x4_t q = vld1q_f32(query + d);
+            auto tile = [&](const uint8_t* code, float32x4_t& acc) {
+                const uint8_t b0 = code[d / 2];
+                const uint8_t b1 = code[d / 2 + 1];
+                float decoded[4] = {
+                    levels[d * K + (b0 & 0x0F)],
+                    levels[(d + 1) * K + ((b0 >> 4) & 0x0F)],
+                    levels[(d + 2) * K + (b1 & 0x0F)],
+                    levels[(d + 3) * K + ((b1 >> 4) & 0x0F)],
+                };
+                const float32x4_t dv = vld1q_f32(decoded);
+                acc = vfmaq_f32(acc, q, dv);
+            };
+            tile(cp[0], a0);
+            tile(cp[1], a1);
+            tile(cp[2], a2);
+            tile(cp[3], a3);
+        }
+        float s0 = vaddvq_f32(a0);
+        float s1 = vaddvq_f32(a1);
+        float s2 = vaddvq_f32(a2);
+        float s3 = vaddvq_f32(a3);
+        // Tail dims (dim%4 != 0): scalar per vector, identical to
+        // scalar_dot_u4_float.
+        for (uint32_t d = d4; d < dim; ++d) {
+            const float qd = query[d];
+            auto tail = [&](const uint8_t* code, float& s) {
+                const uint8_t byte = code[d / 2];
+                const uint8_t nib = (d % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+                s += qd * levels[d * K + nib];
+            };
+            tail(cp[0], s0);
+            tail(cp[1], s1);
+            tail(cp[2], s2);
+            tail(cp[3], s3);
+        }
+        out[i]     = s0;
+        out[i + 1] = s1;
+        out[i + 2] = s2;
+        out[i + 3] = s3;
+    }
+    // Tail vectors (count not multiple of 4): per-vector scalar_dot_u4_float.
+    for (; i < count; ++i) {
+        const uint8_t* code = codes + static_cast<uint64_t>(i) * code_size;
+        out[i] = scalar_dot_u4_float(query, levels, code, dim, K);
+    }
+#else
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint8_t* code = codes + static_cast<uint64_t>(i) * code_size;
+        out[i] = scalar_dot_u4_float(query, levels, code, dim, K);
+    }
+#endif
+}
+
+/// Batch decode-dot dispatcher. On SVE2 hardware routes to the SVE2 gather
+/// kernel; otherwise to the NEON per-vector loop. No indirect call.
+inline void scalar_dot_u4_batch(const float* query,
+                                  const float* levels,
+                                  const uint8_t* codes, uint32_t count,
+                                  uint32_t dim, uint32_t K, uint32_t code_size,
+                                  float* out) {
+#if defined(SEXTANT_HAS_SVE2_KERNEL)
+    scalar_dot_u4_sve2_batch(query, levels, codes, count, dim, K, code_size, out);
+#else
+    scalar_dot_u4_float_batch(query, levels, codes, count, dim, K, code_size, out);
 #endif
 }
 

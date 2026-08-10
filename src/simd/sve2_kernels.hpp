@@ -25,9 +25,23 @@ namespace sextant::simd {
 /// FMA with query. Vector-length-agnostic (uses svcntw() lane count).
 /// `levels` is [dim][K] floats; `code` is (dim*4+7)/8 packed-nibble bytes.
 float scalar_dot_u4_sve2_impl(const float* query,
-                               const float* levels,
-                               const uint8_t* code,
-                               uint32_t dim, uint32_t K);
+                                const float* levels,
+                                const uint8_t* code,
+                                uint32_t dim, uint32_t K);
+
+/// SVE2 batch decode-dot: dot(query, decode(code[i])) for i in [0, count).
+/// `codes` is row-major: vector i at codes + i*code_size. `code` is packed
+/// 4-bit nibbles (2 dims/byte). `out` must hold `count` floats.
+///
+/// Same gather-FMA inner loop as scalar_dot_u4_sve2_impl (rerank kernel),
+/// applied per-vector. The win over the NEON path is svld1_gather_u32index_f32
+/// (hardware-prefetched gather on Neoverse-V2) replacing the scalar
+/// per-dim level-table loads.
+void scalar_dot_u4_sve2_batch(const float* query,
+                                const float* levels,
+                                const uint8_t* codes, uint32_t count,
+                                uint32_t dim, uint32_t K, uint32_t code_size,
+                                float* out);
 #endif
 
 }  // namespace sextant::simd
