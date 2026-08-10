@@ -28,6 +28,14 @@
 #define SEXTANT_HAS_AVX2 1
 #endif
 
+// SVE2 decode-dot kernel: compiled as a separate TU (src/simd/sve2_kernels.cpp)
+// only when meson detects SVE2. The dispatcher (scalar_dot_u4_sve2, defined
+// after scalar_dot_u4_float below) calls scalar_dot_u4_sve2_impl when
+// SEXTANT_HAS_SVE2_KERNEL is defined.
+#if defined(SEXTANT_HAS_SVE2_KERNEL)
+#include "simd/sve2_kernels.hpp"
+#endif
+
 #include <cmath>    // std::sqrt (normalize_row_f32)
 #include <limits>  // std::numeric_limits (used in argmin_scaled)
 #include <cstring> // std::memset (fastscan_many zero-init)
@@ -488,29 +496,6 @@ inline void scalar_dot_u4_i8mm_batch4(const int8_t* query_i8,
 #endif
 }
 
-/// SVE2 float gather decode-dot: one vector. Returns float dot.
-/// Uses svld1_gather_u32index_f32 for hardware-prefetched LUT lookup.
-/// Only available on SVE2 hardware (Neoverse-V2 / c4a). Not on Apple M4.
-inline float scalar_dot_u4_sve2(const float* query,
-                                 const float* levels,
-                                 const uint8_t* code,
-                                 uint32_t dim, uint32_t K) {
-#if defined(__ARM_FEATURE_SVE)
-    // SVE2 requires <arm_sve.h> at file scope, not inside a function.
-    // The real SVE2 path will be in a separate compilation unit.
-    // Fallback to scalar here.
-#endif
-    // Scalar fallback (also used when SVE not compiled in).
-    float acc = 0.0f;
-    for (uint32_t d = 0; d < dim; d += 2) {
-        uint8_t byte = code[d / 2];
-        acc += query[d] * levels[d * K + (byte & 0x0F)];
-        if (d + 1 < dim)
-            acc += query[d + 1] * levels[(d+1) * K + ((byte >> 4) & 0x0F)];
-    }
-    return acc;
-}
-
 /// Float decode-dot (NEON, no I8MM). Returns float dot.
 /// Uses vtbl to decode nibbles, widens to float, FMA with query.
 inline float scalar_dot_u4_float(const float* query,
@@ -571,6 +556,27 @@ inline float scalar_dot_u4_float(const float* query,
             acc += query[d + 1] * levels[(d+1) * K + ((byte >> 4) & 0x0F)];
     }
     return acc;
+#endif
+}
+
+/// SVE2 float gather decode-dot: one vector. Returns float dot.
+/// Uses svld1_gather_u32index_f32 for hardware-prefetched LUT lookup.
+/// Only available on SVE2 hardware (Neoverse-V2 / c4a). Not on Apple M4.
+///
+/// Dispatches at compile time: when the SVE2 TU was compiled in
+/// (SEXTANT_HAS_SVE2_KERNEL, set by meson when simd_target == 'sve2'),
+/// calls scalar_dot_u4_sve2_impl (src/simd/sve2_kernels.cpp). Otherwise
+/// falls back to the NEON kernel above. No indirect call.
+inline float scalar_dot_u4_sve2(const float* query,
+                                 const float* levels,
+                                 const uint8_t* code,
+                                 uint32_t dim, uint32_t K) {
+#if defined(SEXTANT_HAS_SVE2_KERNEL)
+    return scalar_dot_u4_sve2_impl(query, levels, code, dim, K);
+#else
+    // No SVE2 TU compiled in (non-SVE2 hardware, e.g. Apple M4). Use the
+    // NEON decode-dot, which is available on all AArch64.
+    return scalar_dot_u4_float(query, levels, code, dim, K);
 #endif
 }
 

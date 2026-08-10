@@ -3248,7 +3248,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     leaf_codes_offset(manifest_.summary_size) +
                     static_cast<uint64_t>(entry.local_idx) * slm_cs;
                 if (metric == MetricKind::InnerProduct) {
-                    const float dot = simd::scalar_dot_u4_float(
+                    // Dispatcher: uses SVE2 gather-dot on c4a (Neoverse-V2),
+                    // NEON decode-dot everywhere else (e.g. Apple M4).
+                    const float dot = simd::scalar_dot_u4_sve2(
                         query, slm_levels, code_ptr, manifest_.dim, slm_K);
                     exact_dist = -dot;
                 } else {

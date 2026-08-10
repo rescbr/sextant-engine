@@ -64,6 +64,14 @@ else
 endif
 message('SIMD target: ' + simd_target)
 
+# Expose SVE2 availability to simd_kernels.hpp as a compile definition so the
+# scalar_dot_u4_sve2 dispatcher calls the real SVE2 impl when the TU is built.
+# Only on real SVE2 hardware (Neoverse-V2 / c4a). On M4 (neon+i8mm) the
+# dispatcher falls back to the NEON kernel.
+if simd_target == 'sve2'
+    add_project_arguments('-DSEXTANT_HAS_SVE2_KERNEL=1', language: 'cpp')
+endif
+
 version_data = configuration_data()
 version_data.set('SEXTANT_VERSION', meson.project_version())
 version_data.set('SEXTANT_GIT_SHA', git_sha)
@@ -222,8 +230,28 @@ engine_sources = [
     'src/system.cpp',
 ]
 
+# --- SVE2 decode-dot kernel (separate compilation unit) -----------------------
+# arm_sve.h must be included at file scope (clang 18 fails on function-scope
+# SVE intrinsics), and the TU needs -march=armv8-a+sve2 while the rest of the
+# engine builds with -march=native. So we compile it as its own static_library
+# with the SVE2 flag, then fold the object into sextant_lib via extract_objects.
+# Only built when SVE2 is detected; on non-SVE2 hardware (Apple M4) this TU is
+# skipped entirely and the dispatcher falls back to NEON.
+# Pattern follows subprojects/carquet/meson.build (per-ISA TU + extract_objects).
+sve2_objects = []
+if simd_target == 'sve2'
+    sve2_tu = static_library('sextant_sve2_tu',
+        'src/simd/sve2_kernels.cpp',
+        cpp_args: ['-march=armv8-a+sve2', '-fno-lto'],
+        include_directories: [engine_inc, src_inc],
+        install: false,
+    )
+    sve2_objects = sve2_tu.extract_objects('src/simd/sve2_kernels.cpp')
+endif
+
 sextant_lib = static_library('sextant',
     engine_sources,
+    objects: sve2_objects,
     include_directories: [engine_inc, src_inc, third_party_inc],
     dependencies: [nsync_dep, spdlog_dep, cpptoml_dep, cpptrace_dep],
     install: false,
