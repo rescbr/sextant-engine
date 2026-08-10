@@ -33,10 +33,13 @@ float scalar_dot_u4_sve2_impl(const float* query,
 /// `codes` is row-major: vector i at codes + i*code_size. `code` is packed
 /// 4-bit nibbles (2 dims/byte). `out` must hold `count` floats.
 ///
-/// Same gather-FMA inner loop as scalar_dot_u4_sve2_impl (rerank kernel),
-/// applied per-vector. The win over the NEON path is svld1_gather_u32index_f32
-/// (hardware-prefetched gather on Neoverse-V2) replacing the scalar
-/// per-dim level-table loads.
+/// Processes vectors in groups of 4 concurrently (4 independent
+/// svfloat32_t accumulators sharing the per-tile query gather), mirroring the
+/// scalar/NEON batch-4 loops. The win over the NEON path is
+/// svld1_gather_u32index_f32 (hardware-prefetched gather on Neoverse-V2)
+/// replacing the scalar per-dim level-table loads, and 4 independent FMA
+/// chains filling the pipeline. Tail vectors (count%4 != 0) fall back to
+/// the single-vector rerank kernel (scalar_dot_u4_sve2_impl).
 void scalar_dot_u4_sve2_batch(const float* query,
                                 const float* levels,
                                 const uint8_t* codes, uint32_t count,
