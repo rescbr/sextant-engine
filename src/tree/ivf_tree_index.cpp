@@ -2861,6 +2861,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const uint32_t cs = scalar_lm_quantizer_->code_size();
         const uint32_t dim = manifest_.dim;
         const float* levels = scalar_lm_quantizer_->levels();
+        const uint32_t d4 = dim / 4 * 4;  // dim rounded down to multiple of 4
 
         // Build int8 query for fast I8MM scan.
         std::vector<int8_t> query_i8(dim);
@@ -2891,23 +2892,41 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             const RowId* row_ids = reinterpret_cast<const RowId*>(
                 codes + static_cast<uint64_t>(count) * cs);
 
-            // Scan: process vectors in chunks via the batch decode-dot kernel
-            // (SVE2 gather-FMA on c4a, NEON per-vector on M4), writing the
-            // chunk's dots to a small scratch buffer, then do heap maintenance
-            // in a scalar loop. Separating the dot computation (SIMD) from the
-            // heap logic (scalar) lets the SIMD kernel run at full tilt; the
-            // float->uint32 monotonic conversion + heap push is identical to
-            // the original inline code (heap contents are byte-identical on M4
-            // since the NEON fallback uses scalar_dot_u4_float per vector).
-            constexpr uint32_t kChunk = 256;
-            float dots[kChunk];
+            // Scan: process vectors sequentially. For IP, higher dot = closer.
+            // Use float decode-dot (NEON FMA) — faster than I8MM on this
+            // data because the I8MM kernel has per-dim lookup overhead.
+            // Batch 4 vectors to amortize query loads.
             uint32_t i = 0;
-            while (i < count) {
-                const uint32_t n = std::min(kChunk, count - i);
-                simd::scalar_dot_u4_batch(query, levels, codes + (uint64_t)i * cs,
-                                           n, dim, K, cs, dots);
-                for (uint32_t v = 0; v < n; ++v) {
-                    const float dist = -dots[v];
+            for (; i + 3 < count; i += 4) {
+                // Process 4 vectors, accumulating 4 float dots.
+                float dots[4] = {0, 0, 0, 0};
+                const uint8_t* cp[4] = {
+                    codes + (uint64_t)(i)   * cs,
+                    codes + (uint64_t)(i+1) * cs,
+                    codes + (uint64_t)(i+2) * cs,
+                    codes + (uint64_t)(i+3) * cs,
+                };
+                for (uint32_t d = 0; d < d4; d += 4) {
+                    float q4[4] = {query[d], query[d+1], query[d+2], query[d+3]};
+                    for (uint32_t v = 0; v < 4; ++v) {
+                        uint8_t b0 = cp[v][d/2], b1 = cp[v][d/2+1];
+                        dots[v] += q4[0]*levels[d*K+(b0&0xF)]
+                                 + q4[1]*levels[(d+1)*K+((b0>>4)&0xF)]
+                                 + q4[2]*levels[(d+2)*K+(b1&0xF)]
+                                 + q4[3]*levels[(d+3)*K+((b1>>4)&0xF)];
+                    }
+                }
+                // Handle tail dims (dim not multiple of 4)
+                for (uint32_t d = d4; d < dim; ++d) {
+                    for (uint32_t v = 0; v < 4; ++v) {
+                        uint8_t byte = cp[v][d/2];
+                        uint8_t nib = (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+                        dots[v] += query[d] * levels[d*K + nib];
+                    }
+                }
+                // Heap push
+                for (uint32_t v = 0; v < 4; ++v) {
+                    float dist = -dots[v];
                     uint32_t dist_bits;
                     std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
                     uint32_t pq_dist = (dist_bits & 0x80000000u)
@@ -2920,7 +2939,35 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                         heap_replace(h, pq_dist, row_ids[i+v], leaf_ptr, i+v);
                     }
                 }
-                i += n;
+            }
+            // Tail vector (count not multiple of 4)
+            for (; i < count; ++i) {
+                const uint8_t* code_ptr = codes + (uint64_t)i * cs;
+                float dot = 0;
+                for (uint32_t d = 0; d < d4; d += 4) {
+                    uint8_t b0 = code_ptr[d/2], b1 = code_ptr[d/2+1];
+                    dot += query[d]*levels[d*K+(b0&0xF)]
+                         + query[d+1]*levels[(d+1)*K+((b0>>4)&0xF)]
+                         + query[d+2]*levels[(d+2)*K+(b1&0xF)]
+                         + query[d+3]*levels[(d+3)*K+((b1>>4)&0xF)];
+                }
+                for (uint32_t d = d4; d < dim; ++d) {
+                    uint8_t byte = code_ptr[d/2];
+                    uint8_t nib = (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+                    dot += query[d] * levels[d*K + nib];
+                }
+                float dist = -dot;
+                uint32_t dist_bits;
+                std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
+                uint32_t pq_dist = (dist_bits & 0x80000000u)
+                    ? ~dist_bits : (dist_bits | 0x80000000u);
+                if (h.size() < W) {
+                    h.push_back({pq_dist, row_ids[i], leaf_ptr, i});
+                    if (h.size() == W)
+                        std::make_heap(h.begin(), h.end(), heap_less);
+                } else if (pq_dist < h[0].pq_dist) {
+                    heap_replace(h, pq_dist, row_ids[i], leaf_ptr, i);
+                }
             }
         };
 
