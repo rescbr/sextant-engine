@@ -213,8 +213,13 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
     }
 
     // Load the leaf extent table (indirection for mutable leaf extents).
-    if (idx->superblock_.leaf_table_page() != kInvalidPage &&
-        idx->superblock_.leaf_table_pages() > 0) {
+    // Mandatory: every tree built by the current build path writes it.
+    if (idx->superblock_.leaf_table_page() == kInvalidPage ||
+        idx->superblock_.leaf_table_pages() == 0) {
+        throw Error(ErrorCode::CorruptIndex,
+            "tree index is missing the leaf extent table");
+    }
+    {
         const auto ltp = idx->superblock_.leaf_table_page();
         const auto ltpg = idx->superblock_.leaf_table_pages();
         std::vector<uint8_t> blob(static_cast<size_t>(ltpg) * kPageSize);
@@ -291,14 +296,13 @@ void IVFTreeIndex::load_root_from_mmap() {
     const uint8_t* p = root_ptr + sizeof(TreeNodeHeader);
     for (uint32_t i = 0; i < root_header_->n_children; ++i) {
         const auto* ce = reinterpret_cast<const ChildEntry*>(p);
-        // When the leaf table is present, is_leaf children store a leaf_id
-        // (index into leaf_table_) instead of a direct page pointer. Resolve
-        // it to the physical page here so the search path is unchanged.
+        // is_leaf children store a leaf_id (index into leaf_table_), not a
+        // direct page pointer. Resolve it to the physical page here so the
+        // search path is unchanged.
         PageId leaf_id = ce->child_page;
         PageId page = leaf_id;
         uint64_t pages = ce->child_pages;
-        if (ce->is_leaf && !leaf_table_.empty() &&
-            leaf_id < leaf_table_.size()) {
+        if (ce->is_leaf) {
             page = leaf_table_[leaf_id].page;
             pages = leaf_table_[leaf_id].pages;
         }
@@ -2690,14 +2694,13 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             const auto* ce = reinterpret_cast<const ChildEntry*>(
                 p2 + idx * cesize);
             if (ce->child_page == kInvalidPage) continue;  // empty child
-            // Resolve leaf_id → physical page via leaf table.
-            PageId leaf_id = ce->child_page;
-            PageId rpage = leaf_id;
+            // Leaf children store a leaf_id (index into leaf_table_);
+            // internal children store a physical page directly.
+            PageId rpage = ce->child_page;
             uint64_t rpages = ce->child_pages;
-            if (ce->is_leaf && !leaf_table_.empty() &&
-                leaf_id < leaf_table_.size()) {
-                rpage = leaf_table_[leaf_id].page;
-                rpages = leaf_table_[leaf_id].pages;
+            if (ce->is_leaf) {
+                rpage = leaf_table_[ce->child_page].page;
+                rpages = leaf_table_[ce->child_page].pages;
             }
             const float16_t* cent = reinterpret_cast<const float16_t*>(
                 reinterpret_cast<const uint8_t*>(ce) + sizeof(ChildEntry));
@@ -3325,7 +3328,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     manifest_.dim, manifest_.m4, manifest_.scan_pq_bits,
                     n_blocks, block_bytes));
         } else {
-            // Legacy global-PQ path.
+            // Global-PQ (global codebook) path.
             codes = leaf_ptr + leaf_codes_offset(manifest_.summary_size);
             row_ids = reinterpret_cast<const RowId*>(
                 leaf_ptr + leaf_rowids_offset(manifest_.summary_size,
@@ -3614,7 +3617,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 for (uint32_t d = 0; d < manifest_.dim; ++d)
                     decoded_vec[d] += centroid[d];
             } else {
-                // Global-PQ rerank (legacy path).
+                // Global-PQ rerank (global codebook path).
                 extract_code_from_leaf(entry.leaf_ptr, entry.local_idx,
                                        manifest_.summary_size, manifest_.m4,
                                        manifest_.scan_pq_bits, codes_per_block,
@@ -3732,12 +3735,14 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                     return a.row_id == b.row_id;
                                 });
         results.erase(last, results.end());
-        if (results.size() > k) {
-            std::nth_element(results.begin(), results.begin() + k, results.end(),
+        size_t keep = k;
+        if (results.size() > keep) {
+            std::nth_element(results.begin(), results.begin() + keep,
+                             results.end(),
                              [](const Candidate& a, const Candidate& b) {
                                  return a.dist < b.dist;
                              });
-            results.resize(k);
+            results.resize(keep);
         }
         std::sort(results.begin(), results.end(),
                   [](const Candidate& a, const Candidate& b) {
@@ -3929,14 +3934,8 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
             const auto* ce = reinterpret_cast<const ChildEntry*>(p);
             if (ce->child_page == kInvalidPage) { p += cesize; continue; }
             if (ce->is_leaf) {
-                PageId leaf_id = ce->child_page;
-                PageId lp = leaf_id;
-                uint64_t lpg = ce->child_pages;
-                if (!leaf_table_.empty() && leaf_id < leaf_table_.size()) {
-                    lp = leaf_table_[leaf_id].page;
-                    lpg = leaf_table_[leaf_id].pages;
-                }
-                all_leaves.push_back({lp, lpg});
+                all_leaves.push_back({leaf_table_[ce->child_page].page,
+                                      leaf_table_[ce->child_page].pages});
             } else {
                 node_stack.push_back(ce->child_page);
             }

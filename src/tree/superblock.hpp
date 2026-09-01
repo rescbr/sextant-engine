@@ -78,7 +78,7 @@ struct SuperblockDisk {
 
     // Leaf extent table (indirection: leaf_id → page+pages).
     // Enables O(1) leaf growth without parent pointer fixup.
-    // 0 pages = no leaf table (legacy: child_page is direct page pointer).
+    // Mandatory — the format has no leaf-table-less variant.
     PageId   leaf_table_page;        // leaf table blob start
     uint32_t leaf_table_pages;       // leaf table extent length
 

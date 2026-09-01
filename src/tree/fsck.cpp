@@ -47,7 +47,7 @@ std::vector<uint8_t> read_extent(const PageFile& file, PageId page,
 
 /// Validate a leaf header's magic + CRC and accumulate its payload extent.
 /// `physical_page` / `physical_pages` are the resolved page location (from
-/// the leaf table if present, or the raw child_page for legacy trees).
+/// the leaf table).
 void validate_leaf(const PageFile& file, PageId physical_page,
                    uint32_t physical_pages, TreeWalkResult& result) {
     result.leaf_ranges.push_back({physical_page, physical_pages});
@@ -88,9 +88,13 @@ TreeWalkResult walk_tree(const PageFile& file, const Superblock& sb,
                          const TreeManifest& manifest) {
     TreeWalkResult result;
 
-    // Load the leaf extent table (if present) for leaf_id → page resolution.
+    // Load the leaf extent table for leaf_id → page resolution. Mandatory.
     std::vector<LeafTableEntry> leaf_table;
-    if (sb.leaf_table_page() != kInvalidPage && sb.leaf_table_pages() > 0) {
+    if (sb.leaf_table_page() == kInvalidPage || sb.leaf_table_pages() == 0) {
+        throw Error(ErrorCode::CorruptIndex,
+            "superblock: missing leaf extent table");
+    }
+    {
         std::vector<uint8_t> blob(
             static_cast<size_t>(sb.leaf_table_pages()) * kPageSize);
         file.read_pages(sb.leaf_table_page(), sb.leaf_table_pages(),
@@ -309,9 +313,8 @@ FsckResult fsck(const std::string& path, bool repair) {
     if (sb.cardinality_page() != kInvalidPage)
         all_allocated.push_back(
             {sb.cardinality_page(), sb.cardinality_pages()});
-    if (sb.leaf_table_page() != kInvalidPage)
-        all_allocated.push_back(
-            {sb.leaf_table_page(), sb.leaf_table_pages()});
+    all_allocated.push_back(
+        {sb.leaf_table_page(), sb.leaf_table_pages()});
 
     result.total_pages = file.num_pages();
     std::vector<bool> allocated(file.num_pages(), false);

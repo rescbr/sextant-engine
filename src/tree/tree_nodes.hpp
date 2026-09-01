@@ -160,7 +160,7 @@ struct TreeLeafHeader {
     uint8_t  summary_dirty;          // 1 = summary needs repair
     PageId   next_dirty;             // next dirty leaf (kInvalidPage = none)
     // --- Per-leaf residual PQ additions ---
-    /// Leaf state: 0 = CODED (global PQ, legacy), 1 = ACCUMULATING (raw FP32),
+    /// Leaf state: 0 = CODED (global PQ), 1 = ACCUMULATING (raw FP32),
     /// 2 = CODED_LOCAL (local per-leaf codebook).
     uint8_t  leaf_state = 0;
     /// Padding to align the following u32 fields.
@@ -230,7 +230,7 @@ inline uint64_t leaf_extent_pages(uint64_t count, uint16_t m4, uint8_t pq_bits,
 
 /// Leaf state for per-leaf residual PQ trees.
 enum class LeafState : uint8_t {
-    /// Legacy: codes quantized against a global codebook. Used by IVFTreeIndex.
+    /// Coded against a global codebook. Used by IVFTreeIndex.
     Coded = 0,
     /// Accumulating raw FP32 vectors (count < n_train). Searched by brute force.
     Accumulating = 1,
