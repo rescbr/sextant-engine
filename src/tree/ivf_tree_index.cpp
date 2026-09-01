@@ -3749,6 +3749,12 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         // the first distance gap past k. Clustered queries cut at ~k, noisy
         // queries keep the deep list — the caller's rerank bandwidth follows
         // the returned length. Off (0) or without rerank: plain top-k.
+        //
+        // Signal: the gap d[w]-d[k-1] against the top-k region's OWN typical
+        // gap, g = (d[k-1]-d[0])/(k-1). τ is therefore a dimensionless
+        // multiplier of the local score scale and one calibration transfers
+        // across metrics (IP distances are negated dots ≈ -1, so scaling by
+        // |d[k-1]| as in v1 compressed the signal and forced per-metric τ).
         size_t keep = k;
         if (config.adaptive_w_gap > 0 && config.rerank &&
             results.size() > k) {
@@ -3757,7 +3763,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                           return a.dist < b.dist;
                       });
             const float dk = results[k - 1].dist;
-            const float scale = std::max(std::fabs(dk), 1e-9f);
+            const float g = (dk - results[0].dist) / static_cast<float>(k - 1);
+            const float scale = std::max(g, 1e-12f);
             keep = results.size();
             for (size_t w = k; w < results.size(); ++w) {
                 if (results[w].dist - dk >
