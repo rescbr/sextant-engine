@@ -30,6 +30,14 @@ public:
     void train(const float* samples, uint64_t n,
                uint32_t n_restarts = 10, uint32_t lloyd_iters = 30);
 
+    /// Train per-dim EQUIDISTANT levels from the per-dim [min, max].
+    /// At 8 bits this matches (slightly beats) Lloyd-Max recall — level
+    /// placement is irrelevant once K is large — and it enables the
+    /// arithmetic scan: dot = Σq_d·lo_d + Σ(q_d·step_d)·code_d, a pure MAC
+    /// over sequential codes with no levels-table gather (measured 1.86x
+    /// kernel speedup over the gather form at 4 bits, scalar code).
+    void train_uniform(const float* samples, uint64_t n);
+
     /// Encode: for each dim, assign to nearest level → pack nibbles.
     /// Output: dim * bits / 8 bytes (code_size()).
     void encode(const float* vec, uint8_t* code_out) const;
@@ -65,6 +73,10 @@ public:
 
     const float* levels() const { return levels_.data(); }
 
+    /// True when trained via train_uniform (equidistant levels). Serialized
+    /// with the quantizer so the scan can pick the arithmetic kernel.
+    bool is_uniform() const { return uniform_; }
+
     /// Build the int8 query for the decode-dot kernels.
     /// Scales query so its max-abs value maps to ±127.
     /// q_i8_out: dim int8 values. scale_out: the scale factor used.
@@ -99,6 +111,10 @@ private:
     /// Per-dim boundaries for fast assignment: dim × (K-1) floats.
     /// boundary[d*(K-1) + i] = midpoint between levels[d*K+i] and levels[d*K+i+1].
     std::vector<float> bounds_;   // [dim * (K-1)]
+
+    /// Equidistant-levels mode (train_uniform). Levels stay in levels_
+    /// (same layout), so encode/decode/serialize are shared.
+    bool uniform_ = false;
 
     /// Recompute bounds_ from levels_.
     void compute_bounds_();

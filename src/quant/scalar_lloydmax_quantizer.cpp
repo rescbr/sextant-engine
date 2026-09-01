@@ -188,6 +188,27 @@ void ScalarLloydMaxQuantizer::train(const float* samples, uint64_t n,
     compute_int8_levels_();
 }
 
+void ScalarLloydMaxQuantizer::train_uniform(const float* samples, uint64_t n) {
+    if (n < 2) {
+        throw Error(ErrorCode::InvalidParam,
+                    "ScalarLloydMaxQuantizer::train_uniform: need n >= 2");
+    }
+    for (uint32_t d = 0; d < dim_; ++d) {
+        float mn = samples[d], mx = samples[d];
+        for (uint64_t i = 1; i < n; ++i) {
+            const float x = samples[i * dim_ + d];
+            mn = std::min(mn, x);
+            mx = std::max(mx, x);
+        }
+        float* lv = &levels_[static_cast<size_t>(d) * K_];
+        const float step = K_ > 1 ? (mx - mn) / (K_ - 1) : 0.f;
+        for (uint32_t k = 0; k < K_; ++k) lv[k] = mn + step * k;
+    }
+    uniform_ = true;
+    compute_bounds_();
+    compute_int8_levels_();
+}
+
 void ScalarLloydMaxQuantizer::compute_bounds_() {
     for (uint32_t d = 0; d < dim_; ++d) {
         const float* lv = &levels_[static_cast<size_t>(d) * K_];
@@ -376,13 +397,15 @@ static constexpr uint32_t kScalarLloydMaxMagic = 0x534C4D58;  // "SLMX"
 void ScalarLloydMaxQuantizer::serialize(std::vector<uint8_t>& out) const {
     const size_t header = 4 + 1 + 1 + 4;
     const size_t levels_bytes = levels_.size() * sizeof(float);
-    out.resize(header + levels_bytes);
+    // Trailing flag byte: uniform_ (absent in pre-uniform blobs => false).
+    out.resize(header + levels_bytes + 1);
     uint8_t* ptr = out.data();
     std::memcpy(ptr, &kScalarLloydMaxMagic, 4);
     ptr[4] = static_cast<uint8_t>(metric_);
     ptr[5] = bits_;
     std::memcpy(ptr + 6, &dim_, sizeof(dim_));
     std::memcpy(ptr + header, levels_.data(), levels_bytes);
+    ptr[header + levels_bytes] = uniform_ ? 1 : 0;
 }
 
 void ScalarLloydMaxQuantizer::deserialize(const uint8_t* in, size_t size) {
@@ -413,6 +436,7 @@ void ScalarLloydMaxQuantizer::deserialize(const uint8_t* in, size_t size) {
     }
     levels_.resize(levels_floats);
     std::memcpy(levels_.data(), in + header, levels_bytes);
+    uniform_ = (size == header + levels_bytes + 1) && (in[header + levels_bytes] != 0);
     compute_bounds_();
     compute_int8_levels_();
 }
