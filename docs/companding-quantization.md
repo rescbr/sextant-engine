@@ -1,5 +1,11 @@
 # Scalar Quantization for Anisotropic Embeddings: Research Report
 
+> ⚠️ **SUPERSEDED (2026-08-31):** every recall number in this report was measured
+> with the `adaptive_probe_gap=1.5` bug active, which pruned probing to a fraction
+> of the leaves. Recall comparisons here are invalid (scalar_lm's true Cohere
+> recall is 92.2%, not 73.9%). See `sweep-operating-curves.md` and git 322796b.
+> The analysis of *why* companding/Lloyd-Max work on this data remains valid.
+
 **Date**: 2026-08-08  
 **Status**: Implementation complete, benchmarked on Apple M4 and Google Axion c4a.
 
