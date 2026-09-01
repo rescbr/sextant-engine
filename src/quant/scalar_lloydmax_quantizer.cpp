@@ -61,6 +61,30 @@ std::vector<float> lloyd_max_1d(const float* data, uint64_t n,
             counts[idx]++;
         }
 
+        // Reseed empty levels to the data point with the max quantization
+        // error. A dead level kept at its stale position wastes code space
+        // forever (classic k-means empty-cluster repair). Placing it at the
+        // worst-served point directly attacks the largest error term.
+        for (uint32_t k = 0; k < num_levels; ++k) {
+            if (counts[k] > 0) continue;
+            float worst_err = -1.0f;
+            float worst_val = levels[k];
+            for (uint64_t i = 0; i < n; ++i) {
+                const uint32_t idx = static_cast<uint32_t>(
+                    std::upper_bound(bounds.begin(), bounds.end(),
+                                     data[i]) - bounds.begin());
+                const float err = std::fabs(data[i] - levels[idx]);
+                if (err > worst_err) {
+                    worst_err = err;
+                    worst_val = data[i];
+                }
+            }
+            levels[k] = worst_val;
+            // Re-sort so bounds stay consistent for the next iteration.
+            std::sort(levels.begin(), levels.end());
+            break;  // recompute bounds with the reseeded level
+        }
+
         // Update levels = mean of assigned data.
         bool converged = true;
         for (uint32_t k = 0; k < num_levels; ++k) {
@@ -115,6 +139,9 @@ void ScalarLloydMaxQuantizer::train(const float* samples, uint64_t n,
         for (uint64_t i = 0; i < n; ++i)
             col[i] = samples[i * dim_ + d];
 
+        // Sort col FIRST — quantile inits below require ordered data.
+        std::sort(col.begin(), col.end());
+
         // Init 1: uniform quantiles (best default).
         std::vector<float> quantile_init(K_);
         for (uint32_t k = 0; k < K_; ++k) {
@@ -122,22 +149,27 @@ void ScalarLloydMaxQuantizer::train(const float* samples, uint64_t n,
             uint64_t idx = static_cast<uint64_t>(frac * (n - 1));
             quantile_init[k] = col[idx];
         }
-        // Sort col for quantile computation (needed for proper quantiles).
-        std::sort(col.begin(), col.end());
 
         auto best = lloyd_max_1d(col.data(), n, K_, lloyd_iters, quantile_init);
         double best_mse = quantizer_mse(col.data(), n, best);
 
-        // Restart with perturbed inits.
+        // Restarts with DIVERSE inits: K uniformly-spaced random data points.
+        // (The old jittered-quantile init perturbed by ±0.1% of range — every
+        // restart converged to the same local minimum, wasting the restart.)
+        // Sampling actual data points gives genuinely different basins,
+        // matching the spirit of sklearn's n_init with random inits.
         std::mt19937 rng(42 + d);
-        std::uniform_real_distribution<float> jitter(-1e-3f, 1e-3f);
         for (uint32_t r = 1; r < n_restarts; ++r) {
             std::vector<float> init(K_);
+            // Spaced random positions: level k draws from the k-th slice of
+            // the sorted data. Spacing keeps the init sorted-ish (diverse but
+            // not degenerate) and covers the whole distribution.
             for (uint32_t k = 0; k < K_; ++k) {
-                double frac = static_cast<double>(k + 0.5) / K_;
-                uint64_t idx = static_cast<uint64_t>(frac * (n - 1));
-                init[k] = col[idx] + jitter(rng) * std::max(1e-6f,
-                    (col.back() - col.front()) * 0.01f);
+                std::uniform_real_distribution<double> u(
+                    static_cast<double>(k) / K_,
+                    static_cast<double>(k + 1) / K_);
+                uint64_t idx = static_cast<uint64_t>(u(rng) * (n - 1));
+                init[k] = col[idx];
             }
             auto cand = lloyd_max_1d(col.data(), n, K_, lloyd_iters, init);
             double mse = quantizer_mse(col.data(), n, cand);

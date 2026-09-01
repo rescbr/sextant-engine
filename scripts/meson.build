@@ -79,3 +79,21 @@ bench_kernel = executable('bench_kernel',
     dependencies: sextant_dep,
     install: false,
 )
+
+spike_lm_recall = executable('spike_lm_recall',
+    'spike_lm_recall.cpp',
+    include_directories: [engine_inc, src_inc],
+    link_with: sextant_lib,
+)
+
+spike_slm_roundtrip = executable('spike_slm_roundtrip',
+    'spike_slm_roundtrip.cpp',
+    include_directories: [engine_inc, src_inc],
+    link_with: sextant_lib,
+)
+
+spike_slm_storage = executable('spike_slm_storage',
+    'spike_slm_storage.cpp',
+    include_directories: [engine_inc, src_inc],
+    link_with: sextant_lib,
+)

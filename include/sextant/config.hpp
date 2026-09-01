@@ -328,7 +328,12 @@ struct ResolvedParams {
     uint32_t partition_count = 1; ///< Partition count (>1 → partitioned build)
     float closure_factor = 1.033f;  ///< Shard overlap radius ratio
     float closure_epsilon = 0.0f;  ///< Absolute margin for SPANN-style boundary posting. 0 = ratio-based.
-    float adaptive_probe_gap = 1.5f;   ///< Geometric-gap early-exit (derived from LID).
+    float adaptive_probe_gap = 0.0f;   ///< Geometric-gap early-exit. 0 = OFF
+    /// (default). A nonzero value bakes QPS-over-recall probe pruning into
+    /// the index. Derived from LID by the estimator for `autobuild` flows
+    /// only when the LID measurement is trusted. DANGER: on noise-dominated
+    /// embeddings (Cohere), even 1.5 prunes probing to a few leaves and
+    /// silently destroys recall (measured 92.2% → 51.7% recall@10).
     float median_lid = 0.0f;           ///< Median LID measured at build time (0 = unmeasured).
     uint16_t n_entry_points = 16;   ///< K-means centroid count for entry-point selection
     uint16_t n_search_entry_points = 4;  ///< Multi-start: top-M entry points per query

@@ -2488,9 +2488,17 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     };
 
     const uint32_t cesize = child_entry_size(manifest_.dim, manifest_.summary_size);
-    const float gap = (config.adaptive_probe_gap > 0)
-        ? config.adaptive_probe_gap
-        : manifest_.adaptive_probe_gap;
+    // Adaptive gap resolution (SearchConfig::adaptive_probe_gap):
+    //   <0 = off (disable early-exit entirely)
+    //    0 = auto (use the value baked into the manifest at build time)
+    //   >0 = explicit override
+    // NOTE: gap pruning is a QPS/recall trade knob. On noise-dominated
+    // embeddings (e.g. Cohere), centroid distances are nearly uniform, so
+    // even a modest gap (1.5) prunes probing to a few leaves and silently
+    // destroys recall. Disabled by default; see ResolvedParams.
+    float gap = manifest_.adaptive_probe_gap;
+    if (config.adaptive_probe_gap < 0) gap = 0.0f;
+    else if (config.adaptive_probe_gap > 0) gap = config.adaptive_probe_gap;
 
     const uint32_t n_probe_ln_cfg = config.n_probe_ln > 0
         ? config.n_probe_ln

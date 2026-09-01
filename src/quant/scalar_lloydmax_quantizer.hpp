@@ -25,8 +25,10 @@ public:
 
     /// Train per-dim levels from a sample (n × dim floats, row-major).
     /// Runs 1D Lloyd-Max per dimension with quantile init + restarts.
+    /// Default restarts = 10 (matches sklearn k-means n_init=10). Each restart
+    /// uses spaced-random data-point inits for basin diversity.
     void train(const float* samples, uint64_t n,
-               uint32_t n_restarts = 3, uint32_t lloyd_iters = 30);
+               uint32_t n_restarts = 10, uint32_t lloyd_iters = 30);
 
     /// Encode: for each dim, assign to nearest level → pack nibbles.
     /// Output: dim * bits / 8 bytes (code_size()).
