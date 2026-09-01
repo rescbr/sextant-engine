@@ -1,13 +1,18 @@
 # Scalar Quantization for Anisotropic Embeddings: Research Report
 
-> ⚠️ **SUPERSEDED (2026-08-31):** every recall number in this report was measured
-> with the `adaptive_probe_gap=1.5` bug active, which pruned probing to a fraction
-> of the leaves. Recall comparisons here are invalid (scalar_lm's true Cohere
-> recall is 92.2%, not 73.9%). See `sweep-operating-curves.md` and git 322796b.
-> The analysis of *why* companding/Lloyd-Max work on this data remains valid.
+**Date**: 2026-08-08, critically revised 2026-08-31  
+**Status**: Implemented, validated, and re-benchmarked after the
+`adaptive_probe_gap` bug fix (git 322796b). This revision separates numbers that
+are valid (measured without the tree, or post-fix) from those that were tainted,
+and adds what the gap-bug investigation taught us about *methodology* — which
+changes how quantizer research should proceed.
 
-**Date**: 2026-08-08  
-**Status**: Implementation complete, benchmarked on Apple M4 and Google Axion c4a.
+> **What was wrong before:** every recall number measured *through the IVF tree*
+> before 2026-08-31 was depressed by the gap bug (probing pruned to 4-10 of 26
+> leaves). Damage scaled with quantizer quality — scalar_lm lost 40pp, PQ4 lost
+> 12pp, local_pq lost nothing. Numbers measured **in isolation** (Python spike,
+> `spike_lm_recall`) were correct all along. Corrected tables below;
+> operating curves in `sweep-operating-curves.md`.
 
 ## 1. Problem
 
@@ -15,7 +20,7 @@ Cohere embed v3 produces 768-dimensional normalized embeddings with
 extreme anisotropy. Standard Product Quantization (PQ4) degrades
 significantly on this data compared to normal embeddings.
 
-### Eigenvalue spectrum (Cohere 100k vs arxiv-nomic)
+### Eigenvalue spectrum (Cohere 100k vs arxiv-nomic) — valid, tree-independent
 
 | Metric | Cohere v3 | arxiv-nomic |
 |--------|-----------|-------------|
@@ -30,20 +35,21 @@ no neighbor-discriminating information (removing it preserves 100%
 of neighbors). The remaining 43% of variance is an isotropic noise
 floor spread across 767 dimensions.
 
-### Impact on PQ4 recall (corrected, GTMM ground truth)
+### Impact on PQ4 recall — corrected
 
-| Dataset | PQ4 recall@10 | QPS | B/vec |
-|---------|--------------|-----|-------|
-| arxiv-nomic 100k | 67.5% | 18,141 | 96 |
-| Cohere 100k | 43.0% | 17,766 | 96 |
+| Dataset | PQ4 m=96 | PQ4 m=192 | QPS (m=96) | B/vec |
+|---------|----------|-----------|------------|-------|
+| arxiv-nomic 100k | 53.7% | — | ~6.2k | 48/96 |
+| Cohere 100k | 36.2% | 51.6% | ~6.1k | 48/96 |
 
-PQ4 is degraded on Cohere (43% vs 68%) but NOT broken. Earlier
-measurements showing ~0% recall were caused by a ground-truth file
-format bug (legacy vs GTMM header), not actual PQ failure.
+(Old report: 67.5%/43.0% — gap-tainted and measured at different m.)
+PQ4 is degraded on Cohere vs arxiv, and — critically — is **quantizer-bound**:
+recall saturates by n-probe=4, so no amount of probing helps. The ceiling is
+the 4-bit codes themselves.
 
 ## 2. Investigation
 
-### Phase 1: Per-leaf residual PQ (negative result)
+### Phase 1: Per-leaf residual PQ (negative result) — valid
 
 Hypothesis: per-leaf codebooks trained on residuals (vec - centroid)
 would reduce distortion below the neighbor spread.
@@ -53,11 +59,10 @@ Residual norm remains ~0.5 at any k (16 to 4096). The isotropic noise
 floor is unpartitionable. Implemented and tested; recall identical to
 global PQ.
 
-### Phase 2: Signal processing framing
+### Phase 2: Signal processing framing — valid
 
 Reframed as a signal extraction problem: each embedding dimension is a
-frequency band with a DC bias and wideband noise. Explored techniques
-across multiple fields.
+frequency band with a DC bias and wideband noise.
 
 #### Techniques tested and rejected
 
@@ -74,6 +79,9 @@ across multiple fields.
 | Power-law companding (p=1/3) | Panter-Dite | Worse than A-law at 4-bit |
 | Dead-zone quantizer | Heavy-tail theory | Worse than Lloyd-Max |
 
+**Note for future work:** the "PCA rotation + companding" rejection is more
+important than it looked — see §7.E.
+
 #### Key discovery: companding
 
 μ-law/A-law companding (ITU-T G.711, 1972 telephony) applies a logarithmic
@@ -86,35 +94,40 @@ Gaussian's 3.0). Uniform quantization wastes levels on the tails.
 Companding addresses this — exactly the problem it was designed for in
 1972 for speech signals (same dynamic range structure).
 
-### Phase 3: Companding results (Cohere 100k, Python spike)
+### Phase 3: Companding results (Cohere 100k, Python spike) — VALID, and now confirmed
+
+These were measured by brute force over the whole dataset, **no tree** —
+so they were never gap-tainted. The previous revision of this report
+distrusted them ("may not be directly comparable"); that distrust was
+misplaced — the C++ isolated measurement (`spike_lm_recall`, 2026-08-31)
+reproduces the ceiling at 92.21%:
 
 | Method | Bits/dim | B/vec | Recall@10 |
 |--------|----------|-------|-----------|
-| PQ4 m=192 (baseline) | 0.5 | 96 | ~43% |
+| PQ4 m=192 (baseline) | 0.5 | 96 | ~43-52% |
 | μ-law uniform | 4 | 384 | 81.7% |
 | A-law uniform | 4 | 384 | 83.0% |
 | A-law + Lloyd-Max | 4 | 384 | 89.6% |
-| **Raw Lloyd-Max** | **4** | **384** | **91.1%** |
+| **Raw Lloyd-Max** | **4** | **384** | **91.1%** (C++ re-measure: 92.2%) |
 
-### Phase 4: Lloyd-Max is the answer
+**Lesson: when tree-through numbers and isolated numbers disagree, trust the
+isolated ones and suspect the tree.** The gap bug hid exactly this way.
+
+### Phase 4: Lloyd-Max is the answer — revised with new evidence
 
 Raw Lloyd-Max (1D k-means per dimension, no companding) beats all
 companded variants. Companding is a heuristic approximation of the
 optimal scalar quantizer; Lloyd-Max computes the optimum directly.
 
-At 4-bit (16 levels), the companding approximation loss exceeds its
-benefit. Lloyd-Max finds the MSE-optimal level placement for each
-dimension's actual distribution.
-
-Lloyd-Max with 5 restarts and 30 iterations matches high-quality sklearn
-k-means within 7% MSE. The per-dim MSE on Cohere is ~7% worse than
-sklearn, translating to ~8pp recall difference (91% vs 83% — wait,
-91% > 83%, so our Lloyd-Max is actually better than the sklearn number,
-which included the local_pq codebook... let me re-check).
-
-Actually, the Python spike numbers (91%) were computed with a GT format
-bug and may not be directly comparable. The production C++ implementation
-achieves 73.9% recall on Cohere (with correct GT, through the IVF tree).
+Training quality (2026-08-31 update): the C++ trainer had three defects —
+the quantile init read **unsorted** data, empty clusters were never
+reseeded, and restarts jittered by ±0.1% of range (all converged to the
+same basin). All fixed (sorted init, max-error reseed, spaced-random
+restarts, 3→10 restarts). Result: **recall unchanged (+0.05pp), MSE
+improved.** Interpretation: at 4-bit, MSE quality is *not* the binding
+constraint — the quantizer already sits at its information ceiling
+(92.2%). Better MSE optimizes a proxy that no longer moves recall; only
+changing the *objective* (ranking loss, §7.A) or the *bits* can.
 
 ## 3. Implementation
 
@@ -136,20 +149,25 @@ themselves, appearing in the distance computation.
 The decode-then-dot approach sidesteps this entirely: no LUT, no
 quantization of distance values, float precision throughout.
 
-### SIMD kernels
+### SIMD kernels — updated with measured outcomes (2026-08-31)
 
-Three tiers, selected at compile time:
+| Platform | Kernel | Status |
+|----------|--------|--------|
+| Apple M4 | NEON batch-4 float (scan), scalar batch-4 unrolled | **Active** — the hand-unrolled scalar batch-4 beat all vectorized attempts |
+| c4a (Neoverse-V2) | SVE2 gather (rerank only) | Active — correct (byte-identical), modest win (W≈300 entries) |
+| c4a (Neoverse-V2) | SVE2 gather (main scan) | **Measured dead end** — per-vector: 95 QPS; 4-vector concurrent: 65 QPS; scalar batch-4 baseline: 216 QPS |
 
-| Platform | Kernel | Mechanism |
-|----------|--------|-----------|
-| c4a (Neoverse-V2) | SVE2 gather (future) | `svld1_gather_u32index_f32` |
-| Apple M4 | NEON batch-4 float | Decode + `vfmaq_f32` |
-| Fallback | NEON scalar | Correctness only |
+The SVE2 scan result is worth internalizing: the levels table (48 KB) is
+L2-resident with predictable *scalar* access in the batch-4 loop. SVE2 gather
+latency — even with 4 independent FMA chains and hardware prefetch — exceeds
+scalar L1-hit level loads on Neoverse-V2. **Gather-based decode-dot does not
+beat amortized scalar lookups on current ARM cores.** Any future quantizer
+designed for *sequential* code→value mapping (no LUT gather) would change this
+calculus — a SIMD-research reason to prefer uniform-step quantizers, if recall
+allows.
 
 I8MM (`vmmlaq_s32`) was implemented and tested but is slower than
-batch-4 float due to per-dimension lookup overhead. The float path
-with 4-vector unrolling allows the compiler to vectorize across
-independent accumulator chains (+23-140% QPS vs single-vector).
+batch-4 float due to per-dimension lookup overhead.
 
 ### Properties
 
@@ -158,38 +176,47 @@ independent accumulator chains (+23-140% QPS vs single-vector).
 - **Storage**: 384 B/vec (4-bit codes) + 49 KB shared levels table.
 - **No training at insert time**: levels trained once on a sample.
 
-## 4. Benchmarks
+## 4. Benchmarks — corrected (post gap-fix, 2026-08-31)
 
-### Apple M4 (dev machine, 100k datasets)
+All via the `sweep` subcommand (bit-exact vs standalone), M4 8 threads,
+n-probe-ln=8 (full leaf probing), W=100:
 
-| Dataset | Method | k_root | Recall@10 | QPS | B/vec |
-|---------|--------|--------|-----------|-----|-------|
-| arxiv | PQ4 | 256 | 67.5% | 18,141 | 96 |
-| arxiv | Scalar LM | 256 | 90.6% | 3,009 | 384 |
-| arxiv | Scalar LM | 16 | 67.2% | 1,357 | 384 |
-| Cohere | PQ4 | 256 | 43.0% | 17,766 | 96 |
-| Cohere | Scalar LM | 256 | 73.9% | 2,777 | 384 |
-| Cohere | Scalar LM | 16 | 49.2% | 1,738 | 384 |
+| Dataset | Method | B/vec | Recall@10 | QPS |
+|---------|--------|-------|-----------|-----|
+| Cohere | Scalar LM | 384 | **92.2%** | ~371 |
+| Cohere | PQ4 m=192 | 96 | 51.6% | ~7.8k |
+| Cohere | PQ4 m=96 | 48 | 36.2% | ~6.1k |
+| arxiv | Scalar LM | 384 | **94.5%** | ~371 |
+| arxiv | PQ4 m=96 | 48 | 53.7% | ~6.2k |
 
-### Google Axion c4a (Neoverse-V2, production target)
+### The ceiling result
 
-| Dataset | Scale | Method | Recall@10 | QPS | B/vec |
-|---------|-------|--------|-----------|-----|-------|
-| arxiv | 1.3M | PQ4 k256 | 60.0% | 5,582 | 96 |
-| arxiv | 1.3M | Scalar LM k256 | 77.5% | 224 | 384 |
-| Cohere | 100k | PQ4 k256 | 43.1% | 18,167 | 96 |
-| Cohere | 100k | Scalar LM k256 | 73.9% | 2,452 | 384 |
+Cohere scalar_lm through the tree at full probing = **92.2%**, exactly equal
+to the isolated-quantizer measurement (0.9221). **The tree adds zero recall
+loss.** Consequences:
 
-### Key observations
+1. Quantizer research can iterate entirely in the isolated harness
+   (`scripts/spike_lm_recall.cpp`) — the tree is a faithful carrier.
+2. Remaining headroom (7.8pp to 100%) belongs to the quantizer, not the
+   tree. Qdrant reports 97.3% on Cohere at 4-bit (static HNSW + TurboQuant),
+   suggesting ~5pp of it is reachable at this bitrate.
+3. QPS differences between quantizers are then the only tree-side variable.
 
-1. Scalar LM beats PQ4 on recall at every config: +17-31pp.
-2. PQ4 wins on QPS (6-25×) and storage (4×).
-3. Higher k_root improves both methods (~15-20pp from k=16→256).
-4. The recall advantage is larger on Cohere (+31pp) than arxiv (+23pp),
-   confirming scalar quantization helps more on concentrated data.
-5. I8MM kernel is available but slower than batch-4 float (lookup overhead).
+### Methodological rules (learned the hard way)
 
-## 5. Why an IVF tree (not HNSW)
+1. **Isolate before judging through the tree.** The gap bug damaged better
+   quantizers more (scalar_lm −40pp, PQ4 −12pp, local_pq ±0) — tree-through
+   comparisons can *invert* conclusions about quantizer quality.
+2. **Self-lookup test**: query with base vectors; a sound index must return
+   each at distance ≈ 2×quantization-MSE×dim (~0.004 here). Fastest sanity
+   check; it caught the gap bug's signature in minutes.
+3. **Check probe saturation**: if recall stops improving with n-probe before
+   reaching the isolated ceiling, the tree is losing candidates (bug or
+   pruning). If it saturates *at* the isolated ceiling, the quantizer is bound.
+4. **W (rerank shortlist) is a non-knob** for these quantizers — flat from
+   W=100. Historical claims that large W was needed were gap-bug artifacts.
+
+## 5. Why an IVF tree (not HNSW) — unchanged
 
 HNSW dominates RAM-resident benchmarks (2-3× QPS, 97%+ recall). But its
 random-access graph traversal fails on disk. At billion scale:
@@ -206,51 +233,83 @@ sequential leaf scan (NVMe-friendly), filter pruning at centroid level,
 no graph overhead. Scalar Lloyd-Max quantization with centroid-independent
 codes enables dynamic inserts without re-quantization.
 
-## 6. Industry context
+## 6. Industry context — updated positioning
 
-### Systems using scalar quantization (2024-2025)
-
-- **Elasticsearch OSQ** (Jan 2025): per-vector optimized quantiles +
-  correction term. Closest published analog to our approach.
-- **Qdrant TurboQuant** (2026): Hadamard rotation + Lloyd-Max codebook +
-  RaBitQ renormalization + per-coordinate anisotropy compensation.
-  97.3% on Cohere at 4-bit. Static HNSW — not applicable to dynamic IVF.
-- **NVQ** (JVector/DataStax, 2025): per-subvector nonlinear quantizer
-  (learned companding). Dynamic-insert compatible.
-- **RaBitQ** (SIGMOD 2024): centroid-dependent sign quantization.
-  We tested and removed it — incompatible with dynamic IVF trees.
+- **Qdrant TurboQuant (2026)**: Hadamard rotation + Lloyd-Max + RaBitQ
+  renormalization. **97.3% on Cohere at 4-bit** — the number to beat; ~5pp
+  above our 92.2%. Their stack is static HNSW; ours is dynamic IVF. Their
+  result proves the headroom exists at this bitrate.
+- **Elasticsearch OSQ**: per-vector optimized quantiles + correction term.
+- **NVQ (JVector)**: per-subvector nonlinear quantizer (learned companding).
+- **RaBitQ (SIGMOD 2024)**: centroid-dependent; incompatible with dynamic
+  IVF (tested, removed).
 
 ### What's novel in our work
 
-The companding investigation path: discovering that 1972 telecom
-techniques (μ-law/A-law) apply to embedding quantization, and proving
-that Lloyd-Max on raw values beats companding. No ANN paper has
-published this path. The final answer (Lloyd-Max) is textbook, but
-the research journey through DSP, biology, astronomy, and information
-theory to arrive there is original.
+The companding investigation path — 1972 telecom techniques applied to
+embedding quantization, and the proof that Lloyd-Max on raw values beats
+companding — plus the negative-result table (§2 Phase 2). Also: the
+demonstration that a *tree-side* recall bug can masquerade as a quantizer
+quality problem for weeks, and the isolation methodology that detects it.
 
-## 7. Future research directions
+## 7. Future research directions — revised with constraints
 
-### A. Learnable companding (LCQ-style, CVPR 2021)
-Per-dim piecewise-linear compressor trained via SGD on neighbor-ranking
-loss. Lloyd-Max optimizes MSE, not recall. Potential: +3-5pp.
+### A. Learnable companding / ranking-loss optimization (LCQ-style) — the main recall lever
+
+Lloyd-Max optimizes MSE; we showed MSE no longer moves recall (§2 Phase 4).
+The remaining 7.8pp gap needs an objective that preserves neighbor *ordering*.
+Per-dim piecewise-linear compressor trained via SGD on neighbor-ranking loss.
+Headroom bounded by Qdrant's 97.3% → realistic target ~5pp.
+**Evaluate in the isolated harness first** (rule §4.1).
 
 ### B. Discrimination-aware bit allocation
+
 Allocate bits by per-dim neighbor-discrimination importance, not variance.
-Elasticsearch R²-over-NN-pairs objective. Gate: per-dim discrimination
-must vary >2×. Potential: +2-3pp.
+Gate: per-dim discrimination must vary >2× (measure with the isolated spike).
+At fixed total bits this trades tail dims for discriminative ones — the first
+thing to try for the middle-ground frontier (below).
 
 ### C. ScaNN-style anisotropic loss
+
 Replace MSE with score-aware loss during level optimization. Penalize
-quantization error parallel to the vector. Potential: +1-3pp.
+quantization error parallel to the vector. Synergistic with A (same trainer,
+different loss).
 
-### D. SVE2 gather kernel
-Enable the SVE2 path on c4a (blocked by clang 18 arm_sve.h issue).
-Hardware-prefetched float gather would improve QPS on production hardware.
+### D. SVE2 gather kernel — RESOLVED, negative
 
-### E. MRQ-style dimensionality reduction
-PCA project to leading dims, quantize dense subspace. Decouples code
-length from dimensionality. Risk: PCA changes distributions.
+Implemented and measured (two designs). Gather latency > scalar L1 hits on
+Neoverse-V2 for this access pattern. Do not revisit unless the quantizer
+changes to sequential code→value mapping (§3 SIMD note).
+
+### E. Dimensionality reduction for smaller codes — has a known trap
+
+Motivation: the bytes/recall frontier (48B/36% ↔ 384B/92.2%) is unmapped;
+smaller codes are the billion-scale economics question.
+
+**The trap:** the obvious approach — PCA-project then quantize — collides
+with our own Phase 2 result: rotation makes dims Gaussian (CLT), kurtosis
+35.3 → ~3, and Gaussian dims waste Lloyd-Max levels (the companding advantage
+evaporates; that row in the rejection table was measuring exactly this).
+A rotated-then-Lloyd-Max quantizer loses the property that makes Lloyd-Max
+win on this data.
+
+Viable alternatives:
+- **Raw-dim selection** (no rotation): keep the highest-discrimination raw
+  dims, drop tail dims. Preserves per-dim distributions; code length scales
+  down; recall floor set by dropped dims' information. Cheap to evaluate in
+  the isolated spike (zero new machinery).
+- **Partial rotation**: rotate only within near-degenerate subspaces, leaving
+  the heavy-tailed structure intact. Harder; needs a spike to validate.
+- First experiment: isolated recall vs #dims kept curve for raw-dim selection
+  — bounds the whole direction in an afternoon.
+
+### F. Bound the 4-bit headroom (new, cheap, do first)
+
+Measure isolated recall of **8-bit** scalar LM (the quantizer supports it;
+only the tree scan path rejects it). That number is the ceiling of all 4-bit
+work: if 8-bit gives ~97%, ranking-loss training (A) can realistically reach
+it; if 8-bit gives ~93%, the 4-bit information limit is nearly exhausted and
+research effort should shift to E (more bits on fewer dims) instead.
 
 ## 8. References
 
