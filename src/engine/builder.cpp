@@ -604,18 +604,24 @@ void Builder::construct_into(VamanaCore& core, uint32_t count,
         futs.push_back(pool.push(worker));
     }
 
-    // Progress logger: reads the atomic counter every 5s. Zero contention.
+    // Progress logger: reads the atomic counter periodically. Zero contention.
+    // Wakes promptly when the workers finish (finished flag + short sleeps) —
+    // a fixed 5s sleep here imposed a 5s wall floor on EVERY shard build,
+    // dwarfing the actual construct time (workers finish in <1s on shards).
+    std::atomic<bool> finished{false};
     std::thread logger([&]() {
         const auto t_start = std::chrono::steady_clock::now();
         auto t_last = t_start;
         uint32_t last_done = lo;
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+        while (!finished.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
             const auto now = std::chrono::steady_clock::now();
             const uint32_t done = std::min(
                 next_id.load(std::memory_order_relaxed), hi);
             const double elapsed = std::chrono::duration<double>(
                 now - t_start).count();
+            if (done <= last_done && !finished.load(std::memory_order_relaxed))
+                continue;
             const double interval = std::chrono::duration<double>(
                 now - t_last).count();
             const uint32_t processed = done - lo;
@@ -626,7 +632,6 @@ void Builder::construct_into(VamanaCore& core, uint32_t count,
             spdlog::info("[sextant] {}: {}/{} nodes ({:.0f}/s, ETA {:.0f}s)",
                          label, processed + 1, hi - lo,
                          interval_processed / interval, eta);
-            if (done >= hi) break;
             last_done = done;
             t_last = now;
         }
@@ -635,6 +640,7 @@ void Builder::construct_into(VamanaCore& core, uint32_t count,
     for (auto& f : futs) {
         f.get();
     }
+    finished.store(true, std::memory_order_relaxed);
     logger.join();
     core.set_build_progress(nullptr);
 
