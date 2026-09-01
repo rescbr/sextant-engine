@@ -5,6 +5,7 @@
 #include "quant/pq_quantizer.hpp"
 #include "quant/product_residual_quantizer.hpp"
 #include "quant/scalar_lloydmax_quantizer.hpp"
+#include "quant/anisotropic_pq_quantizer.hpp"
 #include "util/fp16.hpp"
 #include "simd_kernels.hpp"
 #include "tree/filter_column_write.hpp"  // filter column write path
@@ -140,6 +141,12 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
             idx->quantizer_ = std::make_unique<ProductResidualQuantizer>(
                 MetricKind::L2Sq, m.dim, m.m4, m.scan_pq_bits,
                 m.prq_nsplits, /*beam_size=*/1);
+        } else if (m.quantizer_type == "anisotropic_pq" ||
+                   m.quantizer_type == "anisotropic-pq") {
+            // Codebook deserializes through the PqQuantizer base — the
+            // anisotropic objective only changes training.
+            idx->quantizer_ = std::make_unique<PqQuantizer>(
+                MetricKind::L2Sq, m.dim, m.m4, m.scan_pq_bits);
         } else if (m.quantizer_type == "scalar_lloydmax" ||
                    m.quantizer_type == "scalar_uniform") {
             idx->scalar_lm_quantizer_ = std::make_unique<ScalarLloydMaxQuantizer>(
@@ -598,6 +605,13 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
         ctx.quantizer = std::make_unique<ProductResidualQuantizer>(
             params.metric, dim, ctx.m4, ctx.scan_bits, nsplits,
             params.prq_beam_size, 42);
+    } else if (params.quantizer_type == "anisotropic_pq" ||
+               params.quantizer_type == "anisotropic-pq") {
+        // ScaNN-style anisotropic Lloyd's training (ranking-loss objective:
+        // penalizes error parallel to the query more than orthogonal).
+        // Hot path inherited from PqQuantizer — search-identical.
+        ctx.quantizer = std::make_unique<AnisotropicPqQuantizer>(
+            params.metric, dim, ctx.m4, ctx.scan_bits);
     } else if (ctx.is_local_pq) {
         // local_pq: no global codebook. Each leaf trains its own codebook
         // on residuals at flush time. Leave ctx.quantizer as nullptr.
