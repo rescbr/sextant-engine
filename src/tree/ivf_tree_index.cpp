@@ -2441,6 +2441,11 @@ struct SearchScratch {
     // scan + predicate filtering of the heap
     std::vector<HeapEntry> heap, filtered_heap;
     std::vector<std::vector<HeapEntry>> worker_heaps;
+    /// FastScan parallel workers: private per-leaf LUT state (local_pq).
+    std::vector<std::vector<float>> worker_residuals;
+    std::vector<std::vector<uint8_t>> worker_lut4;
+    std::vector<std::vector<uint8_t>> worker_lut8;
+    std::vector<std::unique_ptr<PqQuantizer>> worker_leaf_quants;
     std::vector<uint8_t> local_lut4, local_lut8;
     std::vector<float> query_residual, decoded_vec;
     std::vector<int8_t> query_i8;
@@ -2962,15 +2967,13 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     local_lut8.clear();
     if (is_local_pq && !scan_8bit) local_lut4.resize(m * 16);
     if (is_local_pq && scan_8bit) local_lut8.resize(m * 256);
-    float local_lut_scale = 0, local_lut_offset = 0;
     // Reusable per-leaf quantizer wrapper for LUT building. Cached in the
     // thread-local scratch — its parameters are fixed for the index lifetime.
     std::unique_ptr<PqQuantizer>& leaf_quant = scratch.leaf_quant;
     if (is_local_pq && !leaf_quant) {
         leaf_quant = std::make_unique<PqQuantizer>(
             MetricKind::L2Sq, manifest_.dim, manifest_.m4, manifest_.scan_pq_bits);
-    }
-    // Scratch for query residual (local_pq).
+    }    // Scratch for query residual (local_pq).
     auto& query_residual = scratch.query_residual;
     query_residual.clear();
     if (is_local_pq) query_residual.resize(manifest_.dim);
@@ -3202,20 +3205,30 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             }
         }
     } else {  // FastScan scan loop (pq / prq / local_pq)
-    for (const auto& cand : candidates) {
-        if (cand.page == kInvalidPage) continue;
-        const uint8_t* leaf_ptr = mmap_base_ +
-            static_cast<uint64_t>(cand.page) * kPageSize;
-        const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
-        const uint32_t count = lh->count;
-        if (count == 0) continue;
+    // Per-leaf FastScan body. Parameterized on the mutable per-leaf state
+    // (residual, local LUTs, local-PQ quantizer wrapper) so the parallel
+    // dispatch below can give each worker private buffers.
+    auto scan_leaf_fs = [&](const LeafCandidate& cand,
+                            std::vector<HeapEntry>& h,
+                            std::vector<float>& residual,
+                            std::vector<uint8_t>& l4,
+                            std::vector<uint8_t>& l8,
+                            PqQuantizer* leaf_q) {
+        float lut_scale = 0, lut_offset = 0;
+        (void)lut_scale; (void)lut_offset;
+     if (cand.page == kInvalidPage) return;
+         const uint8_t* leaf_ptr = mmap_base_ +
+             static_cast<uint64_t>(cand.page) * kPageSize;
+         const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+         const uint32_t count = lh->count;
+         if (count == 0) return;
 
-        const uint32_t n_blocks = (count + codes_per_block - 1) / codes_per_block;
+         const uint32_t n_blocks = (count + codes_per_block - 1) / codes_per_block;
 
-        // Dispatch by leaf state.
-        const uint8_t leaf_state = lh->leaf_state;
-        const bool is_coded_local = (leaf_state ==
-            static_cast<uint8_t>(LeafState::CodedLocal));
+         // Dispatch by leaf state.
+         const uint8_t leaf_state = lh->leaf_state;
+         const bool is_coded_local = (leaf_state ==
+             static_cast<uint8_t>(LeafState::CodedLocal));
 
         const uint8_t* codes;
         const RowId* row_ids;
@@ -3226,18 +3239,18 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             const float* centroid = reinterpret_cast<const float*>(
                 leaf_ptr + lh->centroid_offset);
             for (uint32_t d = 0; d < manifest_.dim; ++d)
-                query_residual[d] = query[d] - centroid[d];
+                residual[d] = query[d] - centroid[d];
             const float* codebook = reinterpret_cast<const float*>(
                 leaf_ptr + lh->codebook_offset);
-            leaf_quant->set_codebook_data(codebook);
+            leaf_q->set_codebook_data(codebook);
             if (scan_8bit) {
-                leaf_quant->build_fastscan_lut(query_residual.data(),
-                    local_lut8.data(), &local_lut_scale, &local_lut_offset);
-                lut_ptr = local_lut8.data();
+                leaf_q->build_fastscan_lut(residual.data(),
+                    l8.data(), &lut_scale, &lut_offset);
+                lut_ptr = l8.data();
             } else {
-                leaf_quant->build_fastscan_lut4(query_residual.data(),
-                    local_lut4.data(), nullptr);
-                lut_ptr = local_lut4.data();
+                leaf_q->build_fastscan_lut4(residual.data(),
+                    l4.data(), nullptr);
+                lut_ptr = l4.data();
             }
             codes = leaf_ptr + local_codes_offset(manifest_.summary_size,
                 manifest_.dim, manifest_.m4, manifest_.scan_pq_bits);
@@ -3278,45 +3291,45 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 simd::fastscan_block16(blk, lut_ptr, m,
                                         static_cast<uint16_t>(valid_mask), out);
                 const uint32_t base = b * 16;
-                if (heap.size() < W) {
+                if (h.size() < W) {
                     for (uint32_t j = 0; j < 16; ++j) {
                         if (out[j] == 0xFFFFFFFFu) continue;
-                        heap.push_back({out[j], row_ids[base + j], leaf_ptr, base + j});
-                        if (heap.size() == W) {
-                            std::make_heap(heap.begin(), heap.end(), heap_less);
+                        h.push_back({out[j], row_ids[base + j], leaf_ptr, base + j});
+                        if (h.size() == W) {
+                            std::make_heap(h.begin(), h.end(), heap_less);
                             break;
                         }
                     }
-                    if (heap.size() < W) continue;
+                    if (h.size() < W) continue;
                 }
-                const uint32_t front_d = heap[0].pq_dist;
+                const uint32_t front_d = h[0].pq_dist;
                 uint32_t block_min = 0xFFFFFFFFu;
                 for (uint32_t j = 0; j < 16; ++j)
                     if (out[j] < block_min) block_min = out[j];
                 if (block_min >= front_d) continue;
                 for (uint32_t j = 0; j < 16; ++j) {
-                    if (out[j] == 0xFFFFFFFFu || out[j] >= heap[0].pq_dist)
+                    if (out[j] == 0xFFFFFFFFu || out[j] >= h[0].pq_dist)
                         continue;
-                    heap_replace(heap, out[j], row_ids[base + j], leaf_ptr, base + j);
+                    heap_replace(h, out[j], row_ids[base + j], leaf_ptr, base + j);
                 }
             } else {
                 uint32_t out[32];
                 simd::pq4_block32(blk, lut_ptr, m, out);
                 const uint32_t base = b * 32;
 
-                if (heap.size() < W) {
+                if (h.size() < W) {
                     for (uint32_t j = 0; j < 32; ++j) {
                         if (!((valid_mask >> j) & 1u)) continue;
-                        heap.push_back({out[j], row_ids[base + j], leaf_ptr, base + j});
-                        if (heap.size() == W) {
-                            std::make_heap(heap.begin(), heap.end(), heap_less);
+                        h.push_back({out[j], row_ids[base + j], leaf_ptr, base + j});
+                        if (h.size() == W) {
+                            std::make_heap(h.begin(), h.end(), heap_less);
                             break;
                         }
                     }
-                    if (heap.size() < W) continue;
+                    if (h.size() < W) continue;
                 }
 
-                const uint32_t front_d = heap[0].pq_dist;
+                const uint32_t front_d = h[0].pq_dist;
                 uint32_t block_min = 0xFFFFFFFFu;
                 for (uint32_t j = 0; j < 32; ++j)
                     if ((valid_mask >> j) & 1u)
@@ -3325,10 +3338,88 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
                 for (uint32_t j = 0; j < 32; ++j) {
                     if (!((valid_mask >> j) & 1u)) continue;
-                    if (out[j] >= heap[0].pq_dist) continue;
-                    heap_replace(heap, out[j], row_ids[base + j], leaf_ptr, base + j);
+                    if (out[j] >= h[0].pq_dist) continue;
+                    heap_replace(h, out[j], row_ids[base + j], leaf_ptr, base + j);
                 }
             }
+        }
+    };
+
+    // Within-query leaf-parallel FastScan (same dispatch contract as the
+    // scalar path above): T workers, private heaps + private per-leaf LUT
+    // state (residual, local lut4/lut8, local-PQ quantizer), deterministic
+    // merge at the end. Serial path is byte-identical to the original loop.
+    const bool parallel_fs = config.search_threads > 1
+        && candidates.size() >= 2;
+    if (!parallel_fs) {
+        for (const auto& cand : candidates) {
+            scan_leaf_fs(cand, heap, query_residual, local_lut4, local_lut8,
+                         leaf_quant.get());
+        }
+    } else {
+        const uint32_t T = std::min(config.search_threads,
+                                    static_cast<uint32_t>(candidates.size()));
+        auto& th = scratch.worker_heaps;
+        if (th.size() < T) th.resize(T);
+        for (auto& my : th) my.clear();
+        // Per-worker leaf-LUT state, cached in the scratch.
+        auto& wr = scratch.worker_residuals;
+        auto& wl4 = scratch.worker_lut4;
+        auto& wl8 = scratch.worker_lut8;
+        auto& wq = scratch.worker_leaf_quants;
+        if (wr.size() < T) {
+            wr.resize(T); wl4.resize(T); wl8.resize(T); wq.resize(T);
+        }
+        for (uint32_t t = 0; t < T; ++t) {
+            if (is_local_pq) {
+                wr[t].assign(manifest_.dim, 0.f);
+                if (scan_8bit) wl8[t].assign(static_cast<size_t>(m) * 256, 0);
+                else wl4[t].assign(static_cast<size_t>(m) * 16, 0);
+                if (!wq[t]) {
+                    wq[t] = std::make_unique<PqQuantizer>(
+                        MetricKind::L2Sq, manifest_.dim, manifest_.m4,
+                        manifest_.scan_pq_bits);
+                }
+            }
+        }
+        std::vector<std::future<void>> futs;
+        futs.reserve(T);
+        const uint32_t per = (static_cast<uint32_t>(candidates.size()) + T - 1) / T;
+        for (uint32_t t = 0; t < T; ++t) {
+            const uint32_t start = t * per;
+            const uint32_t end = std::min(start + per,
+                static_cast<uint32_t>(candidates.size()));
+            if (start >= end) break;
+            futs.push_back(std::async(std::launch::async,
+                [&](uint32_t s, uint32_t e, uint32_t ti) {
+                    auto& my = th[ti];
+                    my.reserve(W + 32);
+                    for (uint32_t c = s; c < e; ++c) {
+                        scan_leaf_fs(candidates[c], my, wr[ti], wl4[ti], wl8[ti],
+                                     wq[ti].get());
+                    }
+                }, start, end, t));
+        }
+        for (auto& f : futs) f.get();
+
+        // Deterministic merge (same as the scalar path).
+        size_t total = 0;
+        for (const auto& my : th) total += my.size();
+        heap.clear();
+        heap.reserve(total);
+        for (auto& my : th) {
+            heap.insert(heap.end(),
+                        std::make_move_iterator(my.begin()),
+                        std::make_move_iterator(my.end()));
+        }
+        if (heap.size() > W) {
+            std::sort(heap.begin(), heap.end(),
+                      [](const HeapEntry& a, const HeapEntry& b) {
+                          if (a.pq_dist != b.pq_dist)
+                              return a.pq_dist < b.pq_dist;
+                          return a.row_id < b.row_id;
+                      });
+            heap.resize(W);
         }
     }
     }  // end FastScan scan loop (else of is_scalar_lm)
