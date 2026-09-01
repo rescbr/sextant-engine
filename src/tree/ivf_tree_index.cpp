@@ -2497,7 +2497,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                              const SearchConfig& config,
     std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs,
     const std::vector<uint32_t>* sweep_Ws,
-    std::vector<std::vector<Candidate>>* sweep_out) const {
+    std::vector<std::vector<Candidate>>* sweep_out,
+    std::vector<PageId>* visited_leaf_pages) const {
     // Thread-local arena: buffers keep their capacity across calls on this
     // thread (see SearchScratch above). CLI std::async workers and test
     // threads each get their own instance.
@@ -2908,6 +2909,15 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         if (candidates.empty()) {
             return {};
         }
+    }
+
+    // Routing diagnostics: report the physical first-page of every leaf that
+    // will be scanned (post predicate pruning). The harness maps these back
+    // to leaf contents via debug_leaf_info()/debug_leaf_row_ids().
+    if (visited_leaf_pages) {
+        visited_leaf_pages->clear();
+        visited_leaf_pages->reserve(candidates.size());
+        for (const auto& c : candidates) visited_leaf_pages->push_back(c.page);
     }
 
     // --- Prefetch leaf extents ---
@@ -3791,6 +3801,67 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const SearchConfig& config,
         std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs) const {
     return search(query, k, config, payload_locs, nullptr, nullptr);
+}
+
+// ===========================================================================
+// Routing diagnostics — loss-decomposition harness support.
+// ===========================================================================
+
+std::vector<IVFTreeIndex::DebugLeafInfo> IVFTreeIndex::debug_leaf_info()
+    const {
+    std::vector<DebugLeafInfo> out;
+    out.reserve(leaf_table_.size());
+    for (const auto& e : leaf_table_) {
+        uint32_t count = 0;
+        if (e.page != kInvalidPage) {
+            const auto* lh = reinterpret_cast<const TreeLeafHeader*>(
+                mmap_base_ + static_cast<uint64_t>(e.page) * kPageSize);
+            count = static_cast<uint32_t>(lh->count);
+        }
+        out.push_back({e.page, e.pages, count});
+    }
+    return out;
+}
+
+std::vector<RowId> IVFTreeIndex::debug_leaf_row_ids(uint32_t leaf_id) const {
+    if (leaf_id >= leaf_table_.size()) return {};
+    const auto& e = leaf_table_[leaf_id];
+    if (e.page == kInvalidPage) return {};
+    const uint8_t* leaf_ptr = mmap_base_ +
+        static_cast<uint64_t>(e.page) * kPageSize;
+    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+    const uint64_t count = lh->count;
+    if (count == 0) return {};
+
+    // row_ids sit after the codes region; the layout depends on quantizer
+    // type (mirrors the scan paths above).
+    const RowId* rids = nullptr;
+    const bool is_local_pq = (manifest_.quantizer_type == "local_pq");
+    const bool is_scalar_lm =
+        (manifest_.quantizer_type == "scalar_lloydmax" ||
+         manifest_.quantizer_type == "scalar_uniform" ||
+         manifest_.quantizer_type == "scalar_shape");
+    if (is_scalar_lm) {
+        const uint32_t cs = scalar_lm_quantizer_->code_size();
+        rids = reinterpret_cast<const RowId*>(
+            leaf_ptr + leaf_codes_offset(manifest_.summary_size) +
+            count * cs);
+    } else {
+        const uint32_t cpb = (manifest_.scan_pq_bits == 8) ? 16 : 32;
+        const uint32_t block_bytes = manifest_.m4 * 16;
+        const uint64_t n_blocks = (count + cpb - 1) / cpb;
+        if (is_local_pq) {
+            rids = reinterpret_cast<const RowId*>(
+                leaf_ptr + local_rowids_offset(manifest_.summary_size,
+                    manifest_.dim, manifest_.m4, manifest_.scan_pq_bits,
+                    n_blocks, block_bytes));
+        } else {
+            rids = reinterpret_cast<const RowId*>(
+                leaf_ptr + leaf_rowids_offset(manifest_.summary_size,
+                                              n_blocks, block_bytes));
+        }
+    }
+    return std::vector<RowId>(rids, rids + count);
 }
 
 // ===========================================================================

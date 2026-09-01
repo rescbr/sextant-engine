@@ -136,7 +136,21 @@ public:
                                   const SearchConfig& config,
         std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs,
         const std::vector<uint32_t>* sweep_Ws,
-        std::vector<std::vector<Candidate>>* sweep_out) const;
+        std::vector<std::vector<Candidate>>* sweep_out,
+        std::vector<PageId>* visited_leaf_pages = nullptr) const;
+
+    // --- Routing diagnostics (loss-decomposition harness) ---
+
+    /// Physical location + stored vector count of every leaf, in leaf-table
+    /// order. `page` is the first physical page of the leaf extent — the same
+    /// value search() reports in `visited_leaf_pages` for scanned leaves.
+    struct DebugLeafInfo { PageId page; uint64_t pages; uint32_t count; };
+    std::vector<DebugLeafInfo> debug_leaf_info() const;
+
+    /// Row ids stored in leaf `leaf_id` (reads the leaf extent's row_id
+    /// array). With closure replication a row id can appear in several
+    /// leaves. Returns empty for an out-of-range leaf_id.
+    std::vector<RowId> debug_leaf_row_ids(uint32_t leaf_id) const;
 
     /// Fetch the opaque payload blob for a result. O(1): reads the leaf's
     /// payload extent from the mmap, indexes by slot.
@@ -267,9 +281,9 @@ private:
     std::unique_ptr<ScalarLloydMaxQuantizer> scalar_lm_quantizer_;
 
     // --- Leaf extent table (indirection: leaf_id → page+pages) ---
-    // Loaded at open() from the leaf_table blob. Empty when the tree was
-    // built without a leaf table (legacy format). When non-empty, ChildEntry
-    // child_page for is_leaf=1 children is a leaf_id index into this table.
+    // Loaded at open() from the leaf_table blob. Mandatory: every tree the
+    // current build path writes one; is_leaf ChildEntry child_page values
+    // are leaf_id indexes into this table.
     std::vector<LeafTableEntry> leaf_table_;
 
     // Root node (parsed from mmap at open time; points into mmap_base_).
