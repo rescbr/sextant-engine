@@ -38,6 +38,20 @@ public:
     /// kernel speedup over the gather form at 4 bits, scalar code).
     void train_uniform(const float* samples, uint64_t n);
 
+    /// Shared-shape training (see the arithmetic_scan docs). Lloyd-Max +
+    /// alternating LS factorization; levels_ are rebuilt from the fitted
+    /// (lo_d, step_d, f) so encode/decode/rerank are self-consistent.
+    void train_shape(const float* samples, uint64_t n,
+                     uint32_t n_restarts = 10, uint32_t lloyd_iters = 30);
+
+    /// Shared-shape companding: level_d[k] = lo_d + step_d·f[k] with a single
+    /// monotone f shared across dims. Train = Lloyd-Max, then an alternating
+    /// least-squares factorization of the LM level table into per-dim
+    /// (lo_d, step_d) + shared f. Recall matches Lloyd-Max on near-Gaussian
+    /// marginals (arxiv) at the uniform kernel's speed: the scan stays
+    /// dot = c0 + Σ (q_d·step_d)·f[code_d] — f is 16 bytes, one NEON TBL per
+    /// 16 nibbles, no per-dim gather.
+
     /// Encode: for each dim, assign to nearest level → pack nibbles.
     /// Output: dim * bits / 8 bytes (code_size()).
     void encode(const float* vec, uint8_t* code_out) const;
@@ -75,7 +89,23 @@ public:
 
     /// True when trained via train_uniform (equidistant levels). Serialized
     /// with the quantizer so the scan can pick the arithmetic kernel.
-    bool is_uniform() const { return uniform_; }
+    bool is_uniform() const { return mode_ == 1; }
+
+    /// True when the arithmetic MAC scan applies (uniform or shared-shape):
+    /// dot = c0 + Σ (q_d·step_d)·f[code_d] with f == identity for uniform.
+    bool arithmetic_scan() const { return mode_ >= 1; }
+
+    /// Shared-shape table f (K floats, monotone). Identity for uniform/LM.
+    const float* shape() const { return f_.data(); }
+
+    /// Per-dim scan scale (q_d·step_d precomputed per query). For uniform,
+    /// step_d = level[d*K+1]-level[d*K].
+    const float* steps() const { return steps_.data(); }
+
+    /// f quantized to u8 for the NEON TBL kernel (scale folded into steps by
+    /// the caller: fu8[k] = round(f[k]·S), multiply the accumulated dot by 1/S
+    /// — ranking-invariant, so the scan can skip the rescale entirely).
+    const uint8_t* shape_u8() const { return fu8_.data(); }
 
     /// Build the int8 query for the decode-dot kernels.
     /// Scales query so its max-abs value maps to ±127.
@@ -114,7 +144,14 @@ private:
 
     /// Equidistant-levels mode (train_uniform). Levels stay in levels_
     /// (same layout), so encode/decode/serialize are shared.
-    bool uniform_ = false;
+    /// 0 = Lloyd-Max, 1 = uniform (linear f), 2 = shared-shape f.
+    uint8_t mode_ = 0;
+
+    /// Shared shape + per-dim scan scales (mode 2; steps_ also filled for
+    /// mode 1). f_ is K floats; steps_ is dim floats.
+    std::vector<float> f_;
+    std::vector<float> steps_;
+    std::vector<uint8_t> fu8_;  // f scaled to u8 for the TBL kernel
 
     /// Recompute bounds_ from levels_.
     void compute_bounds_();

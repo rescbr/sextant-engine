@@ -148,7 +148,8 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
             idx->quantizer_ = std::make_unique<PqQuantizer>(
                 MetricKind::L2Sq, m.dim, m.m4, m.scan_pq_bits);
         } else if (m.quantizer_type == "scalar_lloydmax" ||
-                   m.quantizer_type == "scalar_uniform") {
+                   m.quantizer_type == "scalar_uniform" ||
+                   m.quantizer_type == "scalar_shape") {
             idx->scalar_lm_quantizer_ = std::make_unique<ScalarLloydMaxQuantizer>(
                 static_cast<MetricKind>(m.metric), m.dim, m.scan_pq_bits);
         } else {
@@ -541,7 +542,8 @@ void resolve_build_params(TreeBuildContext& ctx) {
     ctx.metric = params.metric;
     ctx.is_local_pq = (params.quantizer_type == "local_pq");
     ctx.is_scalar_lm = (params.quantizer_type == "scalar_lloydmax" ||
-                        params.quantizer_type == "scalar_uniform");
+                        params.quantizer_type == "scalar_uniform" ||
+                        params.quantizer_type == "scalar_shape");
     if (ctx.is_scalar_lm) {
         // Scalar quantization is sub_dim=1: m = dim subquantizers.
         ctx.m4 = static_cast<uint16_t>(ctx.dim);
@@ -550,8 +552,8 @@ void resolve_build_params(TreeBuildContext& ctx) {
         // silently producing garbage distances.
         if (params.scan_pq_bits != 4) {
             throw std::invalid_argument(
-                "scalar_lloydmax/scalar_uniform currently support only "
-                "--pq-bits 4");
+                "scalar_lloydmax/scalar_uniform/scalar_shape currently "
+                "support only --pq-bits 4");
         }
     }
 }
@@ -617,12 +619,14 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
         // on residuals at flush time. Leave ctx.quantizer as nullptr.
         ctx.quantizer = nullptr;
     } else if (ctx.is_scalar_lm) {
-        // scalar_lloydmax / scalar_uniform: per-dim scalar quantizer. No
-        // PqQuantizer; codes are flat packed nibbles (not FastScan blocks).
+        // scalar_lloydmax / scalar_uniform / scalar_shape: per-dim scalar
+        // quantizer. No PqQuantizer; codes are flat packed nibbles.
         ctx.scalar_lm_quantizer = std::make_unique<ScalarLloydMaxQuantizer>(
             params.metric, dim, ctx.scan_bits);
         if (params.quantizer_type == "scalar_uniform") {
             ctx.scalar_lm_quantizer->train_uniform(sample.data(), train_n);
+        } else if (params.quantizer_type == "scalar_shape") {
+            ctx.scalar_lm_quantizer->train_shape(sample.data(), train_n);
         } else {
             ctx.scalar_lm_quantizer->train(sample.data(), train_n);
         }
@@ -2510,7 +2514,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     const bool is_local_pq = (manifest_.quantizer_type == "local_pq");
     const bool is_scalar_lm =
         (manifest_.quantizer_type == "scalar_lloydmax" ||
-         manifest_.quantizer_type == "scalar_uniform");
+         manifest_.quantizer_type == "scalar_uniform" ||
+         manifest_.quantizer_type == "scalar_shape");
 
     // LUT buffers (global codebook path only). Scratch refs: clear() keeps
     // the capacity from previous calls on this thread.
@@ -3011,21 +3016,32 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                               &query_i8_scale);
         (void)query_i8.data();
 
-        // Uniform (equidistant) levels: scan without the levels gather.
-        // dot = Σ q_d·(lo_d + step_d·c_d) = c0 + Σ (q_d·step_d)·c_d. c0 is
-        // constant per query (order-preserving), so the kernel accumulates
-        // only a_d·code with a_d = q_d·step_d — sequential code reads, no
-        // table load. Measured 1.86x over the gather kernel (M4, -O3).
-        const bool slm_uniform = scalar_lm_quantizer_->is_uniform();
+        // Arithmetic scan (uniform or shared-shape): scan without the levels
+        // gather. dot = Σ q_d·(lo_d + step_d·f[c_d]) = c0 + Σ (q_d·step_d)·f[c_d]
+        // — c0 is constant per query (order-preserving), so the kernel
+        // accumulates only a_d·f[code] with a_d = q_d·step_d: sequential code
+        // reads, and f is 16 bytes (NEON TBL, or identity for pure uniform).
+        // Measured 1.86x over the gather kernel (M4, -O3, linear f).
+        const bool slm_arith = scalar_lm_quantizer_->arithmetic_scan();
+        const bool slm_shaped = slm_arith && !scalar_lm_quantizer_->is_uniform();
+        const float* slm_steps = scalar_lm_quantizer_->steps();
         std::vector<float>& a_uni = scratch.query_scaled;
-        if (slm_uniform) {
-            a_uni.resize(dim);
-            for (uint32_t d = 0; d < dim; ++d) {
-                const float lo = levels[d * K];
-                const float step = levels[d * K + 1] - lo;
-                a_uni[d] = query[d] * step;
-            }
+        if (slm_arith) {
+            // Zero-pad a_uni to the 16-dim kernel width: tail dims read
+            // garbage nibbles but multiply by 0 — same padded-batch trick as
+            // the vector tail. (Guarded: only when the padded code bytes stay
+            // within the row, which holds for any dim ≡ 0 mod 8.)
+            const uint32_t padded = (dim + 15) / 16 * 16;
+            a_uni.assign(padded, 0.f);
+            for (uint32_t d = 0; d < dim; ++d)
+                a_uni[d] = query[d] * slm_steps[d];
         }
+#if defined(__aarch64__)
+        // f quantized to u8 (scale folded out — ranking-invariant).
+        const uint8x16_t f_tbl = slm_arith
+            ? vld1q_u8(scalar_lm_quantizer_->shape_u8())
+            : vdupq_n_u8(0);
+#endif
 
         // Per-leaf scalar_lloydmax scan, decoded into a bounded top-W max-heap.
         // Self-contained: only reads `query`/levels (read-only) and pushes into
@@ -3060,14 +3076,20 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 for (uint32_t v = nv; v < 4; ++v) cp[v] = pad_row;
 
                 float dots[4] = {0, 0, 0, 0};
-                if (slm_uniform) {
-                    // Arithmetic decode: dot += (q·step)·code — no gather.
+                if (slm_arith) {
+                    // Arithmetic decode: dot += (q·step)·f[code] — no gather.
                     // NEON: 4 vectors × 16 dims per iteration. 8 code bytes
-                    // unpack to 16 dim-ordered nibbles (vzip lo/hi), widened
-                    // to f32 and FMUL-accumulated against a_uni. Pure
-                    // sequential MAC — no table loads, no gather.
+                    // unpack to 16 dim-ordered nibbles (vzip lo/hi); for the
+                    // shared-shape quantizer they index the 16-byte f table
+                    // via one TBL, then widen to f32 and FMLA against a_uni.
 #if defined(__aarch64__)
-                    const uint32_t d16 = dim / 16 * 16;
+                    // Padded width: tail dims multiply by a_uni = 0 (see
+                    // above). Requires padded code bytes <= row size, which
+                    // holds for dim % 8 == 0 (incl. 768); otherwise a tiny
+                    // scalar tail covers the remainder.
+                    const uint32_t padded = (dim + 15) / 16 * 16;
+                    const bool fully_padded = padded / 2 <= cs;
+                    const uint32_t d16 = fully_padded ? padded : dim / 16 * 16;
                     float32x4_t acc[4][4];
                     for (auto& row : acc)
                         for (auto& x : row) x = vdupq_n_f32(0);
@@ -3081,16 +3103,33 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                             const uint8x8_t lo = vand_u8(b, vdup_n_u8(0x0F));
                             const uint8x8_t hi = vshr_n_u8(b, 4);
                             const uint8x8x2_t z = vzip_u8(lo, hi);
-                            const uint16x8_t w0 = vmovl_u8(z.val[0]);
-                            const uint16x8_t w1 = vmovl_u8(z.val[1]);
-                            acc[v][0] = vfmaq_f32(acc[v][0], a0,
-                                vcvtq_f32_u32(vmovl_u16(vget_low_u16(w0))));
-                            acc[v][1] = vfmaq_f32(acc[v][1], a1,
-                                vcvtq_f32_u32(vmovl_u16(vget_high_u16(w0))));
-                            acc[v][2] = vfmaq_f32(acc[v][2], a2,
-                                vcvtq_f32_u32(vmovl_u16(vget_low_u16(w1))));
-                            acc[v][3] = vfmaq_f32(acc[v][3], a3,
-                                vcvtq_f32_u32(vmovl_u16(vget_high_u16(w1))));
+                            if (slm_shaped) {
+                                // nibble -> f[k] (16-byte table, one TBL).
+                                const uint8x16_t fv = vqtbl1q_u8(
+                                    f_tbl, vcombine_u8(z.val[0], z.val[1]));
+                                const uint16x8_t w0 = vmovl_u8(vget_low_u8(fv));
+                                const uint16x8_t w1 = vmovl_u8(vget_high_u8(fv));
+                                acc[v][0] = vfmaq_f32(acc[v][0], a0,
+                                    vcvtq_f32_u32(vmovl_u16(vget_low_u16(w0))));
+                                acc[v][1] = vfmaq_f32(acc[v][1], a1,
+                                    vcvtq_f32_u32(vmovl_u16(vget_high_u16(w0))));
+                                acc[v][2] = vfmaq_f32(acc[v][2], a2,
+                                    vcvtq_f32_u32(vmovl_u16(vget_low_u16(w1))));
+                                acc[v][3] = vfmaq_f32(acc[v][3], a3,
+                                    vcvtq_f32_u32(vmovl_u16(vget_high_u16(w1))));
+                            } else {
+                                // uniform: nibble value IS the f value.
+                                const uint16x8_t w0 = vmovl_u8(z.val[0]);
+                                const uint16x8_t w1 = vmovl_u8(z.val[1]);
+                                acc[v][0] = vfmaq_f32(acc[v][0], a0,
+                                    vcvtq_f32_u32(vmovl_u16(vget_low_u16(w0))));
+                                acc[v][1] = vfmaq_f32(acc[v][1], a1,
+                                    vcvtq_f32_u32(vmovl_u16(vget_high_u16(w0))));
+                                acc[v][2] = vfmaq_f32(acc[v][2], a2,
+                                    vcvtq_f32_u32(vmovl_u16(vget_low_u16(w1))));
+                                acc[v][3] = vfmaq_f32(acc[v][3], a3,
+                                    vcvtq_f32_u32(vmovl_u16(vget_high_u16(w1))));
+                            }
                         }
                     }
                     for (uint32_t v = 0; v < 4; ++v) {
@@ -3101,22 +3140,35 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     for (uint32_t d = 0; d < d4; d += 4) {
                         const float a4[4] = {a_uni[d], a_uni[d + 1],
                                              a_uni[d + 2], a_uni[d + 3]};
+                        const float* ftbl = scalar_lm_quantizer_->shape();
                         for (uint32_t v = 0; v < 4; ++v) {
                             const uint8_t b0 = cp[v][d / 2], b1 = cp[v][d / 2 + 1];
-                            dots[v] += a4[0] * (b0 & 0xF)
-                                     + a4[1] * ((b0 >> 4) & 0xF)
-                                     + a4[2] * (b1 & 0xF)
-                                     + a4[3] * ((b1 >> 4) & 0xF);
+                            if (slm_shaped) {
+                                dots[v] += a4[0] * ftbl[b0 & 0xF]
+                                         + a4[1] * ftbl[(b0 >> 4) & 0xF]
+                                         + a4[2] * ftbl[b1 & 0xF]
+                                         + a4[3] * ftbl[(b1 >> 4) & 0xF];
+                            } else {
+                                dots[v] += a4[0] * (b0 & 0xF)
+                                         + a4[1] * ((b0 >> 4) & 0xF)
+                                         + a4[2] * (b1 & 0xF)
+                                         + a4[3] * ((b1 >> 4) & 0xF);
+                            }
                         }
                     }
 #endif
-                    // Tail dims (dim not multiple of the kernel width).
-                    for (uint32_t d = (dim / 4) * 4; d < dim; ++d) {
-                        for (uint32_t v = 0; v < 4; ++v) {
-                            const uint8_t byte = cp[v][d / 2];
-                            const uint8_t nib =
-                                (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
-                            dots[v] += a_uni[d] * nib;
+                    // Tail dims only when the padded batch can't be used
+                    // (dim % 8 != 0 — not our datasets).
+                    if (!fully_padded) {
+                        const float* ftbl = scalar_lm_quantizer_->shape();
+                        for (uint32_t d = d16; d < dim; ++d) {
+                            for (uint32_t v = 0; v < 4; ++v) {
+                                const uint8_t byte = cp[v][d / 2];
+                                const uint8_t nib =
+                                    (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+                                dots[v] += a_uni[d] *
+                                    (slm_shaped ? ftbl[nib] : float(nib));
+                            }
                         }
                     }
                 } else {
@@ -3836,7 +3888,8 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
     const bool is_local_pq = (manifest_.quantizer_type == "local_pq");
     const bool is_scalar_lm =
         (manifest_.quantizer_type == "scalar_lloydmax" ||
-         manifest_.quantizer_type == "scalar_uniform");
+         manifest_.quantizer_type == "scalar_uniform" ||
+         manifest_.quantizer_type == "scalar_shape");
     // Brute-force filtered search for local_pq / scalar_lloydmax is not yet
     // implemented. This path is only triggered at extreme low selectivity
     // (<1%) with filter columns — not needed for the initial benchmark.

@@ -204,7 +204,81 @@ void ScalarLloydMaxQuantizer::train_uniform(const float* samples, uint64_t n) {
         const float step = K_ > 1 ? (mx - mn) / (K_ - 1) : 0.f;
         for (uint32_t k = 0; k < K_; ++k) lv[k] = mn + step * k;
     }
-    uniform_ = true;
+    mode_ = 1;
+    mode_ = 1;
+    // steps_ for the arithmetic scan: f = identity, step = level spacing.
+    steps_.assign(dim_, 0.f);
+    for (uint32_t d = 0; d < dim_; ++d) {
+        const float* lv = &levels_[static_cast<size_t>(d) * K_];
+        steps_[d] = K_ > 1 ? lv[1] - lv[0] : 0.f;
+    }
+    compute_bounds_();
+    compute_int8_levels_();
+}
+
+void ScalarLloydMaxQuantizer::train_shape(const float* samples, uint64_t n,
+                                          uint32_t n_restarts,
+                                          uint32_t lloyd_iters) {
+    // Stage 1: full Lloyd-Max training (levels_ = per-dim MSE-optimal).
+    train(samples, n, n_restarts, lloyd_iters);
+
+    // Stage 2: alternating LS factorization  lm_d[k] ≈ lo_d + step_d·f[k].
+    // Init f = linear; iterate (per-dim (lo,step) fit) <-> (f = mean_d
+    // (lm_d[k]-lo_d)/step_d). Converges in <8 iterations (measured).
+    std::vector<float> f(K_);
+    for (uint32_t k = 0; k < K_; ++k) f[k] = static_cast<float>(k);
+    std::vector<float> lo(dim_), st(dim_);
+    for (uint32_t it = 0; it < 8; ++it) {
+        for (uint32_t d = 0; d < dim_; ++d) {
+            const float* lv = &levels_[static_cast<size_t>(d) * K_];
+            double sf = 0, sf2 = 0, s1 = 0, sfx = 0;
+            for (uint32_t k = 0; k < K_; ++k) {
+                sf += f[k];
+                sf2 += static_cast<double>(f[k]) * f[k];
+                s1 += lv[k];
+                sfx += static_cast<double>(f[k]) * lv[k];
+            }
+            const double denom = K_ * sf2 - sf * sf;
+            const double step = denom != 0 ? (K_ * sfx - sf * s1) / denom : 0.0;
+            st[d] = static_cast<float>(step);
+            lo[d] = static_cast<float>((s1 - step * sf) / K_);
+        }
+        std::vector<double> fn(K_, 0.0);
+        for (uint32_t d = 0; d < dim_; ++d) {
+            const float* lv = &levels_[static_cast<size_t>(d) * K_];
+            for (uint32_t k = 0; k < K_; ++k)
+                fn[k] += (lv[k] - lo[d]) / (st[d] + 1e-30f);
+        }
+        for (uint32_t k = 0; k < K_; ++k) f[k] = static_cast<float>(fn[k] / dim_);
+        for (uint32_t k = 1; k < K_; ++k)  // monotone (defensive)
+            if (f[k] < f[k - 1]) f[k] = f[k - 1];
+    }
+
+    // Stage 3: rebuild levels_ from the factorization (the shape class is
+    // the constraint — encode/decode/rerank see the shared-shape levels),
+    // fill steps_ + the u8 TBL table.
+    float fmin = f[0], fmax = f[0];
+    for (uint32_t k = 0; k < K_; ++k) {
+        fmin = std::min(fmin, f[k]);
+        fmax = std::max(fmax, f[k]);
+    }
+    f_ = f;
+    steps_.assign(dim_, 0.f);
+    fu8_.assign(K_, 0);
+    // Affine map f -> [0, 255] for the TBL kernel. The constant shift is
+    // ranking-invariant (it adds shift·Σa_d to every dot); the 255 scale
+    // likewise. Do NOT map signed f directly into u8 — it wraps.
+    const float S = fmax > fmin ? 255.f / (fmax - fmin) : 1.f;
+    for (uint32_t k = 0; k < K_; ++k)
+        fu8_[k] = static_cast<uint8_t>(
+            std::lround((f[k] - fmin) * S));
+    for (uint32_t d = 0; d < dim_; ++d) {
+        float* lv = &levels_[static_cast<size_t>(d) * K_];
+        for (uint32_t k = 0; k < K_; ++k)
+            lv[k] = lo[d] + st[d] * f[k];
+        steps_[d] = st[d];
+    }
+    mode_ = 2;
     compute_bounds_();
     compute_int8_levels_();
 }
@@ -397,15 +471,24 @@ static constexpr uint32_t kScalarLloydMaxMagic = 0x534C4D58;  // "SLMX"
 void ScalarLloydMaxQuantizer::serialize(std::vector<uint8_t>& out) const {
     const size_t header = 4 + 1 + 1 + 4;
     const size_t levels_bytes = levels_.size() * sizeof(float);
-    // Trailing flag byte: uniform_ (absent in pre-uniform blobs => false).
-    out.resize(header + levels_bytes + 1);
+    // Trailing tail: [mode byte] (+ for mode 2: f[K] + steps[dim] floats).
+    // Absent tail (pre-uniform blobs) => mode 0.
+    size_t tail = 1;
+    if (mode_ == 2) tail += (f_.size() + steps_.size()) * sizeof(float);
+    out.resize(header + levels_bytes + tail);
     uint8_t* ptr = out.data();
     std::memcpy(ptr, &kScalarLloydMaxMagic, 4);
     ptr[4] = static_cast<uint8_t>(metric_);
     ptr[5] = bits_;
     std::memcpy(ptr + 6, &dim_, sizeof(dim_));
     std::memcpy(ptr + header, levels_.data(), levels_bytes);
-    ptr[header + levels_bytes] = uniform_ ? 1 : 0;
+    ptr[header + levels_bytes] = mode_;
+    if (mode_ == 2) {
+        uint8_t* t = ptr + header + levels_bytes + 1;
+        std::memcpy(t, f_.data(), f_.size() * sizeof(float));
+        t += f_.size() * sizeof(float);
+        std::memcpy(t, steps_.data(), steps_.size() * sizeof(float));
+    }
 }
 
 void ScalarLloydMaxQuantizer::deserialize(const uint8_t* in, size_t size) {
@@ -436,7 +519,44 @@ void ScalarLloydMaxQuantizer::deserialize(const uint8_t* in, size_t size) {
     }
     levels_.resize(levels_floats);
     std::memcpy(levels_.data(), in + header, levels_bytes);
-    uniform_ = (size == header + levels_bytes + 1) && (in[header + levels_bytes] != 0);
+    const size_t tail_off = header + levels_bytes;
+    if (size == tail_off) {
+        mode_ = 0;  // pre-uniform blob
+    } else {
+        mode_ = in[tail_off];
+        if (mode_ > 2)
+            throw Error(ErrorCode::CorruptIndex,
+                        "ScalarLloydMax deserialize: invalid mode");
+        if (mode_ == 2) {
+            const size_t need = tail_off + 1 +
+                (static_cast<size_t>(K_) + dim_) * sizeof(float);
+            if (size < need)
+                throw Error(ErrorCode::CorruptIndex,
+                            "ScalarLloydMax deserialize: shape tail truncated");
+            const uint8_t* t = in + tail_off + 1;
+            f_.resize(K_);
+            std::memcpy(f_.data(), t, K_ * sizeof(float));
+            t += K_ * sizeof(float);
+            steps_.resize(dim_);
+            std::memcpy(steps_.data(), t, dim_ * sizeof(float));
+            float fmin = f_[0], fmax = f_[0];
+            for (uint32_t k = 0; k < K_; ++k) {
+                fmin = std::min(fmin, f_[k]);
+                fmax = std::max(fmax, f_[k]);
+            }
+            const float S = fmax > fmin ? 255.f / (fmax - fmin) : 1.f;
+            fu8_.assign(K_, 0);
+            for (uint32_t k = 0; k < K_; ++k)
+                fu8_[k] = static_cast<uint8_t>(
+                    std::lround((f_[k] - fmin) * S));
+        } else if (mode_ == 1) {
+            steps_.assign(dim_, 0.f);
+            for (uint32_t d = 0; d < dim_; ++d) {
+                const float* lv = &levels_[static_cast<size_t>(d) * K_];
+                steps_[d] = K_ > 1 ? lv[1] - lv[0] : 0.f;
+            }
+        }
+    }
     compute_bounds_();
     compute_int8_levels_();
 }

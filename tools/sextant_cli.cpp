@@ -421,7 +421,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<uint32_t>("leaf-capacity", 0, "Max vectors per leaf", false, 5000);
     p.add<uint16_t>("pq4-m", 0, "PQ subquantizers (0=dim/4)", false, 0);
     p.add<uint32_t>("pq-bits", 0, "PQ bits (4 or 8)", false, 4);
-    p.add<std::string>("quantizer", 0, "pq / prq / local_pq / scalar_lloydmax / scalar_uniform / anisotropic_pq", false, "pq");
+    p.add<std::string>("quantizer", 0, "pq / prq / local_pq / scalar_lloydmax / scalar_uniform / scalar_shape / anisotropic_pq", false, "pq");
     p.add<std::string>("metric", 0, "l2sq / ip", false, "l2sq");
     p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
     p.add<uint32_t>("pca-dims", 0, "PCA dimensions (default 32)", false, 32);
