@@ -1079,6 +1079,272 @@ int cmd_tree_search(int argc, char* argv[]) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// sweep: n-probe × rerank-shortlist (W) recall/QPS grid.
+//
+// Exploits W-sharing: one search() per query with sweep_Ws = all W values
+// scans once at W_max and evaluates every W as a prefix cut (bit-exact
+// equivalent to a standalone search per W). The grid costs one scan per
+// n-probe instead of one scan per (n-probe, W) pair — ~L× cheaper for L W
+// values. shared_qps is the throughput of that shared scan+rerank pass (the
+// per-W prefix selection is O(W log W), negligible by comparison).
+// ---------------------------------------------------------------------------
+
+/// Parse a comma-separated list of unsigned integers ("4,8,16").
+static std::vector<uint32_t> parse_u32_list(const std::string& s) {
+    std::vector<uint32_t> vals;
+    std::stringstream ss(s);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        if (tok.empty()) continue;
+        vals.push_back(static_cast<uint32_t>(std::stoul(tok)));
+    }
+    return vals;
+}
+
+int cmd_sweep(int argc, char* argv[]) {
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("index", 0, "Tree index file", true);
+    p.add<std::string>("query", 0, "Query vectors (.fbin)", true);
+    p.add<std::string>("ground-truth", 0, "Ground-truth .gtmm file", true);
+    p.add<uint32_t>("topk", 0, "K nearest neighbors", false, 10);
+    p.add<std::string>("n-probe", 0,
+        "Comma-separated root probe counts, e.g. \"4,8,16,32\"", true);
+    p.add<std::string>("fastscan-w", 0,
+        "Comma-separated rerank shortlist widths, e.g. \"100,300,1000,3000\"",
+        true);
+    p.add<uint32_t>("n-probe-ln", 0,
+        "Leaf probe count per root child (0=manifest default)", false, 0);
+    p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
+    p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)",
+                 false, 0.0f);
+    p.add<uint32_t>("threads", 0, "Query-parallel threads (0=auto)", false, 0);
+    p.add<uint32_t>("search-threads", 0,
+        "Within-query leaf-parallel scan threads (0=serial)", false, 0);
+    p.add<uint32_t>("dump-results", 0,
+        "Debug: dump per-query result row_ids for this W "
+        "(first n-probe, forces serial)", false, 0);
+    p.add<std::string>("filter", 0,
+        "(unsupported — sweep runs unfiltered)", false, "");
+    p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
+    p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+
+    // No predicates in sweep mode. The engine API supports sweeping with
+    // predicates (filtering commutes with the prefix cut), but sweeping under
+    // a fixed selectivity changes the W semantics — keep the tool unfiltered.
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--filter" || arg.rfind("--filter=", 0) == 0) {
+            std::cerr << "sweep: --filter is not supported (run unfiltered)\n";
+            return 1;
+        }
+    }
+
+    p.parse_check(argc, argv);
+
+    {
+        const auto lvl = p.get<std::string>("log-level");
+        if (lvl == "debug") set_log_level(LogLevel::Debug);
+        else if (lvl == "warn") set_log_level(LogLevel::Warn);
+        else if (lvl == "error") set_log_level(LogLevel::Error);
+    }
+
+    const uint32_t k = p.get<uint32_t>("topk");
+    std::vector<uint32_t> n_probes = parse_u32_list(p.get<std::string>("n-probe"));
+    std::vector<uint32_t> w_vals = parse_u32_list(p.get<std::string>("fastscan-w"));
+    if (n_probes.empty() || w_vals.empty()) {
+        std::cerr << "sweep: --n-probe and --fastscan-w must be non-empty "
+                     "comma-separated lists\n";
+        return 1;
+    }
+    // Ascending, deduped W list (the engine evaluates prefix cuts in scan
+    // order; the output rows stay sorted by W).
+    std::sort(w_vals.begin(), w_vals.end());
+    w_vals.erase(std::unique(w_vals.begin(), w_vals.end()), w_vals.end());
+    const uint32_t dump_w = p.get<uint32_t>("dump-results");
+    const size_t dump_idx = dump_w
+        ? std::find(w_vals.begin(), w_vals.end(), dump_w) - w_vals.begin()
+        : static_cast<size_t>(-1);
+    if (dump_w && dump_idx >= w_vals.size()) {
+        std::cerr << "sweep: --dump-results W " << dump_w
+                  << " is not in the --fastscan-w list\n";
+        return 1;
+    }
+    const bool dump = dump_w != 0;
+
+    auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"));
+
+    // Load queries (.fbin only — sweep is a benchmarking tool).
+    const std::string query_path = p.get<std::string>("query");
+    FbinHeader qh;
+    if (!read_fbin_header(query_path, qh) || qh.dim != idx->dim()) {
+        std::cerr << "sweep: invalid query file (dim=" << qh.dim
+                  << ", expected " << idx->dim() << ")\n";
+        return 1;
+    }
+    const uint32_t qdim = qh.dim;
+    const uint32_t qcount = qh.n;
+    std::vector<float> queries(static_cast<size_t>(qcount) * qdim);
+    {
+        std::ifstream qf(query_path, std::ios::binary);
+        qf.seekg(8);
+        qf.read(reinterpret_cast<char*>(queries.data()),
+                static_cast<std::streamsize>(qcount) * qdim * sizeof(float));
+        if (!qf.good()) {
+            std::cerr << "sweep: failed to read query vectors\n";
+            return 1;
+        }
+    }
+    if (idx->metric() == MetricKind::InnerProduct) {
+        for (uint32_t i = 0; i < qcount; ++i)
+            simd::normalize_row_f32(&queries[static_cast<size_t>(i) * qdim],
+                                    qdim);
+    }
+
+    // Load ground truth (GTMM binary — same layout as tree-search):
+    // [magic "GTMM":4B][n:u32][k:u32][metric:u8][ids (k×u32)][dists (k×f32)]...
+    std::vector<std::vector<RowId>> gt;
+    {
+        std::ifstream gtf(p.get<std::string>("ground-truth"), std::ios::binary);
+        if (!gtf) {
+            std::cerr << "sweep: cannot open ground truth\n";
+            return 1;
+        }
+        constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
+        uint32_t magic = 0;
+        gtf.read(reinterpret_cast<char*>(&magic), 4);
+        if (magic != kGtMagic) {
+            std::cerr << "sweep: ground truth missing GTMM magic\n";
+            return 1;
+        }
+        uint32_t gt_n = 0, gt_k = 0;
+        gtf.read(reinterpret_cast<char*>(&gt_n), 4);
+        gtf.read(reinterpret_cast<char*>(&gt_k), 4);
+        uint8_t metric_byte = 0;
+        gtf.read(reinterpret_cast<char*>(&metric_byte), 1);
+        (void)metric_byte;
+        gt.resize(gt_n);
+        std::vector<uint32_t> row(gt_k);
+        for (uint32_t i = 0; i < gt_n; ++i) {
+            gtf.read(reinterpret_cast<char*>(row.data()),
+                     static_cast<std::streamsize>(gt_k) * sizeof(uint32_t));
+            gt[i].assign(row.begin(), row.end());
+            gtf.seekg(static_cast<std::streamoff>(gt_k) * sizeof(float),
+                      std::ios::cur);
+        }
+        std::cerr << "loaded ground truth: " << gt_n << " queries, k="
+                  << gt_k << "\n";
+    }
+    if (gt.empty()) {
+        std::cerr << "sweep: ground truth is empty\n";
+        return 1;
+    }
+    // Recall metric (identical to tree-search): fraction of result top-k
+    // row_ids present in the GT top-k.
+    const uint32_t recall_k = std::min(k, static_cast<uint32_t>(gt[0].size()));
+    const uint32_t scored = std::min(qcount,
+                                     static_cast<uint32_t>(gt.size()));
+
+    uint32_t num_threads = p.get<uint32_t>("threads");
+    if (num_threads == 0)
+        num_threads = std::max(1u, std::thread::hardware_concurrency());
+    if (dump) num_threads = 1;  // deterministic, inspectable dump pass
+
+    SearchConfig scfg;
+    scfg.k = k;
+    scfg.n_probe_ln = p.get<uint32_t>("n-probe-ln");
+    scfg.rerank = !p.exist("no-rerank");
+    scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
+    scfg.search_threads = p.get<uint32_t>("search-threads");
+
+    std::ofstream out_file;
+    std::ostream* out = &std::cout;
+    if (!p.get<std::string>("output").empty()) {
+        out_file.open(p.get<std::string>("output"));
+        out = &out_file;
+    }
+    *out << "# sweep grid — W evaluation is shared: one scan+rerank per "
+            "(n-probe) serves all W; shared_qps is that shared pass\n";
+    *out << "n_probe\tW\trecall@" << k << "\tshared_qps\n";
+    std::cerr << "sweep: " << n_probes.size() << " n-probe x " << w_vals.size()
+              << " W values, " << scored << " queries\n";
+
+    for (uint32_t np : n_probes) {
+        scfg.n_probe = np;
+        std::vector<std::atomic<uint64_t>> hits(w_vals.size());
+        for (auto& h : hits) h.store(0, std::memory_order_relaxed);
+        std::vector<std::vector<Candidate>> dump_rows;
+        if (dump) dump_rows.resize(qcount);
+
+        // Score one query's sweep output against the GT top-k set.
+        auto score = [&](uint32_t qi,
+                         const std::vector<std::vector<Candidate>>& so) {
+            std::unordered_set<RowId> gt_set(
+                gt[qi].begin(),
+                gt[qi].begin() + std::min(recall_k,
+                                          static_cast<uint32_t>(gt[qi].size())));
+            for (size_t wi = 0; wi < w_vals.size(); ++wi) {
+                if (wi >= so.size()) break;
+                for (const auto& c : so[wi])
+                    if (gt_set.count(c.row_id))
+                        hits[wi].fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+
+        const auto t0 = std::chrono::steady_clock::now();
+        if (num_threads <= 1) {
+            for (uint32_t qi = 0; qi < qcount; ++qi) {
+                std::vector<std::vector<Candidate>> sweep_out;
+                idx->search(&queries[static_cast<size_t>(qi) * qdim], k, scfg,
+                            nullptr, &w_vals, &sweep_out);
+                if (qi < scored) score(qi, sweep_out);
+                if (dump) dump_rows[qi] = sweep_out[dump_idx];
+            }
+        } else {
+            // Query-level parallelism (same pattern as tree-search): each
+            // worker owns its sweep_out; the thread-local scratch arena
+            // inside search() is per-worker automatically.
+            std::vector<std::future<void>> futs;
+            std::atomic<uint32_t> next_qi{0};
+            for (uint32_t t = 0; t < num_threads; ++t) {
+                futs.push_back(std::async(std::launch::async, [&]() {
+                    while (true) {
+                        const uint32_t qi = next_qi.fetch_add(1);
+                        if (qi >= qcount) break;
+                        std::vector<std::vector<Candidate>> sweep_out;
+                        idx->search(&queries[static_cast<size_t>(qi) * qdim],
+                                    k, scfg, nullptr, &w_vals, &sweep_out);
+                        if (qi < scored) score(qi, sweep_out);
+                    }
+                }));
+            }
+            for (auto& f : futs) f.get();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        const double qps = (secs > 0) ? qcount / secs : 0;
+
+        for (size_t wi = 0; wi < w_vals.size(); ++wi) {
+            const float recall = static_cast<float>(hits[wi].load())
+                                 / (static_cast<double>(scored) * k);
+            *out << np << '\t' << w_vals[wi] << '\t' << recall << '\t'
+                 << qps << '\n';
+        }
+        std::cerr << "n_probe=" << np << ": " << secs << "s (" << qps
+                  << " shared QPS)\n";
+
+        if (dump && np == n_probes[0]) {
+            for (uint32_t qi = 0; qi < qcount; ++qi)
+                for (const auto& c : dump_rows[qi])
+                    std::cerr << "dump\t" << qi << '\t' << c.row_id << '\t'
+                              << c.dist << '\n';
+        }
+    }
+    return 0;
+}
+
 int cmd_insert(int argc, char* argv[]) {
     cmdline::parser p;
     p.add<std::string>("index", 0, "Index name/path prefix", true);
@@ -1386,6 +1652,8 @@ void print_usage() {
               << "  analyze    Read-only dataset-adaptive parameter advisory.\n"
               << "             Flags: --input --metric --proximity-target\n"
               << "             --recall-target --max-node-neighbors --prune-threshold\n"
+              << "  sweep       n-probe × W recall/QPS grid with shared scans\n"
+              << "             (one scan per n-probe serves all W)\n"
               << "             --pq-segments --pq-bits --pq-max-distortion --threads\n"
               << "             --log-level\n"
               << "  search     Search an index with query vectors\n"
@@ -1434,6 +1702,8 @@ int main(int argc, char* argv[]) {
             return cmd_search(sub_argc, sub_argv.data());
         } else if (cmd == "tree-search") {
             return cmd_tree_search(sub_argc, sub_argv.data());
+        } else if (cmd == "sweep") {
+            return cmd_sweep(sub_argc, sub_argv.data());
         } else if (cmd == "insert") {
             return cmd_insert(sub_argc, sub_argv.data());
         } else if (cmd == "tree-insert") {

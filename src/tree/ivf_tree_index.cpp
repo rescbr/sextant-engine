@@ -2386,9 +2386,88 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
 
 }  // namespace
 
+// ===========================================================================
+// SearchScratch — per-thread reusable arena for search().
+//
+// search() allocates ~15-20 vectors per query (LUTs, routing frontier, heap,
+// rerank buffers, results). Under query-level parallelism (CLI std::async
+// workers) those allocations hammer malloc from every thread. This arena is
+// thread_local: buffers are clear()ed per call and keep their capacity, so a
+// warm thread performs zero heap allocations in the steady state. Retained
+// memory is bounded by W_max × sizeof(HeapEntry) plus LUTs (a few MB/thread).
+//
+// The within-query parallel scan path (search_threads > 1) gives each worker
+// a private heap from `worker_heaps`: resized to the worker count per call,
+// cleared (not destroyed) so capacity persists across queries.
+// ===========================================================================
+namespace {
+
+/// Frontier entry during routing (was local to search()).
+struct ProbeEntry {
+    float    dist;
+    PageId   page;
+    uint64_t pages;
+    uint16_t is_leaf;
+    const float16_t* centroid;  // inline FP16 centroid (points into mmap)
+};
+
+/// Result candidate carrying its payload location (was local to search()).
+struct ResultWithLoc {
+    Candidate cand;
+    const uint8_t* leaf_ptr;
+    uint32_t local_idx;
+};
+
+struct SearchScratch {
+    // LUT + query prep
+    std::vector<uint8_t> lut4, lut8;
+    std::vector<float16_t> query_fp16;
+    std::vector<float> query_pca;
+    // predicate column resolution
+    std::vector<uint32_t> pred_col_indices, geo_lng_col_indices;
+    // routing
+    std::vector<std::pair<float, uint32_t>> root_dists, child_dists;
+    std::vector<const uint8_t*> root_summaries;
+    std::vector<ProbeEntry> frontier, next_frontier;
+    std::vector<uint32_t> root_idx, next_root_idx;
+    std::vector<LeafCandidate> candidates, pruned_candidates;
+    // scan + predicate filtering of the heap
+    std::vector<HeapEntry> heap, filtered_heap;
+    std::vector<std::vector<HeapEntry>> worker_heaps;
+    std::vector<uint8_t> local_lut4, local_lut8;
+    std::vector<float> query_residual, decoded_vec;
+    std::vector<int8_t> query_i8;
+    std::unique_ptr<PqQuantizer> leaf_quant;  // local_pq LUT builder (cached)
+    std::vector<ColumnView> filter_cols;
+    // rerank + results
+    std::vector<uint8_t> code_buf;
+    std::vector<Candidate> results;
+    std::vector<ResultWithLoc> results_loc;
+    // sweep scratch
+    struct SweepEntry { uint32_t pq_dist; RowId row_id; float dist; };
+    std::vector<SweepEntry> sweep_entries;
+    std::vector<uint32_t> sweep_order;
+    std::vector<Candidate> sweep_work;
+    std::vector<std::pair<uint32_t, uint32_t>> sweep_plan;  // (W, out index)
+};
+
+}  // namespace
+
 std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                              const SearchConfig& config,
-    std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs) const {
+    std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs,
+    const std::vector<uint32_t>* sweep_Ws,
+    std::vector<std::vector<Candidate>>* sweep_out) const {
+    // Thread-local arena: buffers keep their capacity across calls on this
+    // thread (see SearchScratch above). CLI std::async workers and test
+    // threads each get their own instance.
+    static thread_local SearchScratch scratch;
+    const bool sweep = sweep_Ws != nullptr && sweep_out != nullptr
+        && payload_locs == nullptr && !sweep_Ws->empty();
+    if (sweep) {
+        sweep_out->clear();
+        sweep_out->resize(sweep_Ws->size());
+    }
     // Build the FastScan LUT once per query (global codebook path).
     // For local_pq, each leaf has its own codebook; the LUT is built per-leaf
     // inside the scan loop.
@@ -2400,9 +2479,14 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     const bool is_scalar_lm =
         (manifest_.quantizer_type == "scalar_lloydmax");
 
-    // LUT buffers (global codebook path only).
-    std::vector<uint8_t> lut4(scan_8bit || is_local_pq || is_scalar_lm ? 0 : m * 16);
-    std::vector<uint8_t> lut8((!scan_8bit || is_local_pq || is_scalar_lm) ? 0 : m * 256);
+    // LUT buffers (global codebook path only). Scratch refs: clear() keeps
+    // the capacity from previous calls on this thread.
+    auto& lut4 = scratch.lut4;
+    auto& lut8 = scratch.lut8;
+    lut4.clear();
+    lut8.clear();
+    if (!scan_8bit && !is_local_pq && !is_scalar_lm) lut4.resize(m * 16);
+    if (scan_8bit && !is_local_pq && !is_scalar_lm) lut8.resize(m * 256);
     float lut_scale = 0, lut_offset = 0;
 
     if (!is_local_pq && !is_scalar_lm) {
@@ -2415,14 +2499,16 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     }
 
     // Cast query to FP16 for routing (used for non-PCA path + leaf centroid reads).
-    std::vector<float16_t> query_fp16(manifest_.dim);
+    auto& query_fp16 = scratch.query_fp16;
+    query_fp16.resize(manifest_.dim);
     cast_fp32_to_fp16(query, query_fp16.data(), manifest_.dim);
     const MetricKind metric = (is_local_pq || is_scalar_lm)
         ? static_cast<MetricKind>(manifest_.metric)
         : quantizer_->metric();
 
     // --- Project query to PCA space if PCA routing is enabled ---
-    std::vector<float> query_pca;
+    auto& query_pca = scratch.query_pca;
+    query_pca.clear();
     if (pca_dims_ > 0) {
         query_pca.resize(pca_dims_);
         for (uint32_t k = 0; k < pca_dims_; ++k) {
@@ -2437,8 +2523,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // its schema column index up-front. A predicate referencing an unknown
     // column yields no results. For geo predicates, also resolve the longitude
     // column name.
-    std::vector<uint32_t> pred_col_indices;
-    std::vector<uint32_t> geo_lng_col_indices;  // valid only for geo predicates
+    auto& pred_col_indices = scratch.pred_col_indices;
+    auto& geo_lng_col_indices = scratch.geo_lng_col_indices;  // geo only
+    pred_col_indices.clear();
+    geo_lng_col_indices.clear();
     if (!config.predicates.empty()) {
         pred_col_indices.reserve(config.predicates.size());
         geo_lng_col_indices.resize(config.predicates.size(), UINT32_MAX);
@@ -2474,19 +2562,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // from the mmap, its children are scored, and the top-n_probe_ln are kept.
     // Leaf frontier entries are carried through unchanged. After the final
     // descent, all surviving leaf entries become scan candidates.
-    //
     // Level 0 (root) uses PCA-space distances when pca_dims_ > 0. For depth=2
     // with PCA enabled, the L1→leaf step also uses PCA leaf centroids. For
     // depth>=3, deeper levels (L1→L2, L2→leaves) route by FP16 distance to the
     // inline child centroids (the data is already well-partitioned there).
-    struct ProbeEntry {
-        float    dist;
-        PageId   page;
-        uint64_t pages;
-        uint16_t is_leaf;
-        const float16_t* centroid;  // inline FP16 centroid (points into mmap)
-    };
-
     const uint32_t cesize = child_entry_size(manifest_.dim, manifest_.summary_size);
     // Adaptive gap resolution (SearchConfig::adaptive_probe_gap):
     //   <0 = off (disable early-exit entirely)
@@ -2514,7 +2593,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
         const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
 
-        std::vector<std::pair<float, uint32_t>> child_dists;
+        auto& child_dists = scratch.child_dists;
+        child_dists.clear();
         child_dists.reserve(nh->n_children);
         // Summary offset within each child entry (after the inline FP16
         // centroid). Used for subtree-level pruning during routing.
@@ -2600,7 +2680,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         } else {
             // Fallback: root-summary-based subtree overlap estimation.
             selectivity = 1.0f;
-            std::vector<const uint8_t*> root_summaries(root_children_.size());
+            auto& root_summaries = scratch.root_summaries;
+            root_summaries.clear();
+            root_summaries.resize(root_children_.size());
             const uint32_t dim16 = manifest_.dim;
             for (uint32_t c = 0; c < root_children_.size(); ++c) {
                 root_summaries[c] = reinterpret_cast<const uint8_t*>(
@@ -2652,7 +2734,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // Score root children, sort, select top-n_probe_l0 with gap pruning. We
     // track each entry's root-child index (needed later for the depth=2 PCA
     // leaf-centroid lookup).
-    std::vector<std::pair<float, uint32_t>> root_dists;
+    auto& root_dists = scratch.root_dists;
+    root_dists.clear();
     root_dists.reserve(k_root);
     // Summary offset within each root child entry (after the inline FP16
     // centroid). root_children_[c].centroid points at the centroid, which sits
@@ -2689,8 +2772,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     }
     std::sort(root_dists.begin(), root_dists.end());
 
-    std::vector<ProbeEntry> frontier;
-    std::vector<uint32_t>   root_idx;  // root-child index per frontier entry
+    auto& frontier = scratch.frontier;
+    auto& root_idx = scratch.root_idx;  // root-child index per frontier entry
+    frontier.clear();
+    root_idx.clear();
     // When filter-directed, probe ALL summary-matching children (no n_probe_l0
     // cap, no gap pruning). Otherwise, top-n_probe_l0 with gap pruning.
     const uint32_t effective_probe = filter_directed
@@ -2713,8 +2798,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // depth=3 → two expansions (root → L1 → L2, then L2 → leaves).
     const bool pca_depth2 = (pca_dims_ > 0 && manifest_.depth == 2);
     for (uint16_t level = 1; level < manifest_.depth; ++level) {
-        std::vector<ProbeEntry> next_frontier;
-        std::vector<uint32_t>   next_root_idx;  // only meaningful for depth=2
+        auto& next_frontier = scratch.next_frontier;
+        auto& next_root_idx = scratch.next_root_idx;  // only depth=2
+        next_frontier.clear();
+        next_root_idx.clear();
         next_frontier.reserve(frontier.size() * std::max(1u, n_probe_ln_cfg));
 
         for (uint32_t fi = 0; fi < frontier.size(); ++fi) {
@@ -2745,7 +2832,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     }
 
     // --- Collect leaf candidates from the final frontier ---
-    std::vector<LeafCandidate> candidates;
+    auto& candidates = scratch.candidates;
+    candidates.clear();
     for (const auto& e : frontier) {
         if (e.is_leaf && e.page != kInvalidPage) {
             candidates.push_back({e.page, e.pages, e.dist, e.centroid});
@@ -2761,7 +2849,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // matches for the predicates (numeric range miss or bloom negative). This
     // skips entire leaves, saving the FastScan cost at low selectivity.
     if (has_predicates) {
-        std::vector<LeafCandidate> pruned;
+        auto& pruned = scratch.pruned_candidates;
+        pruned.clear();
         pruned.reserve(candidates.size());
         for (const auto& cand : candidates) {
             if (cand.page == kInvalidPage) continue;
@@ -2797,6 +2886,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // --- Scan leaves ---
     // Adaptive W driven by predicate selectivity (computed above, before routing).
     uint32_t W = std::max(config.fastscan_W > 0 ? config.fastscan_W : 300u, k);
+    if (sweep) {
+        // One scan at W_max serves every W in the sweep (prefix cut below).
+        W = std::max(W, *std::max_element(sweep_Ws->begin(), sweep_Ws->end()));
+    }
     if (has_predicates) {
         // Adaptive W: the heap collects top-W by PQ distance WITHOUT predicate
         // filtering (deferred). We need W wide enough that the true matching
@@ -2818,7 +2911,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // Max-heap of (pq_dist, row_id, leaf_ptr, local_idx). The leaf_ptr /
     // local_idx are carried so the rerank step can decode each candidate's
     // PQ code back to FP32 without a row_id → code lookup.
-    std::vector<HeapEntry> heap;
+    auto& heap = scratch.heap;
+    heap.clear();
     heap.reserve(W + 32);
     const auto heap_less = [](const HeapEntry& a, const HeapEntry& b) {
         return a.pq_dist < b.pq_dist;
@@ -2847,18 +2941,25 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         }
     };
 
-    // Per-leaf LUT buffers (local_pq path). Allocated once, reused per leaf.
-    std::vector<uint8_t> local_lut4(is_local_pq && !scan_8bit ? m * 16 : 0);
-    std::vector<uint8_t> local_lut8(is_local_pq && scan_8bit ? m * 256 : 0);
+    // Per-leaf LUT buffers (local_pq path). Reused across leaves and calls.
+    auto& local_lut4 = scratch.local_lut4;
+    auto& local_lut8 = scratch.local_lut8;
+    local_lut4.clear();
+    local_lut8.clear();
+    if (is_local_pq && !scan_8bit) local_lut4.resize(m * 16);
+    if (is_local_pq && scan_8bit) local_lut8.resize(m * 256);
     float local_lut_scale = 0, local_lut_offset = 0;
-    // Reusable per-leaf quantizer wrapper for LUT building.
-    std::unique_ptr<PqQuantizer> leaf_quant;
-    if (is_local_pq) {
+    // Reusable per-leaf quantizer wrapper for LUT building. Cached in the
+    // thread-local scratch — its parameters are fixed for the index lifetime.
+    std::unique_ptr<PqQuantizer>& leaf_quant = scratch.leaf_quant;
+    if (is_local_pq && !leaf_quant) {
         leaf_quant = std::make_unique<PqQuantizer>(
             MetricKind::L2Sq, manifest_.dim, manifest_.m4, manifest_.scan_pq_bits);
     }
     // Scratch for query residual (local_pq).
-    std::vector<float> query_residual(is_local_pq ? manifest_.dim : 0);
+    auto& query_residual = scratch.query_residual;
+    query_residual.clear();
+    if (is_local_pq) query_residual.resize(manifest_.dim);
 
     // --- scalar_lloydmax scan: decode-dot over flat packed nibbles ---
     // Separate from the FastScan loop: codes are count × code_size bytes laid
@@ -2872,13 +2973,12 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const uint32_t d4 = dim / 4 * 4;  // dim rounded down to multiple of 4
 
         // Build int8 query for fast I8MM scan.
-        std::vector<int8_t> query_i8(dim);
+        auto& query_i8 = scratch.query_i8;
+        query_i8.resize(dim);
         float query_i8_scale;
         scalar_lm_quantizer_->build_query_i8(query, query_i8.data(),
                                               &query_i8_scale);
-
-        // Scratch for full decode (L2sq rerank).
-        std::vector<float> decoded(dim);
+        (void)query_i8.data();
 
         // Per-leaf scalar_lloydmax scan, decoded into a bounded top-W max-heap.
         // Self-contained: only reads `query`/levels (read-only) and pushes into
@@ -2994,7 +3094,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         } else {
             const uint32_t T = std::min(config.search_threads,
                                         static_cast<uint32_t>(candidates.size()));
-            std::vector<std::vector<HeapEntry>> th(T);
+            auto& th = scratch.worker_heaps;
+            if (th.size() < T) th.resize(T);
+            for (auto& my : th) my.clear();
             std::vector<std::future<void>> futs;
             futs.reserve(T);
             const uint32_t per = (static_cast<uint32_t>(candidates.size()) + T - 1) / T;
@@ -3171,19 +3273,18 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     }  // end FastScan scan loop (else of is_scalar_lm)
 
     // --- Extract top-k from the heap ---
-    std::vector<Candidate> results;
+    auto& results = scratch.results;
+    results.clear();
     results.reserve(heap.size());
+    auto& sweep_entries = scratch.sweep_entries;
+    sweep_entries.clear();
 
     // Phase E: when payload locations are requested, carry (leaf_ptr, local_idx)
     // alongside each result through dedup/sort/truncate. The heap entries'
     // payload locations are valid mmap pointers (stable for the index's life).
-    struct ResultWithLoc {
-        Candidate cand;
-        const uint8_t* leaf_ptr;
-        uint32_t local_idx;
-    };
     const bool want_locs = (payload_locs != nullptr);
-    std::vector<ResultWithLoc> results_loc;
+    auto& results_loc = scratch.results_loc;
+    results_loc.clear();
     if (want_locs) results_loc.reserve(heap.size());
 
     // --- Phase D: filter the heap survivors by predicate ---
@@ -3202,10 +3303,12 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                   [](const HeapEntry& a, const HeapEntry& b) {
                       return a.leaf_ptr < b.leaf_ptr;
                   });
-        std::vector<HeapEntry> filtered;
+        auto& filtered = scratch.filtered_heap;
+        filtered.clear();
         filtered.reserve(heap.size());
         const uint8_t* cur_leaf = nullptr;
-        std::vector<ColumnView> cols;
+        auto& cols = scratch.filter_cols;
+        cols.clear();
         for (const auto& entry : heap) {
             if (entry.leaf_ptr != cur_leaf) {
                 cur_leaf = entry.leaf_ptr;
@@ -3231,8 +3334,12 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const uint32_t code_sz = (is_local_pq || is_scalar_lm)
             ? (static_cast<uint32_t>(manifest_.m4) * manifest_.scan_pq_bits + 7) / 8
             : quantizer_->code_size();
-        std::vector<uint8_t> code_buf(code_sz);
-        std::vector<float> decoded_vec(manifest_.dim);
+        std::vector<uint8_t>& code_buf = scratch.code_buf;
+        code_buf.clear();
+        code_buf.resize(code_sz);
+        auto& decoded_vec = scratch.decoded_vec;
+        decoded_vec.clear();
+        decoded_vec.resize(manifest_.dim);
         // Cache the last leaf's local codebook to avoid re-reading per entry.
         const uint8_t* rerank_last_leaf = nullptr;
 
@@ -3302,6 +3409,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                         ? -simd::dot_f32(query, decoded_vec.data(), manifest_.dim)
                         :  simd::l2sq_f32(query, decoded_vec.data(), manifest_.dim);
             }
+            if (sweep) {
+                sweep_entries.push_back({entry.pq_dist, entry.row_id,
+                                          exact_dist});
+            }
             if (want_locs) {
                 results_loc.push_back({{entry.row_id, exact_dist},
                                         entry.leaf_ptr, entry.local_idx});
@@ -3312,6 +3423,11 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     } else {
         // No rerank: use the raw PQ-approximate uint32 distances.
         for (const auto& entry : heap) {
+            if (sweep) {
+                sweep_entries.push_back(
+                    {entry.pq_dist, entry.row_id,
+                     static_cast<float>(entry.pq_dist)});
+            }
             if (want_locs) {
                 results_loc.push_back({{entry.row_id,
                                          static_cast<float>(entry.pq_dist)},
@@ -3320,6 +3436,67 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 results.push_back({entry.row_id,
                                    static_cast<float>(entry.pq_dist)});
             }
+        }
+    }
+
+    // --- Sweep: per-W prefix cuts over the (filtered, reranked) heap ---
+    // recall@k for shortlist W is exactly "top-k by exact distance among the
+    // top-W entries by scan distance", so one scan at W_max serves every
+    // W <= W_max: take the first W entries in scan order (pq_dist asc, ties
+    // by row_id for determinism), then apply the SAME dedup-by-row_id (keep
+    // min dist) + top-k-by-exact-dist selection as the normal path below.
+    //
+    // CRITICAL ordering: prefix-cut FIRST, then dedup — replicas of a row can
+    // straddle the W boundary, and a standalone search with that W only sees
+    // the in-prefix replicas. Predicates already filtered the heap above;
+    // filtering doesn't reorder, so it commutes with the prefix cut.
+    if (sweep) {
+        const auto& entries = scratch.sweep_entries;
+        auto& order = scratch.sweep_order;
+        order.resize(entries.size());
+        std::iota(order.begin(), order.end(), 0u);
+        std::sort(order.begin(), order.end(),
+                  [&](uint32_t a, uint32_t b) {
+                      if (entries[a].pq_dist != entries[b].pq_dist)
+                          return entries[a].pq_dist < entries[b].pq_dist;
+                      return entries[a].row_id < entries[b].row_id;
+                  });
+        // Ascending W so each cut is a prefix of the previous one.
+        auto& plan = scratch.sweep_plan;
+        plan.clear();
+        for (uint32_t i = 0; i < sweep_Ws->size(); ++i)
+            plan.emplace_back((*sweep_Ws)[i], i);
+        std::sort(plan.begin(), plan.end());
+        for (const auto& step : plan) {
+            auto& work = scratch.sweep_work;
+            work.clear();
+            const size_t cnt = std::min<size_t>(step.first, order.size());
+            for (size_t j = 0; j < cnt; ++j) {
+                const auto& e = entries[order[j]];
+                work.push_back({e.row_id, e.dist});
+            }
+            std::sort(work.begin(), work.end(),
+                      [](const Candidate& a, const Candidate& b) {
+                          if (a.row_id != b.row_id) return a.row_id < b.row_id;
+                          return a.dist < b.dist;
+                      });
+            auto wlast = std::unique(work.begin(), work.end(),
+                                     [](const Candidate& a, const Candidate& b) {
+                                         return a.row_id == b.row_id;
+                                     });
+            work.erase(wlast, work.end());
+            if (work.size() > k) {
+                std::nth_element(work.begin(), work.begin() + k, work.end(),
+                                 [](const Candidate& a, const Candidate& b) {
+                                     return a.dist < b.dist;
+                                 });
+                work.resize(k);
+            }
+            std::sort(work.begin(), work.end(),
+                      [](const Candidate& a, const Candidate& b) {
+                          return a.dist < b.dist;
+                      });
+            (*sweep_out)[step.second] = work;
         }
     }
 
@@ -3385,6 +3562,12 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         results.push_back(rl.cand);
     }
     return results;
+}
+
+std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
+        const SearchConfig& config,
+        std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs) const {
+    return search(query, k, config, payload_locs, nullptr, nullptr);
 }
 
 // ===========================================================================

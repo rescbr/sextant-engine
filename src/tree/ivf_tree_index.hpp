@@ -123,6 +123,21 @@ public:
         std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs
             = nullptr) const;
 
+    /// Sweep mode: evaluate multiple rerank shortlist widths W from ONE scan.
+    /// When sweep_Ws is non-null, the search runs with W = max(*sweep_Ws) and
+    /// fills sweep_out[i] with the result set (top-k, deduped) for sweep_Ws[i].
+    /// Bit-exact equivalent to running search() separately with each W (each
+    /// W result is a prefix cut of the W_max scan order, followed by the same
+    /// dedup/top-k selection as the normal path).
+    /// Ignored when payload_locs is non-null (payload locations require the
+    /// single-W path); also ignored when either sweep argument is null or
+    /// sweep_Ws is empty.
+    std::vector<Candidate> search(const float* query, uint32_t k,
+                                  const SearchConfig& config,
+        std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs,
+        const std::vector<uint32_t>* sweep_Ws,
+        std::vector<std::vector<Candidate>>* sweep_out) const;
+
     /// Fetch the opaque payload blob for a result. O(1): reads the leaf's
     /// payload extent from the mmap, indexes by slot.
     /// `leaf_ptr` = mmap base of the leaf extent (from a search payload_loc).
