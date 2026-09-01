@@ -2446,6 +2446,10 @@ struct SearchScratch {
     std::vector<int8_t> query_i8;
     /// Uniform-scan query: a_d = q_d * step_d (arithmetic-decode kernel).
     std::vector<float> query_scaled;
+    /// Zero-filled code row shared by tail batches (count % 4 != 0):
+    /// padding vectors read zeros -> dot 0, are never heap-pushed.
+    /// Measured faster than a scalar tail on every kernel we have.
+    std::vector<uint8_t> pad_code_row;
     std::unique_ptr<PqQuantizer> leaf_quant;  // local_pq LUT builder (cached)
     std::vector<ColumnView> filter_cols;
     // rerank + results
@@ -3026,23 +3030,58 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             const RowId* row_ids = reinterpret_cast<const RowId*>(
                 codes + static_cast<uint64_t>(count) * cs);
 
-            // Scan: process vectors sequentially. For IP, higher dot = closer.
-            // Use float decode-dot (NEON FMA) — faster than I8MM on this
-            // data because the I8MM kernel has per-dim lookup overhead.
-            // Batch 4 vectors to amortize query loads.
-            uint32_t i = 0;
-            for (; i + 3 < count; i += 4) {
-                // Process 4 vectors, accumulating 4 float dots.
+            // Scan: batch-4 vectors, zero-padded tail (no scalar remainder
+            // loop — padded batches measured faster on every kernel).
+            std::vector<uint8_t>& pad_row_buf = scratch.pad_code_row;
+            if (pad_row_buf.size() < cs) pad_row_buf.assign(cs, 0);
+            const uint8_t* pad_row = pad_row_buf.data();
+            for (uint32_t i = 0; i < count; i += 4) {
+                const uint32_t nv = std::min(4u, count - i);
+                const uint8_t* cp[4];
+                for (uint32_t v = 0; v < nv; ++v)
+                    cp[v] = codes + (uint64_t)(i + v) * cs;
+                for (uint32_t v = nv; v < 4; ++v) cp[v] = pad_row;
+
                 float dots[4] = {0, 0, 0, 0};
-                const uint8_t* cp[4] = {
-                    codes + (uint64_t)(i)   * cs,
-                    codes + (uint64_t)(i+1) * cs,
-                    codes + (uint64_t)(i+2) * cs,
-                    codes + (uint64_t)(i+3) * cs,
-                };
-                for (uint32_t d = 0; d < d4; d += 4) {
-                    if (slm_uniform) {
-                        // Arithmetic decode: dot += (q·step)·code — no gather.
+                if (slm_uniform) {
+                    // Arithmetic decode: dot += (q·step)·code — no gather.
+                    // NEON: 4 vectors × 16 dims per iteration. 8 code bytes
+                    // unpack to 16 dim-ordered nibbles (vzip lo/hi), widened
+                    // to f32 and FMUL-accumulated against a_uni. Pure
+                    // sequential MAC — no table loads, no gather.
+#if defined(__aarch64__)
+                    const uint32_t d16 = dim / 16 * 16;
+                    float32x4_t acc[4][4];
+                    for (auto& row : acc)
+                        for (auto& x : row) x = vdupq_n_f32(0);
+                    for (uint32_t d = 0; d < d16; d += 16) {
+                        const float32x4_t a0 = vld1q_f32(&a_uni[d]);
+                        const float32x4_t a1 = vld1q_f32(&a_uni[d + 4]);
+                        const float32x4_t a2 = vld1q_f32(&a_uni[d + 8]);
+                        const float32x4_t a3 = vld1q_f32(&a_uni[d + 12]);
+                        for (uint32_t v = 0; v < 4; ++v) {
+                            const uint8x8_t b = vld1_u8(cp[v] + d / 2);
+                            const uint8x8_t lo = vand_u8(b, vdup_n_u8(0x0F));
+                            const uint8x8_t hi = vshr_n_u8(b, 4);
+                            const uint8x8x2_t z = vzip_u8(lo, hi);
+                            const uint16x8_t w0 = vmovl_u8(z.val[0]);
+                            const uint16x8_t w1 = vmovl_u8(z.val[1]);
+                            acc[v][0] = vfmaq_f32(acc[v][0], a0,
+                                vcvtq_f32_u32(vmovl_u16(vget_low_u16(w0))));
+                            acc[v][1] = vfmaq_f32(acc[v][1], a1,
+                                vcvtq_f32_u32(vmovl_u16(vget_high_u16(w0))));
+                            acc[v][2] = vfmaq_f32(acc[v][2], a2,
+                                vcvtq_f32_u32(vmovl_u16(vget_low_u16(w1))));
+                            acc[v][3] = vfmaq_f32(acc[v][3], a3,
+                                vcvtq_f32_u32(vmovl_u16(vget_high_u16(w1))));
+                        }
+                    }
+                    for (uint32_t v = 0; v < 4; ++v) {
+                        dots[v] = vaddvq_f32(acc[v][0]) + vaddvq_f32(acc[v][1]) +
+                                  vaddvq_f32(acc[v][2]) + vaddvq_f32(acc[v][3]);
+                    }
+#else
+                    for (uint32_t d = 0; d < d4; d += 4) {
                         const float a4[4] = {a_uni[d], a_uni[d + 1],
                                              a_uni[d + 2], a_uni[d + 3]};
                         for (uint32_t v = 0; v < 4; ++v) {
@@ -3052,27 +3091,39 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                      + a4[2] * (b1 & 0xF)
                                      + a4[3] * ((b1 >> 4) & 0xF);
                         }
-                        continue;
                     }
-                    float q4[4] = {query[d], query[d+1], query[d+2], query[d+3]};
-                    for (uint32_t v = 0; v < 4; ++v) {
-                        uint8_t b0 = cp[v][d/2], b1 = cp[v][d/2+1];
-                        dots[v] += q4[0]*levels[d*K+(b0&0xF)]
-                                 + q4[1]*levels[(d+1)*K+((b0>>4)&0xF)]
-                                 + q4[2]*levels[(d+2)*K+(b1&0xF)]
-                                 + q4[3]*levels[(d+3)*K+((b1>>4)&0xF)];
+#endif
+                    // Tail dims (dim not multiple of the kernel width).
+                    for (uint32_t d = (dim / 4) * 4; d < dim; ++d) {
+                        for (uint32_t v = 0; v < 4; ++v) {
+                            const uint8_t byte = cp[v][d / 2];
+                            const uint8_t nib =
+                                (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+                            dots[v] += a_uni[d] * nib;
+                        }
+                    }
+                } else {
+                    // Lloyd-Max gather kernel: batch-4, amortized query loads.
+                    for (uint32_t d = 0; d < d4; d += 4) {
+                        float q4[4] = {query[d], query[d+1], query[d+2], query[d+3]};
+                        for (uint32_t v = 0; v < 4; ++v) {
+                            uint8_t b0 = cp[v][d/2], b1 = cp[v][d/2+1];
+                            dots[v] += q4[0]*levels[d*K+(b0&0xF)]
+                                     + q4[1]*levels[(d+1)*K+((b0>>4)&0xF)]
+                                     + q4[2]*levels[(d+2)*K+(b1&0xF)]
+                                     + q4[3]*levels[(d+3)*K+((b1>>4)&0xF)];
+                        }
+                    }
+                    for (uint32_t d = d4; d < dim; ++d) {
+                        for (uint32_t v = 0; v < 4; ++v) {
+                            uint8_t byte = cp[v][d/2];
+                            uint8_t nib = (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+                            dots[v] += query[d] * levels[d*K + nib];
+                        }
                     }
                 }
-                // Handle tail dims (dim not multiple of 4)
-                for (uint32_t d = d4; d < dim; ++d) {
-                    for (uint32_t v = 0; v < 4; ++v) {
-                        uint8_t byte = cp[v][d/2];
-                        uint8_t nib = (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
-                        dots[v] += query[d] * levels[d*K + nib];
-                    }
-                }
-                // Heap push
-                for (uint32_t v = 0; v < 4; ++v) {
+                // Heap push — real vectors only (padding never enters).
+                for (uint32_t v = 0; v < nv; ++v) {
                     float dist = -dots[v];
                     uint32_t dist_bits;
                     std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
@@ -3085,35 +3136,6 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     } else if (pq_dist < h[0].pq_dist) {
                         heap_replace(h, pq_dist, row_ids[i+v], leaf_ptr, i+v);
                     }
-                }
-            }
-            // Tail vector (count not multiple of 4)
-            for (; i < count; ++i) {
-                const uint8_t* code_ptr = codes + (uint64_t)i * cs;
-                float dot = 0;
-                for (uint32_t d = 0; d < d4; d += 4) {
-                    uint8_t b0 = code_ptr[d/2], b1 = code_ptr[d/2+1];
-                    dot += query[d]*levels[d*K+(b0&0xF)]
-                         + query[d+1]*levels[(d+1)*K+((b0>>4)&0xF)]
-                         + query[d+2]*levels[(d+2)*K+(b1&0xF)]
-                         + query[d+3]*levels[(d+3)*K+((b1>>4)&0xF)];
-                }
-                for (uint32_t d = d4; d < dim; ++d) {
-                    uint8_t byte = code_ptr[d/2];
-                    uint8_t nib = (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
-                    dot += query[d] * levels[d*K + nib];
-                }
-                float dist = -dot;
-                uint32_t dist_bits;
-                std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
-                uint32_t pq_dist = (dist_bits & 0x80000000u)
-                    ? ~dist_bits : (dist_bits | 0x80000000u);
-                if (h.size() < W) {
-                    h.push_back({pq_dist, row_ids[i], leaf_ptr, i});
-                    if (h.size() == W)
-                        std::make_heap(h.begin(), h.end(), heap_less);
-                } else if (pq_dist < h[0].pq_dist) {
-                    heap_replace(h, pq_dist, row_ids[i], leaf_ptr, i);
                 }
             }
         };
