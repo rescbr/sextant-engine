@@ -700,6 +700,9 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("fastscan-w", 0, "Rerank shortlist per shard (0=300)", false, 0);
     p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
+    p.add<float>("adaptive-w-gap", 0,
+        "Adaptive shortlist cut: truncate results at the first reranked "
+        "distance gap past k (0=off)", false, 0.0f);
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
     p.add<uint32_t>("search-threads", 0,
         "Within-query leaf-parallel scan threads (0=serial; orthorgonal to --threads)", false, 0);
@@ -816,6 +819,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.n_probe_ln = p.get<uint32_t>("n-probe-ln");
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
     scfg.rerank = !p.exist("no-rerank");
+    scfg.adaptive_w_gap = p.get<float>("adaptive-w-gap");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
     scfg.search_threads = p.get<uint32_t>("search-threads");
 
@@ -1031,8 +1035,9 @@ int cmd_tree_search(int argc, char* argv[]) {
     // Recall metric: fraction of search top-k results that appear in the
     // GT top-k (not the full GT list). This is the standard recall@k:
     // "of the k results returned, how many are true top-k neighbors."
-    const uint32_t recall_k = std::min(static_cast<uint32_t>(
-        all_results.empty() ? 0 : all_results[0].size()),
+    // (k, not results.size(): the adaptive-W path returns variable-length
+    // shortlists — hits anywhere in the returned list count, denominator k.)
+    const uint32_t recall_k = std::min(k,
         gt.empty() ? 0 : static_cast<uint32_t>(gt[0].size()));
     for (uint32_t qi = 0; qi < qcount; ++qi) {
         const auto& results = all_results[qi];
@@ -1072,6 +1077,14 @@ int cmd_tree_search(int argc, char* argv[]) {
     std::cerr << "queries: " << qcount << "\n";
     std::cerr << "k: " << k << "\n";
     std::cerr << "time: " << secs << "s (" << qps << " QPS)\n";
+    {
+        uint64_t len_sum = 0;
+        for (const auto& r : all_results) len_sum += r.size();
+        if (!all_results.empty())
+            std::cerr << "mean results/query: "
+                      << static_cast<double>(len_sum) / all_results.size()
+                      << "\n";
+    }
     if (total_queries > 0) {
         const float recall = float(total_hits) / (total_queries * k);
         std::cerr << "recall@" << k << ": " << recall << "\n";

@@ -3745,7 +3745,28 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                     return a.row_id == b.row_id;
                                 });
         results.erase(last, results.end());
+        // Adaptive shortlist cut: keep up to W (not just k) and truncate at
+        // the first distance gap past k. Clustered queries cut at ~k, noisy
+        // queries keep the deep list — the caller's rerank bandwidth follows
+        // the returned length. Off (0) or without rerank: plain top-k.
         size_t keep = k;
+        if (config.adaptive_w_gap > 0 && config.rerank &&
+            results.size() > k) {
+            std::sort(results.begin(), results.end(),
+                      [](const Candidate& a, const Candidate& b) {
+                          return a.dist < b.dist;
+                      });
+            const float dk = results[k - 1].dist;
+            const float scale = std::max(std::fabs(dk), 1e-9f);
+            keep = results.size();
+            for (size_t w = k; w < results.size(); ++w) {
+                if (results[w].dist - dk >
+                    config.adaptive_w_gap * scale) {
+                    keep = w;
+                    break;
+                }
+            }
+        }
         if (results.size() > keep) {
             std::nth_element(results.begin(), results.begin() + keep,
                              results.end(),

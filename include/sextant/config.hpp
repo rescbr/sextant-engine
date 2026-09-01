@@ -296,6 +296,17 @@ struct SearchConfig {
     /// A true rerank would use stored FP16 vectors, not PQ-decoded approximations.
     bool rerank = false;
 
+    /// Adaptive shortlist cut (rerank-bandwidth saver): after the scan heap
+    /// is reranked and sorted, truncate the returned list at the first index
+    /// w >= k whose distance gaps out from the k-th best:
+    ///     d[w] - d[k-1] > adaptive_w_gap * max(|d[k-1]|, 1e-9)
+    /// Clustered queries (clean score separation) cut just past k; noisy
+    /// queries keep the full W. Saves downstream rerank I/O (at billion
+    /// scale the caller re-scores each returned id against stored vectors —
+    /// shortlist length IS the bandwidth). 0 = off (return top-k as
+    /// before). Requires rerank (the signal is the reranked distance).
+    float adaptive_w_gap = 0.0f;
+
     /// Filter predicates (Phase D). Empty = no filtering (today's behavior).
     std::vector<Predicate> predicates;
 
