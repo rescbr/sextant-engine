@@ -107,20 +107,6 @@ public:
     /// — ranking-invariant, so the scan can skip the rescale entirely).
     const uint8_t* shape_u8() const { return fu8_.data(); }
 
-    /// Build the int8 query for the decode-dot kernels.
-    /// Scales query so its max-abs value maps to ±127.
-    /// q_i8_out: dim int8 values. scale_out: the scale factor used.
-    void build_query_i8(const float* query, int8_t* q_i8_out,
-                        float* scale_out) const;
-
-    /// Decode a packed code into int8 levels (pre-scaled).
-    /// out: dim int8 values (one per dimension, looked up from levels_i8_).
-    void decode_to_i8(const uint8_t* code, int8_t* out) const;
-
-    /// Pre-scaled int8 levels table: dim × K int8 values.
-    const int8_t* levels_i8() const { return levels_i8_.data(); }
-    float int8_scale() const { return int8_scale_; }
-
     void serialize(std::vector<uint8_t>& out) const;
     void deserialize(const uint8_t* in, size_t size);
 
@@ -132,11 +118,6 @@ private:
 
     /// Per-dim quantization levels: dim × K floats (sorted ascending per dim).
     std::vector<float> levels_;   // [dim * K]
-
-    /// Pre-scaled int8 levels for the decode-dot kernels: dim × K int8 values.
-    /// Populated by compute_int8_levels_() after train() / deserialize().
-    std::vector<int8_t> levels_i8_;  // [dim * K]
-    float int8_scale_ = 0.0f;
 
     /// Per-dim boundaries for fast assignment: dim × (K-1) floats.
     /// boundary[d*(K-1) + i] = midpoint between levels[d*K+i] and levels[d*K+i+1].
@@ -155,9 +136,6 @@ private:
 
     /// Recompute bounds_ from levels_.
     void compute_bounds_();
-
-    /// Recompute levels_i8_ + int8_scale_ from levels_.
-    void compute_int8_levels_();
 };
 
 }  // namespace sextant

@@ -185,7 +185,6 @@ void ScalarLloydMaxQuantizer::train(const float* samples, uint64_t n,
     }
 
     compute_bounds_();
-    compute_int8_levels_();
 }
 
 void ScalarLloydMaxQuantizer::train_uniform(const float* samples, uint64_t n) {
@@ -213,7 +212,6 @@ void ScalarLloydMaxQuantizer::train_uniform(const float* samples, uint64_t n) {
         steps_[d] = K_ > 1 ? lv[1] - lv[0] : 0.f;
     }
     compute_bounds_();
-    compute_int8_levels_();
 }
 
 void ScalarLloydMaxQuantizer::train_shape(const float* samples, uint64_t n,
@@ -280,7 +278,6 @@ void ScalarLloydMaxQuantizer::train_shape(const float* samples, uint64_t n,
     }
     mode_ = 2;
     compute_bounds_();
-    compute_int8_levels_();
 }
 
 void ScalarLloydMaxQuantizer::compute_bounds_() {
@@ -289,50 +286,6 @@ void ScalarLloydMaxQuantizer::compute_bounds_() {
         float* bd = &bounds_[static_cast<size_t>(d) * (K_ - 1)];
         for (uint32_t i = 0; i < K_ - 1; ++i)
             bd[i] = 0.5f * (lv[i] + lv[i + 1]);
-    }
-}
-
-void ScalarLloydMaxQuantizer::compute_int8_levels_() {
-    float level_max = 0.0f;
-    for (float v : levels_)
-        level_max = std::max(level_max, std::fabs(v));
-    int8_scale_ = 127.0f / std::max(level_max, 1e-15f);
-    levels_i8_.resize(levels_.size());
-    for (size_t i = 0; i < levels_.size(); ++i)
-        levels_i8_[i] = static_cast<int8_t>(
-            std::lround(levels_[i] * int8_scale_));
-}
-
-// ---------------------------------------------------------------------------
-// int8 query / decode-dot helpers
-// ---------------------------------------------------------------------------
-
-void ScalarLloydMaxQuantizer::build_query_i8(const float* query,
-                                               int8_t* q_i8_out,
-                                               float* scale_out) const {
-    float qmax = 0.0f;
-    for (uint32_t d = 0; d < dim_; ++d)
-        qmax = std::max(qmax, std::fabs(query[d]));
-    const float scale = 127.0f / std::max(qmax, 1e-15f);
-    *scale_out = scale;
-    for (uint32_t d = 0; d < dim_; ++d)
-        q_i8_out[d] = static_cast<int8_t>(std::lround(query[d] * scale));
-}
-
-void ScalarLloydMaxQuantizer::decode_to_i8(const uint8_t* code,
-                                             int8_t* out) const {
-    const int8_t* li8 = levels_i8_.data();
-    if (bits_ == 4) {
-        for (uint32_t d = 0; d < dim_; d += 2) {
-            const uint8_t byte = code[d / 2];
-            out[d] = li8[static_cast<size_t>(d) * K_ + (byte & 0x0F)];
-            if (d + 1 < dim_)
-                out[d + 1] = li8[static_cast<size_t>(d + 1) * K_ +
-                                 ((byte >> 4) & 0x0F)];
-        }
-    } else {
-        for (uint32_t d = 0; d < dim_; ++d)
-            out[d] = li8[static_cast<size_t>(d) * K_ + code[d]];
     }
 }
 
@@ -558,7 +511,6 @@ void ScalarLloydMaxQuantizer::deserialize(const uint8_t* in, size_t size) {
         }
     }
     compute_bounds_();
-    compute_int8_levels_();
 }
 
 }  // namespace sextant

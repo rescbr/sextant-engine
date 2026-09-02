@@ -943,5 +943,184 @@ TEST(TreeInsertDelete, Depth3SplitIncreasesLeafCount) {
     std::filesystem::remove(tree_path);
 }
 
+// ===========================================================================
+// Scalar quantizers (scalar_lloydmax): insert_batch + split wiring
+// ===========================================================================
+
+TEST(TreeInsertDelete, ScalarInsertIncreasesLiveCount) {
+    const uint64_t n = 2000;
+    const uint32_t dim = 64;
+    const std::string base_path = write_test_fbin(
+        "phasej_scalar_insert.fbin", n, dim, /*n_clusters=*/20, /*seed=*/42);
+    const std::string tree_path = temp_path(".tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "scalar_lloydmax";
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 500;
+    cfg.num_threads = 4;
+    cfg.adaptive_probe_gap = 0.0f;
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    auto idx = IVFTreeIndex::open(tree_path);
+    EXPECT_EQ(idx->live_count(), n);
+
+    const uint32_t n_insert = 100;
+    std::vector<IVFTreeIndex::InsertPoint> points;
+    std::vector<float> vec_storage(n_insert * dim);
+    std::mt19937 rng(999);
+    for (uint32_t i = 0; i < n_insert; ++i) {
+        for (uint32_t d = 0; d < dim; ++d)
+            vec_storage[i * dim + d] = std::uniform_real_distribution<float>(-10, 10)(rng);
+        points.push_back({&vec_storage[i * dim], static_cast<RowId>(n + i), {}, {}});
+    }
+
+    idx->insert_batch(points);
+    EXPECT_EQ(idx->live_count(), n + n_insert);
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
+TEST(TreeInsertDelete, ScalarInsertedVectorsAreSearchable) {
+    const uint64_t n = 2000;
+    const uint32_t dim = 64;
+    const std::string base_path = write_test_fbin(
+        "phasej_scalar_search.fbin", n, dim, /*n_clusters=*/20, /*seed=*/42);
+    const std::string tree_path = temp_path(".tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "scalar_lloydmax";
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 500;
+    cfg.num_threads = 4;
+    cfg.adaptive_probe_gap = 0.0f;
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    auto idx = IVFTreeIndex::open(tree_path);
+
+    uint64_t fbin_n;
+    uint32_t fbin_dim;
+    auto data = read_fbin(base_path, fbin_n, fbin_dim);
+    ASSERT_EQ(fbin_dim, dim);
+
+    // Baseline: the original vector is searchable.
+    {
+        SearchConfig sconfig;
+        sconfig.k = 200;
+        sconfig.n_probe = 8;
+        sconfig.adaptive_probe_gap = 0.0f;
+        auto results = idx->search(&data[42 * dim], 200, sconfig);
+        std::unordered_set<RowId> ids;
+        for (const auto& c : results) ids.insert(c.row_id);
+        EXPECT_TRUE(ids.count(42))
+            << "Baseline scalar search can't find vector 42";
+    }
+
+    // Insert an exact copy of vector 42 and check both are searchable.
+    std::vector<float> query_vec(dim);
+    std::memcpy(query_vec.data(), &data[42 * dim], dim * sizeof(float));
+    IVFTreeIndex::InsertPoint point;
+    point.vector = query_vec.data();
+    point.row_id = static_cast<RowId>(999999);
+    idx->insert_batch({point});
+
+    SearchConfig sconfig;
+    sconfig.k = 200;
+    sconfig.n_probe = 8;
+    sconfig.adaptive_probe_gap = 0.0f;
+    sconfig.fastscan_W = 3000;
+    auto results = idx->search(query_vec.data(), 200, sconfig);
+    std::unordered_set<RowId> ids;
+    for (const auto& c : results) ids.insert(c.row_id);
+    EXPECT_TRUE(ids.count(999999))
+        << "Inserted vector not found by scalar search after insert_batch";
+    EXPECT_TRUE(ids.count(42))
+        << "Original vector lost after scalar insert_batch";
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
+TEST(TreeInsertDelete, ScalarInsertTriggersLeafSplit) {
+    const uint64_t n = 2000;
+    const uint32_t dim = 64;
+    const std::string base_path = write_test_fbin(
+        "tree_scalar_split.fbin", n, dim, /*n_clusters=*/20, /*seed=*/42);
+    const std::string tree_path = temp_path(".tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "scalar_lloydmax";
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 200;
+    cfg.num_threads = 4;
+    cfg.adaptive_probe_gap = 0.0f;
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    auto idx = IVFTreeIndex::open(tree_path);
+    const uint32_t n_leaves_before = idx->n_leaves();
+    EXPECT_EQ(idx->live_count(), n);
+
+    uint64_t fbin_n;
+    uint32_t fbin_dim;
+    auto orig_data = read_fbin(base_path, fbin_n, fbin_dim);
+    ASSERT_EQ(fbin_dim, dim);
+
+    // Insert out-of-distribution vectors to push leaves over 2×cap=400.
+    std::mt19937 insert_rng(31337);
+    const uint32_t batch = 1600;
+    std::vector<IVFTreeIndex::InsertPoint> points;
+    std::vector<float> vec_storage(batch * dim);
+    for (uint32_t i = 0; i < batch; ++i) {
+        for (uint32_t d = 0; d < dim; ++d)
+            vec_storage[i * dim + d] =
+                std::uniform_real_distribution<float>(-50, 50)(insert_rng);
+        points.push_back({&vec_storage[i * dim],
+                          static_cast<RowId>(n + i), {}, {}});
+    }
+    idx->insert_batch(points);
+
+    EXPECT_EQ(idx->live_count(), n + batch);
+    EXPECT_GT(idx->n_leaves(), n_leaves_before)
+        << "Scalar insert did not trigger a leaf split";
+
+    // Search must remain functional after the split: inserted vectors
+    // (exact queries against themselves) must be findable.
+    SearchConfig sconfig;
+    sconfig.k = 10;
+    sconfig.n_probe = 8;
+    sconfig.adaptive_probe_gap = 0.0f;
+    sconfig.fastscan_W = 5000;
+    uint32_t found = 0;
+    const uint32_t n_check = 50;
+    for (uint32_t i = 0; i < n_check; ++i) {
+        auto results = idx->search(&vec_storage[i * dim], 10, sconfig);
+        for (const auto& c : results)
+            if (c.row_id == static_cast<RowId>(n + i)) { ++found; break; }
+    }
+    // Scalar 4-bit quantization is coarse; require the large majority.
+    EXPECT_GE(found, n_check - 5)
+        << "Only " << found << "/" << n_check
+        << " inserted vectors self-searchable after scalar split";
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
 }  // namespace
 }  // namespace sextant::tree

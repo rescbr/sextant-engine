@@ -352,150 +352,16 @@ inline float dist_f32(MetricKind metric, const float* a, const float* b, uint32_
 // level via a per-dim lookup table (levels[d*K + nibble]).
 //
 // Three tiers:
-// 1. I8MM (NEON): decode to int8 via vtbl, dot via vmmlaq_s32. Cross-platform.
-//    Precision: ~81% recall (1.4pp loss vs float). Fastest on most hardware.
-// 2. SVE2: float gather via svld1_gather_u32index_f32. c4a (Neoverse-V2).
+// 1. SVE2: float gather via svld1_gather_u32index_f32. c4a (Neoverse-V2).
 //    Precision: ~82% recall (float). Hardware-prefetched gather.
-// 3. SME: float matrix multiply via fmopa. Apple M4 only.
+// 2. SME: float matrix multiply via fmopa. Apple M4 only.
 //    Precision: ~82% recall (float).
 //
 // All tiers produce a float dot product. For IP metric, higher = closer.
 // For L2sq, the caller wraps with the norm decomposition.
 
-/// I8MM decode-dot: one vector. Returns int32 dot (caller divides by scale).
-/// query_i8: dim int8 values (pre-scaled query).
-/// levels_i8: dim × K int8 values (pre-scaled Lloyd-Max levels).
-/// code: dim/2 bytes, packed 4-bit nibbles (low nibble = even dim,
-///       high nibble = odd dim).
-/// dim: must be even and divisible by 4 for SIMD alignment.
-inline int32_t scalar_dot_u4_i8mm(const int8_t* query_i8,
-                                   const int8_t* levels_i8,
-                                   const uint8_t* code,
-                                   uint32_t dim, uint32_t K) {
-#if defined(SEXTANT_HAS_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-    // Process 4 dims at a time using I8MM (smmla / vmmlaq_s32).
-    // vmmlaq_s32(acc, a[16B], b[16B]):
-    //   acc[d] += sum_{k=0..3} a[4*d+k] * b[k]   for d=0..3
-    //
-    // For a single vector: a = [decoded_4_dims | 0 0 0 0 | 0 0 0 0 | 0 0 0 0]
-    //                        b = [query_4_dims | * * * * | * * * * | * * * *]
-    // But vmmlaq computes 4 dot products of length 4. We only need 1.
-    // So we put decoded values in row 0 and query in column 0, zeros elsewhere.
-    // Result: acc[0] = decoded · query (what we want), acc[1..3] = 0.
-    //
-    // Actually this wastes 3/4 of the I8MM throughput. For batch-4 vectors,
-    // see scalar_dot_u4_i8mm_batch4 below.
-    const uint8x16_t mask4 = vdupq_n_u8(0x0F);
-    int32x4_t acc = vdupq_n_s32(0);
-
-    for (uint32_t d = 0; d < dim; d += 4) {
-        // Decode 4 nibbles from 2 code bytes.
-        // code[d/2] → dims d, d+1; code[d/2+1] → dims d+2, d+3.
-        uint8x8_t code_bytes = vld1_u8(code + d / 2);  // load 8 bytes (we use 2)
-        uint8x8_t nib_lo = vand_u8(code_bytes, vget_low_u8(mask4));
-        uint8x8_t nib_hi = vshr_n_u8(code_bytes, 4);
-
-        // Extract the 4 nibbles we need: d, d+1, d+2, d+3
-        // d and d+1 from code[d/2], d+2 and d+3 from code[d/2+1]
-        uint8_t n0 = vget_lane_u8(nib_lo, 0);  // dim d
-        uint8_t n1 = vget_lane_u8(nib_hi, 0);  // dim d+1
-        uint8_t n2 = vget_lane_u8(nib_lo, 1);  // dim d+2
-        uint8_t n3 = vget_lane_u8(nib_hi, 1);  // dim d+3
-
-        // Lookup int8 levels: levels_i8[d*K + nibble]
-        int8_t dvals[4] = {
-            levels_i8[d * K + n0],
-            levels_i8[(d+1) * K + n1],
-            levels_i8[(d+2) * K + n2],
-            levels_i8[(d+3) * K + n3],
-        };
-        int8_t qvals[4] = {query_i8[d], query_i8[d+1], query_i8[d+2], query_i8[d+3]};
-
-        // Build int8x16: decoded in row 0, query in column 0 (rest zero).
-        // Use vld1q_s8 on stack arrays — compiler keeps in registers.
-        int8_t a_buf[16] = {}; memcpy(a_buf, dvals, 4);
-        int8_t b_buf[16] = {}; memcpy(b_buf, qvals, 4);
-        int8x16_t a = vld1q_s8(a_buf);
-        int8x16_t b = vld1q_s8(b_buf);
-
-        acc = vmmlaq_s32(acc, a, b);
-    }
-    return vgetq_lane_s32(acc, 0);
-
-#elif defined(SEXTANT_HAS_NEON)
-    // NEON fallback without I8MM: manual int8 accumulation via widening.
-    int32_t acc = 0;
-    for (uint32_t d = 0; d < dim; d += 2) {
-        uint8_t byte = code[d / 2];
-        int8_t v0 = levels_i8[d * K + (byte & 0x0F)];
-        int8_t v1 = (d + 1 < dim) ? levels_i8[(d+1) * K + ((byte >> 4) & 0x0F)] : 0;
-        acc += (int32_t)query_i8[d] * v0 + (int32_t)query_i8[d+1] * v1;
-    }
-    return acc;
-#else
-    // Scalar fallback.
-    int32_t acc = 0;
-    for (uint32_t d = 0; d < dim; d += 2) {
-        uint8_t byte = code[d / 2];
-        acc += (int32_t)query_i8[d] * levels_i8[d * K + (byte & 0x0F)];
-        if (d + 1 < dim)
-            acc += (int32_t)query_i8[d+1] * levels_i8[(d+1) * K + ((byte >> 4) & 0x0F)];
-    }
-    return acc;
-#endif
-}
-
-/// I8MM decode-dot: batch of 4 vectors. Returns 4 int32 dots.
-/// Most efficient use of vmmlaq_s32 (4 dot products of length 4 per call).
-/// codes: 4 pointers to dim/2-byte code arrays.
-/// out: 4 int32 values.
-inline void scalar_dot_u4_i8mm_batch4(const int8_t* query_i8,
-                                       const int8_t* levels_i8,
-                                       const uint8_t* const* codes,
-                                       uint32_t dim, uint32_t K,
-                                       int32_t out[4]) {
-#if defined(SEXTANT_HAS_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-    int32x4_t acc = vdupq_n_s32(0);
-
-    for (uint32_t d = 0; d < dim; d += 4) {
-        // Decode 4 dims for each of 4 vectors → 16 int8 values.
-        int8_t decoded_buf[16] = {};
-        for (uint32_t v = 0; v < 4; ++v) {
-            uint8_t b0 = codes[v][d / 2], b1 = codes[v][d / 2 + 1];
-            decoded_buf[v*4 + 0] = levels_i8[d * K + (b0 & 0x0F)];
-            decoded_buf[v*4 + 1] = levels_i8[(d+1) * K + ((b0 >> 4) & 0x0F)];
-            decoded_buf[v*4 + 2] = levels_i8[(d+2) * K + (b1 & 0x0F)];
-            decoded_buf[v*4 + 3] = levels_i8[(d+3) * K + ((b1 >> 4) & 0x0F)];
-        }
-        int8x16_t decoded = vld1q_s8(decoded_buf);
-
-        // Query: 4 dims in bytes 0-3 (column 0 of the 4x4 matrix).
-        int8_t qbuf[16] = {};
-        qbuf[0] = query_i8[d]; qbuf[1] = query_i8[d+1];
-        qbuf[2] = query_i8[d+2]; qbuf[3] = query_i8[d+3];
-        int8x16_t q = vld1q_s8(qbuf);
-
-        acc = vmmlaq_s32(acc, decoded, q);
-    }
-    vst1q_s32(out, acc);
-
-#elif defined(SEXTANT_HAS_NEON)
-    for (uint32_t v = 0; v < 4; ++v)
-        out[v] = scalar_dot_u4_i8mm(query_i8, levels_i8, codes[v], dim, K);
-#else
-    for (uint32_t v = 0; v < 4; ++v) {
-        int32_t a = 0;
-        for (uint32_t d = 0; d < dim; d += 2) {
-            uint8_t byte = codes[v][d / 2];
-            a += (int32_t)query_i8[d] * levels_i8[d * K + (byte & 0x0F)];
-            if (d + 1 < dim)
-                a += (int32_t)query_i8[d+1] * levels_i8[(d+1) * K + ((byte >> 4) & 0x0F)];
-        }
-        out[v] = a;
-    }
-#endif
-}
-
+/// Float decode-dot (NEON, no I8MM). Returns float dot.
+/// Uses vtbl to decode nibbles, widens to float, FMA with query.
 /// Float decode-dot (NEON, no I8MM). Returns float dot.
 /// Uses vtbl to decode nibbles, widens to float, FMA with query.
 inline float scalar_dot_u4_float(const float* query,
