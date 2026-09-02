@@ -2710,6 +2710,11 @@ struct SearchScratch {
     std::vector<std::unique_ptr<PqQuantizer>> worker_leaf_quants;
     std::vector<uint8_t> local_lut4, local_lut8;
     std::vector<float> query_residual, decoded_vec;
+    std::vector<int8_t> query_scaled_i8;  // i8 SDOT scan (serial path)
+    // i8 SDOT scan (SEXTANT_SCAN_I8): serial-path a8 buffer. NOTE: if a
+    // future per-leaf scan buffer is added here, it MUST also join the
+    // parallel workers' per-worker set (see the flush_buffer reset-list
+    // lesson) — this one is per-worker allocated at the call site.
     /// Uniform-scan query: a_d = q_d * step_d (arithmetic-decode kernel).
     std::vector<float> query_scaled;
     /// Zero-filled code row shared by tail batches (count % 4 != 0):
@@ -3315,10 +3320,22 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         // per-LEAF mutable state (a[d] = q_d·step_d of THIS leaf) — sharing
         // it across workers was a data race that corrupted scores (recall
         // 0.99 → 0.66 at ST=8 on cohere 100k local_scalar).
+        // i8 SDOT scan (SEXTANT_SCAN_I8=1): quantize this leaf's a_d to
+        // int8 and score with DOTPROD instead of the f32 widen+FMA chain —
+        // one vdotq_s32 per 16 dims per vector. NOT score-bit-identical to
+        // the f32 kernel (a_d carries ≤1/2-LSB quantization error), so it
+        // ships env-gated until the matched-recall A/B passes.
+        const bool use_i8_scan =
+#if defined(__ARM_FEATURE_DOTPROD)
+            slm_arith && !slm_shaped && getenv("SEXTANT_SCAN_I8") != nullptr;
+#else
+            false;
+#endif
         auto scan_one_leaf = [&](const LeafCandidate& cand, uint32_t leaf_slot,
                                  std::vector<HeapEntry>& h,
                                  std::vector<float>& a_buf,
-                                 std::vector<uint8_t>& pad_buf) {
+                                 std::vector<uint8_t>& pad_buf,
+                                 std::vector<int8_t>& a8_buf) {
             if (cand.page == kInvalidPage) return;
             std::vector<float>& a_uni = a_buf;
             std::vector<uint8_t>& pad_row_buf = pad_buf;
@@ -3346,6 +3363,25 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     c0_leaf += query[d] * static_cast<float>(lo16[d]);
                 }
             }
+            // i8 scan prep: a8[d] = clamp(round(a_d · s)), s = 127/max|a_d|.
+            // Per-leaf (local_scalar) / per-query (slm) — matches a_uni's
+            // scope exactly. Padded tail dims stay 0 (garbage nibbles × 0).
+            float i8_inv = 0.f;
+            if (use_i8_scan) {
+                const uint32_t padded8 = (dim + 15) / 16 * 16;
+                if (a8_buf.size() < padded8) a8_buf.assign(padded8, 0);
+                float amax = 1e-12f;
+                for (uint32_t d = 0; d < dim; ++d)
+                    amax = std::max(amax, std::fabs(a_uni[d]));
+                const float i8_scale = 127.0f / amax;
+                i8_inv = 1.0f / i8_scale;
+                for (uint32_t d = 0; d < dim; ++d) {
+                    float q = a_uni[d] * i8_scale;
+                    a8_buf[d] = static_cast<int8_t>(q >= 0.f
+                        ? (q + 0.5f >= 127.f ? 127.f : q + 0.5f)
+                        : (q - 0.5f <= -127.f ? -127.f : q - 0.5f));
+                }
+            }
             // InnerProduct trees: per-vector fp16 bias right after the
             // codes; the scan score is <q,x_hat> * (||x||/||x_hat||),
             // cancelling the per-vector reconstruction norm shrinkage
@@ -3370,7 +3406,43 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 for (uint32_t v = nv; v < 4; ++v) cp[v] = pad_row;
 
                 float dots[4] = {0, 0, 0, 0};
-                if (slm_arith) {
+                if (use_i8_scan) {
+#if defined(__ARM_FEATURE_DOTPROD)
+                    // Integer dot: nibble value IS the level (uniform).
+                    // acc = Σ a8[d]·c_d in i32; rescale once at the end.
+                    const uint32_t padded = (dim + 15) / 16 * 16;
+                    const bool fully_padded_i8 = padded / 2 <= cs;
+                    const uint32_t d16i = fully_padded_i8 ? padded : dim / 16 * 16;
+                    int32x4_t acc8[4];
+                    for (auto& x : acc8) x = vdupq_n_s32(0);
+                    for (uint32_t d = 0; d < d16i; d += 16) {
+                        const int8x16_t a8 = vld1q_s8(
+                            reinterpret_cast<const int8_t*>(a8_buf.data()) + d);
+                        for (uint32_t v = 0; v < 4; ++v) {
+                            const uint8x8_t b = vld1_u8(cp[v] + d / 2);
+                            const uint8x8_t lo = vand_u8(b, vdup_n_u8(0x0F));
+                            const uint8x8_t hi = vshr_n_u8(b, 4);
+                            const uint8x8x2_t z = vzip_u8(lo, hi);
+                            acc8[v] = vdotq_s32(acc8[v], a8,
+                                vreinterpretq_s8_u8(
+                                    vcombine_u8(z.val[0], z.val[1])));
+                        }
+                    }
+                    for (uint32_t v = 0; v < 4; ++v)
+                        dots[v] = static_cast<float>(vaddvq_s32(acc8[v])) * i8_inv;
+                    if (!fully_padded_i8) {
+                        for (uint32_t d = d16i; d < dim; ++d) {
+                            const int8_t a8d = a8_buf[d];
+                            for (uint32_t v = 0; v < 4; ++v) {
+                                const uint8_t byte = cp[v][d / 2];
+                                const uint8_t nib = (d % 2 == 0)
+                                    ? (byte & 0xF) : ((byte >> 4) & 0xF);
+                                dots[v] += static_cast<float>(a8d) * nib;
+                            }
+                        }
+                    }
+#endif
+                } else if (slm_arith) {
                     // Arithmetic decode: dot += (q·step)·f[code] — no gather.
                     // NEON: 4 vectors × 16 dims per iteration. 8 code bytes
                     // unpack to 16 dim-ordered nibbles (vzip lo/hi); for the
@@ -3517,7 +3589,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         if (!parallel_scan) {
             for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
                 scan_one_leaf(candidates[ci], ci, sheap,
-                              scratch.query_scaled, scratch.pad_code_row);
+                              scratch.query_scaled, scratch.pad_code_row,
+                              scratch.query_scaled_i8);
             }
         } else {
             const uint32_t T = std::min(config.search_threads,
@@ -3535,6 +3608,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             std::vector<std::vector<float>> a_bufs(
                 T, std::vector<float>(padded_w, 0.f));
             std::vector<std::vector<uint8_t>> pad_bufs(T);
+            std::vector<std::vector<int8_t>> a8_bufs(T);
             for (uint32_t t = 0; t < T; ++t) {
                 const uint32_t start = t * per;
                 const uint32_t end = std::min(start + per,
@@ -3542,13 +3616,15 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 if (start >= end) break;
                 futs.push_back(std::async(std::launch::async,
                     [&](uint32_t s, uint32_t e, std::vector<HeapEntry>& my,
-                        std::vector<float>& ab, std::vector<uint8_t>& pb) {
+                        std::vector<float>& ab, std::vector<uint8_t>& pb,
+                        std::vector<int8_t>& a8b) {
                         my.reserve(W + 32);
                         for (uint32_t c = s; c < e; ++c) {
-                            scan_one_leaf(candidates[c], c, my, ab, pb);
+                            scan_one_leaf(candidates[c], c, my, ab, pb, a8b);
                         }
                     }, start, end, std::ref(th[t]),
-                    std::ref(a_bufs[t]), std::ref(pad_bufs[t])));
+                    std::ref(a_bufs[t]), std::ref(pad_bufs[t]),
+                    std::ref(a8_bufs[t])));
             }
             for (auto& f : futs) f.get();
 
