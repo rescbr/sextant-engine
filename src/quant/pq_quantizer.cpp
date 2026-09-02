@@ -52,6 +52,10 @@ inline uint32_t read_code(const uint8_t* code, uint8_t bits, uint32_t s) {
     if (bits == 8) {
         return static_cast<uint32_t>(code[s]);
     }
+    if (bits == 2) {
+        // Four codes per byte, slot 0 = two LSBs.
+        return (static_cast<uint32_t>(code[s / 4]) >> (2 * (s % 4))) & 0x3u;
+    }
     // bits == 4 — two codes per byte, slot 0 = low nibble, slot 1 = high.
     const uint32_t byte_off = s / 2;
     const uint8_t shift = static_cast<uint8_t>((s % 2) * 4);
@@ -62,6 +66,14 @@ inline uint32_t read_code(const uint8_t* code, uint8_t bits, uint32_t s) {
 inline void write_code(uint8_t* code, uint8_t bits, uint32_t s, uint32_t cid) {
     if (bits == 8) {
         code[s] = static_cast<uint8_t>(cid & 0xFFu);
+        return;
+    }
+    if (bits == 2) {
+        const uint32_t byte_off = s / 4;
+        const uint8_t shift = static_cast<uint8_t>(2 * (s % 4));
+        const uint8_t pair = static_cast<uint8_t>(cid & 0x3u);
+        code[byte_off] = static_cast<uint8_t>(
+            (code[byte_off] & ~(0x3u << shift)) | (pair << shift));
         return;
     }
     const uint32_t byte_off = s / 2;
@@ -662,8 +674,8 @@ PqQuantizer::PqQuantizer(MetricKind metric, Dim dim, uint16_t m, uint8_t bits,
     if (dim_ % static_cast<Dim>(m_) != 0) {
         throw Error(ErrorCode::InvalidParam, "PQ requires dim divisible by m");
     }
-    if (bits_ != 4 && bits_ != 8) {
-        throw Error(ErrorCode::InvalidParam, "PQ 'bits' must be 4 or 8");
+    if (bits_ != 2 && bits_ != 4 && bits_ != 8) {
+        throw Error(ErrorCode::InvalidParam, "PQ 'bits' must be 2, 4 or 8");
     }
 
     K_ = 1u << bits_;
@@ -1373,7 +1385,7 @@ void PqQuantizer::deserialize(const uint8_t* in, size_t size) {
     std::memcpy(&d, in + 4, sizeof(d));
     dim_ = d;
     if (m_ == 0 || dim_ % static_cast<Dim>(m_) != 0 ||
-        (bits_ != 4 && bits_ != 8)) {
+        (bits_ != 2 && bits_ != 4 && bits_ != 8)) {
         throw Error(ErrorCode::CorruptIndex,
                     "PQ deserialize: invalid header");
     }
