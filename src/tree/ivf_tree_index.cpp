@@ -384,6 +384,32 @@ inline void extract_code_from_leaf(const uint8_t* leaf_ptr, uint32_t local_idx,
     }
 }
 
+inline uint32_t u32_min32(const uint32_t* v) {
+#if defined(__aarch64__)
+    const uint32x4_t a = vminq_u32(vld1q_u32(v),      vld1q_u32(v + 4));
+    const uint32x4_t b = vminq_u32(vld1q_u32(v + 8),  vld1q_u32(v + 12));
+    const uint32x4_t c = vminq_u32(vld1q_u32(v + 16), vld1q_u32(v + 20));
+    const uint32x4_t d = vminq_u32(vld1q_u32(v + 24), vld1q_u32(v + 28));
+    return vminvq_u32(vminq_u32(vminq_u32(a, b), vminq_u32(c, d)));
+#else
+    uint32_t m = 0xFFFFFFFFu;
+    for (uint32_t j = 0; j < 32; ++j) m = std::min(m, v[j]);
+    return m;
+#endif
+}
+
+inline uint32_t u32_min16(const uint32_t* v) {
+#if defined(__aarch64__)
+    const uint32x4_t a = vminq_u32(vld1q_u32(v),     vld1q_u32(v + 4));
+    const uint32x4_t b = vminq_u32(vld1q_u32(v + 8), vld1q_u32(v + 12));
+    return vminvq_u32(vminq_u32(a, b));
+#else
+    uint32_t m = 0xFFFFFFFFu;
+    for (uint32_t j = 0; j < 16; ++j) m = std::min(m, v[j]);
+    return m;
+#endif
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -3439,9 +3465,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     if (h.size() < W) continue;
                 }
                 const uint32_t front_d = h[0].pq_dist;
-                uint32_t block_min = 0xFFFFFFFFu;
-                for (uint32_t j = 0; j < 16; ++j)
-                    if (out[j] < block_min) block_min = out[j];
+                const uint32_t block_min = u32_min16(out);
                 if (block_min >= front_d) continue;
                 for (uint32_t j = 0; j < 16; ++j) {
                     if (out[j] == 0xFFFFFFFFu || out[j] >= h[0].pq_dist)
@@ -3466,10 +3490,15 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 }
 
                 const uint32_t front_d = h[0].pq_dist;
-                uint32_t block_min = 0xFFFFFFFFu;
-                for (uint32_t j = 0; j < 32; ++j)
-                    if ((valid_mask >> j) & 1u)
-                        block_min = std::min(block_min, out[j]);
+                uint32_t block_min;
+                if (valid_mask == 0xFFFFFFFFu) {
+                    block_min = u32_min32(out);   // all blocks but the tail
+                } else {
+                    block_min = 0xFFFFFFFFu;      // tail block: masked scalar
+                    for (uint32_t j = 0; j < 32; ++j)
+                        if ((valid_mask >> j) & 1u)
+                            block_min = std::min(block_min, out[j]);
+                }
                 if (block_min >= front_d) continue;
 
                 for (uint32_t j = 0; j < 32; ++j) {
@@ -3680,6 +3709,39 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const uint32_t slm_cs = is_scalar_lm
             ? scalar_lm_quantizer_->code_size() : 0;
 
+        // Global-PQ rerank via a per-query FP32 LUT (m × K partial dots +
+        // codeword norm²): mathematically the same value as decode_code +
+        // dot/l2sq (segment-summed instead of dim-summed), but replaces the
+        // scalar nibble-unpack + 768-dim float kernel with m table lookups.
+        // Profiling (task 3): extract+decode+l2sq was ~13% of total at weak-
+        // ranking configs (pq4 m96 tau3); this collapses it to the LUT sums.
+        std::vector<float> pq_rerank_dot, pq_rerank_nrm;
+        float pq_qsq = 0.f;
+        const bool pq_lut_rerank = !is_scalar_lm && !is_local_pq;
+        if (pq_lut_rerank) {
+            const uint32_t K = quantizer_->K();
+            const uint32_t sub = quantizer_->sub_dim();
+            const float* cb = quantizer_->codebook();
+            const uint32_t m = manifest_.m4;
+            pq_rerank_dot.assign(static_cast<size_t>(m) * K, 0.f);
+            pq_rerank_nrm.assign(static_cast<size_t>(m) * K, 0.f);
+            for (uint32_t d = 0; d < manifest_.dim; ++d)
+                pq_qsq += query[d] * query[d];
+            for (uint32_t sg = 0; sg < m; ++sg) {
+                const float* qseg = query + static_cast<size_t>(sg) * sub;
+                for (uint32_t c = 0; c < K; ++c) {
+                    const float* cw = cb + (static_cast<size_t>(sg) * K + c) * sub;
+                    float dsum = 0.f, nsum = 0.f;
+                    for (uint32_t j = 0; j < sub; ++j) {
+                        dsum += qseg[j] * cw[j];
+                        nsum += cw[j] * cw[j];
+                    }
+                    pq_rerank_dot[static_cast<size_t>(sg) * K + c] = dsum;
+                    pq_rerank_nrm[static_cast<size_t>(sg) * K + c] = nsum;
+                }
+            }
+        }
+
         for (const auto& entry : heap) {
             const auto* elh = reinterpret_cast<const TreeLeafHeader*>(entry.leaf_ptr);
             const bool entry_local = (elh->leaf_state ==
@@ -3734,6 +3796,37 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     entry.leaf_ptr + elh->centroid_offset);
                 for (uint32_t d = 0; d < manifest_.dim; ++d)
                     decoded_vec[d] += centroid[d];
+            } else if (pq_lut_rerank) {
+                // LUT rerank: index the tables directly with the block-
+                // layout nibbles — no code extraction, no decode, no
+                // dim-wide float kernel.
+                const uint32_t block = entry.local_idx / codes_per_block;
+                const uint32_t slot = entry.local_idx % codes_per_block;
+                const uint8_t* blk = entry.leaf_ptr +
+                    leaf_codes_offset(manifest_.summary_size) +
+                    static_cast<uint64_t>(block) * block_bytes;
+                const uint32_t m = manifest_.m4;
+                const uint32_t K = quantizer_->K();
+                float acc = 0.f, nacc = 0.f;
+                if (manifest_.scan_pq_bits == 8) {
+                    for (uint32_t sg = 0; sg < m; ++sg) {
+                        const uint32_t c = blk[sg * 16 + slot];
+                        acc += pq_rerank_dot[static_cast<size_t>(sg) * K + c];
+                        nacc += pq_rerank_nrm[static_cast<size_t>(sg) * K + c];
+                    }
+                } else {
+                    const uint32_t byte_idx = slot % 16;
+                    const bool is_hi = slot >= 16;
+                    for (uint32_t sg = 0; sg < m; ++sg) {
+                        const uint8_t byte = blk[sg * 16 + byte_idx];
+                        const uint32_t c = is_hi ? (byte >> 4) : (byte & 0x0F);
+                        acc += pq_rerank_dot[static_cast<size_t>(sg) * K + c];
+                        nacc += pq_rerank_nrm[static_cast<size_t>(sg) * K + c];
+                    }
+                }
+                exact_dist = (metric == MetricKind::InnerProduct)
+                    ? -acc
+                    : (pq_qsq - 2.f * acc + nacc);
             } else {
                 // Global-PQ rerank (global codebook path).
                 extract_code_from_leaf(entry.leaf_ptr, entry.local_idx,
@@ -3742,7 +3835,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                        block_bytes, code_buf.data());
                 quantizer_->decode_code(code_buf.data(), decoded_vec.data());
             }
-            if (!is_scalar_lm) {
+            if (!is_scalar_lm && !pq_lut_rerank) {
                 exact_dist =
                     (metric == MetricKind::InnerProduct)
                         ? -simd::dot_f32(query, decoded_vec.data(), manifest_.dim)
