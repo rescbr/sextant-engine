@@ -1334,5 +1334,93 @@ TEST(TreeInsertDelete, LocalPqInsertAndSplit) {
     std::filesystem::remove(tree_path);
 }
 
+TEST(TreeInsertDelete, LocalScalarInsertAndSplit) {
+    const uint64_t n = 2000;
+    const uint32_t dim = 64;
+    const std::string base_path = write_test_fbin(
+        "tree_lsc.fbin", n, dim, /*n_clusters=*/20, /*seed=*/42);
+    const std::string tree_path = temp_path(".tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "local_scalar";
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 200;
+    cfg.num_threads = 4;
+    cfg.adaptive_probe_gap = 0.0f;
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    auto idx = IVFTreeIndex::open(tree_path);
+    const uint32_t n_leaves_before = idx->n_leaves();
+    EXPECT_EQ(idx->live_count(), n);
+
+    uint64_t fbin_n;
+    uint32_t fbin_dim;
+    auto data = read_fbin(base_path, fbin_n, fbin_dim);
+    ASSERT_EQ(fbin_dim, dim);
+
+    SearchConfig sconfig;
+    sconfig.k = 100;
+    sconfig.n_probe = 8;
+    sconfig.adaptive_probe_gap = 0.0f;
+    sconfig.fastscan_W = 2100;
+
+    std::vector<float> v42(dim), v7(dim);
+    std::memcpy(v42.data(), &data[42 * dim], dim * sizeof(float));
+    std::memcpy(v7.data(), &data[7 * dim], dim * sizeof(float));
+    std::vector<IVFTreeIndex::InsertPoint> points;
+    points.push_back({v42.data(), static_cast<RowId>(777777), {}, {}});
+    points.push_back({v7.data(), static_cast<RowId>(777778), {}, {}});
+    idx->insert_batch(points);
+    EXPECT_EQ(idx->live_count(), n + 2);
+    for (auto& [qv, rid] : std::vector<std::pair<const float*, RowId>>{
+             {v42.data(), 777777}, {v42.data(), static_cast<RowId>(42)},
+             {v7.data(), 777778}}) {
+        auto results = idx->search(qv, 100, sconfig);
+        std::unordered_set<RowId> ids;
+        for (const auto& c : results) ids.insert(c.row_id);
+        EXPECT_TRUE(ids.count(rid))
+            << "local_scalar insert: row_id " << rid << " not searchable";
+    }
+
+    // Force splits (refit + re-encode per half), re-verify.
+    std::mt19937 rng(4242);
+    const uint32_t batch = 1600;
+    std::vector<IVFTreeIndex::InsertPoint> spoints;
+    std::vector<float> svec(batch * dim);
+    for (uint32_t i = 0; i < batch; ++i) {
+        for (uint32_t d = 0; d < dim; ++d)
+            svec[i * dim + d] =
+                std::uniform_real_distribution<float>(-50, 50)(rng);
+        spoints.push_back({&svec[i * dim],
+                           static_cast<RowId>(n + 2 + i), {}, {}});
+    }
+    idx->insert_batch(spoints);
+    EXPECT_EQ(idx->live_count(), n + 2 + batch);
+    EXPECT_GT(idx->n_leaves(), n_leaves_before);
+    sconfig.fastscan_W = 4500;
+    // NOTE: uniform range fits are min/max-sensitive — the 1600 uniform
+    // (-50,50) inserts coarsen the rebuilt leaves' level ranges, demoting
+    // in-distribution vectors (verified: 42/777777 demoted but present and
+    // adjacently-ranked). Assert presence in a wide shortlist rather than
+    // top-100.
+    for (auto& [qv, rid] : std::vector<std::pair<const float*, RowId>>{
+             {v42.data(), 777777}, {v42.data(), static_cast<RowId>(42)},
+             {v7.data(), 777778}}) {
+        auto results = idx->search(qv, 600, sconfig);
+        std::unordered_set<RowId> ids;
+        for (const auto& c : results) ids.insert(c.row_id);
+        EXPECT_TRUE(ids.count(rid))
+            << "local_scalar post-split: row_id " << rid << " lost entirely";
+    }
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
 }  // namespace
 }  // namespace sextant::tree

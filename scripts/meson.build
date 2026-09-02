@@ -98,6 +98,12 @@ spike_pq2_tier = executable('spike_pq2_tier',
     link_with: sextant_lib,
 )
 
+spike_local_shape = executable('spike_local_shape',
+    'spike_local_shape.cpp',
+    include_directories: [engine_inc, src_inc],
+    link_with: sextant_lib,
+)
+
 spike_routing = executable('spike_routing',
     'spike_routing.cpp',
     include_directories: [engine_inc, src_inc, third_party_inc],

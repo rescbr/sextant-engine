@@ -199,6 +199,17 @@ inline uint64_t leaf_rowids_offset(uint32_t summary_size, uint64_t n_blocks,
            static_cast<uint64_t>(n_blocks) * block_bytes;
 }
 
+/// Byte offset of the per-leaf uniform levels (lo: dim × fp16, then
+/// steps: dim × fp16) in a CodedLocalScalar leaf.
+inline uint64_t lsc_levels_offset(uint32_t summary_size) {
+    return leaf_codes_offset(summary_size);
+}
+
+/// Byte offset of the flat packed-nibble codes in a CodedLocalScalar leaf.
+inline uint64_t lsc_codes_offset(uint32_t summary_size, uint16_t dim) {
+    return leaf_codes_offset(summary_size) + 2ull * dim * sizeof(float16_t);
+}
+
 /// Scalar leaves (flat packed-nibble layout) in InnerProduct trees carry a
 /// per-vector fp16 IP bias (||x|| / ||x̂||, RaBitQ-style) between the codes
 /// and row_ids: the scan multiplies ⟨q, x̂⟩ by it to cancel the per-vector
@@ -253,6 +264,11 @@ enum class LeafState : uint8_t {
     /// Coded with a local per-leaf codebook + FP32 centroid. Searched via
     /// FastScan with a per-leaf LUT built from query_residual = query - centroid.
     CodedLocal = 2,
+    /// Scalar-coded with per-leaf uniform levels: level_d(c) = lo_d +
+    /// step_d·c (fp16 lo/steps stored in the leaf). Arithmetic scan with a
+    /// per-leaf query transform; layout [header][summary][lo][steps]
+    /// [codes][ip_biases?][row_ids][filters].
+    CodedLocalScalar = 3,
 };
 
 /// Local-PQ codebook size in bytes: m4 × K × sub_dim × 4.
