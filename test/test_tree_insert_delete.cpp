@@ -1217,5 +1217,122 @@ TEST(TreeInsertDelete, ScalarIPBiasRecallAndInsert) {
     std::filesystem::remove(tree_path);
 }
 
+// ===========================================================================
+// local_pq: insert_batch (frozen codebook, residual encode) + split with
+// per-half codebook retrain
+// ===========================================================================
+
+TEST(TreeInsertDelete, LocalPqInsertAndSplit) {
+    const uint64_t n = 2000;
+    const uint32_t dim = 64;
+    const std::string base_path = write_test_fbin(
+        "tree_lpq.fbin", n, dim, /*n_clusters=*/20, /*seed=*/42);
+    const std::string tree_path = temp_path(".tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "local_pq";
+    cfg.params.pq4_m = 16;
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 8;
+    // leaf_capacity=100: ~250/leaf initially (above cap, under 2×cap=200?
+    // no — 250 > 200 → build itself would split; use 200 so inserts push
+    // leaves over 400).
+    cfg.leaf_capacity = 200;
+    cfg.num_threads = 4;
+    cfg.adaptive_probe_gap = 0.0f;
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    auto idx = IVFTreeIndex::open(tree_path);
+    const uint32_t n_leaves_before = idx->n_leaves();
+    EXPECT_EQ(idx->live_count(), n);
+
+    uint64_t fbin_n;
+    uint32_t fbin_dim;
+    auto data = read_fbin(base_path, fbin_n, fbin_dim);
+    ASSERT_EQ(fbin_dim, dim);
+
+    // Baseline recall: original vector 42 findable (top-200 shortlist).
+    {
+        SearchConfig sconfig;
+        sconfig.k = 10;
+        sconfig.n_probe = 8;
+        sconfig.adaptive_probe_gap = 0.0f;
+        sconfig.fastscan_W = 2000;
+        auto results = idx->search(&data[42 * dim], 200, sconfig);
+        std::unordered_set<RowId> ids;
+        for (const auto& c : results) ids.insert(c.row_id);
+        EXPECT_TRUE(ids.count(42)) << "local_pq baseline search broken";
+    }
+
+    // Insert: exact copies of vectors 42 and 7 under fresh row_ids.
+    std::vector<float> v42(dim), v7(dim);
+    std::memcpy(v42.data(), &data[42 * dim], dim * sizeof(float));
+    std::memcpy(v7.data(), &data[7 * dim], dim * sizeof(float));
+    std::vector<IVFTreeIndex::InsertPoint> points;
+    points.push_back({v42.data(), static_cast<RowId>(888888), {}, {}});
+    points.push_back({v7.data(), static_cast<RowId>(888889), {}, {}});
+    idx->insert_batch(points);
+    EXPECT_EQ(idx->live_count(), n + 2);
+
+    {
+        SearchConfig sconfig;
+        sconfig.k = 100;
+        sconfig.n_probe = 8;
+        sconfig.adaptive_probe_gap = 0.0f;
+        sconfig.fastscan_W = 2100;
+        for (auto& [qv, rid] : std::vector<std::pair<const float*, RowId>>{
+                 {v42.data(), 888888}, {v42.data(), static_cast<RowId>(42)},
+                 {v7.data(), 888889}}) {
+            auto results = idx->search(qv, 100, sconfig);
+            std::unordered_set<RowId> ids;
+            for (const auto& c : results) ids.insert(c.row_id);
+            EXPECT_TRUE(ids.count(rid))
+                << "local_pq insert: row_id " << rid << " not searchable";
+        }
+    }
+
+    // Now push over 2×leaf_capacity to force splits (which retrain the
+    // per-half codebooks), then re-verify searchability.
+    std::mt19937 rng(31337);
+    const uint32_t batch = 1600;
+    std::vector<IVFTreeIndex::InsertPoint> spoints;
+    std::vector<float> svec(batch * dim);
+    for (uint32_t i = 0; i < batch; ++i) {
+        for (uint32_t d = 0; d < dim; ++d)
+            svec[i * dim + d] =
+                std::uniform_real_distribution<float>(-50, 50)(rng);
+        spoints.push_back({&svec[i * dim],
+                           static_cast<RowId>(n + 2 + i), {}, {}});
+    }
+    idx->insert_batch(spoints);
+    EXPECT_EQ(idx->live_count(), n + 2 + batch);
+    EXPECT_GT(idx->n_leaves(), n_leaves_before)
+        << "local_pq insert did not trigger splits";
+
+    {
+        SearchConfig sconfig;
+        sconfig.k = 100;
+        sconfig.n_probe = 8;
+        sconfig.adaptive_probe_gap = 0.0f;
+        sconfig.fastscan_W = 4500;
+        for (auto [qv, rid] : std::vector<std::pair<const float*, RowId>>{
+                 {v42.data(), 888888}, {v42.data(), static_cast<RowId>(42)},
+                 {v7.data(), 888889}}) {
+            auto results = idx->search(qv, 100, sconfig);
+            std::unordered_set<RowId> ids;
+            for (const auto& c : results) ids.insert(c.row_id);
+            EXPECT_TRUE(ids.count(rid))
+                << "local_pq post-split: row_id " << rid << " lost";
+        }
+    }
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
 }  // namespace
 }  // namespace sextant::tree
