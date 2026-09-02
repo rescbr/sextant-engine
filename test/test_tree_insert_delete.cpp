@@ -1403,11 +1403,10 @@ TEST(TreeInsertDelete, LocalScalarInsertAndSplit) {
     EXPECT_EQ(idx->live_count(), n + 2 + batch);
     EXPECT_GT(idx->n_leaves(), n_leaves_before);
     sconfig.fastscan_W = 4500;
-    // NOTE: uniform range fits are min/max-sensitive — the 1600 uniform
-    // (-50,50) inserts coarsen the rebuilt leaves' level ranges, demoting
-    // in-distribution vectors (verified: 42/777777 demoted but present and
-    // adjacently-ranked). Assert presence in a wide shortlist rather than
-    // top-100.
+    // Range fits degrade under OOD insert mass: min/max demoted these to
+    // rank ~174, 3σ clipping to ~161 (3σ cannot trim a 20-30% OOD mass —
+    // percentile clipping would, at the risk of in-distribution tails;
+    // unmeasured). Assert presence in a wide shortlist, not top-100.
     for (auto& [qv, rid] : std::vector<std::pair<const float*, RowId>>{
              {v42.data(), 777777}, {v42.data(), static_cast<RowId>(42)},
              {v7.data(), 777778}}) {

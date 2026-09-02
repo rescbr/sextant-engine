@@ -152,6 +152,16 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
                    m.quantizer_type == "local_scalar") {
             // No global quantizer blob: local_pq carries per-leaf codebooks,
             // local_scalar per-leaf levels, in the leaves themselves.
+            //
+            // ⚠ NULL-QUANTIZER GAUNTLET — adding another quantizer type
+            // with no global quantizer_ / scalar_lm_quantizer_? Every one of
+            // these sites dereferences a quantizer and must learn the new
+            // type, or it will crash (search: LUT build, metric dispatch,
+            // scan block entry, rerank code_sz + decode branch +
+            // pq_lut_rerank guard, materialization rowids; also
+            // debug_leaf_row_ids, open()'s codebook check above,
+            // write_tree_structure's serialize, build's train phase +
+            // streaming encode condition). local_scalar hit all of them.
         } else if (m.quantizer_type == "scalar_lloydmax" ||
                    m.quantizer_type == "scalar_uniform" ||
                    m.quantizer_type == "scalar_shape") {
@@ -408,6 +418,44 @@ inline void u32_mask_sentinel32(uint32_t* v, uint32_t valid_mask) {
     for (uint32_t j = 0; j < 32; ++j)
         if (!((valid_mask >> j) & 1u)) v[j] = 0xFFFFFFFFu;
 #endif
+}
+
+/// Fit per-dim uniform scalar levels (lo, step) for a local_scalar leaf
+/// from `count` interleaved vectors. Outlier-CLIPPED (mean ± 3σ per dim,
+/// widened back to min/max when that is narrower or σ≈0): pure min/max fits
+/// are destroyed by a handful of out-of-distribution inserts — the core
+/// distribution's 4-bit resolution collapses. Encode clamps to level 0/15,
+/// so clipped outliers land on the end levels instead of stretching them.
+inline void fit_local_scalar_levels(const float* vecs, uint32_t count,
+                                    uint16_t dim, float16_t* lo,
+                                    float16_t* steps) {
+    std::vector<float> mean(dim, 0.f), var(dim, 0.f);
+    for (uint32_t i = 0; i < count; ++i)
+        for (uint16_t d = 0; d < dim; ++d)
+            mean[d] += vecs[static_cast<size_t>(i) * dim + d];
+    for (uint16_t d = 0; d < dim; ++d) mean[d] /= count;
+    for (uint32_t i = 0; i < count; ++i)
+        for (uint16_t d = 0; d < dim; ++d) {
+            const float e = vecs[static_cast<size_t>(i) * dim + d] - mean[d];
+            var[d] += e * e;
+        }
+    std::vector<float> mn(dim, 1e30f), mx(dim, -1e30f);
+    for (uint32_t i = 0; i < count; ++i)
+        for (uint16_t d = 0; d < dim; ++d) {
+            const float v = vecs[static_cast<size_t>(i) * dim + d];
+            mn[d] = std::min(mn[d], v);
+            mx[d] = std::max(mx[d], v);
+        }
+    for (uint16_t d = 0; d < dim; ++d) {
+        const float sd = std::sqrt(var[d] / count);
+        float lo_f = mean[d] - 3.f * sd, hi_f = mean[d] + 3.f * sd;
+        if (hi_f - lo_f <= 0.f) { lo_f = mn[d]; hi_f = mx[d]; }
+        lo_f = std::min(lo_f, mn[d]);
+        hi_f = std::max(hi_f, mx[d]);
+        const float step = std::max((hi_f - lo_f) / 15.0f, 1e-8f);
+        lo[d] = float16_t(lo_f - 0.5f * step);
+        steps[d] = float16_t(step);
+    }
 }
 
 inline uint32_t u32_min32(const uint32_t* v) {
@@ -1549,22 +1597,11 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             // over global levels on cohere (scripts/spike_local_shape.cpp).
             std::vector<float16_t> lo(dim), steps(dim);
             {
-                std::vector<float> mn(dim, 1e30f), mx(dim, -1e30f);
-                for (uint32_t i = 0; i < count; ++i) {
-                    const float16_t* fv = buf.fp16_vecs.data() + i * dim;
-                    for (uint16_t d = 0; d < dim; ++d) {
-                        const float v = static_cast<float>(fv[d]);
-                        mn[d] = std::min(mn[d], v);
-                        mx[d] = std::max(mx[d], v);
-                    }
-                }
-                for (uint16_t d = 0; d < dim; ++d) {
-                    // 16 levels spanning the range with half-step margins.
-                    const float step = std::max((mx[d] - mn[d]) / 15.0f,
-                                                1e-8f);
-                    lo[d] = float16_t(mn[d] - 0.5f * step);
-                    steps[d] = float16_t(step);
-                }
+                std::vector<float> f32vecs(static_cast<size_t>(count) * dim);
+                for (size_t i = 0; i < f32vecs.size(); ++i)
+                    f32vecs[i] = static_cast<float>(buf.fp16_vecs.data()[i]);
+                fit_local_scalar_levels(f32vecs.data(), count, dim,
+                                        lo.data(), steps.data());
             }
             buf.codes.assign(static_cast<size_t>(count) * code_size, 0);
             if (ctx.has_ip_bias) buf.ip_biases.resize(count);
@@ -5155,20 +5192,14 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
             // point), write CodedLocalScalar layout.
             std::vector<float16_t> lo(dim), st(dim);
             {
-                std::vector<float> mn(dim, 1e30f), mx(dim, -1e30f);
+                std::vector<float> gvecs(static_cast<size_t>(gc) * dim);
                 for (uint32_t i = 0; i < gc; ++i)
-                    for (uint32_t d = 0; d < dim; ++d) {
-                        const float v =
-                            lpq_vecs[static_cast<size_t>(group[i]) * dim + d];
-                        mn[d] = std::min(mn[d], v);
-                        mx[d] = std::max(mx[d], v);
-                    }
-                for (uint32_t d = 0; d < dim; ++d) {
-                    const float step = std::max((mx[d] - mn[d]) / 15.0f,
-                                                1e-8f);
-                    lo[d] = float16_t(mn[d] - 0.5f * step);
-                    st[d] = float16_t(step);
-                }
+                    std::copy_n(lpq_vecs.data() +
+                                    static_cast<size_t>(group[i]) * dim,
+                                dim, gvecs.begin() +
+                                    static_cast<size_t>(i) * dim);
+                fit_local_scalar_levels(gvecs.data(), gc, dim,
+                                        lo.data(), st.data());
             }
             uint8_t* ncb = nb.data() +
                 lsc_codes_offset(summary_size, dim);
