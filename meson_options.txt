@@ -1,2 +1,4 @@
 option('tests', type: 'feature', value: 'enabled', description: 'Build unit tests')
 option('benchmarks', type: 'feature', value: 'disabled', description: 'Build benchmarks')
+option('capi_shared', type: 'boolean', value: false,
+       description: 'Also build libsextant_c.so for external FFI harnesses')

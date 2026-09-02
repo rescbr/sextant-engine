@@ -121,3 +121,9 @@ spike_slm_storage = executable('spike_slm_storage',
     include_directories: [engine_inc, src_inc],
     link_with: sextant_lib,
 )
+
+capi_smoke = executable('capi_smoke',
+    'capi_smoke.cpp',
+    include_directories: [engine_inc, src_inc, sources_inc],
+    link_with: [sextant_lib, sextant_sources_lib, sextant_c_lib],
+)

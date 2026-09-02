@@ -283,6 +283,27 @@ sextant_sources_dep = declare_dependency(
     dependencies: [sextant_dep, carquet_dep],
 )
 
+# --- C ABI shim (task 5: external benchmark harnesses) ------------------------
+# Header-only install surface: include/sextant/sextant_c.h. Links the engine
+# plus the fbin source adapter so a harness can build straight from .fbin.
+sextant_c_lib = static_library('sextant_c',
+    ['src/capi/sextant_c.cpp'],
+    include_directories: [engine_inc, src_inc, sources_inc, third_party_inc],
+    dependencies: [sextant_dep, sextant_sources_dep],
+    install: false,
+)
+
+# Shared variant for external harnesses (task 5: Rust FFI links one .so
+# instead of a thin-archive merge). -Dcapi_shared=true.
+if get_option('capi_shared')
+    sextant_c_shared = shared_library('sextant_c',
+        ['src/capi/sextant_c.cpp'],
+        include_directories: [engine_inc, src_inc, sources_inc, third_party_inc],
+        dependencies: [sextant_dep, sextant_sources_dep],
+        install: false,
+    )
+endif
+
 # --- CLI tool -----------------------------------------------------------------
 subdir('tools')
 
