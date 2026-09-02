@@ -384,6 +384,27 @@ inline void extract_code_from_leaf(const uint8_t* leaf_ptr, uint32_t local_idx,
     }
 }
 
+/// Overwrite lanes whose valid_mask bit is 0 with the 0xFFFFFFFF sentinel
+/// (max pq_dist): downstream min/push loops then need no mask checks — the
+/// same contract fastscan_block16 already uses for the 8-bit path. Real
+/// distances can never reach the sentinel (m x 255 < 2^32).
+inline void u32_mask_sentinel32(uint32_t* v, uint32_t valid_mask) {
+#if defined(__aarch64__)
+    for (int r = 0; r < 4; ++r) {
+        const int32x4_t sh = {-(4 * r), -(4 * r + 1), -(4 * r + 2),
+                              -(4 * r + 3)};
+        const uint32x4_t bit = vandq_u32(
+            vshlq_u32(vdupq_n_u32(valid_mask), sh), vdupq_n_u32(1));
+        const uint32x4_t invalid = vceqq_u32(bit, vdupq_n_u32(0));
+        vst1q_u32(v + 4 * r,
+                  vorrq_u32(vld1q_u32(v + 4 * r), invalid));
+    }
+#else
+    for (uint32_t j = 0; j < 32; ++j)
+        if (!((valid_mask >> j) & 1u)) v[j] = 0xFFFFFFFFu;
+#endif
+}
+
 inline uint32_t u32_min32(const uint32_t* v) {
 #if defined(__aarch64__)
     const uint32x4_t a = vminq_u32(vld1q_u32(v),      vld1q_u32(v + 4));
@@ -3475,11 +3496,13 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             } else {
                 uint32_t out[32];
                 simd::pq4_block32(blk, lut_ptr, m, out);
+                if (valid_mask != 0xFFFFFFFFu)
+                    u32_mask_sentinel32(out, valid_mask);  // tail block
                 const uint32_t base = b * 32;
 
                 if (h.size() < W) {
                     for (uint32_t j = 0; j < 32; ++j) {
-                        if (!((valid_mask >> j) & 1u)) continue;
+                        if (out[j] == 0xFFFFFFFFu) continue;
                         h.push_back({out[j], leaf_slot, base + j});
                         if (h.size() == W) {
                             std::make_heap(h.begin(), h.end(), heap_less);
@@ -3490,19 +3513,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 }
 
                 const uint32_t front_d = h[0].pq_dist;
-                uint32_t block_min;
-                if (valid_mask == 0xFFFFFFFFu) {
-                    block_min = u32_min32(out);   // all blocks but the tail
-                } else {
-                    block_min = 0xFFFFFFFFu;      // tail block: masked scalar
-                    for (uint32_t j = 0; j < 32; ++j)
-                        if ((valid_mask >> j) & 1u)
-                            block_min = std::min(block_min, out[j]);
-                }
-                if (block_min >= front_d) continue;
+                if (u32_min32(out) >= front_d) continue;
 
                 for (uint32_t j = 0; j < 32; ++j) {
-                    if (!((valid_mask >> j) & 1u)) continue;
                     if (out[j] >= h[0].pq_dist) continue;
                     heap_replace(h, out[j], leaf_slot, base + j);
                 }
