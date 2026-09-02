@@ -326,7 +326,20 @@ namespace {
 /// `leaf_ptr` (the mmap base of the leaf extent) and `local_idx` (the
 /// vector's index within that leaf). `pq_dist` is the PQ-approximate
 /// uint32 ADC distance used to order the heap during the scan.
+/// Scan-heap entry: the minimum state needed to maintain the top-W max-heap
+/// — 12 bytes vs the previous 32. Sifting moves 2.7x less data, which the
+/// pq4 profiles showed as 16% of scan CPU (weak ranking -> many replaces).
+/// row_id/leaf_ptr are re-derived AFTER the scan for the <=W survivors
+/// (materialized into HeapEntryFull) — one load each, negligible.
 struct HeapEntry {
+    uint32_t pq_dist;
+    uint32_t leaf_slot;        // index into the scan candidate list
+    uint32_t local_idx;        // vector index within the leaf
+};
+
+/// Post-scan form: everything the extraction/rerank/filter paths need.
+/// Produced from HeapEntry by a <=W-entry materialization pass.
+struct HeapEntryFull {
     uint32_t pq_dist;
     int64_t  row_id;
     const uint8_t* leaf_ptr;   // mmap base of the leaf extent
@@ -2461,7 +2474,9 @@ struct SearchScratch {
     std::vector<uint32_t> root_idx, next_root_idx;
     std::vector<LeafCandidate> candidates, pruned_candidates;
     // scan + predicate filtering of the heap
-    std::vector<HeapEntry> heap, filtered_heap;
+    std::vector<HeapEntry> heap;              // scan-time (12B entries)
+    std::vector<HeapEntryFull> heap_full;      // materialized post-scan
+    std::vector<HeapEntryFull> filtered_heap;
     std::vector<std::vector<HeapEntry>> worker_heaps;
     /// FastScan parallel workers: private per-leaf LUT state (local_pq).
     std::vector<std::vector<float>> worker_residuals;
@@ -2962,9 +2977,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // Max-heap of (pq_dist, row_id, leaf_ptr, local_idx). The leaf_ptr /
     // local_idx are carried so the rerank step can decode each candidate's
     // PQ code back to FP32 without a row_id → code lookup.
-    auto& heap = scratch.heap;
-    heap.clear();
-    heap.reserve(W + 32);
+    auto& sheap = scratch.heap;
+    sheap.clear();
+    sheap.reserve(W + 32);
     const auto heap_less = [](const HeapEntry& a, const HeapEntry& b) {
         return a.pq_dist < b.pq_dist;
     };
@@ -2973,9 +2988,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // bounded top-W heap during the scalar_lloydmax scan. Parameterized on
     // the heap so it can drive both the shared heap and per-thread heaps.
     auto heap_replace = [](std::vector<HeapEntry>& h, uint32_t new_d,
-                           int64_t new_id, const uint8_t* leaf_ptr,
-                           uint32_t local_idx) {
-        h[0] = {new_d, new_id, leaf_ptr, local_idx};
+                           uint32_t leaf_slot, uint32_t local_idx) {
+        h[0] = {new_d, leaf_slot, local_idx};
         uint32_t pos = 0;
         const uint32_t n = h.size();
         while (true) {
@@ -3062,7 +3076,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         // logic exists in exactly one place. The heap maintenance (push-back
         // until full, then make_heap, then sift-down replace) is identical to
         // the original inline code.
-        auto scan_one_leaf = [&](const LeafCandidate& cand,
+        auto scan_one_leaf = [&](const LeafCandidate& cand, uint32_t leaf_slot,
                                  std::vector<HeapEntry>& h) {
             if (cand.page == kInvalidPage) return;
             const uint8_t* leaf_ptr = mmap_base_ +
@@ -3073,8 +3087,6 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
             const uint8_t* codes = leaf_ptr +
                 leaf_codes_offset(manifest_.summary_size);
-            const RowId* row_ids = reinterpret_cast<const RowId*>(
-                codes + static_cast<uint64_t>(count) * cs);
 
             // Scan: batch-4 vectors, zero-padded tail (no scalar remainder
             // loop — padded batches measured faster on every kernel).
@@ -3212,11 +3224,11 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     uint32_t pq_dist = (dist_bits & 0x80000000u)
                         ? ~dist_bits : (dist_bits | 0x80000000u);
                     if (h.size() < W) {
-                        h.push_back({pq_dist, row_ids[i+v], leaf_ptr, i+v});
+                        h.push_back({pq_dist, leaf_slot, i+v});
                         if (h.size() == W)
                             std::make_heap(h.begin(), h.end(), heap_less);
                     } else if (pq_dist < h[0].pq_dist) {
-                        heap_replace(h, pq_dist, row_ids[i+v], leaf_ptr, i+v);
+                        heap_replace(h, pq_dist, leaf_slot, i+v);
                     }
                 }
             }
@@ -3231,8 +3243,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const bool parallel_scan = config.search_threads > 1
             && candidates.size() >= 2;
         if (!parallel_scan) {
-            for (const auto& cand : candidates) {
-                scan_one_leaf(cand, heap);
+            for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
+                scan_one_leaf(candidates[ci], ci, sheap);
             }
         } else {
             const uint32_t T = std::min(config.search_threads,
@@ -3252,7 +3264,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     [&](uint32_t s, uint32_t e, std::vector<HeapEntry>& my) {
                         my.reserve(W + 32);
                         for (uint32_t c = s; c < e; ++c) {
-                            scan_one_leaf(candidates[c], my);
+                            scan_one_leaf(candidates[c], c, my);
                         }
                     }, start, end, std::ref(th[t])));
             }
@@ -3266,28 +3278,34 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             // sorted vector is exactly what it wants.
             size_t total = 0;
             for (const auto& my : th) total += my.size();
-            heap.clear();
-            heap.reserve(total);
+            sheap.clear();
+            sheap.reserve(total);
             for (auto& my : th) {
-                heap.insert(heap.end(),
+                sheap.insert(sheap.end(),
                             std::make_move_iterator(my.begin()),
                             std::make_move_iterator(my.end()));
             }
-            if (heap.size() > W) {
-                std::sort(heap.begin(), heap.end(),
+            if (sheap.size() > W) {
+                // Tie-break (leaf_slot, local_idx): deterministic under any
+                // candidate sharding (row_id is not in the 12B entry; ties
+                // resolve differently than the old row_id tie-break, which
+                // only matters for equal-distance duplicates).
+                std::sort(sheap.begin(), sheap.end(),
                           [](const HeapEntry& a, const HeapEntry& b) {
                               if (a.pq_dist != b.pq_dist)
                                   return a.pq_dist < b.pq_dist;
-                              return a.row_id < b.row_id;
+                              if (a.leaf_slot != b.leaf_slot)
+                                  return a.leaf_slot < b.leaf_slot;
+                              return a.local_idx < b.local_idx;
                           });
-                heap.resize(W);
+                sheap.resize(W);
             }
         }
     } else {  // FastScan scan loop (pq / prq / local_pq)
     // Per-leaf FastScan body. Parameterized on the mutable per-leaf state
     // (residual, local LUTs, local-PQ quantizer wrapper) so the parallel
     // dispatch below can give each worker private buffers.
-    auto scan_leaf_fs = [&](const LeafCandidate& cand,
+    auto scan_leaf_fs = [&](const LeafCandidate& cand, uint32_t leaf_slot,
                             std::vector<HeapEntry>& h,
                             std::vector<float>& residual,
                             std::vector<uint8_t>& l4,
@@ -3310,7 +3328,6 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
              static_cast<uint8_t>(LeafState::CodedLocal));
 
         const uint8_t* codes;
-        const RowId* row_ids;
         const uint8_t* lut_ptr;  // which LUT to use for this leaf
 
         if (is_coded_local) {
@@ -3333,16 +3350,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             }
             codes = leaf_ptr + local_codes_offset(manifest_.summary_size,
                 manifest_.dim, manifest_.m4, manifest_.scan_pq_bits);
-            row_ids = reinterpret_cast<const RowId*>(
-                leaf_ptr + local_rowids_offset(manifest_.summary_size,
-                    manifest_.dim, manifest_.m4, manifest_.scan_pq_bits,
-                    n_blocks, block_bytes));
         } else {
             // Global-PQ (global codebook) path.
             codes = leaf_ptr + leaf_codes_offset(manifest_.summary_size);
-            row_ids = reinterpret_cast<const RowId*>(
-                leaf_ptr + leaf_rowids_offset(manifest_.summary_size,
-                                              n_blocks, block_bytes));
             lut_ptr = scan_8bit ? lut8.data() : lut4.data();
         }
 
@@ -3373,7 +3383,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 if (h.size() < W) {
                     for (uint32_t j = 0; j < 16; ++j) {
                         if (out[j] == 0xFFFFFFFFu) continue;
-                        h.push_back({out[j], row_ids[base + j], leaf_ptr, base + j});
+                        h.push_back({out[j], leaf_slot, base + j});
                         if (h.size() == W) {
                             std::make_heap(h.begin(), h.end(), heap_less);
                             break;
@@ -3389,7 +3399,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 for (uint32_t j = 0; j < 16; ++j) {
                     if (out[j] == 0xFFFFFFFFu || out[j] >= h[0].pq_dist)
                         continue;
-                    heap_replace(h, out[j], row_ids[base + j], leaf_ptr, base + j);
+                    heap_replace(h, out[j], leaf_slot, base + j);
                 }
             } else {
                 uint32_t out[32];
@@ -3399,7 +3409,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 if (h.size() < W) {
                     for (uint32_t j = 0; j < 32; ++j) {
                         if (!((valid_mask >> j) & 1u)) continue;
-                        h.push_back({out[j], row_ids[base + j], leaf_ptr, base + j});
+                        h.push_back({out[j], leaf_slot, base + j});
                         if (h.size() == W) {
                             std::make_heap(h.begin(), h.end(), heap_less);
                             break;
@@ -3418,7 +3428,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 for (uint32_t j = 0; j < 32; ++j) {
                     if (!((valid_mask >> j) & 1u)) continue;
                     if (out[j] >= h[0].pq_dist) continue;
-                    heap_replace(h, out[j], row_ids[base + j], leaf_ptr, base + j);
+                    heap_replace(h, out[j], leaf_slot, base + j);
                 }
             }
         }
@@ -3431,9 +3441,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     const bool parallel_fs = config.search_threads > 1
         && candidates.size() >= 2;
     if (!parallel_fs) {
-        for (const auto& cand : candidates) {
-            scan_leaf_fs(cand, heap, query_residual, local_lut4, local_lut8,
-                         leaf_quant.get());
+        for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
+            scan_leaf_fs(candidates[ci], ci, sheap, query_residual, local_lut4,
+                         local_lut8, leaf_quant.get());
         }
     } else {
         const uint32_t T = std::min(config.search_threads,
@@ -3474,8 +3484,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     auto& my = th[ti];
                     my.reserve(W + 32);
                     for (uint32_t c = s; c < e; ++c) {
-                        scan_leaf_fs(candidates[c], my, wr[ti], wl4[ti], wl8[ti],
-                                     wq[ti].get());
+                        scan_leaf_fs(candidates[c], c, my, wr[ti], wl4[ti],
+                                     wl8[ti], wq[ti].get());
                     }
                 }, start, end, t));
         }
@@ -3484,24 +3494,64 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         // Deterministic merge (same as the scalar path).
         size_t total = 0;
         for (const auto& my : th) total += my.size();
-        heap.clear();
-        heap.reserve(total);
+        sheap.clear();
+        sheap.reserve(total);
         for (auto& my : th) {
-            heap.insert(heap.end(),
+            sheap.insert(sheap.end(),
                         std::make_move_iterator(my.begin()),
                         std::make_move_iterator(my.end()));
         }
-        if (heap.size() > W) {
-            std::sort(heap.begin(), heap.end(),
+        if (sheap.size() > W) {
+            std::sort(sheap.begin(), sheap.end(),
                       [](const HeapEntry& a, const HeapEntry& b) {
                           if (a.pq_dist != b.pq_dist)
                               return a.pq_dist < b.pq_dist;
-                          return a.row_id < b.row_id;
+                          if (a.leaf_slot != b.leaf_slot)
+                              return a.leaf_slot < b.leaf_slot;
+                          return a.local_idx < b.local_idx;
                       });
-            heap.resize(W);
+            sheap.resize(W);
         }
     }
     }  // end FastScan scan loop (else of is_scalar_lm)
+
+    // --- Materialize full entries for the extraction/rerank paths ---
+    // Resolve row_id + leaf_ptr from (leaf_slot, local_idx) for the <=W
+    // survivors. Layout mirrors the scan-side row_ids placement.
+    {
+        auto& hf = scratch.heap_full;
+        hf.clear();
+        hf.reserve(sheap.size());
+        for (const auto& e : sheap) {
+            const LeafCandidate& c = candidates[e.leaf_slot];
+            const uint8_t* leaf_ptr = mmap_base_ +
+                static_cast<uint64_t>(c.page) * kPageSize;
+            const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+            const RowId* rids;
+            if (is_scalar_lm) {
+                const uint32_t cs = scalar_lm_quantizer_->code_size();
+                rids = reinterpret_cast<const RowId*>(
+                    leaf_ptr + leaf_codes_offset(manifest_.summary_size) +
+                    lh->count * cs);
+            } else if (is_local_pq) {
+                const uint64_t nb = (lh->count + codes_per_block - 1) /
+                    codes_per_block;
+                rids = reinterpret_cast<const RowId*>(
+                    leaf_ptr + local_rowids_offset(manifest_.summary_size,
+                        manifest_.dim, manifest_.m4, manifest_.scan_pq_bits,
+                        nb, block_bytes));
+            } else {
+                const uint64_t nb = (lh->count + codes_per_block - 1) /
+                    codes_per_block;
+                rids = reinterpret_cast<const RowId*>(
+                    leaf_ptr + leaf_rowids_offset(manifest_.summary_size,
+                                                  nb, block_bytes));
+            }
+            hf.push_back({e.pq_dist, rids[e.local_idx], leaf_ptr,
+                          e.local_idx});
+        }
+    }
+    auto& heap = scratch.heap_full;
 
     // --- Extract top-k from the heap ---
     auto& results = scratch.results;
@@ -3531,7 +3581,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     if (has_predicates && !heap.empty()) {
         // Sort by leaf_ptr so entries from the same leaf are contiguous.
         std::sort(heap.begin(), heap.end(),
-                  [](const HeapEntry& a, const HeapEntry& b) {
+                  [](const HeapEntryFull& a, const HeapEntryFull& b) {
                       return a.leaf_ptr < b.leaf_ptr;
                   });
         auto& filtered = scratch.filtered_heap;
