@@ -3085,7 +3085,12 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         auto& next_root_idx = scratch.next_root_idx;  // only depth=2
         next_frontier.clear();
         next_root_idx.clear();
-        next_frontier.reserve(frontier.size() * std::max(1u, n_probe_ln_cfg));
+        // Capacity hint only — clamp the multiply: probe-all callers pass
+        // n_probe_ln = UINT32_MAX, and frontier.size() × UINT32_MAX overflows
+        // into a multi-TB reserve (bad_alloc). The real per-node clamp lives
+        // at the expansion loop (min against each node's child count).
+        next_frontier.reserve(std::min<uint64_t>(
+            frontier.size() * std::max(1u, n_probe_ln_cfg), 1u << 20));
 
         for (uint32_t fi = 0; fi < frontier.size(); ++fi) {
             const auto& e = frontier[fi];
@@ -3305,9 +3310,18 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         // logic exists in exactly one place. The heap maintenance (push-back
         // until full, then make_heap, then sift-down replace) is identical to
         // the original inline code.
+        // a_buf/pad_buf are per-caller buffers: the serial path shares the
+        // scratch ones; each parallel worker passes its own. a_uni is
+        // per-LEAF mutable state (a[d] = q_d·step_d of THIS leaf) — sharing
+        // it across workers was a data race that corrupted scores (recall
+        // 0.99 → 0.66 at ST=8 on cohere 100k local_scalar).
         auto scan_one_leaf = [&](const LeafCandidate& cand, uint32_t leaf_slot,
-                                 std::vector<HeapEntry>& h) {
+                                 std::vector<HeapEntry>& h,
+                                 std::vector<float>& a_buf,
+                                 std::vector<uint8_t>& pad_buf) {
             if (cand.page == kInvalidPage) return;
+            std::vector<float>& a_uni = a_buf;
+            std::vector<uint8_t>& pad_row_buf = pad_buf;
             const uint8_t* leaf_ptr = mmap_base_ +
                 static_cast<uint64_t>(cand.page) * kPageSize;
             const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
@@ -3346,7 +3360,6 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
             // Scan: batch-4 vectors, zero-padded tail (no scalar remainder
             // loop — padded batches measured faster on every kernel).
-            std::vector<uint8_t>& pad_row_buf = scratch.pad_code_row;
             if (pad_row_buf.size() < cs) pad_row_buf.assign(cs, 0);
             const uint8_t* pad_row = pad_row_buf.data();
             for (uint32_t i = 0; i < count; i += 4) {
@@ -3503,7 +3516,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             && candidates.size() >= 2;
         if (!parallel_scan) {
             for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
-                scan_one_leaf(candidates[ci], ci, sheap);
+                scan_one_leaf(candidates[ci], ci, sheap,
+                              scratch.query_scaled, scratch.pad_code_row);
             }
         } else {
             const uint32_t T = std::min(config.search_threads,
@@ -3514,18 +3528,27 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             std::vector<std::future<void>> futs;
             futs.reserve(T);
             const uint32_t per = (static_cast<uint32_t>(candidates.size()) + T - 1) / T;
+            // Per-worker query-transform + pad buffers (see scan_one_leaf):
+            // zero-padded to the 16-dim kernel width once; per-leaf writes
+            // only touch [0, dim), so the padding survives across leaves.
+            const uint32_t padded_w = (dim + 15) / 16 * 16;
+            std::vector<std::vector<float>> a_bufs(
+                T, std::vector<float>(padded_w, 0.f));
+            std::vector<std::vector<uint8_t>> pad_bufs(T);
             for (uint32_t t = 0; t < T; ++t) {
                 const uint32_t start = t * per;
                 const uint32_t end = std::min(start + per,
                     static_cast<uint32_t>(candidates.size()));
                 if (start >= end) break;
                 futs.push_back(std::async(std::launch::async,
-                    [&](uint32_t s, uint32_t e, std::vector<HeapEntry>& my) {
+                    [&](uint32_t s, uint32_t e, std::vector<HeapEntry>& my,
+                        std::vector<float>& ab, std::vector<uint8_t>& pb) {
                         my.reserve(W + 32);
                         for (uint32_t c = s; c < e; ++c) {
-                            scan_one_leaf(candidates[c], c, my);
+                            scan_one_leaf(candidates[c], c, my, ab, pb);
                         }
-                    }, start, end, std::ref(th[t])));
+                    }, start, end, std::ref(th[t]),
+                    std::ref(a_bufs[t]), std::ref(pad_bufs[t])));
             }
             for (auto& f : futs) f.get();
 
