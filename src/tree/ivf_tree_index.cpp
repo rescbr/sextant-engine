@@ -467,6 +467,9 @@ struct TreeBuildContext {
     std::unique_ptr<PqQuantizer> quantizer;
     bool is_local_pq = false;  // true when quantizer_type == "local_pq"
     bool is_scalar_lm = false;  // true when quantizer_type == "scalar_lloydmax"
+    // Scalar + InnerProduct: leaves carry a per-vector fp16 IP bias
+    // (||x||/||x_hat||) between codes and row_ids.
+    bool has_ip_bias = false;
     std::unique_ptr<ScalarLloydMaxQuantizer> scalar_lm_quantizer;
 
     // --- FP16 root centroids (original space, for tree storage) ---
@@ -572,6 +575,7 @@ void resolve_build_params(TreeBuildContext& ctx) {
                 "scalar_lloydmax/scalar_uniform/scalar_shape currently "
                 "support only --pq-bits 4");
         }
+        ctx.has_ip_bias = params.metric == MetricKind::InnerProduct;
     }
 }
 
@@ -1214,6 +1218,8 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     struct LeafBuffer {
         std::vector<uint8_t> codes;
         std::vector<RowId> row_ids;
+        // Per-vector IP bias (||x||/||x_hat||, fp16) for scalar + InnerProduct.
+        std::vector<float16_t> ip_biases;
         // Incremental centroid accumulator (replaces fp16_vecs). A running
         // FP32-sum (stored as double for stability) + count per buffer.
         // At flush time, divide sum by count to get the centroid. This keeps
@@ -1381,14 +1387,18 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                     summary_size, fcb));
             }
             if (ctx.is_scalar_lm) {
-                // Flat packed-nibble layout: [header][summary][codes][row_ids]
+                // Flat packed-nibble layout:
+                // [header][summary][codes][ip_biases?][row_ids][filters]
                 // codes = count * code_size (no FastScan block padding).
                 const uint64_t codes_bytes =
                     static_cast<uint64_t>(count) * code_size;
+                const uint64_t bias_bytes =
+                    scalar_bias_bytes(count, ctx.has_ip_bias);
                 const uint64_t rowids_bytes =
                     static_cast<uint64_t>(count) * sizeof(RowId);
                 const uint64_t total = leaf_codes_offset(summary_size) +
-                                       codes_bytes + rowids_bytes + fcb;
+                                       codes_bytes + bias_bytes +
+                                       rowids_bytes + fcb;
                 return static_cast<uint32_t>(
                     (total + kPageSize - 1) / kPageSize);
             }
@@ -1503,11 +1513,17 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         uint64_t rowids_off;
         if (ctx.is_scalar_lm) {
             // Flat packed-nibble layout: codes are count × code_size bytes,
-            // stored sequentially (no FastScan block interleaving).
+            // stored sequentially (no FastScan block interleaving), then the
+            // per-vector IP biases (InnerProduct only), then row_ids.
             std::memcpy(codes_out, buf.codes.data(),
                         static_cast<size_t>(count) * code_size);
-            rowids_off = codes_off +
-                         static_cast<uint64_t>(count) * code_size;
+            if (ctx.has_ip_bias) {
+                std::memcpy(codes_out + static_cast<uint64_t>(count) * code_size,
+                            buf.ip_biases.data(),
+                            static_cast<size_t>(count) * sizeof(float16_t));
+            }
+            rowids_off = scalar_rowids_offset(summary_size, count, code_size,
+                                              ctx.has_ip_bias);
         } else {
             for (uint32_t b = 0; b < n_blocks; ++b) {
                 const uint32_t base = b * cpb;
@@ -1580,6 +1596,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         // Reset the buffer for the next leaf in this cluster.
         buf.codes.clear();
         buf.row_ids.clear();
+        buf.ip_biases.clear();
         buf.fp16_vecs.clear();
         std::fill(buf.centroid_sum.begin(), buf.centroid_sum.end(), 0.0);
         buf.centroid_count = 0;
@@ -1648,14 +1665,16 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         // chunk-local row index needed to replay the filter-column append.
         struct ThreadLeafBuffer {
             std::vector<uint8_t> codes;        // non-local_pq
+            std::vector<float16_t> ip_biases;  // scalar + InnerProduct
             std::vector<float16_t> fp16_vecs;  // always (centroid source)
             std::vector<RowId> row_ids;
             std::vector<uint32_t> local_indices;
             std::vector<uint32_t> payload_lens;
             std::vector<const uint8_t*> payload_ptrs;
             void clear() {
-                codes.clear(); fp16_vecs.clear(); row_ids.clear();
-                local_indices.clear(); payload_lens.clear(); payload_ptrs.clear();
+                codes.clear(); ip_biases.clear(); fp16_vecs.clear();
+                row_ids.clear(); local_indices.clear(); payload_lens.clear();
+                payload_ptrs.clear();
             }
         };
         // Hoisted outside the chunk loop so capacity is reused across chunks.
@@ -1693,6 +1712,8 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             // Format: for each vector, a list of target centroid IDs + the code.
             std::vector<std::vector<uint8_t>> chunk_codes(take);
             std::vector<std::vector<uint32_t>> chunk_targets(take);
+            std::vector<float16_t> chunk_biases(
+                ctx.has_ip_bias ? take : 0, float16_t(1.0f));
 
             std::vector<std::future<void>> futs;
             const uint32_t n_threads = std::min(hw, take);
@@ -1724,6 +1745,23 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                                 std::vector<uint8_t> code(code_size);
                                 ctx.scalar_lm_quantizer->encode(xi, code.data());
                                 chunk_codes[i].assign(code.begin(), code.end());
+                                if (ctx.has_ip_bias) {
+                                    // bias = ||x||/||x_hat||: cancels the
+                                    // per-vector reconstruction norm shrink-
+                                    // age in the IP scan ordering.
+                                    std::vector<float> dec(dim);
+                                    ctx.scalar_lm_quantizer->decode(
+                                        code.data(), dec.data());
+                                    double sx = 0, sxh = 0;
+                                    for (uint16_t d = 0; d < dim; ++d) {
+                                        sx += static_cast<double>(xi[d]) * xi[d];
+                                        sxh += static_cast<double>(dec[d]) * dec[d];
+                                    }
+                                    const float nx = static_cast<float>(std::sqrt(sx));
+                                    const float nxh = static_cast<float>(
+                                        std::sqrt(std::max(sxh, 1e-30)));
+                                    chunk_biases[i] = float16_t(nx / nxh);
+                                }
                             } else if (!ctx.is_local_pq) {
                                 std::vector<uint8_t> code(code_size);
                                 ctx.quantizer->encode(xi, code.data());
@@ -1878,6 +1916,8 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                                                         chunk_codes[i].begin(),
                                                         chunk_codes[i].end());
                                     }
+                                    if (ctx.has_ip_bias)
+                                        tb.ip_biases.push_back(chunk_biases[i]);
                                     // Always store the raw FP16 vector: it is
                                     // the source for the incremental centroid
                                     // accumulated during the serial merge.
@@ -1933,6 +1973,8 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                                 tb.codes.data() + static_cast<size_t>(j) * code_size,
                                 tb.codes.data() + static_cast<size_t>(j + 1) * code_size);
                         }
+                        if (ctx.has_ip_bias)
+                            buf.ip_biases.push_back(tb.ip_biases[j]);
                         buf.row_ids.push_back(tb.row_ids[j]);
                         // Incremental centroid accumulator (from raw FP16).
                         const float16_t* fv = tb.fp16_vecs.data()
@@ -3079,6 +3121,17 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
             const uint8_t* codes = leaf_ptr +
                 leaf_codes_offset(manifest_.summary_size);
+            // InnerProduct trees: per-vector fp16 bias right after the
+            // codes; the scan score is <q,x_hat> * (||x||/||x_hat||),
+            // cancelling the per-vector reconstruction norm shrinkage
+            // (measured +11.8pp top-10 on cohere 100k slm-4bit;
+            // see scripts/spike_ip_bias.cpp).
+            const float16_t* ip_bias =
+                getenv("SEXTANT_NO_IP_BIAS") ? nullptr :
+                metric == MetricKind::InnerProduct
+                    ? reinterpret_cast<const float16_t*>(
+                          codes + static_cast<uint64_t>(count) * cs)
+                    : nullptr;
 
             // Scan: batch-4 vectors, zero-padded tail (no scalar remainder
             // loop — padded batches measured faster on every kernel).
@@ -3210,7 +3263,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 }
                 // Heap push — real vectors only (padding never enters).
                 for (uint32_t v = 0; v < nv; ++v) {
-                    float dist = -dots[v];
+                    float dist = ip_bias
+                        ? -(dots[v] * static_cast<float>(ip_bias[i + v]))
+                        : -dots[v];
                     uint32_t dist_bits;
                     std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
                     uint32_t pq_dist = (dist_bits & 0x80000000u)
@@ -3523,8 +3578,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             if (is_scalar_lm) {
                 const uint32_t cs = scalar_lm_quantizer_->code_size();
                 rids = reinterpret_cast<const RowId*>(
-                    leaf_ptr + leaf_codes_offset(manifest_.summary_size) +
-                    lh->count * cs);
+                    leaf_ptr + scalar_rowids_offset(
+                        manifest_.summary_size, lh->count, cs,
+                        metric == MetricKind::InnerProduct));
             } else if (is_local_pq) {
                 const uint64_t nb = (lh->count + codes_per_block - 1) /
                     codes_per_block;
@@ -3638,8 +3694,18 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 if (metric == MetricKind::InnerProduct) {
                     // Dispatcher: uses SVE2 gather-dot on c4a (Neoverse-V2),
                     // NEON decode-dot everywhere else (e.g. Apple M4).
-                    const float dot = simd::scalar_dot_u4_sve2(
+                    float dot = simd::scalar_dot_u4_sve2(
                         query, slm_levels, code_ptr, manifest_.dim, slm_K);
+                    // Apply the leaf's per-vector IP bias (same correction as
+                    // the scan) — the uncorrected decode-dot ranking is the
+                    // rerank-side half of the IP deficit.
+                    if (elh->count > 0) {
+                        const float16_t* bias = reinterpret_cast<const float16_t*>(
+                            entry.leaf_ptr + leaf_codes_offset(
+                                manifest_.summary_size) +
+                            static_cast<uint64_t>(elh->count) * slm_cs);
+                        dot *= static_cast<float>(bias[entry.local_idx]);
+                    }
                     exact_dist = -dot;
                 } else {
                     scalar_lm_quantizer_->decode(code_ptr, decoded_vec.data());
@@ -3914,8 +3980,10 @@ std::vector<RowId> IVFTreeIndex::debug_leaf_row_ids(uint32_t leaf_id) const {
     if (is_scalar_lm) {
         const uint32_t cs = scalar_lm_quantizer_->code_size();
         rids = reinterpret_cast<const RowId*>(
-            leaf_ptr + leaf_codes_offset(manifest_.summary_size) +
-            count * cs);
+            leaf_ptr + scalar_rowids_offset(
+                manifest_.summary_size, count, cs,
+                manifest_.metric ==
+                    static_cast<uint8_t>(MetricKind::InnerProduct)));
     } else {
         const uint32_t cpb = (manifest_.scan_pq_bits == 8) ? 16 : 32;
         const uint32_t block_bytes = manifest_.m4 * 16;
@@ -4532,6 +4600,8 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
     const uint32_t bb = m4 * 16;
     const uint32_t code_size = is_scalar_lm
         ? scalar_lm_quantizer_->code_size() : quantizer_->code_size();
+    const bool has_ip_bias = is_scalar_lm &&
+        manifest_.metric == static_cast<uint8_t>(MetricKind::InnerProduct);
 
     // 1. Read the leaf.
     std::vector<uint8_t> old_buf = read_leaf_(leaf_id);
@@ -4542,10 +4612,18 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
     // 2. Extract codes → compact code array. Scalar leaves use a flat
     // packed-nibble layout (count × code_size bytes, no block padding).
     std::vector<uint8_t> codes(static_cast<size_t>(count) * code_size);
+    // Scalar + InnerProduct: per-vector IP biases follow the codes.
+    std::vector<float16_t> old_biases;
     if (is_scalar_lm) {
         std::memcpy(codes.data(),
                     old_buf.data() + leaf_codes_offset(summary_size),
                     static_cast<size_t>(count) * code_size);
+        if (has_ip_bias) {
+            const float16_t* src = reinterpret_cast<const float16_t*>(
+                old_buf.data() + leaf_codes_offset(summary_size) +
+                static_cast<uint64_t>(count) * code_size);
+            old_biases.assign(src, src + count);
+        }
     } else {
         for (uint32_t i = 0; i < count; ++i) {
             extract_code_from_leaf(old_buf.data(), i, summary_size, m4,
@@ -4657,8 +4735,8 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
     // 5. Read old row_ids.
     const RowId* old_rids = reinterpret_cast<const RowId*>(
         is_scalar_lm
-            ? (old_buf.data() + leaf_codes_offset(summary_size) +
-               static_cast<uint64_t>(count) * code_size)
+            ? (old_buf.data() + scalar_rowids_offset(
+                   summary_size, count, code_size, has_ip_bias))
             : (old_buf.data() +
                leaf_rowids_offset(summary_size, old_nb, bb)));
 
@@ -4668,9 +4746,9 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
     if (has_filter) {
         const uint64_t old_filter_off =
             (is_scalar_lm
-                 ? (leaf_codes_offset(summary_size) +
-                    static_cast<uint64_t>(count) *
-                        (code_size + sizeof(RowId)))
+                 ? (scalar_rowids_offset(summary_size, count, code_size,
+                                         has_ip_bias) +
+                    static_cast<uint64_t>(count) * sizeof(RowId))
                  : (leaf_rowids_offset(summary_size, old_nb, bb) +
                     static_cast<uint64_t>(count) * sizeof(RowId)));
         read_filter_columns(old_buf.data() + old_filter_off, count,
@@ -4694,8 +4772,9 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
 
         const uint32_t npg = is_scalar_lm
             ? static_cast<uint32_t>(
-                (leaf_codes_offset(summary_size) +
-                 static_cast<uint64_t>(gc) * (code_size + sizeof(RowId)) +
+                (scalar_rowids_offset(summary_size, gc, code_size,
+                                      has_ip_bias) +
+                 static_cast<uint64_t>(gc) * sizeof(RowId) +
                  fcb + kPageSize - 1) / kPageSize)
             : leaf_extent_pages(gc, m4, pq_bits, summary_size, fcb);
         std::vector<uint8_t> nb(static_cast<size_t>(npg) * kPageSize, 0);
@@ -4707,23 +4786,30 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
         const uint32_t new_nb = (gc + cpb - 1) / cpb;
 
         if (is_scalar_lm) {
-            // Flat packed-nibble layout: codes then row_ids, no blocks.
+            // Flat packed-nibble layout: codes, then IP biases
+            // (InnerProduct only), then row_ids, then filters. No blocks.
             uint8_t* ncb = nb.data() + leaf_codes_offset(summary_size);
             for (uint32_t i = 0; i < gc; ++i) {
                 std::memcpy(ncb + static_cast<uint64_t>(i) * code_size,
                             codes.data() + static_cast<size_t>(group[i]) * code_size,
                             code_size);
             }
+            if (has_ip_bias) {
+                float16_t* nbias = reinterpret_cast<float16_t*>(
+                    ncb + static_cast<uint64_t>(gc) * code_size);
+                for (uint32_t i = 0; i < gc; ++i)
+                    nbias[i] = old_biases[group[i]];
+            }
             RowId* nrid = reinterpret_cast<RowId*>(
-                nb.data() + leaf_codes_offset(summary_size) +
-                static_cast<uint64_t>(gc) * code_size);
+                nb.data() + scalar_rowids_offset(summary_size, gc,
+                                                 code_size, has_ip_bias));
             for (uint32_t i = 0; i < gc; ++i)
                 nrid[i] = old_rids[group[i]];
             if (has_filter && fcb > 0) {
                 write_filter_columns(
-                    nb.data() + leaf_codes_offset(summary_size) +
-                        static_cast<uint64_t>(gc) *
-                            (code_size + sizeof(RowId)),
+                    nb.data() + scalar_rowids_offset(
+                                   summary_size, gc, code_size, has_ip_bias) +
+                        static_cast<uint64_t>(gc) * sizeof(RowId),
                     gc, manifest_.schema, group_filter_cols);
             }
         } else {
@@ -4773,9 +4859,9 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
         lh->extent_pages = npg;
         if (has_filter && fcb > 0) {
             lh->filter_columns_offset = is_scalar_lm
-                ? (leaf_codes_offset(summary_size) +
-                   static_cast<uint64_t>(gc) *
-                       (code_size + sizeof(RowId)))
+                ? (scalar_rowids_offset(summary_size, gc, code_size,
+                                        has_ip_bias) +
+                   static_cast<uint64_t>(gc) * sizeof(RowId))
                 : (leaf_rowids_offset(summary_size, new_nb, bb) +
                    static_cast<uint64_t>(gc) * sizeof(RowId));
         } else {
@@ -5068,6 +5154,8 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
     const uint32_t bb = m4 * 16;
     const uint32_t code_size = is_scalar_lm
         ? scalar_lm_quantizer_->code_size() : quantizer_->code_size();
+    const bool has_ip_bias = is_scalar_lm &&
+        manifest_.metric == static_cast<uint8_t>(MetricKind::InnerProduct);
     const bool has_filter = manifest_.schema.n_filter_columns() > 0;
     const bool has_payload = manifest_.schema.has_payload;
 
@@ -5114,9 +5202,8 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
         const uint64_t old_filter_bytes = lh->filter_columns_offset != 0
             ? (static_cast<uint64_t>(lh->extent_pages) * kPageSize -
                (is_scalar_lm
-                    ? (leaf_codes_offset(summary_size) +
-                       static_cast<uint64_t>(old_count) *
-                           (code_size + sizeof(RowId)))
+                    ? scalar_rowids_offset(summary_size, old_count,
+                                           code_size, has_ip_bias)
                     : leaf_extent_bytes(old_count, m4, pq_bits,
                                         summary_size, 0)))
             : 0;
@@ -5163,9 +5250,9 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
 
         const uint32_t new_npg = is_scalar_lm
             ? static_cast<uint32_t>(
-                (leaf_codes_offset(summary_size) +
-                 static_cast<uint64_t>(new_count) *
-                     (code_size + sizeof(RowId)) +
+                (scalar_rowids_offset(summary_size, new_count,
+                                      code_size, has_ip_bias) +
+                 static_cast<uint64_t>(new_count) * sizeof(RowId) +
                  new_filter_bytes + kPageSize - 1) / kPageSize)
             : leaf_extent_pages(
                 new_count, m4, pq_bits, summary_size, new_filter_bytes);
@@ -5181,23 +5268,50 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
 
         if (is_scalar_lm) {
             // --- Flat packed-nibble layout: codes are count × code_size
-            // bytes, stored sequentially (no FastScan block interleaving). ---
+            // bytes, stored sequentially (no FastScan block interleaving),
+            // then per-vector IP biases (InnerProduct only), then row_ids. ---
             uint8_t* ncb = nb.data() + leaf_codes_offset(summary_size);
             std::memcpy(ncb, buf.data() + leaf_codes_offset(summary_size),
                         static_cast<size_t>(old_count) * code_size);
+            float16_t* nbias = has_ip_bias
+                ? reinterpret_cast<float16_t*>(
+                      ncb + static_cast<uint64_t>(new_count) * code_size)
+                : nullptr;
+            if (has_ip_bias) {
+                std::memcpy(nbias,
+                            buf.data() + leaf_codes_offset(summary_size) +
+                                static_cast<uint64_t>(old_count) * code_size,
+                            static_cast<size_t>(old_count) *
+                                sizeof(float16_t));
+            }
+            const uint16_t dim = manifest_.dim;
+            std::vector<float> dec(has_ip_bias ? dim : 0);
             for (uint32_t ai = 0; ai < indices.size(); ++ai) {
-                scalar_lm_quantizer_->encode(
-                    points[indices[ai]].vector,
-                    ncb + static_cast<uint64_t>(old_count + ai) * code_size);
+                uint8_t* dst =
+                    ncb + static_cast<uint64_t>(old_count + ai) * code_size;
+                scalar_lm_quantizer_->encode(points[indices[ai]].vector, dst);
+                if (has_ip_bias) {
+                    scalar_lm_quantizer_->decode(dst, dec.data());
+                    const float* xv = points[indices[ai]].vector;
+                    double sx = 0, sxh = 0;
+                    for (uint16_t d = 0; d < dim; ++d) {
+                        sx += static_cast<double>(xv[d]) * xv[d];
+                        sxh += static_cast<double>(dec[d]) * dec[d];
+                    }
+                    const float nx = static_cast<float>(std::sqrt(sx));
+                    const float nxh = static_cast<float>(
+                        std::sqrt(std::max(sxh, 1e-30)));
+                    nbias[old_count + ai] = float16_t(nx / nxh);
+                }
             }
 
             // --- Copy + append row_ids ---
             RowId* nrid = reinterpret_cast<RowId*>(
-                nb.data() + leaf_codes_offset(summary_size) +
-                static_cast<uint64_t>(new_count) * code_size);
+                nb.data() + scalar_rowids_offset(summary_size, new_count,
+                                                 code_size, has_ip_bias));
             std::memcpy(nrid,
-                        buf.data() + leaf_codes_offset(summary_size) +
-                            static_cast<uint64_t>(old_count) * code_size,
+                        buf.data() + scalar_rowids_offset(
+                            summary_size, old_count, code_size, has_ip_bias),
                         old_count * sizeof(RowId));
             for (uint32_t ai = 0; ai < indices.size(); ++ai)
                 nrid[old_count + ai] = points[indices[ai]].row_id;
@@ -5246,9 +5360,9 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
         // --- Rebuild filter column data ---
         if (has_filter) {
             const uint64_t filter_off = is_scalar_lm
-                ? (leaf_codes_offset(summary_size) +
-                   static_cast<uint64_t>(new_count) *
-                       (code_size + sizeof(RowId)))
+                ? (scalar_rowids_offset(summary_size, new_count,
+                                        code_size, has_ip_bias) +
+                   static_cast<uint64_t>(new_count) * sizeof(RowId))
                 : (leaf_rowids_offset(summary_size, new_nb, bb) +
                    static_cast<uint64_t>(new_count) * sizeof(RowId));
 
@@ -5256,9 +5370,9 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
             std::vector<ColumnData> all_cols;
             if (old_count > 0 && old_filter_bytes > 0) {
                 const uint64_t old_filter_off = is_scalar_lm
-                    ? (leaf_codes_offset(summary_size) +
-                       static_cast<uint64_t>(old_count) *
-                           (code_size + sizeof(RowId)))
+                    ? (scalar_rowids_offset(summary_size, old_count,
+                                            code_size, has_ip_bias) +
+                       static_cast<uint64_t>(old_count) * sizeof(RowId))
                     : (leaf_rowids_offset(summary_size, old_nb, bb) +
                        static_cast<uint64_t>(old_count) * sizeof(RowId));
                 read_filter_columns(buf.data() + old_filter_off, old_count,
@@ -5416,9 +5530,9 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
         nlh->extent_pages = new_npg;
         nlh->filter_columns_offset = (has_filter && new_filter_bytes > 0)
             ? (is_scalar_lm
-                   ? (leaf_codes_offset(summary_size) +
-                      static_cast<uint64_t>(new_count) *
-                          (code_size + sizeof(RowId)))
+                   ? (scalar_rowids_offset(summary_size, new_count,
+                                           code_size, has_ip_bias) +
+                      static_cast<uint64_t>(new_count) * sizeof(RowId))
                    : (leaf_rowids_offset(summary_size, new_nb, bb) +
                       static_cast<uint64_t>(new_count) * sizeof(RowId)))
             : 0;

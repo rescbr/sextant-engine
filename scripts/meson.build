@@ -86,6 +86,12 @@ spike_lm_recall = executable('spike_lm_recall',
     link_with: sextant_lib,
 )
 
+spike_ip_bias = executable('spike_ip_bias',
+    'spike_ip_bias.cpp',
+    include_directories: [engine_inc, src_inc],
+    link_with: sextant_lib,
+)
+
 spike_routing = executable('spike_routing',
     'spike_routing.cpp',
     include_directories: [engine_inc, src_inc, third_party_inc],

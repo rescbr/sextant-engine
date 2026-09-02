@@ -1122,5 +1122,100 @@ TEST(TreeInsertDelete, ScalarInsertTriggersLeafSplit) {
     std::filesystem::remove(tree_path);
 }
 
+// ===========================================================================
+// Scalar + InnerProduct: per-vector IP bias (||x||/||x_hat||) wiring
+// ===========================================================================
+
+TEST(TreeInsertDelete, ScalarIPBiasRecallAndInsert) {
+    const uint64_t n = 2000;
+    const uint32_t dim = 64;
+    const std::string base_path = write_test_fbin(
+        "tree_slm_ip.fbin", n, dim, /*n_clusters=*/20, /*seed=*/42);
+    const std::string tree_path = temp_path(".tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::InnerProduct;
+    cfg.params.quantizer_type = "scalar_lloydmax";
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 500;
+    cfg.num_threads = 4;
+    cfg.adaptive_probe_gap = 0.0f;
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    auto idx = IVFTreeIndex::open(tree_path);
+    EXPECT_EQ(idx->live_count(), n);
+
+    uint64_t fbin_n;
+    uint32_t fbin_dim;
+    auto data = read_fbin(base_path, fbin_n, fbin_dim);
+    ASSERT_EQ(fbin_dim, dim);
+
+    // Recall@10 vs brute-force IP ground truth. The bias-corrected scan
+    // recovers most of the shrinkage-induced ordering loss (spike: 0.813 →
+    // 0.931 on cohere); 0.85 catches both corruption and regression to the
+    // uncorrected ordering on this easy clustered data.
+    SearchConfig sconfig;
+    sconfig.k = 10;
+    sconfig.n_probe = 8;
+    sconfig.adaptive_probe_gap = 0.0f;
+    sconfig.fastscan_W = 2500;
+    uint32_t hits = 0;
+    const uint32_t n_queries = 100;
+    for (uint32_t qi = 0; qi < n_queries; ++qi) {
+        const float* qv = &data[qi * dim];
+        std::vector<std::pair<float, RowId>> gt(n);
+        for (uint64_t i = 0; i < n; ++i) {
+            float dot = 0;
+            for (uint32_t d = 0; d < dim; ++d)
+                dot += qv[d] * data[i * dim + d];
+            gt[i] = {-dot, static_cast<RowId>(i)};
+        }
+        std::partial_sort(gt.begin(), gt.begin() + 10, gt.end());
+        std::unordered_set<RowId> g;
+        for (uint32_t i = 0; i < 10; ++i) g.insert(gt[i].second);
+
+        auto results = idx->search(qv, 10, sconfig);
+        for (const auto& c : results)
+            if (g.count(c.row_id)) ++hits;
+    }
+    const float recall = static_cast<float>(hits) / (n_queries * 10);
+    spdlog::info("ScalarIPBias: recall@10 = {:.3f}", recall);
+    EXPECT_GE(recall, 0.85f);
+
+    // Insert an exact copy of vector 7 under a fresh row_id — must be
+    // searchable through the biased scan + bias append path.
+    std::vector<float> qv7(dim);
+    std::memcpy(qv7.data(), &data[7 * dim], dim * sizeof(float));
+    IVFTreeIndex::InsertPoint point;
+    point.vector = qv7.data();
+    point.row_id = static_cast<RowId>(777777);
+    idx->insert_batch({point});
+    EXPECT_EQ(idx->live_count(), n + 1);
+
+    // 4-bit ordering is coarse on this data (vector 7 ranks ~14th even
+    // before the insert), so assert containment in a wide shortlist rather
+    // than top-10 membership. The inserted copy is an exact duplicate of
+    // vector 7: both must appear in the top-W, which also proves the
+    // appended code + bias score identically to the originals.
+    SearchConfig wide = sconfig;
+    wide.k = 100;
+    auto results = idx->search(qv7.data(), 100, wide);
+    std::unordered_set<RowId> ids;
+    for (const auto& c : results) ids.insert(c.row_id);
+    EXPECT_TRUE(ids.count(777777))
+        << "Inserted vector not in top-100 of scalar IP tree after "
+           "insert_batch";
+    EXPECT_TRUE(ids.count(7))
+        << "Original vector lost from top-100 of scalar IP tree after "
+           "insert_batch";
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
 }  // namespace
 }  // namespace sextant::tree

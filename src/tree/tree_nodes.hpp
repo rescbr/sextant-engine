@@ -199,6 +199,22 @@ inline uint64_t leaf_rowids_offset(uint32_t summary_size, uint64_t n_blocks,
            static_cast<uint64_t>(n_blocks) * block_bytes;
 }
 
+/// Scalar leaves (flat packed-nibble layout) in InnerProduct trees carry a
+/// per-vector fp16 IP bias (||x|| / ||x̂||, RaBitQ-style) between the codes
+/// and row_ids: the scan multiplies ⟨q, x̂⟩ by it to cancel the per-vector
+/// reconstruction norm shrinkage. Absent in L2Sq trees (no effect there).
+inline uint64_t scalar_bias_bytes(uint64_t count, bool has_ip_bias) {
+    return has_ip_bias ? count * sizeof(float16_t) : 0;
+}
+
+/// Byte offset of the row_ids array within a scalar (flat layout) leaf.
+inline uint64_t scalar_rowids_offset(uint32_t summary_size, uint64_t count,
+                                     uint32_t code_size, bool has_ip_bias) {
+    return leaf_codes_offset(summary_size) +
+           static_cast<uint64_t>(count) * code_size +
+           scalar_bias_bytes(count, has_ip_bias);
+}
+
 /// Compute the total byte size of a leaf extent.
 /// `filter_cols_bytes` is the total bytes of the filter column region (after
 /// row_ids). Defaults to 0 — the layout is then identical to the pre-Phase-C
