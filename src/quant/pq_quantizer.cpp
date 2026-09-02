@@ -24,6 +24,7 @@
 #include <limits>
 #include <random>
 #include <thread>
+#include <future>
 #include <vector>
 
 // SVE2 detection disabled: arm_sve.h has compatibility issues on some
@@ -560,23 +561,78 @@ std::vector<float> compute_pca_rotation_public(const float* samples, uint64_t n,
     }
     for (uint32_t d = 0; d < dim; d++) mean[d] /= static_cast<double>(n);
 
-    // Random Gaussian matrix Ω (dim × p), seed for reproducibility.
+    // Random Gaussian matrix Ω, seed for reproducibility. Stored
+    // TRANSPOSED (p × dim, row-major over d): the projection kernel below
+    // streams omegaT[j][d] at unit stride, which is what makes the inner
+    // loop SIMD-able (the old dim × p layout strided by p per d).
     std::mt19937_64 rng(42);
     std::normal_distribution<double> gauss(0.0, 1.0);
     std::vector<double> omega(dim * p);
     for (auto& v : omega) v = gauss(rng);
+    std::vector<double> omegaT(static_cast<size_t>(p) * dim);
+    for (uint32_t d = 0; d < dim; ++d)
+        for (uint32_t j = 0; j < p; ++j)
+            omegaT[static_cast<size_t>(j) * dim + d] = omega[d * p + j];
 
     // Y = (X - mean) × Ω → n × p matrix.
     // Y[i][j] = Σ_d (x[i][d] - mean[d]) × omega[d][j]
+    // Threaded over rows: at the build sample size (20k × dim 768 × p≈48)
+    // this is ~0.7G double MACs — serial it was 75% of the whole build wall
+    // (1.5s of 2.5s on M4). Row writes are disjoint; omega/mean read-only.
     std::vector<double> Y(n * p, 0.0);
-    for (uint64_t i = 0; i < n; i++) {
-        const float* xi = samples + i * dim;
-        for (uint32_t j = 0; j < p; j++) {
-            double acc = 0.0;
-            for (uint32_t d = 0; d < dim; d++)
-                acc += (static_cast<double>(xi[d]) - mean[d]) * omega[d * p + j];
-            Y[i * p + j] = acc;
+    {
+        const uint32_t hw = std::max(1u,
+            std::thread::hardware_concurrency());
+        const uint64_t n_threads = std::min<uint64_t>(hw, n);
+        std::vector<std::future<void>> futs;
+        const uint64_t per = (n + n_threads - 1) / n_threads;
+        for (uint64_t t = 0; t < n_threads; ++t) {
+            const uint64_t start = t * per;
+            const uint64_t end = std::min(start + per, n);
+            if (start >= end) break;
+            futs.push_back(std::async(std::launch::async,
+                [&](uint64_t s, uint64_t e) {
+#if defined(__aarch64__)
+                    // 2-wide f64 FMLA over d. NOTE: this reorders the
+                    // accumulation (pairwise, then horizontal add), so the
+                    // projection is NOT bit-identical to the old scalar
+                    // form — but it is deterministic (fixed rounding order,
+                    // same every run); variance-explained matches at log
+                    // precision. Tail handled scalar.
+                    const uint32_t d2 = dim / 2 * 2;
+                    for (uint64_t i = s; i < e; ++i) {
+                        const float* xi = samples + i * dim;
+                        for (uint32_t j = 0; j < p; j++) {
+                            const double* wj = &omegaT[static_cast<size_t>(j) * dim];
+                            float64x2_t acc = vdupq_n_f64(0.0);
+                            for (uint32_t d = 0; d < d2; d += 2) {
+                                const float64x2_t x = vcvt_f64_f32(
+                                    vld1_f32(xi + d));
+                                const float64x2_t m = vld1q_f64(&mean[d]);
+                                acc = vfmaq_f64(acc, vsubq_f64(x, m),
+                                                vld1q_f64(wj + d));
+                            }
+                            double a = vaddvq_f64(acc);
+                            for (uint32_t d = d2; d < dim; d++)
+                                a += (static_cast<double>(xi[d]) - mean[d]) * wj[d];
+                            Y[i * p + j] = a;
+                        }
+                    }
+#else
+                    for (uint64_t i = s; i < e; ++i) {
+                        const float* xi = samples + i * dim;
+                        for (uint32_t j = 0; j < p; j++) {
+                            const double* wj = &omegaT[static_cast<size_t>(j) * dim];
+                            double acc = 0.0;
+                            for (uint32_t d = 0; d < dim; d++)
+                                acc += (static_cast<double>(xi[d]) - mean[d]) * wj[d];
+                            Y[i * p + j] = acc;
+                        }
+                    }
+#endif
+                }, start, end));
         }
+        for (auto& f : futs) f.get();
     }
 
     // QR via modified Gram-Schmidt on Y^T (p × n → orthonormal rows).
