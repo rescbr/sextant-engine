@@ -148,6 +148,8 @@ sextant_search_opts sextant_default_search_opts(void) {
     o.scan_code_budget = 0;
     o.rerank = 0;
     o.search_threads = 0;
+    o.int8_scan = -1;  // env decides (SEXTANT_SCAN_I8); 0 here previously
+                        // force-disabled the i8 kernel for default callers
     o.exhaustive = 0;
     return o;
 }

@@ -3380,9 +3380,13 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     c0_leaf += query[d] * static_cast<float>(lo16[d]);
                 }
             }
-            // i8 scan prep: a8[d] = clamp(round(a_d · s)), s = 127/max|a_d|.
+            // i8 scan prep: a8[d] = clamp(round(a_d · s)), s = 127/amax.
             // Per-leaf (local_scalar) / per-query (slm) — matches a_uni's
             // scope exactly. Padded tail dims stay 0 (garbage nibbles × 0).
+            // NOTE: a robust (k·RMS-clamped) bound was tried and measured
+            // WORSE (dbpedia-1536 flat raw: 0.693 amax vs 0.575-0.636 for
+            // k∈{3,4,6,8}) — saturating outlier dims loses more than the
+            // resolution they steal. amax stands; do not revisit.
             float i8_inv = 0.f;
             if (use_i8_scan) {
                 const uint32_t padded8 = (dim + 15) / 16 * 16;
