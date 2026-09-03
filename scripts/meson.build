@@ -133,3 +133,9 @@ spike_uniform_check = executable('spike_uniform_check',
     include_directories: [engine_inc, src_inc],
     link_with: sextant_lib,
 )
+
+capi_qps = executable('capi_qps',
+    'capi_qps.cpp',
+    include_directories: [engine_inc, src_inc, sources_inc],
+    link_with: [sextant_lib, sextant_sources_lib, sextant_c_lib],
+)
