@@ -4272,7 +4272,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                        block_bytes, code_buf.data());
                 quantizer_->decode_code(code_buf.data(), decoded_vec.data());
             }
-            if (!is_scalar_lm && !pq_lut_rerank) {
+            // local_scalar falls through to this generic decode-dot; the
+            // exact-rerank branch above already finalised exact_dist (and
+            // must NOT be clobbered — decoded_vec is untouched there).
+            if (!is_scalar_lm && !pq_lut_rerank && !config.exact_rerank_base) {
                 exact_dist =
                     (metric == MetricKind::InnerProduct)
                         ? -simd::dot_f32(query, decoded_vec.data(), manifest_.dim)
