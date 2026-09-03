@@ -4123,23 +4123,23 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
             float exact_dist;
             if (config.exact_rerank_base) {
-                const float* v = config.exact_rerank_base +
-                    static_cast<size_t>(entry.row_id) * manifest_.dim;
-                if (getenv("SEXTANT_DBG_EXACT")) {
-                    static std::atomic<int> dbg_n{0};
-                    if (dbg_n.fetch_add(1) < 3)
-                        fprintf(stderr, "EXACT row=%u local=%u v0=%g q0=%g "
-                                "dim=%u ptr=%p base=%p metric=%d\n",
-                                entry.row_id, entry.local_idx, v[0], query[0],
-                                manifest_.dim, (void*)v,
-                                (void*)config.exact_rerank_base,
-                                static_cast<int>(metric));
-                }
                 // Exact rerank against the caller's original vectors: no
                 // decode, no extract, no quantization ranking error, no IP
                 // bias (the true vector has no reconstruction shrinkage).
                 const float* v = config.exact_rerank_base +
                     static_cast<size_t>(entry.row_id) * manifest_.dim;
+                if (getenv("SEXTANT_DBG_EXACT")) {
+                    static int dbg_n = 0;
+                    if (dbg_n++ < 3)
+                        fprintf(stderr, "EXACT row=%u local=%u v0=%g q0=%g "
+                                "dim=%u ptr=%p base=%p metric=%d\n",
+                                static_cast<unsigned>(entry.row_id),
+                                static_cast<unsigned>(entry.local_idx),
+                                (double)v[0], (double)query[0],
+                                static_cast<unsigned>(manifest_.dim),
+                                (void*)v, (void*)config.exact_rerank_base,
+                                static_cast<int>(metric));
+                }
                 exact_dist =
                     (metric == MetricKind::InnerProduct)
                         ? -simd::dot_f32(query, v, manifest_.dim)
