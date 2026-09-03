@@ -67,6 +67,12 @@ typedef struct sextant_search_opts {
                                ///< k-th — the adaptive-W contract the bench
                                ///  grades recall over. Requires rerank.
     uint32_t search_threads;   ///< within-query leaf-parallel scan (0 = serial)
+    int int8_scan;             ///< 1 = i8 SDOT kernel (uniform scalar codes).
+                               ///< 3-4x faster, NOT score-bit-identical:
+                               ///< raw-ranking recall drops (dbpedia 100K
+                               ///< flat: -25pp; tau-rerank path: ~0). Use
+                               ///< for rerank-serving rows only. -1 = env
+                               ///< SEXTANT_SCAN_I8 decides. Default -1.
     int exhaustive;            ///< 1 overrides the above into probe-all:
                                ///< n_probe = n_probe_ln = UINT32_MAX,
                                ///< gap pruning off, budget unlimited.

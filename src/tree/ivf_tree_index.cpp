@@ -2685,6 +2685,20 @@ struct ResultWithLoc {
     uint32_t local_idx;
 };
 
+}  // namespace (anon, re-opened below)
+
+namespace scan_detail {
+/// Per-thread i8-kernel override for the C ABI (a harness process serves
+/// both raw-flat rows, which want the score-exact f32 kernel, and
+/// rerank-serving rows, which want the 3-4x i8 kernel). -1 = env decides.
+thread_local int g_scan_i8_override = -1;
+int scan_i8_override() { return g_scan_i8_override; }
+}  // namespace scan_detail
+
+void set_scan_i8_override(int v) { scan_detail::g_scan_i8_override = v; }
+
+namespace {
+
 struct SearchScratch {
     // LUT + query prep
     std::vector<uint8_t> lut4, lut8;
@@ -3327,7 +3341,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         // ships env-gated until the matched-recall A/B passes.
         const bool use_i8_scan =
 #if defined(__ARM_FEATURE_DOTPROD)
-            slm_arith && !slm_shaped && getenv("SEXTANT_SCAN_I8") != nullptr;
+            slm_arith && !slm_shaped
+            && (scan_detail::scan_i8_override() > 0
+                || (scan_detail::scan_i8_override() < 0
+                    && getenv("SEXTANT_SCAN_I8") != nullptr));
 #else
             false;
 #endif

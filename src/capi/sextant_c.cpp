@@ -163,6 +163,7 @@ int32_t sextant_search(void* index, const float* query,
         return -1;
     }
     try {
+        int scan_i8_override = -1;
         sextant::SearchConfig cfg;
         cfg.k = opts->k;
         if (opts->exhaustive) {
@@ -182,7 +183,11 @@ int32_t sextant_search(void* index, const float* query,
         cfg.fastscan_W = opts->fastscan_W;
         cfg.rerank = opts->rerank != 0;
         cfg.adaptive_w_gap = opts->adaptive_w_gap;
+        scan_i8_override = opts->int8_scan;
         cfg.search_threads = opts->search_threads;
+        // The engine gates its i8 kernel on SEXTANT_SCAN_I8 (process-global
+        // env). A per-call override uses a thread-local the scan reads.
+        sextant::tree::set_scan_i8_override(scan_i8_override);
         auto results = idx->search(query, opts->k, cfg);
         // Under the adaptive-W contract (adaptive_w_gap > 0) the engine may
         // return more than k ids. The caller's arrays are sized k, so clamp;
