@@ -166,6 +166,17 @@ int main(int argc, char** argv) {
                 for (uint32_t g : gt[q])
                     if (g == ids[i]) { ++ehits; break; }
             erecall += double(ehits) / k;
+            if (getenv("DBG") && q < 2) {
+                fprintf(stderr, "q%u got=%d engine[0..4]:", q, got);
+                for (int32_t i = 0; i < got && i < 5; ++i) {
+                    const float* v = &base.vecs[size_t(ids[i]) * base.dim];
+                    float d = 0.f;
+                    for (uint32_t dd = 0; dd < base.dim; ++dd) d += qv0[dd] * v[dd];
+                    fprintf(stderr, " [%llu d=%.4f true=%.4f]",
+                            (unsigned long long)ids[i], dists[i], d);
+                }
+                fprintf(stderr, "\n");
+            }
             uint32_t chits = 0;
             for (int32_t i = 0; i < got; ++i)
                 for (uint32_t g : gt[q])
