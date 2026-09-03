@@ -2725,6 +2725,7 @@ struct SearchScratch {
     std::vector<uint8_t> local_lut4, local_lut8;
     std::vector<float> query_residual, decoded_vec;
     std::vector<int8_t> query_scaled_i8;  // i8 SDOT scan (serial path)
+    std::vector<int8_t> query_scaled_i8_lo;  // dual-SDOT residual operand (mode 2)
     // i8 SDOT scan (SEXTANT_SCAN_I8): serial-path a8 buffer. NOTE: if a
     // future per-leaf scan buffer is added here, it MUST also join the
     // parallel workers' per-worker set (see the flush_buffer reset-list
@@ -3353,20 +3354,36 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         // one vdotq_s32 per 16 dims per vector. NOT score-bit-identical to
         // the f32 kernel (a_d carries ≤1/2-LSB quantization error), so it
         // ships env-gated until the matched-recall A/B passes.
-        const bool use_i8_scan =
+        // Scan-kernel mode for the arith family:
+        //   0 = f32 widen+FMA (score-exact), 1 = single i8 SDOT (a_d at 8
+        //   bits — fast, but the a_d quantization noise cost -24pp raw
+        //   recall on dbpedia-1536), 2 = dual i8 SDOT: a_d·s split as
+        //   hi + lo/127 (hi = rounded a_d·s, lo = rounded 127·residual,
+        //   |residual| ≤ 0.5 so lo fits i8), two vdotq against the SAME
+        //   nibble operand, i32 accumulate — ~15 effective mantissa bits
+        //   on a_d at ~1.5x the mode-1 inner cost (nibble unpack shared).
+        //   The nibble operand c_d ∈ [0,15] is exact in all modes; only
+        //   a_d carries error, which is the failure mode mode 2 removes.
+        int i8_scan_mode = 0;
 #if defined(__ARM_FEATURE_DOTPROD)
-            slm_arith && !slm_shaped
-            && (scan_detail::scan_i8_override() > 0
-                || (scan_detail::scan_i8_override() < 0
-                    && getenv("SEXTANT_SCAN_I8") != nullptr));
-#else
-            false;
+        if (slm_arith && !slm_shaped) {
+            const int ov = scan_detail::scan_i8_override();
+            if (ov > 0) i8_scan_mode = ov;
+            else if (ov < 0) {
+                const char* env = getenv("SEXTANT_SCAN_I8");
+                if (env) {
+                    const int m = atoi(env);
+                    i8_scan_mode = m >= 2 ? 2 : 1;
+                }
+            }
+        }
 #endif
         auto scan_one_leaf = [&](const LeafCandidate& cand, uint32_t leaf_slot,
                                  std::vector<HeapEntry>& h,
                                  std::vector<float>& a_buf,
                                  std::vector<uint8_t>& pad_buf,
-                                 std::vector<int8_t>& a8_buf) {
+                                 std::vector<int8_t>& a8_buf,
+                                 std::vector<int8_t>& a8_lo_buf) {
             if (cand.page == kInvalidPage) return;
             std::vector<float>& a_uni = a_buf;
             std::vector<uint8_t>& pad_row_buf = pad_buf;
@@ -3402,9 +3419,11 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             // k∈{3,4,6,8}) — saturating outlier dims loses more than the
             // resolution they steal. amax stands; do not revisit.
             float i8_inv = 0.f;
-            if (use_i8_scan) {
+            if (i8_scan_mode) {
                 const uint32_t padded8 = (dim + 15) / 16 * 16;
                 if (a8_buf.size() < padded8) a8_buf.assign(padded8, 0);
+                if (i8_scan_mode >= 2
+                    && a8_lo_buf.size() < padded8) a8_lo_buf.assign(padded8, 0);
                 float amax = 1e-12f;
                 for (uint32_t d = 0; d < dim; ++d)
                     amax = std::max(amax, std::fabs(a_uni[d]));
@@ -3412,9 +3431,18 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 i8_inv = 1.0f / i8_scale;
                 for (uint32_t d = 0; d < dim; ++d) {
                     float q = a_uni[d] * i8_scale;
-                    a8_buf[d] = static_cast<int8_t>(q >= 0.f
+                    // |a_d·s| ≤ 127 by construction of s — the clamps are
+                    // belt-and-braces; the residual r = q − hi stays in
+                    // [−0.5, 0.5] so lo = round(r·127) fits i8 comfortably.
+                    const int8_t hi = static_cast<int8_t>(q >= 0.f
                         ? (q + 0.5f >= 127.f ? 127.f : q + 0.5f)
                         : (q - 0.5f <= -127.f ? -127.f : q - 0.5f));
+                    a8_buf[d] = hi;
+                    if (i8_scan_mode >= 2) {
+                        const float r = q - static_cast<float>(hi);
+                        a8_lo_buf[d] = static_cast<int8_t>(r >= 0.f
+                            ? r * 127.f + 0.5f : r * 127.f - 0.5f);
+                    }
                 }
             }
             // InnerProduct trees: per-vector fp16 bias right after the
@@ -3441,38 +3469,53 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 for (uint32_t v = nv; v < 4; ++v) cp[v] = pad_row;
 
                 float dots[4] = {0, 0, 0, 0};
-                if (use_i8_scan) {
+                if (i8_scan_mode) {
 #if defined(__ARM_FEATURE_DOTPROD)
                     // Integer dot: nibble value IS the level (uniform).
                     // acc = Σ a8[d]·c_d in i32; rescale once at the end.
                     const uint32_t padded = (dim + 15) / 16 * 16;
                     const bool fully_padded_i8 = padded / 2 <= cs;
                     const uint32_t d16i = fully_padded_i8 ? padded : dim / 16 * 16;
+                    const int8_t* a8p = reinterpret_cast<const int8_t*>(a8_buf.data());
+                    const int8_t* a8lop = i8_scan_mode >= 2
+                        ? reinterpret_cast<const int8_t*>(a8_lo_buf.data()) : nullptr;
                     int32x4_t acc8[4];
+                    int32x4_t acc8lo[4];
                     for (auto& x : acc8) x = vdupq_n_s32(0);
+                    if (a8lop) for (auto& x : acc8lo) x = vdupq_n_s32(0);
                     for (uint32_t d = 0; d < d16i; d += 16) {
-                        const int8x16_t a8 = vld1q_s8(
-                            reinterpret_cast<const int8_t*>(a8_buf.data()) + d);
+                        const int8x16_t a8 = vld1q_s8(a8p + d);
+                        const int8x16_t a8lo = a8lop ? vld1q_s8(a8lop + d) : a8;
                         for (uint32_t v = 0; v < 4; ++v) {
                             const uint8x8_t b = vld1_u8(cp[v] + d / 2);
                             const uint8x8_t lo = vand_u8(b, vdup_n_u8(0x0F));
                             const uint8x8_t hi = vshr_n_u8(b, 4);
                             const uint8x8x2_t z = vzip_u8(lo, hi);
-                            acc8[v] = vdotq_s32(acc8[v], a8,
-                                vreinterpretq_s8_u8(
-                                    vcombine_u8(z.val[0], z.val[1])));
+                            const int8x16_t c8 = vreinterpretq_s8_u8(
+                                vcombine_u8(z.val[0], z.val[1]));
+                            acc8[v] = vdotq_s32(acc8[v], a8, c8);
+                            if (a8lop)
+                                acc8lo[v] = vdotq_s32(acc8lo[v], a8lo, c8);
                         }
                     }
+                    // a_d·s = hi + lo/127 → dot·s = Σhi·c + (Σlo·c)/127.
+                    // The 1/127 lives in the final rescale (i8_inv covers 1/s).
+                    const float lo_w = a8lop ? (1.0f / 127.0f) : 0.f;
                     for (uint32_t v = 0; v < 4; ++v)
-                        dots[v] = static_cast<float>(vaddvq_s32(acc8[v])) * i8_inv;
+                        dots[v] = (static_cast<float>(vaddvq_s32(acc8[v]))
+                                   + lo_w * static_cast<float>(vaddvq_s32(acc8lo[v])))
+                                  * i8_inv;
                     if (!fully_padded_i8) {
+                        // Tail dims (dim % 16 != 0 without padding cover):
+                        // same hi + lo/127 decomposition, rescaled to match.
                         for (uint32_t d = d16i; d < dim; ++d) {
-                            const int8_t a8d = a8_buf[d];
+                            const float a8d = static_cast<float>(a8_buf[d])
+                                + (a8lop ? static_cast<float>(a8_lo_buf[d]) / 127.0f : 0.f);
                             for (uint32_t v = 0; v < 4; ++v) {
                                 const uint8_t byte = cp[v][d / 2];
                                 const uint8_t nib = (d % 2 == 0)
                                     ? (byte & 0xF) : ((byte >> 4) & 0xF);
-                                dots[v] += static_cast<float>(a8d) * nib;
+                                dots[v] += a8d * nib * i8_inv;
                             }
                         }
                     }
@@ -3625,7 +3668,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
                 scan_one_leaf(candidates[ci], ci, sheap,
                               scratch.query_scaled, scratch.pad_code_row,
-                              scratch.query_scaled_i8);
+                              scratch.query_scaled_i8, scratch.query_scaled_i8_lo);
             }
         } else {
             const uint32_t T = std::min(config.search_threads,
@@ -3652,6 +3695,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             for (auto& ab : a_bufs) ab.resize(padded_w, 0.f);
             std::vector<std::vector<uint8_t>> pad_bufs(T);
             std::vector<std::vector<int8_t>> a8_bufs(T);
+            std::vector<std::vector<int8_t>> a8_lo_bufs(T);
             for (uint32_t t = 0; t < T; ++t) {
                 const uint32_t start = t * per;
                 const uint32_t end = std::min(start + per,
@@ -3660,14 +3704,14 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 futs.push_back(std::async(std::launch::async,
                     [&](uint32_t s, uint32_t e, std::vector<HeapEntry>& my,
                         std::vector<float>& ab, std::vector<uint8_t>& pb,
-                        std::vector<int8_t>& a8b) {
+                        std::vector<int8_t>& a8b, std::vector<int8_t>& a8lb) {
                         my.reserve(W + 32);
                         for (uint32_t c = s; c < e; ++c) {
-                            scan_one_leaf(candidates[c], c, my, ab, pb, a8b);
+                            scan_one_leaf(candidates[c], c, my, ab, pb, a8b, a8lb);
                         }
                     }, start, end, std::ref(th[t]),
                     std::ref(a_bufs[t]), std::ref(pad_bufs[t]),
-                    std::ref(a8_bufs[t])));
+                    std::ref(a8_bufs[t]), std::ref(a8_lo_bufs[t])));
             }
             for (auto& f : futs) f.get();
 

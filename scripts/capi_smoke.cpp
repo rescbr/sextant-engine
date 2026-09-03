@@ -122,6 +122,7 @@ int main(int argc, char** argv) {
         so.rerank = mode & 2;
         so.adaptive_w_gap = (mode & 2) ? cfg_tau : 0.0f;
         so.search_threads = cfg_st;
+        so.int8_scan = env("I8", -1);
         std::vector<uint64_t> ids(65536);
         std::vector<float> dists(65536);
         double recall = 0.0, crecall = 0.0, gsum = 0.0;
