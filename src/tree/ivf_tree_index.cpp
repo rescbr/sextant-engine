@@ -3640,8 +3640,16 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             // zero-padded to the 16-dim kernel width once; per-leaf writes
             // only touch [0, dim), so the padding survives across leaves.
             const uint32_t padded_w = (dim + 15) / 16 * 16;
+            // Global-ruler arith scan (scalar_uniform/slm-shape) sets a_uni
+            // ONCE per query in the shared scratch; workers scan from their
+            // OWN buffers, so seed each with the query transform (local_scalar
+            // overwrites per leaf inside scan_one_leaf — harmless). Without
+            // this, parallel workers scored with a zero transform: harness
+            // scalar_uniform row read 0.000 recall at search_threads=8 while
+            // every serial test passed.
             std::vector<std::vector<float>> a_bufs(
-                T, std::vector<float>(padded_w, 0.f));
+                T, scratch.query_scaled);
+            for (auto& ab : a_bufs) ab.resize(padded_w, 0.f);
             std::vector<std::vector<uint8_t>> pad_bufs(T);
             std::vector<std::vector<int8_t>> a8_bufs(T);
             for (uint32_t t = 0; t < T; ++t) {
