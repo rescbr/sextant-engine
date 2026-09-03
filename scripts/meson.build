@@ -127,3 +127,9 @@ capi_smoke = executable('capi_smoke',
     include_directories: [engine_inc, src_inc, sources_inc],
     link_with: [sextant_lib, sextant_sources_lib, sextant_c_lib],
 )
+
+spike_uniform_check = executable('spike_uniform_check',
+    'spike_uniform_check.cpp',
+    include_directories: [engine_inc, src_inc],
+    link_with: sextant_lib,
+)

@@ -3299,6 +3299,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             : (slm_arith && !scalar_lm_quantizer_->is_uniform());
         const float* slm_steps = is_scalar_lm
             ? scalar_lm_quantizer_->steps() : nullptr;
+        const float* slm_levels0 = is_scalar_lm
+            ? scalar_lm_quantizer_->levels() : nullptr;  // row-major K/dim
+        float slm_c0 = 0.f;
         std::vector<float>& a_uni = scratch.query_scaled;
         if (!is_scalar_lm) {
             // local_scalar: per-leaf transform, set inside scan_one_leaf.
@@ -3311,8 +3314,19 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             // within the row, which holds for any dim ≡ 0 mod 8.)
             const uint32_t padded = (dim + 15) / 16 * 16;
             a_uni.assign(padded, 0.f);
-            for (uint32_t d = 0; d < dim; ++d)
+            // c0 = Σ q_d·lo_d (lo = level 0): a per-QUERY constant for a
+            // global ruler, and ranking-invariant on its own — but NOT
+            // droppable once the per-vector IP bias multiplies the score
+            // ((c0 + Σ a·c)·bias ≠ (Σ a·c)·bias). On raw embeddings with
+            // skewed per-dim means |c0| is large and dropping it destroyed
+            // the ranking entirely (cohere flat recall@10 0.0005). Gaussian
+            // synthetic data hid this (mean≈0 → c0≈0). local_scalar always
+            // added its per-leaf c0; the LM gather path decodes levels in
+            // full — only the global-uniform arith path was missing it.
+            for (uint32_t d = 0; d < dim; ++d) {
                 a_uni[d] = query[d] * slm_steps[d];
+                slm_c0 += query[d] * slm_levels0[d];
+            }
         }
 #if defined(__aarch64__)
         // f quantized to u8 (scale folded out — ranking-invariant).
@@ -3370,7 +3384,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             // c0 = Σ q_d·lo_d. Unlike the global path (where c0 is a
             // per-query constant and ranking-invariant), c0 differs per
             // leaf and MUST be added before the cross-leaf heap merge.
-            float c0_leaf = 0.f;
+            float c0_leaf = slm_c0;  // 0 for gather/local paths (local sets its own)
             if (is_local_scalar) {
                 const float16_t* lo16 = reinterpret_cast<const float16_t*>(
                     leaf_ptr + lsc_levels_offset(manifest_.summary_size));

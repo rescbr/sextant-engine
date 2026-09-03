@@ -52,7 +52,8 @@ int main(int argc, char** argv) {
     // --- Build through the C ABI ---
     sextant_build_opts bo = sextant_default_build_opts();
     bo.quantizer = quantizer;
-    bo.metric = SEXTANT_METRIC_IP;  // normalized cohere → cosine/IP
+    const char* m = getenv("METRIC");
+    bo.metric = (m && m[0] == "l"[0]) ? SEXTANT_METRIC_L2SQ : SEXTANT_METRIC_IP;
     bo.num_threads = 8;
     char err[512] = {0};
     const std::string tree_path = tree_override ? tree_override : "/tmp/capi_smoke.tree";
