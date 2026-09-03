@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
         so.int8_scan = env("I8", -1);
         std::vector<uint64_t> ids(65536);
         std::vector<float> dists(65536);
-        double recall = 0.0, crecall = 0.0, gsum = 0.0;
+        double recall = 0.0, crecall = 0.0, erecall = 0.0, gsum = 0.0;
         auto t1 = std::chrono::steady_clock::now();
         for (uint32_t q = 0; q < nq_final; ++q) {
             const float* qv0 = &query.vecs[size_t(q) * base.dim];
@@ -154,6 +154,15 @@ int main(int argc, char** argv) {
                         if (g == ids[i]) { ++hits; break; }
             }
             recall += double(hits) / k;
+            // Engine-order recall: hits among the FIRST k ids as returned
+            // (the engine's own rerank ranking, no external rescore). The
+            // gap to `recall` (exact rescore of the same shortlist) is the
+            // headroom for rerank-precision work (fp16/exact rerank).
+            uint32_t ehits = 0;
+            for (int32_t i = 0; i < got && i < int32_t(k); ++i)
+                for (uint32_t g : gt[q])
+                    if (g == ids[i]) { ++ehits; break; }
+            erecall += double(ehits) / k;
             uint32_t chits = 0;
             for (int32_t i = 0; i < got; ++i)
                 for (uint32_t g : gt[q])
@@ -163,10 +172,10 @@ int main(int argc, char** argv) {
         double ms = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t1).count() * 1000.0 / nq_final;
         printf("%s %s: recall@%u = %.4f, %.3f ms/query "
-               "(containment %.4f, shortlist %.1f)\n",
+               "(containment %.4f, engine-order %.4f, shortlist %.1f)\n",
                mode & 1 ? "EXHAUSTIVE" : "ROUTED   ",
                mode & 2 ? "+rerank" : "raw    ", k, recall / nq_final, ms,
-               crecall / nq_final, gsum / nq_final);
+               crecall / nq_final, erecall / nq_final, gsum / nq_final);
     }
 
     sextant_close_index(idx);

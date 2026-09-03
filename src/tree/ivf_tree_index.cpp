@@ -4212,12 +4212,35 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     lsc_codes_offset(manifest_.summary_size, manifest_.dim) +
                     static_cast<uint64_t>(entry.local_idx) *
                         ((manifest_.dim + 1) / 2);
+                // Per-vector IP bias, same correction as the scan and the
+                // slm rerank path above: without it the decode-dot ranking
+                // ignores the per-vector reconstruction-norm shrinkage and
+                // disagrees with the scan's ordering (the slm path's comment
+                // calls this "the rerank-side half of the IP deficit").
+                float16_t ls_bias = 1.f;
+                if (metric == MetricKind::InnerProduct && elh->count > 0) {
+                    const float16_t* biases = reinterpret_cast<const float16_t*>(
+                        entry.leaf_ptr +
+                        lsc_codes_offset(manifest_.summary_size,
+                                         manifest_.dim) +
+                        static_cast<uint64_t>(elh->count) *
+                            ((manifest_.dim + 1) / 2));
+                    ls_bias = biases[entry.local_idx];
+                }
                 for (uint32_t d = 0; d < manifest_.dim; ++d) {
                     const uint8_t byte = code[d / 2];
                     const uint32_t c = (d % 2 == 0) ? (byte & 0xF)
                                                     : (byte >> 4);
                     decoded_vec[d] = static_cast<float>(lo16[d]) +
                                      static_cast<float>(st16[d]) * c;
+                }
+                // dot(q, x̂)·bias == dot(q, x̂·bias): fold the per-vector IP
+                // bias into the decoded vector so the generic dot below
+                // carries the correction (IP only; bias == 1 otherwise).
+                if (ls_bias != float16_t(1.f)) {
+                    const float b = static_cast<float>(ls_bias);
+                    for (uint32_t d = 0; d < manifest_.dim; ++d)
+                        decoded_vec[d] *= b;
                 }
             } else {
                 // Global-PQ rerank (global codebook path).
