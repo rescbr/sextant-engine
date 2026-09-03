@@ -76,6 +76,15 @@ typedef struct sextant_search_opts {
     int exhaustive;            ///< 1 overrides the above into probe-all:
                                ///< n_probe = n_probe_ln = UINT32_MAX,
                                ///< gap pruning off, budget unlimited.
+    const float* exact_rerank_base; ///< NULL = decoded rerank (default);
+                               ///< non-NULL = exact rerank against these
+                               ///< row-major f32 vectors (n × dim, indexed
+                               ///< by returned row_id; caller owns memory,
+                               ///< e.g. an mmap of the corpus). Removes the
+                               ///< quantization ranking error entirely.
+                               ///< ABI: added at struct tail — old callers
+                               ///< passing smaller structs read as NULL via
+                               ///< designated-init zero fill.
 } sextant_search_opts;
 
 sextant_search_opts sextant_default_search_opts(void);

@@ -184,6 +184,7 @@ int32_t sextant_search(void* index, const float* query,
         }
         cfg.fastscan_W = opts->fastscan_W;
         cfg.rerank = opts->rerank != 0;
+        cfg.exact_rerank_base = opts->exact_rerank_base;
         cfg.adaptive_w_gap = opts->adaptive_w_gap;
         scan_i8_override = opts->int8_scan;
         cfg.search_threads = opts->search_threads;

@@ -296,6 +296,18 @@ struct SearchConfig {
     /// A true rerank would use stored FP16 vectors, not PQ-decoded approximations.
     bool rerank = false;
 
+    /// Exact-rerank base: row-major f32 vectors (n × dim, indexed by
+    /// row_id), owned by the CALLER (e.g. an mmap of the original corpus).
+    /// When set and rerank is on, rerank scores are computed against these
+    /// ORIGINAL vectors instead of decoded quantized codes: removes the
+    /// quantization-ranking error (dbpedia-933K local_scalar np64/W1000:
+    /// engine-order 0.9480 = 4-bit ceiling → containment ceiling 1.0000,
+    /// +5.2pp) and skips the per-entry code extract/decode work. No IP-bias
+    /// correction applies (the true vector has no reconstruction shrinkage).
+    /// null = decoded rerank (default; standalone operation, no corpus
+    /// dependency). dim must equal the index dim (caller's contract).
+    const float* exact_rerank_base = nullptr;
+
     /// Adaptive shortlist cut (rerank-bandwidth saver): after the scan heap
     /// is reranked and sorted, truncate the returned list at the first index
     /// w >= k whose distance gaps out from the k-th best:

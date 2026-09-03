@@ -4122,7 +4122,17 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 static_cast<uint8_t>(LeafState::CodedLocal));
 
             float exact_dist;
-            if (is_scalar_lm) {
+            if (config.exact_rerank_base) {
+                // Exact rerank against the caller's original vectors: no
+                // decode, no extract, no quantization ranking error, no IP
+                // bias (the true vector has no reconstruction shrinkage).
+                const float* v = config.exact_rerank_base +
+                    static_cast<size_t>(entry.row_id) * manifest_.dim;
+                exact_dist =
+                    (metric == MetricKind::InnerProduct)
+                        ? -simd::dot_f32(query, v, manifest_.dim)
+                        : simd::l2sq_f32(query, v, manifest_.dim);
+            } else if (is_scalar_lm) {
                 // Flat packed-nibble layout: code at codes_off + idx * cs.
                 const uint8_t* code_ptr = entry.leaf_ptr +
                     leaf_codes_offset(manifest_.summary_size) +

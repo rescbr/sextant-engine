@@ -125,6 +125,9 @@ int main(int argc, char** argv) {
         so.adaptive_w_gap = (mode & 2) ? cfg_tau : 0.0f;
         so.search_threads = cfg_st;
         so.int8_scan = env("I8", -1);
+        // EXACT=1: rerank against the loaded base vectors (the driver keeps
+        // them in memory anyway for GT) — the exact-rerank A/B knob.
+        if (env("EXACT", 0)) so.exact_rerank_base = base.vecs.data();
         std::vector<uint64_t> ids(65536);
         std::vector<float> dists(65536);
         double recall = 0.0, crecall = 0.0, erecall = 0.0, gsum = 0.0;
