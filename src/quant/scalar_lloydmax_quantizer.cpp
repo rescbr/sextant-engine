@@ -192,18 +192,35 @@ void ScalarLloydMaxQuantizer::train_uniform(const float* samples, uint64_t n) {
         throw Error(ErrorCode::InvalidParam,
                     "ScalarLloydMaxQuantizer::train_uniform: need n >= 2");
     }
+    // σ-loaded ruler: levels uniform over mean ± c·σ (c = 2.7, the
+    // optimal 16-level Gaussian loading — the same construction as
+    // Infino's SQ4 ruler). A plain min/max ruler is set by each dim's
+    // single most extreme sample and collapses on outlier-heavy raw
+    // axes: measured dbpedia-1536 flat recall@10 0.002 with min/max.
+    // Outliers saturate at the edge codes by design.
+    constexpr float kClipSigma = 2.7f;
     for (uint32_t d = 0; d < dim_; ++d) {
-        float mn = samples[d], mx = samples[d];
-        for (uint64_t i = 1; i < n; ++i) {
-            const float x = samples[i * dim_ + d];
-            mn = std::min(mn, x);
-            mx = std::max(mx, x);
+        double sum = 0.0;
+        for (uint64_t i = 0; i < n; ++i) sum += samples[i * dim_ + d];
+        const double mean = sum / static_cast<double>(n);
+        double var = 0.0;
+        for (uint64_t i = 0; i < n; ++i) {
+            const double x = static_cast<double>(samples[i * dim_ + d]) - mean;
+            var += x * x;
+        }
+        var /= static_cast<double>(n);
+        const double sigma = std::sqrt(var);
+        double lo = mean, hi = mean;
+        if (sigma > 1e-12) {
+            lo = mean - kClipSigma * sigma;
+            hi = mean + kClipSigma * sigma;
         }
         float* lv = &levels_[static_cast<size_t>(d) * K_];
-        const float step = K_ > 1 ? (mx - mn) / (K_ - 1) : 0.f;
-        for (uint32_t k = 0; k < K_; ++k) lv[k] = mn + step * k;
+        const float step = K_ > 1
+            ? static_cast<float>((hi - lo) / (K_ - 1)) : 0.f;
+        for (uint32_t k = 0; k < K_; ++k)
+            lv[k] = static_cast<float>(lo) + step * k;
     }
-    mode_ = 1;
     mode_ = 1;
     // steps_ for the arithmetic scan: f = identity, step = level spacing.
     steps_.assign(dim_, 0.f);
