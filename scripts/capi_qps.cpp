@@ -35,6 +35,15 @@ int main(int argc, char** argv) {
     }
     const char* tree = argv[1];
     Fbin q = load(argv[2]);
+    // EXACT=<base.fbin>: load the base corpus and rerank against it
+    // (exact_rerank_base) instead of decode — regime-(b) QPS dial.
+    const char* exact_path = getenv("EXACT");
+    std::vector<float> exact_base;
+    if (exact_path) {
+        Fbin b = load(exact_path);
+        if (b.dim != q.dim) { fprintf(stderr, "dim mismatch\n"); return 1; }
+        exact_base = std::move(b.vecs);
+    }
     const uint32_t T = argc > 3 ? atoi(argv[3]) : 8;
     const uint32_t k = argc > 4 ? atoi(argv[4]) : 10;
     const uint32_t nq = q.n;
@@ -61,6 +70,8 @@ int main(int argc, char** argv) {
                 so.fastscan_W = W; so.rerank = 1;
                 so.adaptive_w_gap = tau; so.int8_scan = int8;
                 so.exhaustive = exhaustive; so.search_threads = 0;
+                if (exact_base.data())
+                    so.exact_rerank_base = exact_base.data();
                 std::vector<uint64_t> ids(65536);
                 std::vector<float> ds(65536);
                 for (uint32_t i = r; i < nq * 2; ++i) {
@@ -76,8 +87,9 @@ int main(int argc, char** argv) {
         uint64_t total = done.load();
         // last round is steady-state
         if (r == rounds - 1)
-            printf("threads=%u k=%u%s np=%u W=%u tau=%.1f: %.0f QPS (%.3f ms/query amortized, %llu queries)\n",
-                   T, k, exhaustive ? " EXH" : "", np, W, tau, total / s, s * 1000.0 / total,
+            printf("threads=%u k=%u%s%s np=%u W=%u tau=%.1f: %.0f QPS (%.3f ms/query amortized, %llu queries)\n",
+                   T, k, exhaustive ? " EXH" : "", exact_base.data() ? " EXACT" : "",
+                   np, W, tau, total / s, s * 1000.0 / total,
                    (unsigned long long)total);
     }
     sextant_close_index(idx);
