@@ -39,7 +39,7 @@ convert_sift() {
     mkdir -p "$OUT_DIR"
     "$FVECS_TO_FBIN" --input "$src_dir/sift_base.fvecs"      --output "$OUT_DIR/sift1m_base.fbin"
     "$FVECS_TO_FBIN" --input "$src_dir/sift_query.fvecs"     --output "$OUT_DIR/sift1m_query.fbin"
-    "$FVECS_TO_FBIN" --input "$src_dir/sift_groundtruth.ivecs" --output "$OUT_DIR/sift1m_gt.gt" --gt
+    "$FVECS_TO_FBIN" --input "$src_dir/sift_groundtruth.ivecs" --output "$OUT_DIR/sift1m_gt.gtmm" --gt
     echo "SIFT-1M ready in $OUT_DIR"
 }
 

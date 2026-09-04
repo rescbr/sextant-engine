@@ -63,16 +63,20 @@ bool read_fbin(const std::string& path, FbinData& out) {
 }
 
 struct GroundTruth { uint32_t n = 0, k = 0; std::vector<uint32_t> ids; };
-bool read_gt(const std::string& path, GroundTruth& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    f.read(reinterpret_cast<char*>(&out.n), 4);
-    f.read(reinterpret_cast<char*>(&out.k), 4);
-    if (!f || out.n == 0 || out.k == 0) return false;
-    out.ids.resize(size_t(out.n) * out.k);
-    f.read(reinterpret_cast<char*>(out.ids.data()),
-           std::streamsize(out.ids.size() * sizeof(uint32_t)));
-    return bool(f) || f.eof();
+bool read_gt(const std::string& p, GroundTruth& o) {
+    std::ifstream f(p, std::ios::binary); if (!f) return false;
+    constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
+    uint32_t magic = 0; f.read((char*)&magic, 4);
+    if (magic != kGtMagic) return false;
+    f.read((char*)&o.n, 4); f.read((char*)&o.k, 4);
+    char metric = 0; f.read(&metric, 1); (void)metric;
+    if (!f || o.n == 0) return false;
+    o.ids.resize(size_t(o.n) * o.k);
+    for (uint32_t i = 0; i < o.n; ++i) {
+        f.read((char*)&o.ids[size_t(i) * o.k], size_t(o.k) * 4);
+        f.seekg(size_t(o.k) * 4, std::ios::cur);  // dists
+    }
+    return !f.fail() || f.eof();
 }
 
 // --- Timing ----------------------------------------------------------------
@@ -378,7 +382,7 @@ int main(int argc, char** argv) {
     setbuf(stdout, nullptr);  // unbuffered so progress is visible
     const std::string base_path = (argc > 1) ? argv[1] : "datasets/arxiv_nomic_base.fbin";
     const std::string query_path = (argc > 2) ? argv[2] : "datasets/arxiv_nomic_query.fbin";
-    const std::string gt_path = (argc > 3) ? argv[3] : "datasets/arxiv_nomic_gt.gt";
+    const std::string gt_path = (argc > 3) ? argv[3] : "datasets/arxiv_nomic_gt.gtmm";
 
     FbinData db, queries;
     GroundTruth gt;

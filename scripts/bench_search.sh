@@ -133,8 +133,8 @@ if [ -f "$DATA/sift1m_base.fbin" ] || [ -f "$DATA/sift1m.parquet" ]; then
     PQT=$(ensure_parquet "sift1m")
     if [ -n "$PQT" ]; then
         build_index "sift1m" "$PQT" 128 "l2sq"
-        search_sweep "sift1m" "$OUT/sift1m.tree" "$DATA/sift1m_query.fbin" "$DATA/sift1m_gt.gt"
-        filtered_sweep "sift1m" "$OUT/sift1m.tree" "$DATA/sift1m_query.fbin" "$DATA/sift1m_gt.gt"
+        search_sweep "sift1m" "$OUT/sift1m.tree" "$DATA/sift1m_query.fbin" "$DATA/sift1m_gt.gtmm"
+        filtered_sweep "sift1m" "$OUT/sift1m.tree" "$DATA/sift1m_query.fbin" "$DATA/sift1m_gt.gtmm"
     fi
 fi
 
@@ -143,8 +143,8 @@ if [ -f "$DATA/arxiv_nomic_base.fbin" ] || [ -f "$DATA/arxiv_nomic.parquet" ]; t
     PQT=$(ensure_parquet "arxiv_nomic")
     if [ -n "$PQT" ]; then
         build_index "arxiv" "$PQT" 768 "l2sq"
-        search_sweep "arxiv" "$OUT/arxiv.tree" "$DATA/arxiv_nomic_query.fbin" "$DATA/arxiv_nomic_gt.gt"
-        filtered_sweep "arxiv" "$OUT/arxiv.tree" "$DATA/arxiv_nomic_query.fbin" "$DATA/arxiv_nomic_gt.gt"
+        search_sweep "arxiv" "$OUT/arxiv.tree" "$DATA/arxiv_nomic_query.fbin" "$DATA/arxiv_nomic_gt.gtmm"
+        filtered_sweep "arxiv" "$OUT/arxiv.tree" "$DATA/arxiv_nomic_query.fbin" "$DATA/arxiv_nomic_gt.gtmm"
     fi
 fi
 
@@ -153,7 +153,7 @@ if [ -f "$DATA/msmarco_base.fbin" ] || [ -f "$DATA/msmarco.parquet" ]; then
     PQT=$(ensure_parquet "msmarco")
     if [ -n "$PQT" ]; then
         build_index "msmarco" "$PQT" 768 "l2sq"
-        search_sweep "msmarco" "$OUT/msmarco.tree" "$DATA/msmarco_query.fbin" "$DATA/msmarco_gt.gt"
+        search_sweep "msmarco" "$OUT/msmarco.tree" "$DATA/msmarco_query.fbin" "$DATA/msmarco_gt.gtmm"
     fi
 fi
 
@@ -162,7 +162,7 @@ if [ -f "$DATA/sphere_ip_base.fbin" ] || [ -f "$DATA/sphere_ip.parquet" ]; then
     PQT=$(ensure_parquet "sphere_ip")
     if [ -n "$PQT" ]; then
         build_index "sphere" "$PQT" 768 "ip"
-        search_sweep "sphere" "$OUT/sphere.tree" "$DATA/sphere_ip_query.fbin" "$DATA/sphere_ip_gt.gt"
+        search_sweep "sphere" "$OUT/sphere.tree" "$DATA/sphere_ip_query.fbin" "$DATA/sphere_ip_gt.gtmm"
     fi
 fi
 

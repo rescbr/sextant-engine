@@ -10,7 +10,7 @@ mkdir -p "$OUT"
 
 BASE_FBIN="$DATA/arxiv_nomic_base.fbin"
 QUERY_FBIN="$DATA/arxiv_nomic_query.fbin"
-GT_FILE="$DATA/arxiv_nomic_gt.gt"
+GT_FILE="$DATA/arxiv_nomic_gt.gtmm"
 PARQUET_ZSTD="$OUT/arxiv_nomic_zstd.parquet"
 PARQUET_RAW="$OUT/arxiv_nomic_raw.parquet"
 

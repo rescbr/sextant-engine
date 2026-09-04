@@ -4,9 +4,9 @@
 // .ivecs format (per vector):  [int32 k][k × int32 values]
 //
 // .fbin format (global header): [uint32 n][uint32 dim][n × dim × float32]
-// .gt   format (ground truth):  [uint32 n_queries][uint32 k]
-//                              [n × k × uint32 neighbor IDs]
-//                              [n × k × float32 distances]
+// .gtmm format (ground truth):  [magic "GTMM"][uint32 n_queries][uint32 k]
+//                               [uint8 metric (0=L2Sq)]
+//                               per query: [k × uint32 ids][k × float32 dists]
 //   With --base + --queries: distances are real L2-sq (enables proximity metrics).
 //   Without: distances are zero-filled.
 //
@@ -233,17 +233,23 @@ void convert_ivecs(const std::string& input, const std::string& output,
         throw Error(ErrorCode::IoError,
                     "cannot open output '" + output + "'");
     }
+    // GTMM format (the only GT layout the engine reads):
+    // [magic "GTMM"][n:u32][k:u32][metric:u8=0 L2Sq]
+    // per query: [k x u32 ids][k x f32 dists] (interleaved).
+    constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
+    const uint8_t metric = 0;  // L2Sq
+    out.write(reinterpret_cast<const char*>(&kGtMagic), sizeof(uint32_t));
     out.write(reinterpret_cast<const char*>(&n), sizeof(uint32_t));
     out.write(reinterpret_cast<const char*>(&k), sizeof(uint32_t));
-    for (const auto& r : records) {
-        out.write(reinterpret_cast<const char*>(r.data()),
-                  static_cast<std::streamsize>(k * sizeof(uint32_t)));
-    }
+    out.write(reinterpret_cast<const char*>(&metric), sizeof(uint8_t));
     // Distances: real L2-sq if base+queries provided, else zero-filled.
+    // Written per query, interleaved after that query's ids.
     if (compute_dists) {
         const uint32_t dim = base_dim;
         std::vector<float> dists(k);
         for (uint32_t qi = 0; qi < n; qi++) {
+            out.write(reinterpret_cast<const char*>(records[qi].data()),
+                      static_cast<std::streamsize>(k * sizeof(uint32_t)));
             const float* qv = &query_vecs[static_cast<size_t>(qi) * dim];
             for (uint32_t ki = 0; ki < k; ki++) {
                 const uint32_t nid = records[qi][ki];
@@ -267,6 +273,8 @@ void convert_ivecs(const std::string& input, const std::string& output,
                      "distances zero-filled (proximity metrics will be unavailable)");
         std::vector<float> zeros(k, 0.0f);
         for (uint32_t i = 0; i < n; i++) {
+            out.write(reinterpret_cast<const char*>(records[i].data()),
+                      static_cast<std::streamsize>(k * sizeof(uint32_t)));
             out.write(reinterpret_cast<const char*>(zeros.data()),
                       static_cast<std::streamsize>(k * sizeof(float)));
         }

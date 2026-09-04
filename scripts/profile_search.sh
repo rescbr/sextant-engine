@@ -27,7 +27,7 @@ fi
 # Default dataset paths (override via args after index).
 QUERY="$ENGINE_ROOT/datasets/sift1m_query.fbin"
 BASE="$ENGINE_ROOT/datasets/sift1m_base.fbin"
-GT="$ENGINE_ROOT/datasets/sift1m_gt.gt"
+GT="$ENGINE_ROOT/datasets/sift1m_gt.gtmm"
 
 if [[ ! -d "$INDEX.manifest" && ! -f "$INDEX.manifest" ]]; then
     if [[ ! -f "$INDEX.graph" ]]; then

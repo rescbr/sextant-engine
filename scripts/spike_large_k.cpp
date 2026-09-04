@@ -41,11 +41,18 @@ bool read_fbin(const std::string& p, FbinData& o) {
 struct GroundTruth { uint32_t n=0, k=0; std::vector<uint32_t> ids; };
 bool read_gt(const std::string& p, GroundTruth& o) {
     std::ifstream f(p, std::ios::binary); if (!f) return false;
+    constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
+    uint32_t magic = 0; f.read((char*)&magic, 4);
+    if (magic != kGtMagic) return false;
     f.read((char*)&o.n, 4); f.read((char*)&o.k, 4);
-    if (!f || o.n==0) return false;
-    o.ids.resize(size_t(o.n)*o.k);
-    f.read((char*)o.ids.data(), o.ids.size()*4);
-    return f.good() || f.eof();
+    char metric = 0; f.read(&metric, 1); (void)metric;
+    if (!f || o.n == 0) return false;
+    o.ids.resize(size_t(o.n) * o.k);
+    for (uint32_t i = 0; i < o.n; ++i) {
+        f.read((char*)&o.ids[size_t(i) * o.k], size_t(o.k) * 4);
+        f.seekg(size_t(o.k) * 4, std::ios::cur);  // dists
+    }
+    return !f.fail() || f.eof();
 }
 
 struct KmeansResult { std::vector<float> centroids; };
@@ -145,7 +152,7 @@ int main(int argc, char** argv) {
 
     const std::string base_path = (argc > 1) ? argv[1] : "datasets/arxiv_nomic_base.fbin";
     const std::string query_path = (argc > 2) ? argv[2] : "datasets/arxiv_nomic_query.fbin";
-    const std::string gt_path = (argc > 3) ? argv[3] : "datasets/arxiv_nomic_gt.gt";
+    const std::string gt_path = (argc > 3) ? argv[3] : "datasets/arxiv_nomic_gt.gtmm";
 
     FbinData db, queries; GroundTruth gt;
     if (!read_fbin(base_path, db)) { printf("cannot read %s\n", base_path.c_str()); return 1; }

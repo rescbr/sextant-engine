@@ -56,11 +56,18 @@ bool read_fbin(const std::string& p, FbinData& o) {
 struct GroundTruth { uint32_t n=0, k=0; std::vector<uint32_t> ids; };
 bool read_gt(const std::string& p, GroundTruth& o) {
     std::ifstream f(p, std::ios::binary); if (!f) return false;
+    constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
+    uint32_t magic = 0; f.read((char*)&magic, 4);
+    if (magic != kGtMagic) return false;
     f.read((char*)&o.n, 4); f.read((char*)&o.k, 4);
-    if (!f || o.n==0) return false;
-    o.ids.resize(size_t(o.n)*o.k);
-    f.read((char*)o.ids.data(), o.ids.size()*4);
-    return f.good() || f.eof();
+    char metric = 0; f.read(&metric, 1); (void)metric;
+    if (!f || o.n == 0) return false;
+    o.ids.resize(size_t(o.n) * o.k);
+    for (uint32_t i = 0; i < o.n; ++i) {
+        f.read((char*)&o.ids[size_t(i) * o.k], size_t(o.k) * 4);
+        f.seekg(size_t(o.k) * 4, std::ios::cur);  // dists
+    }
+    return !f.fail() || f.eof();
 }
 
 // --- 4-bit FastScan kernel (32 codes/block, identical to spike_pq4_recall).
@@ -163,7 +170,7 @@ KmeansResult kmeans(const float* data, uint32_t n, uint32_t dim, uint32_t K,
 int main(int argc, char** argv) {
     std::string base_path  = "datasets/arxiv_nomic_base.fbin";
     std::string query_path = "datasets/arxiv_nomic_query.fbin";
-    std::string gt_path    = "datasets/arxiv_nomic_gt.gt";
+    std::string gt_path    = "datasets/arxiv_nomic_gt.gtmm";
     bool apply_jlt = false;
     uint64_t jlt_seed = 12345;
     for (int i = 1; i < argc; i++) {
@@ -172,7 +179,7 @@ int main(int argc, char** argv) {
         else if (s == "--jlt-seed" && i + 1 < argc) jlt_seed = strtoull(argv[++i], nullptr, 10);
         else if (base_path == "datasets/arxiv_nomic_base.fbin" && i == 1) base_path = s;
         else if (query_path == "datasets/arxiv_nomic_query.fbin" && i == 2) query_path = s;
-        else if (gt_path == "datasets/arxiv_nomic_gt.gt" && i == 3) gt_path = s;
+        else if (gt_path == "datasets/arxiv_nomic_gt.gtmm" && i == 3) gt_path = s;
     }
 
     FbinData db, queries;
