@@ -47,6 +47,8 @@ Fbin load(const char* path) {
     return fb;
 }
 
+int g_f16_fidelity = 0;  // 1 = replicate engine fp16 ingestion/bias
+
 }  // namespace
 
 using sextant::simd::dot_f32;
@@ -121,15 +123,21 @@ int main(int argc, char** argv) {
                 const float* v = &base.vecs[(size_t)i * dim];
                 float dot = 0.f, nx2 = 0.f, nh2 = 0.f;
                 for (uint32_t d = 0; d < dim; ++d) {
-                    int c = int((v[d] - lo[d]) / st[d] + 0.5f);
+                    // F16: replicate engine ingestion — source vector stored
+                    // fp16 before encode (affects codes AND the f32 norm).
+                    const float xd = g_f16_fidelity
+                        ? static_cast<float>(float16_t(v[d])) : v[d];
+                    int c = int((xd - lo[d]) / st[d] + 0.5f);
                     c = std::clamp(c, 0, int(levels - 1));
                     const float r = lo[d] + st[d] * c;
                     dec[d] = r;
                     dot += qv[d] * r;
-                    nx2 += v[d] * v[d];
+                    (void)0;
+                    nx2 += xd * xd;
                     nh2 += r * r;
                 }
-                const float bias = std::sqrt(nx2 / std::max(nh2, 1e-30f));
+                float bias = std::sqrt(nx2 / std::max(nh2, 1e-30f));
+                if (g_f16_fidelity) bias = static_cast<float>(float16_t(bias));
                 sc[i] = {dot * bias, i};
             }
             std::partial_sort(sc.begin(), sc.begin() + k, sc.end(),
@@ -169,6 +177,7 @@ int main(int argc, char** argv) {
             run_row("sq8", 256, m);
         return 0;
     }
+    if (getenv("F16")) g_f16_fidelity = 1;
     run_row("sq4", 16, 2.7f);
     run_row("sq8", 256, 3.3f);
 
