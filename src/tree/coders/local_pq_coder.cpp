@@ -278,11 +278,15 @@ float LocalPqCoder::rerank(const float* query, const uint8_t* leaf,
     const uint64_t codes_off = local_codes_offset(
         lh->summary_size, params_.dim, lh->m4, lh->pq_bits);
     const uint32_t cpb = (lh->pq_bits == 8) ? 16 : 32;
-    uint8_t code[64];
+    // Sized by m4 (m4=768 at dim=1536 needs 384 bytes; a fixed 64-byte
+    // stack buffer overran for any m4 > 128 — ASan caught it).
+    static thread_local std::vector<uint8_t> code;
+    code.resize((static_cast<uint32_t>(lh->m4) * lh->pq_bits + 7) / 8);
     extract_code_from_leaf(leaf, local_idx, lh->summary_size, lh->m4,
-                           lh->pq_bits, cpb, lh->m4 * 16, code, codes_off);
+                           lh->pq_bits, cpb, lh->m4 * 16, code.data(),
+                           codes_off);
     std::vector<float> dec(params_.dim);
-    ctx.quant->decode_code(code, dec.data());
+    ctx.quant->decode_code(code.data(), dec.data());
     const float* centroid = reinterpret_cast<const float*>(
         leaf + lh->centroid_offset);
     for (uint32_t d = 0; d < params_.dim; ++d) dec[d] += centroid[d];
