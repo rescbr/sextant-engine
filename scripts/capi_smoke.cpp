@@ -53,6 +53,7 @@ int main(int argc, char** argv) {
     sextant_build_opts bo = sextant_default_build_opts();
     bo.quantizer = quantizer;
     if (getenv("KR")) bo.k_root = uint32_t(atoi(getenv("KR")));
+    if (getenv("PQM")) bo.pq_m = uint32_t(atoi(getenv("PQM")));
     if (getenv("LEAF")) bo.leaf_capacity = uint32_t(atoi(getenv("LEAF")));
     const char* m = getenv("METRIC");
     bo.metric = (m && m[0] == "l"[0]) ? SEXTANT_METRIC_L2SQ : SEXTANT_METRIC_IP;
