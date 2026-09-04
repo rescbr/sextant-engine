@@ -238,6 +238,13 @@ void GlobalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
 float GlobalPqCoder::rerank(const float* query, const ScanSetup& setup,
                             const uint8_t* leaf, uint32_t local_idx,
                             float* scratch_decoded) {
+    // PRQ codes are multi-split residual indices: the plain-PQ LUT sums
+    // (partial dots over the first-level codebook) do not reconstruct the
+    // distance, and reranking with them scrambles the order (measured
+    // 0.50 raw -> 0.014 reranked on mini10k). Route PRQ through the
+    // exact extract+decode path, which uses PRQ's own decode_code.
+    if (kind_ == Kind::Prq)
+        return rerank(query, leaf, local_idx, scratch_decoded);
     (void)query;
     (void)scratch_decoded;
     const auto& s = static_cast<const Setup&>(setup);
