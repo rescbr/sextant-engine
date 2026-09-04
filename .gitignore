@@ -29,8 +29,16 @@ subprojects/packagecache/
 *.so
 *.dylib
 
-# Test datasets and benchmark artifacts
-datasets/
+# Test datasets and benchmark artifacts (large corpora stay local;
+# the mini* fixtures are committed for tests — see datasets/README.md)
+datasets/*
+!datasets/mini10k_base.fbin
+!datasets/mini10k_query.fbin
+!datasets/mini10k_gt.gtmm
+!datasets/mini20k_base.fbin
+!datasets/mini20k_query.fbin
+!datasets/mini20k_gt.gtmm
+!datasets/README.md
 *.fbin
 *.bvec
 *.fvec
@@ -46,3 +54,9 @@ profiles/
 *.samply
 subprojects/.wraplock
 subprojects/packagecache/
+
+# Committed dataset fixtures (must come after the *.fbin rule above).
+!datasets/mini10k_base.fbin
+!datasets/mini10k_query.fbin
+!datasets/mini20k_base.fbin
+!datasets/mini20k_query.fbin
