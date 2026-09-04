@@ -1,6 +1,7 @@
 #include "ivf_tree_index.hpp"
 
 #include "engine/manifest_io.hpp"
+#include "engine/probe.hpp"
 #include "engine/partition.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "quant/product_residual_quantizer.hpp"
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <random>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -712,19 +714,42 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
 
     // --- 1. Sample + train quantizer ---
     const auto t_sample = std::chrono::steady_clock::now();
+    // RANDOM sample, not a sequential prefix: embeddings arrive ordered
+    // (topic/time-clustered fbins, streamed inserts), and a prefix-trained
+    // global ruler is fitted to the wrong distribution — measured
+    // dbpedia-933K scalar_uniform decoded ceiling 0.950 (20K prefix) vs
+    // 0.956 (full-corpus stats). Seek-based draw when the source is a file
+    // (O(k) I/O); Algorithm R reservoir over next() otherwise (the source
+    // API's documented fallback for path-less sources).
     uint32_t train_n = std::min<uint64_t>(20'000, n);
-    ctx.source.reset();
-    Chunk chunk;
-    uint32_t collected = 0;
-    std::vector<float> sample_buf;
-    while (collected < train_n && ctx.source.next(chunk)) {
-        const uint32_t take = std::min<uint32_t>(chunk.count, train_n - collected);
-        sample_buf.insert(sample_buf.end(), chunk.vectors,
-                          chunk.vectors + static_cast<size_t>(take) * dim);
-        collected += take;
+    std::vector<float> sample;
+    if (!ctx.source.path().empty()) {
+        sample = draw_random_sample(ctx.source.path(), n, dim, train_n);
+    } else {
+        ctx.source.reset();
+        Chunk chunk;
+        std::vector<float> reservoir(size_t(train_n) * dim);
+        uint64_t seen = 0;
+        std::mt19937_64 rng(42);
+        while (ctx.source.next(chunk)) {
+            for (uint32_t i = 0; i < chunk.count; ++i) {
+                const float* v = chunk.vectors + size_t(i) * dim;
+                if (seen < train_n) {
+                    std::memcpy(&reservoir[sample_size_t(seen) * dim], v,
+                                sample_size_t(dim) * sizeof(float));
+                } else {
+                    const uint64_t j = std::uniform_int_distribution<uint64_t>(
+                        0, seen)(rng);
+                    if (j < train_n)
+                        std::memcpy(&reservoir[sample_size_t(j) * dim], v,
+                                    sample_size_t(dim) * sizeof(float));
+                }
+                ++seen;
+            }
+        }
+        sample = std::move(reservoir);
+        ctx.source.reset();
     }
-    train_n = collected;  // actual count
-    std::vector<float> sample = std::move(sample_buf);
 
     if (params.quantizer_type == "prq") {
         uint32_t nsplits = (params.prq_nsplits > 0)
