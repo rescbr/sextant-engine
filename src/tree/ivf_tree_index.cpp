@@ -735,14 +735,14 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
             for (uint32_t i = 0; i < chunk.count; ++i) {
                 const float* v = chunk.vectors + size_t(i) * dim;
                 if (seen < train_n) {
-                    std::memcpy(&reservoir[sample_size_t(seen) * dim], v,
-                                sample_size_t(dim) * sizeof(float));
+                    std::memcpy(&reservoir[size_t(seen) * dim], v,
+                                size_t(dim) * sizeof(float));
                 } else {
                     const uint64_t j = std::uniform_int_distribution<uint64_t>(
                         0, seen)(rng);
                     if (j < train_n)
-                        std::memcpy(&reservoir[sample_size_t(j) * dim], v,
-                                    sample_size_t(dim) * sizeof(float));
+                        std::memcpy(&reservoir[size_t(j) * dim], v,
+                                    size_t(dim) * sizeof(float));
                 }
                 ++seen;
             }
