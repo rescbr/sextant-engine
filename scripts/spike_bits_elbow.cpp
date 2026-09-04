@@ -90,11 +90,16 @@ int main(int argc, char** argv) {
     // ---- Per-dim stats (mean, sigma) over the full corpus ----
     std::vector<float> mean(dim, 0.f), sigma(dim, 0.f);
     {
+        // SAMPLE_N: stats over the first N vectors (prefix — replicating the
+        // engine's 20K-prefix training sample) vs full corpus (default 0).
+        const size_t stat_n = getenv("SAMPLE_N")
+            ? std::min<size_t>(size_t(atoll(getenv("SAMPLE_N"))), base.vecs.size())
+            : base.vecs.size();
         std::vector<double> s(dim, 0.0), s2(dim, 0.0);
-        for (size_t i = 0; i < base.vecs.size(); ++i) { s[i % dim] += base.vecs[i]; s2[i % dim] += double(base.vecs[i]) * base.vecs[i]; }
+        for (size_t i = 0; i < stat_n; ++i) { s[i % dim] += base.vecs[i]; s2[i % dim] += double(base.vecs[i]) * base.vecs[i]; }
         for (uint32_t d = 0; d < dim; ++d) {
-            mean[d] = float(s[d] / n);
-            const double var = std::max(s2[d] / n - double(mean[d]) * mean[d], 0.0);
+            mean[d] = float(s[d] * dim / double(stat_n));
+            const double var = std::max(s2[d] * dim / double(stat_n) - double(mean[d]) * mean[d], 0.0);
             sigma[d] = float(std::sqrt(var));
         }
     }
