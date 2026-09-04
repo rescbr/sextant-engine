@@ -39,23 +39,27 @@ The original FastScan motivations did not apply here anyway:
 
 ## The opportunity: grouped-dim scalar quantization
 
-The obvious next idea is *not* to give up on LUTs for scalar codes, but
-to change what a "subquantizer" covers. Per-dim scalar quantization is
-exactly PQ with `sub_dim = 1`. If we group **G=2 dims per codebook**
-(learned per leaf, K=16 centroids over the 2-dim residual pairs), we get:
+**Correction (2026-09-04, post-review): the arithmetic first.** A group
+of G dims with a K=16 codebook costs 4 bits per *group* — i.e.
+**4/G bits per dim**, not 4. G=2/K=16 is 2 bits/dim; keeping 4 bits/dim
+at G=2 requires K=256 per pair, whose 8-bit LUT lookup costs
+~2×TBL+blend per group on NEON and re-loses to dual-SDOT on the same
+axis argument as above. So grouped LUT scanning is not "same recall,
+fewer passes" — it is a **bits-vs-scan-time frontier**: G-fold cheaper
+block scans (m4 = dim/G) bought with G-fold fewer bits per dim, with
+joint G-dim codebooks recovering part of the lost precision (the
+Jégou sub_dim tradeoff) and rerank recovering the rest. This is the
+same tradeoff that motivates production RaBitQ-1-bit-shortlist +
+rerank pipelines (Infino's menu; rejected for our dynamic tree, but
+the frontier point is testable cheaply).
 
-- same code size (4 bits/dim — 8 bits per pair);
-- LUT count halves (`m4 = dim/2` → 2× fewer TBL iterations per block);
-- **better recall per bit**: a joint 2-dim codebook captures the
-  correlation between paired dims that two independent uniform rulers
-  cannot — this is the classic PQ-vs-scalar-quantization tradeoff at the
-  smallest possible group size;
-- and mechanically it is just `local_pq` with `sub_dim=2` — the FastScan
-  path for that already exists and is measured fast.
-
-Pairing adjacent dims only pays off if the pairs are roughly
-independent of each other; an OPQ-style rotation (Ge et al., TPAMI 2014)
-could choose the pairing. Literature anchoring this direction:
+The cheapest test needs NO new code: `local_pq` with `m4 = dim/2`
+(sub_dim=2, K=16, 2 bits/dim joint pairs) exercises the whole path —
+per-leaf pair codebooks, FastScan blocks at m4=768, existing kernels.
+Compare recall/latency against `local_scalar` (4 bits/dim rulers) and
+`local_pq` at other m4; if the 2 b/dim point lands near the 4 b/dim
+recall at materially lower scan cost, the frontier is worth climbing
+with G>2 and anisotropic weighting. Literature anchoring the direction:
 
 - André, Kermarrec, Le Scouarnec — *Cache locality is not enough:
   high-performance NN search with product quantization fast scan*
@@ -73,10 +77,34 @@ could choose the pairing. Literature anchoring this direction:
   (TPAMI 2011): the sub_dim tradeoff (quantization error falls as
   sub_dim grows at fixed bits, for correlated sub-vectors).
 
-Gating note (measured this session): per-dim LUT machinery loses to
-dual-SDOT on V2, so the grouped variant must be **spiked before any
-layout commitment** — win condition is roughly `≥2× fewer TBL passes
-+ joint-pair recall gain` beating `2 vdotq per 16 dims` at equal recall.
-The per-leaf training cost of `dim/2` tiny codebooks also needs a
-budget (single pass of 2-dim k-means over leaf vectors; likely fine at
-leaf sizes ~4K but must be measured on the flush path).
+## Spike result (2026-09-04, same evening): FALSIFIED
+
+Ran the frontier with zero new code — `local_pq` trees at sub_dim=2 and
+sub_dim=4 on dbpedia 933K×1536, vs the `local_scalar` 4 b/dim reference
+(50 queries, c4a, back-to-back):
+
+| config            | bits/dim | bytes/vec | exh. ms | exh. raw R@10 | exh. rerank R@10 |
+|-------------------|----------|-----------|---------|---------------|------------------|
+| local_scalar      | 4        | 768       | 233     | 0.934         | 1.000            |
+| local_pq sub_dim=2| 2        | 384       | 42      | **0.140**     | 0.174            |
+| local_pq sub_dim=4| 1        | 192       | 24      | **0.124**     | 0.166            |
+
+The frontier is a **cliff, not a slope**: 2 b/dim recall collapses to
+0.14 (vs 0.93 at 4 b/dim), and joint 2-dim pair codebooks recover
+essentially nothing (0.140 vs 0.124 at 1 b/dim — the Jégou sub_dim
+gain is absent at G=2 on this data). Rerank cannot rescue it: the scan
+ceiling (0.14) caps the shortlist, so even exact rerank tops out at
+0.17. Root cause is the same phenomenon as the earlier "locality
+falsified" finding: at d=1536 embeddings the per-dim correlation
+structure is too weak for joint small-group codebooks to exploit — the
+recall elbow is driven almost entirely by bits, and 4 b/dim is below
+the knee for scan-only use.
+
+Conclusion: scalar stays at 4 b/dim flat + dual-SDOT (mode 2), with
+the regime-(b) dial (decode-only / exact_rerank_base) already covering
+the low-bytes point properly. The G=2/G=4 LUT points are dominated on
+both axes for this workload class.
+
+(The spike also flushed out and fixed a real bug: LocalPqCoder::rerank
+used a fixed 64-byte code buffer — stack overflow for any m4 > 128,
+i.e. the default m4=dim/4 on dim>512.)
