@@ -448,10 +448,16 @@ inline void fit_local_scalar_levels(const float* vecs, uint32_t count,
         }
     for (uint16_t d = 0; d < dim; ++d) {
         const float sd = std::sqrt(var[d] / count);
-        float lo_f = mean[d] - 3.f * sd, hi_f = mean[d] + 3.f * sd;
+        // Pure σ-loaded ruler (mean ± 2.7σ — the optimal 16-level loading
+        // for a Gaussian marginal, same construction as the global
+        // train_uniform ruler). Do NOT expand to min/max: with thousands of
+        // vectors per leaf an outlier almost always exceeds 2.7σ and
+        // stretches the ruler back to min/max, which measured WORSE than the
+        // global σ ruler at identical bytes (dbpedia-933K decoded ceiling:
+        // local min/max-stretched 0.948 vs global 2.7σ 0.956). Out-of-range
+        // values simply saturate at code 0/15 — the encoder clamps.
+        float lo_f = mean[d] - 2.7f * sd, hi_f = mean[d] + 2.7f * sd;
         if (hi_f - lo_f <= 0.f) { lo_f = mn[d]; hi_f = mx[d]; }
-        lo_f = std::min(lo_f, mn[d]);
-        hi_f = std::max(hi_f, mx[d]);
         const float step = std::max((hi_f - lo_f) / 15.0f, 1e-8f);
         lo[d] = float16_t(lo_f - 0.5f * step);
         steps[d] = float16_t(step);

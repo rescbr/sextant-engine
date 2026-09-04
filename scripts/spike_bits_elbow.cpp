@@ -154,6 +154,16 @@ int main(int argc, char** argv) {
                hits / (double(nq) * k));
     };
 
+    // Loading sweep: derived MSE-optimal for N=16 Gaussian is ~2.5 (mid-tread
+    // uniform, saturation outside); the cited value is 2.7 (Infino blog).
+    // Ranking recall is the real metric — let the corpus decide.
+    if (getenv("SWEEP")) {
+        for (float m : {2.1f, 2.3f, 2.5f, 2.7f, 3.0f, 3.3f})
+            run_row("sq4", 16, m);
+        for (float m : {3.3f, 3.9f, 4.5f})
+            run_row("sq8", 256, m);
+        return 0;
+    }
     run_row("sq4", 16, 2.7f);
     run_row("sq8", 256, 3.3f);
 
