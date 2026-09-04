@@ -1,4 +1,5 @@
 #include "filter_scan.hpp"
+#include "leaf_coder.hpp"  // LeafGeometry
 #include "filter_column_write.hpp"  // kBloomThreshold
 
 #include <algorithm>
@@ -26,6 +27,21 @@ LeafFilterLayout LeafFilterLayout::compute(const uint8_t* leaf_ptr, uint16_t m4,
     l.filter_base = leaf_ptr + leaf_rowids_offset(summary_size, l.n_blocks,
                                                      l.block_bytes)
                      + static_cast<uint64_t>(l.count) * sizeof(RowId);
+    return l;
+}
+
+LeafFilterLayout LeafFilterLayout::from_geometry(
+        const uint8_t* leaf_ptr, const LeafGeometry& geo) {
+    LeafFilterLayout l;
+    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+    l.count = static_cast<uint32_t>(lh->count);
+    l.summary_size = lh->summary_size;
+    l.codes_per_block = (lh->pq_bits == 4) ? 32 : 16;
+    l.block_bytes = lh->m4 * 16;
+    l.n_blocks = (l.count + l.codes_per_block - 1) / l.codes_per_block;
+    l.codes = leaf_ptr + geo.codes_offset;
+    l.row_ids = reinterpret_cast<const RowId*>(leaf_ptr + geo.rowids_offset);
+    l.filter_base = leaf_ptr + geo.filter_offset;
     return l;
 }
 

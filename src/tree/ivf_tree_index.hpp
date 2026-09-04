@@ -21,6 +21,7 @@
 #include "tree/superblock.hpp"
 #include "tree/tree_manifest.hpp"
 #include "tree/tree_nodes.hpp"
+#include "tree/leaf_coder.hpp"
 #include "tree/cardinality.hpp"  // CardinalityTable (Phase D selectivity estimation)
 #include <sextant/column_data.hpp>
 #include "sextant/config.hpp"
@@ -177,7 +178,12 @@ public:
     uint32_t n_probe_l0_default() const { return manifest_.n_probe_l0; }
     uint32_t n_probe_ln_default() const { return manifest_.n_probe_ln; }
     const std::string& quantizer_type() const { return manifest_.quantizer_type; }
-    const PqQuantizer& quantizer() const { return *quantizer_; }
+    /// Global PQ quantizer view (global-codebook families only). Callers
+    /// must not invoke this on local/scalar families.
+    const PqQuantizer& quantizer() const { return *coder_->pq_quantizer(); }
+
+    /// The per-family leaf coder owning all quantizer state.
+    const LeafCoder& coder() const { return *coder_; }
 
     /// Safe metric accessor: works even when quantizer_ is null (local_pq).
     /// Uses the manifest's metric field (stored for all trees).
@@ -186,7 +192,9 @@ public:
     }
 
     /// True when this index uses per-leaf codebooks (no global codebook).
-    bool is_local_pq() const { return manifest_.quantizer_type == "local_pq"; }
+    bool is_local_pq() const {
+        return coder_ && coder_->leaf_state() == LeafState::CodedLocal;
+    }
 
     /// Global cardinality table (Phase D). Empty when no filter columns were
     /// present at build time. Used for predicate selectivity estimation.
@@ -282,8 +290,9 @@ private:
     Superblock superblock_;
     TreeManifest manifest_;
     CardinalityTable card_table_;  // per-value frequencies for selectivity (Phase D)
-    std::unique_ptr<PqQuantizer> quantizer_;
-    std::unique_ptr<ScalarLloydMaxQuantizer> scalar_lm_quantizer_;
+    // Single per-family coder: owns the quantizer objects + all
+    // family-specific leaf layout / scan / mutation logic.
+    std::unique_ptr<LeafCoder> coder_;
 
     // --- Leaf extent table (indirection: leaf_id → page+pages) ---
     // Loaded at open() from the leaf_table blob. Mandatory: every tree the

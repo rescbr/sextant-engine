@@ -39,6 +39,8 @@ namespace sextant::tree {
 
 /// Locates the filter column regions within a mmap'd leaf extent.
 /// Computed once per leaf, then used for per-candidate lookups.
+struct LeafGeometry;  // tree/leaf_coder.hpp
+
 struct LeafFilterLayout {
     uint32_t count = 0;               // live vector count
     uint32_t n_blocks = 0;
@@ -53,9 +55,18 @@ struct LeafFilterLayout {
     const uint8_t* filter_base = nullptr;
 
     /// Compute the layout for a mmap'd leaf. leaf_ptr = start of leaf extent.
+    /// NOTE: this overload assumes the global-PQ FastScan layout; prefer
+    /// from_geometry() with the owning LeafCoder's geometry() — the offsets
+    /// differ for the scalar / local families.
     static LeafFilterLayout compute(const uint8_t* leaf_ptr, uint16_t m4,
                                      uint8_t pq_bits,
                                      uint32_t summary_size);
+
+    /// Family-agnostic layout from a LeafGeometry (the LeafCoder-computed
+    /// row_ids / filter offsets). Fixes the hardcoded-global-PQ offset bug
+    /// for scalar / local families.
+    static LeafFilterLayout from_geometry(const uint8_t* leaf_ptr,
+                                          const struct LeafGeometry& geo);
 };
 
 /// View into a single column's on-disk data within a leaf.
