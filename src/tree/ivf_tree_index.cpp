@@ -3781,12 +3781,13 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
             coder_->decode_one(old_buf.data(), i,
                                vecs.data() + static_cast<size_t>(i) * dim);
     }
-    // Scalar + InnerProduct: per-vector IP biases follow the codes.
+    // Scalar + InnerProduct: per-vector IP biases sit between the code
+    // region and row_ids (block-padded for scalar families).
     std::vector<float16_t> old_biases;
     if (has_ip_bias) {
         const float16_t* src = reinterpret_cast<const float16_t*>(
-            old_buf.data() + old_geo.codes_offset +
-            static_cast<uint64_t>(count) * code_size);
+            old_buf.data() + old_geo.rowids_offset -
+            scalar_bias_bytes(count, true));
         old_biases.assign(src, src + count);
     }
 

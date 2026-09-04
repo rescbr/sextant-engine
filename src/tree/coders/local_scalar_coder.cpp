@@ -11,19 +11,20 @@
 
 namespace sextant::tree {
 
+using coders::extract_code_from_leaf;
 using coders::lloyd_split_f32;
 using coders::scalar_scan_leaf;
 using coders::ScalarScanCtx;
+using coders::write_code_to_fs_block;
 
-// Per-(query,leaf) scan context. a_uni / a8 / a8_lo / c0 are PER-LEAF
+// Per-(query,leaf) scan context. a_uni / lut / c0 are PER-LEAF
 // mutable state — each parallel worker owns its own Setup (see the
 // per-worker a_buf note in the old search()).
 struct LocalScalarCoder::Setup : public ScanSetup {
-    std::vector<float> a_uni;      // padded to the 16-dim kernel width
+    std::vector<float> a_uni;      // per-leaf a_d = q_d*step_d (scratch)
     float c0 = 0.f;
     std::vector<float> query_copy;
-    std::vector<int8_t> a8, a8_lo;
-    float i8_inv = 0.f;
+    coders::ScalarLut lut;         // per-leaf FastScan LUT (dim x 16)
     int i8_mode = 0;
 };
 
@@ -103,11 +104,10 @@ void LocalScalarCoder::decode_one_with_levels(const float16_t* lo,
 // --- layout ---
 
 LeafGeometry LocalScalarCoder::geometry(const TreeLeafHeader* h) const {
-    const uint32_t cs = (params_.dim + 1) / 2;
     LeafGeometry g;
     g.codes_offset = lsc_codes_offset(h->summary_size, params_.dim);
-    g.rowids_offset = g.codes_offset + static_cast<uint64_t>(h->count) * cs +
-        scalar_bias_bytes(h->count, params_.has_ip_bias);
+    g.rowids_offset = lsc_rowids_offset(h->summary_size, params_.dim,
+                                        h->count, params_.has_ip_bias);
     g.filter_offset =
         g.rowids_offset + static_cast<uint64_t>(h->count) * sizeof(RowId);
     g.extent_bytes = g.rowids_offset +
@@ -117,10 +117,11 @@ LeafGeometry LocalScalarCoder::geometry(const TreeLeafHeader* h) const {
 
 uint64_t LocalScalarCoder::extent_bytes(uint32_t count, uint32_t summary_size,
                                         uint64_t filter_cols_bytes) const {
-    // [header][summary][lo][steps][codes][ip_biases?][row_ids][filters]
-    const uint32_t cs = (params_.dim + 1) / 2;
+    // [header][summary][lo][steps][code blocks (FastScan, m4=dim)]
+    // [ip_biases?][row_ids][filters]
     return lsc_codes_offset(summary_size, params_.dim) +
-           static_cast<uint64_t>(count) * cs +
+           static_cast<uint64_t>(scalar_n_blocks(count)) *
+               scalar_block_bytes(params_.dim) +
            scalar_bias_bytes(count, params_.has_ip_bias) +
            static_cast<uint64_t>(count) * sizeof(RowId) + filter_cols_bytes;
 }
@@ -180,16 +181,25 @@ uint64_t LocalScalarCoder::flush_leaf(const LeafFlushInput& in,
                     static_cast<uint64_t>(dim) * sizeof(float16_t),
                 steps.data(), dim * sizeof(float16_t));
     uint8_t* codes_out = leaf_out + lsc_codes_offset(in.summary_size, dim);
-    std::memcpy(codes_out, codes.data(),
-                static_cast<size_t>(in.count) * cs);
+    const uint32_t bb = scalar_block_bytes(dim);
+    const uint32_t nb = scalar_n_blocks(in.count);
+    for (uint32_t b = 0; b < nb; ++b) {
+        uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
+        std::memset(blk, 0, bb);
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t gi = b * 32 + j;
+            if (gi >= in.count) break;
+            write_code_to_fs_block(blk, j, dim, 4, cs,
+                                   codes.data() + static_cast<size_t>(gi) * cs);
+        }
+    }
     if (params_.has_ip_bias) {
-        std::memcpy(codes_out + static_cast<uint64_t>(in.count) * cs,
+        std::memcpy(codes_out + static_cast<uint64_t>(nb) * bb,
                     biases.data(),
                     static_cast<size_t>(in.count) * sizeof(float16_t));
     }
-    return lsc_codes_offset(in.summary_size, dim) +
-           static_cast<uint64_t>(in.count) * cs +
-           scalar_bias_bytes(in.count, params_.has_ip_bias);
+    return lsc_rowids_offset(in.summary_size, dim, in.count,
+                             params_.has_ip_bias);
 }
 
 // --- search ---
@@ -202,10 +212,13 @@ std::unique_ptr<ScanSetup> LocalScalarCoder::scan_setup(const float* query) {
     s->i8_mode = 0;
 #if defined(__ARM_FEATURE_DOTPROD)
     {
+        // Default: dual-LUT FastScan; per-thread override, then the
+        // env-resolved params default.
+        s->i8_mode = 2;
         const int ov = scan_detail::scan_i8_override();
         if (ov > 0) s->i8_mode = ov;
-        else if (ov < 0 && params_.scan_i8_mode > 0)
-            s->i8_mode = params_.scan_i8_mode;
+        else if (ov == 0) s->i8_mode = 0;
+        else if (params_.scan_i8_mode > 0) s->i8_mode = params_.scan_i8_mode;
     }
 #endif
     return s;
@@ -225,27 +238,12 @@ void LocalScalarCoder::bind_leaf(ScanSetup& setup, const uint8_t* leaf) const {
         s.c0 += query[d] * static_cast<float>(lo16[d]);
     }
     if (s.i8_mode) {
-        const uint32_t padded8 = (dim + 15) / 16 * 16;
-        if (s.a8.size() < padded8) s.a8.assign(padded8, 0);
-        if (s.i8_mode >= 2 && s.a8_lo.size() < padded8)
-            s.a8_lo.assign(padded8, 0);
-        float amax = 1e-12f;
-        for (uint32_t d = 0; d < dim; ++d)
-            amax = std::max(amax, std::fabs(s.a_uni[d]));
-        const float i8_scale = 127.0f / amax;
-        s.i8_inv = 1.0f / i8_scale;
-        for (uint32_t d = 0; d < dim; ++d) {
-            float q = s.a_uni[d] * i8_scale;
-            const int8_t hi = static_cast<int8_t>(q >= 0.f
-                ? (q + 0.5f >= 127.f ? 127.f : q + 0.5f)
-                : (q - 0.5f <= -127.f ? -127.f : q - 0.5f));
-            s.a8[d] = hi;
-            if (s.i8_mode >= 2) {
-                const float r = q - static_cast<float>(hi);
-                s.a8_lo[d] = static_cast<int8_t>(r >= 0.f
-                    ? r * 127.f + 0.5f : r * 127.f - 0.5f);
-            }
-        }
+        // Per-leaf LUT build (a_d depends on this leaf's step levels).
+        // Cost: ~2 x dim x 16 u8 writes + 2 passes over dim terms; tiny next
+        // to the dim x count table lookups it feeds.
+        if (!coders::scalar_build_lut(s.a_uni.data(), dim, nullptr,
+                                      s.i8_mode >= 2, s.lut))
+            s.i8_mode = 0;  // dim > 65535: u16 accum headroom gone
     }
 }
 
@@ -259,21 +257,25 @@ void LocalScalarCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
     ScalarScanCtx c;
     c.codes = leaf + lsc_codes_offset(lh->summary_size, params_.dim);
     c.count = count;
-    c.cs = code_size();
+    c.block_bytes = scalar_block_bytes(params_.dim);
     c.ip_bias = getenv("SEXTANT_NO_IP_BIAS")
         ? nullptr
         : (params_.metric == MetricKind::InnerProduct
                ? reinterpret_cast<const float16_t*>(
-                     c.codes + static_cast<uint64_t>(count) * c.cs)
+                     c.codes + static_cast<uint64_t>(scalar_n_blocks(count)) *
+                                   c.block_bytes)
                : nullptr);
     c.a_uni = s.a_uni.data();
     c.c0 = s.c0;
     c.query = s.query_copy.data();
     c.dim = params_.dim;
     c.i8_mode = s.i8_mode;
-    c.a8 = s.a8.data();
-    c.a8_lo = s.a8_lo.data();
-    c.i8_inv = s.i8_inv;
+    c.lut_hi = s.lut.hi.data();
+    c.lut_lo = s.lut.dual ? s.lut.lo.data() : nullptr;
+    c.lut_inv_ah = s.lut.inv_ah;
+    c.lut_inv_al = s.lut.inv_al;
+    c.lut_lo_off = s.lut.lo_off;
+    c.lut_b = s.lut.b;
     c.slm_arith = true;   // local levels are always arithmetic (uniform)
     c.slm_shaped = false;
     c.K = 16;
@@ -287,18 +289,21 @@ float LocalScalarCoder::rerank(const float* query, const uint8_t* leaf,
     const float16_t* lo16 = reinterpret_cast<const float16_t*>(
         leaf + lsc_levels_offset(lh->summary_size));
     const float16_t* st16 = lo16 + dim;
-    const uint8_t* code = leaf + lsc_codes_offset(lh->summary_size, dim) +
-        static_cast<uint64_t>(local_idx) * ((dim + 1) / 2);
+    const uint32_t bb = scalar_block_bytes(dim);
+    const uint64_t codes_off = lsc_codes_offset(lh->summary_size, dim);
+    std::vector<uint8_t> code_buf(code_size());
+    extract_code_from_leaf(leaf, local_idx, lh->summary_size, dim, 4, 32, bb,
+                           code_buf.data(), codes_off);
     // Per-vector IP bias, same correction as the scan.
     float16_t ls_bias = 1.f;
     if (params_.metric == MetricKind::InnerProduct && lh->count > 0) {
         const float16_t* biases = reinterpret_cast<const float16_t*>(
-            leaf + lsc_codes_offset(lh->summary_size, dim) +
-            static_cast<uint64_t>(lh->count) * ((dim + 1) / 2));
+            leaf + codes_off +
+            static_cast<uint64_t>(scalar_n_blocks(lh->count)) * bb);
         ls_bias = biases[local_idx];
     }
     std::vector<float> decoded(dim);
-    decode_one_with_levels(lo16, st16, code, dim, decoded.data());
+    decode_one_with_levels(lo16, st16, code_buf.data(), dim, decoded.data());
     // Fold the per-vector IP bias into the decoded vector so the generic dot
     // below carries the correction (IP only; bias == 1 otherwise).
     if (ls_bias != float16_t(1.f)) {
@@ -320,18 +325,24 @@ void LocalScalarCoder::decode_one(const uint8_t* leaf, uint32_t local_idx,
     const float16_t* lo16 = reinterpret_cast<const float16_t*>(
         leaf + lsc_levels_offset(lh->summary_size));
     const float16_t* st16 = lo16 + params_.dim;
-    const uint8_t* code = leaf +
-        lsc_codes_offset(lh->summary_size, params_.dim) +
-        static_cast<uint64_t>(local_idx) * code_size();
-    decode_one_with_levels(lo16, st16, code, params_.dim, out);
+    const uint32_t dim = params_.dim;
+    std::vector<uint8_t> code_buf(code_size());
+    extract_code_from_leaf(leaf, local_idx, lh->summary_size, dim, 4, 32,
+                           scalar_block_bytes(dim), code_buf.data(),
+                           lsc_codes_offset(lh->summary_size, dim));
+    decode_one_with_levels(lo16, st16, code_buf.data(), dim, out);
 }
 
 void LocalScalarCoder::extract_codes(const uint8_t* leaf, uint32_t count,
                                      uint8_t* codes) const {
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
-    std::memcpy(codes,
-                leaf + lsc_codes_offset(lh->summary_size, params_.dim),
-                static_cast<size_t>(count) * code_size());
+    const uint32_t dim = params_.dim;
+    const uint32_t cs = code_size();
+    for (uint32_t i = 0; i < count; ++i)
+        extract_code_from_leaf(leaf, i, lh->summary_size, dim, 4, 32,
+                               scalar_block_bytes(dim),
+                               codes + static_cast<size_t>(i) * cs,
+                               lsc_codes_offset(lh->summary_size, dim));
 }
 
 LeafCoder::SplitPlan LocalScalarCoder::plan_split(const uint8_t*,
@@ -352,21 +363,30 @@ void LocalScalarCoder::encode_group(const GroupEncodeInput& in,
     // Refit uniform levels per half, re-encode (the one re-fit point).
     std::vector<float16_t> lo(dim), st(dim);
     fit_local_scalar_levels(in.vecs, in.count, dim, lo.data(), st.data());
+    const uint32_t bb = scalar_block_bytes(dim);
+    const uint32_t nb = scalar_n_blocks(in.count);
     uint8_t* ncb = leaf_out + lsc_codes_offset(in.summary_size, dim);
-    for (uint32_t i = 0; i < in.count; ++i) {
-        encode_one(in.vecs + static_cast<size_t>(i) * dim, dim, lo.data(),
-                   st.data(), ncb + static_cast<uint64_t>(i) * cs, nullptr);
+    std::vector<uint8_t> code(cs, 0);
+    for (uint32_t b = 0; b < nb; ++b) {
+        uint8_t* blk = ncb + static_cast<uint64_t>(b) * bb;
+        std::memset(blk, 0, bb);
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t gi = b * 32 + j;
+            if (gi >= in.count) break;
+            encode_one(in.vecs + static_cast<size_t>(gi) * dim, dim, lo.data(),
+                       st.data(), code.data(), nullptr);
+            write_code_to_fs_block(blk, j, dim, 4, cs, code.data());
+        }
     }
     if (params_.has_ip_bias && in.src_biases) {
         float16_t* nbias = reinterpret_cast<float16_t*>(
-            ncb + static_cast<uint64_t>(in.count) * cs);
+            ncb + static_cast<uint64_t>(nb) * bb);
         std::memcpy(nbias, in.src_biases,
                     static_cast<size_t>(in.count) * sizeof(float16_t));
     }
     RowId* nrid = reinterpret_cast<RowId*>(
-        leaf_out + lsc_codes_offset(in.summary_size, dim) +
-        static_cast<uint64_t>(in.count) * cs +
-        scalar_bias_bytes(in.count, params_.has_ip_bias));
+        leaf_out + lsc_rowids_offset(in.summary_size, dim, in.count,
+                                     params_.has_ip_bias));
     std::memcpy(nrid, in.row_ids, static_cast<size_t>(in.count) * sizeof(RowId));
     auto* lh = reinterpret_cast<TreeLeafHeader*>(leaf_out);
     lh->leaf_state = static_cast<uint8_t>(LeafState::CodedLocalScalar);
@@ -389,22 +409,29 @@ void LocalScalarCoder::append_encode(const AppendInput& in) {
     const float16_t* lo16 = reinterpret_cast<const float16_t*>(
         in.old_leaf + lsc_levels_offset(olh->summary_size));
     const float16_t* st16 = lo16 + dim;
+    const uint32_t bb = scalar_block_bytes(dim);
+    const uint32_t old_nb = scalar_n_blocks(in.old_count);
     uint8_t* ncb = in.new_leaf + codes_off;
     std::memcpy(ncb, in.old_leaf + codes_off,
-                static_cast<size_t>(in.old_count) * cs);
+                static_cast<size_t>(old_nb) * bb);
     float16_t* nbias = nullptr;
     if (params_.has_ip_bias) {
+        const uint32_t nb = scalar_n_blocks(in.new_count);
         nbias = reinterpret_cast<float16_t*>(
-            ncb + static_cast<uint64_t>(in.new_count) * cs);
+            ncb + static_cast<uint64_t>(nb) * bb);
         std::memcpy(nbias,
                     in.old_leaf + codes_off +
-                        static_cast<uint64_t>(in.old_count) * cs,
+                        static_cast<uint64_t>(old_nb) * bb,
                     static_cast<size_t>(in.old_count) * sizeof(float16_t));
     }
-    for (uint32_t ai = 0; ai < in.n_vecs; ++ai)
-        encode_one(in.vecs[ai], dim, lo16, st16,
-                   ncb + static_cast<uint64_t>(in.old_count + ai) * cs,
-                   nbias ? &nbias[in.old_count + ai] : nullptr);
+    std::vector<uint8_t> code(cs, 0);
+    for (uint32_t ai = 0; ai < in.n_vecs; ++ai) {
+        const uint32_t gi = in.old_count + ai;
+        encode_one(in.vecs[ai], dim, lo16, st16, code.data(),
+                   nbias ? &nbias[gi] : nullptr);
+        write_code_to_fs_block(ncb + static_cast<uint64_t>(gi / 32) * bb,
+                               gi % 32, dim, 4, cs, code.data());
+    }
 }
 
 }  // namespace sextant::tree

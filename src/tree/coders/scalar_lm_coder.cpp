@@ -11,19 +11,19 @@
 
 namespace sextant::tree {
 
+using coders::extract_code_from_leaf;
 using coders::lloyd_split_f32;
 using coders::scalar_scan_leaf;
 using coders::ScalarScanCtx;
+using coders::write_code_to_fs_block;
 
 struct ScalarLmCoder::Setup : public ScanSetup {
-    // Per-query global-ruler transform (a_d = q_d·step_d, zero-padded to the
-    // 16-dim kernel width) + additive constant c0 = Σ q_d·lo_d.
+    // Per-query global-ruler transform (a_d = q_d·step_d) + additive constant
+    // c0 = Σ q_d·lo_d.
     std::vector<float> a_uni;
     float c0 = 0.f;
     std::vector<float> query_copy;
-    // i8 SDOT operands (mode 1/2).
-    std::vector<int8_t> a8, a8_lo;
-    float i8_inv = 0.f;
+    coders::ScalarLut lut;   // per-query FastScan LUT (dim x 16)
     int i8_mode = 0;
 };
 
@@ -43,11 +43,10 @@ std::string ScalarLmCoder::family_name() const {
 }
 
 LeafGeometry ScalarLmCoder::geometry(const TreeLeafHeader* h) const {
-    const uint32_t cs = quantizer_->code_size();
     LeafGeometry g;
     g.codes_offset = leaf_codes_offset(h->summary_size);
-    g.rowids_offset = scalar_rowids_offset(h->summary_size, h->count, cs,
-                                           params_.has_ip_bias);
+    g.rowids_offset = scalar_rowids_offset(h->summary_size, params_.dim,
+                                           h->count, params_.has_ip_bias);
     g.filter_offset =
         g.rowids_offset + static_cast<uint64_t>(h->count) * sizeof(RowId);
     g.extent_bytes = g.rowids_offset +
@@ -57,14 +56,15 @@ LeafGeometry ScalarLmCoder::geometry(const TreeLeafHeader* h) const {
 
 uint64_t ScalarLmCoder::extent_bytes(uint32_t count, uint32_t summary_size,
                                      uint64_t filter_cols_bytes) const {
-    // Flat packed-nibble layout: [header][summary][codes][ip_biases?]
-    // [row_ids][filters].
-    const uint64_t codes_bytes =
-        static_cast<uint64_t>(count) * quantizer_->code_size();
+    // FastScan block layout (m4 = dim): [header][summary][code blocks]
+    // [ip_biases?][row_ids][filters].
+    const uint64_t blocks_bytes =
+        static_cast<uint64_t>(scalar_n_blocks(count)) *
+        scalar_block_bytes(params_.dim);
     const uint64_t bias_bytes = scalar_bias_bytes(count, params_.has_ip_bias);
     const uint64_t rowids_bytes =
         static_cast<uint64_t>(count) * sizeof(RowId);
-    return leaf_codes_offset(summary_size) + codes_bytes + bias_bytes +
+    return leaf_codes_offset(summary_size) + blocks_bytes + bias_bytes +
            rowids_bytes + filter_cols_bytes;
 }
 
@@ -112,15 +112,29 @@ void ScalarLmCoder::encode(const float* vec, uint8_t* code_out,
 uint64_t ScalarLmCoder::flush_leaf(const LeafFlushInput& in,
                                    uint8_t* leaf_out) {
     const uint32_t cs = quantizer_->code_size();
+    const uint32_t dim = params_.dim;
+    const uint32_t bb = scalar_block_bytes(dim);
+    const uint32_t nb = scalar_n_blocks(in.count);
+    // Interleave the flat packed-nibble codes into FastScan blocks
+    // (m4 = dim, one nibble per dim).
     uint8_t* codes_out = leaf_out + leaf_codes_offset(in.summary_size);
-    std::memcpy(codes_out, in.codes,
-                static_cast<size_t>(in.count) * cs);
+    for (uint32_t b = 0; b < nb; ++b) {
+        uint8_t* blk = codes_out + static_cast<uint64_t>(b) * bb;
+        std::memset(blk, 0, bb);
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t gi = b * 32 + j;
+            if (gi >= in.count) break;
+            write_code_to_fs_block(blk, j, dim, 4, cs,
+                                   in.codes + static_cast<size_t>(gi) * cs);
+        }
+    }
     if (params_.has_ip_bias && in.ip_biases) {
-        std::memcpy(codes_out + static_cast<uint64_t>(in.count) * cs,
-                    in.ip_biases,
+        auto* nbias = reinterpret_cast<float16_t*>(
+            codes_out + static_cast<uint64_t>(nb) * bb);
+        std::memcpy(nbias, in.ip_biases,
                     static_cast<size_t>(in.count) * sizeof(float16_t));
     }
-    return scalar_rowids_offset(in.summary_size, in.count, cs,
+    return scalar_rowids_offset(in.summary_size, dim, in.count,
                                 params_.has_ip_bias);
 }
 
@@ -143,40 +157,28 @@ std::unique_ptr<ScanSetup> ScalarLmCoder::scan_setup(const float* query) {
             s->c0 += query[d] * levels0[d];
         }
     }
-    // i8 scan-kernel selection: thread-local override, else env-resolved
-    // default from CoderParams.scan_i8_mode.
+    // LUT scan-kernel selection: thread-local override, else env-resolved
+    // default from CoderParams.scan_i8_mode, else dual-LUT FastScan. The LUT
+    // captures the shape table directly (term = a_d·shape[n]), so shaped
+    // rulers use the same kernel as uniform ones.
     s->i8_mode = 0;
 #if defined(__ARM_FEATURE_DOTPROD)
-    if (slm_arith && !slm_shaped) {
+    if (slm_arith) {
+        s->i8_mode = 2;
         const int ov = scan_detail::scan_i8_override();
         if (ov > 0) s->i8_mode = ov;
-        else if (ov < 0 && params_.scan_i8_mode > 0)
-            s->i8_mode = params_.scan_i8_mode;
+        else if (ov == 0) s->i8_mode = 0;
+        else if (params_.scan_i8_mode > 0) s->i8_mode = params_.scan_i8_mode;
     }
 #endif
-    // i8 operand prep: a8[d] = clamp(round(a_d · s)), s = 127/amax.
+    // Per-query LUT build (a_d is query-only for scalar_lm; one LUT serves
+    // every leaf of the query).
     if (s->i8_mode) {
-        const uint32_t dim = params_.dim;
-        const uint32_t padded8 = (dim + 15) / 16 * 16;
-        s->a8.assign(padded8, 0);
-        if (s->i8_mode >= 2) s->a8_lo.assign(padded8, 0);
-        float amax = 1e-12f;
-        for (uint32_t d = 0; d < dim; ++d)
-            amax = std::max(amax, std::fabs(s->a_uni[d]));
-        const float i8_scale = 127.0f / amax;
-        s->i8_inv = 1.0f / i8_scale;
-        for (uint32_t d = 0; d < dim; ++d) {
-            float q = s->a_uni[d] * i8_scale;
-            const int8_t hi = static_cast<int8_t>(q >= 0.f
-                ? (q + 0.5f >= 127.f ? 127.f : q + 0.5f)
-                : (q - 0.5f <= -127.f ? -127.f : q - 0.5f));
-            s->a8[d] = hi;
-            if (s->i8_mode >= 2) {
-                const float r = q - static_cast<float>(hi);
-                s->a8_lo[d] = static_cast<int8_t>(r >= 0.f
-                    ? r * 127.f + 0.5f : r * 127.f - 0.5f);
-            }
-        }
+        if (!coders::scalar_build_lut(
+                s->a_uni.data(), dim,
+                slm_shaped ? quantizer_->shape() : nullptr,
+                s->i8_mode >= 2, s->lut))
+            s->i8_mode = 0;  // dim > 65535: u16 accum headroom gone
     }
     return s;
 }
@@ -193,21 +195,25 @@ void ScalarLmCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
     ScalarScanCtx c;
     c.codes = leaf + leaf_codes_offset(lh->summary_size);
     c.count = count;
-    c.cs = quantizer_->code_size();
+    c.block_bytes = scalar_block_bytes(params_.dim);
     c.ip_bias = getenv("SEXTANT_NO_IP_BIAS")
         ? nullptr
         : (params_.metric == MetricKind::InnerProduct
                ? reinterpret_cast<const float16_t*>(
-                     c.codes + static_cast<uint64_t>(count) * c.cs)
+                     c.codes + static_cast<uint64_t>(scalar_n_blocks(count)) *
+                                   c.block_bytes)
                : nullptr);
     c.a_uni = s.a_uni.data();
     c.c0 = s.c0;
     c.query = s.query_copy.data();
     c.dim = params_.dim;
     c.i8_mode = s.i8_mode;
-    c.a8 = s.a8.data();
-    c.a8_lo = s.a8_lo.data();
-    c.i8_inv = s.i8_inv;
+    c.lut_hi = s.lut.hi.data();
+    c.lut_lo = s.lut.dual ? s.lut.lo.data() : nullptr;
+    c.lut_inv_ah = s.lut.inv_ah;
+    c.lut_inv_al = s.lut.inv_al;
+    c.lut_lo_off = s.lut.lo_off;
+    c.lut_b = s.lut.b;
     c.slm_arith = quantizer_->arithmetic_scan();
     c.slm_shaped = c.slm_arith && !quantizer_->is_uniform();
     c.levels = quantizer_->levels();
@@ -220,9 +226,14 @@ void ScalarLmCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
 float ScalarLmCoder::rerank(const float* query, const uint8_t* leaf,
                             uint32_t local_idx, float* scratch_decoded) {
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
+    const uint16_t dim = params_.dim;
+    const uint64_t codes_off = leaf_codes_offset(lh->summary_size);
     const uint32_t slm_cs = quantizer_->code_size();
-    const uint8_t* code_ptr = leaf + leaf_codes_offset(lh->summary_size) +
-        static_cast<uint64_t>(local_idx) * slm_cs;
+    std::vector<uint8_t> code_buf(slm_cs);
+    extract_code_from_leaf(leaf, local_idx, lh->summary_size, dim, 4, 32,
+                           scalar_block_bytes(dim), code_buf.data(),
+                           codes_off);
+    const uint8_t* code_ptr = code_buf.data();
     if (params_.metric == MetricKind::InnerProduct) {
         // Dispatcher: SVE2 gather-dot on c4a, NEON decode-dot elsewhere.
         float dot = simd::scalar_dot_u4_sve2(
@@ -231,8 +242,9 @@ float ScalarLmCoder::rerank(const float* query, const uint8_t* leaf,
         // Apply the leaf's per-vector IP bias (same correction as the scan).
         if (lh->count > 0) {
             const float16_t* bias = reinterpret_cast<const float16_t*>(
-                leaf + leaf_codes_offset(lh->summary_size) +
-                static_cast<uint64_t>(lh->count) * slm_cs);
+                leaf + codes_off +
+                static_cast<uint64_t>(scalar_n_blocks(lh->count)) *
+                    scalar_block_bytes(dim));
             dot *= static_cast<float>(bias[local_idx]);
         }
         return -dot;
@@ -247,17 +259,22 @@ float ScalarLmCoder::rerank(const float* query, const uint8_t* leaf,
 void ScalarLmCoder::decode_one(const uint8_t* leaf, uint32_t local_idx,
                                float* out) const {
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
-    quantizer_->decode(
-        leaf + leaf_codes_offset(lh->summary_size) +
-            static_cast<uint64_t>(local_idx) * quantizer_->code_size(),
-        out);
+    const uint16_t dim = params_.dim;
+    std::vector<uint8_t> code_buf(quantizer_->code_size());
+    extract_code_from_leaf(leaf, local_idx, lh->summary_size, dim, 4, 32,
+                           scalar_block_bytes(dim), code_buf.data());
+    quantizer_->decode(code_buf.data(), out);
 }
 
 void ScalarLmCoder::extract_codes(const uint8_t* leaf, uint32_t count,
                                   uint8_t* codes) const {
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
-    std::memcpy(codes, leaf + leaf_codes_offset(lh->summary_size),
-                static_cast<size_t>(count) * quantizer_->code_size());
+    const uint16_t dim = params_.dim;
+    const uint32_t cs = quantizer_->code_size();
+    for (uint32_t i = 0; i < count; ++i)
+        extract_code_from_leaf(leaf, i, lh->summary_size, dim, 4, 32,
+                               scalar_block_bytes(dim),
+                               codes + static_cast<size_t>(i) * cs);
 }
 
 LeafCoder::SplitPlan ScalarLmCoder::plan_split(const uint8_t*,
@@ -273,44 +290,65 @@ LeafCoder::SplitPlan ScalarLmCoder::plan_split(const uint8_t*,
 
 void ScalarLmCoder::encode_group(const GroupEncodeInput& in,
                                  uint8_t* leaf_out) {
-    // Flat packed-nibble layout: codes, then IP biases (InnerProduct only),
-    // then row_ids. No blocks.
+    // FastScan block layout: codes, then IP biases (InnerProduct only),
+    // then row_ids.
+    const uint16_t dim = params_.dim;
     const uint32_t cs = quantizer_->code_size();
+    const uint32_t bb = scalar_block_bytes(dim);
+    const uint32_t nb = scalar_n_blocks(in.count);
     uint8_t* ncb = leaf_out + leaf_codes_offset(in.summary_size);
-    std::memcpy(ncb, in.src_codes, static_cast<size_t>(in.count) * cs);
+    for (uint32_t b = 0; b < nb; ++b) {
+        uint8_t* blk = ncb + static_cast<uint64_t>(b) * bb;
+        std::memset(blk, 0, bb);
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t gi = b * 32 + j;
+            if (gi >= in.count) break;
+            write_code_to_fs_block(blk, j, dim, 4, cs,
+                                   in.src_codes + static_cast<size_t>(gi) * cs);
+        }
+    }
     if (params_.has_ip_bias && in.src_biases) {
-        float16_t* nbias = reinterpret_cast<float16_t*>(
-            ncb + static_cast<uint64_t>(in.count) * cs);
+        auto* nbias = reinterpret_cast<float16_t*>(
+            ncb + static_cast<uint64_t>(nb) * bb);
         std::memcpy(nbias, in.src_biases,
                     static_cast<size_t>(in.count) * sizeof(float16_t));
     }
     RowId* nrid = reinterpret_cast<RowId*>(
-        leaf_out + scalar_rowids_offset(in.summary_size, in.count, cs,
+        leaf_out + scalar_rowids_offset(in.summary_size, dim, in.count,
                                         params_.has_ip_bias));
     std::memcpy(nrid, in.row_ids, static_cast<size_t>(in.count) * sizeof(RowId));
 }
 
 void ScalarLmCoder::append_encode(const AppendInput& in) {
     const auto* olh = reinterpret_cast<const TreeLeafHeader*>(in.old_leaf);
+    const uint16_t dim = params_.dim;
     const uint32_t cs = quantizer_->code_size();
-    uint8_t* ncb = in.new_leaf + leaf_codes_offset(olh->summary_size);
-    std::memcpy(ncb, in.old_leaf + leaf_codes_offset(olh->summary_size),
-                static_cast<size_t>(in.old_count) * cs);
+    const uint32_t bb = scalar_block_bytes(dim);
+    const uint32_t old_nb = scalar_n_blocks(in.old_count);
+    const uint64_t codes_off = leaf_codes_offset(olh->summary_size);
+    uint8_t* ncb = in.new_leaf + codes_off;
+    // Copy the old blocks wholesale (tail lanes stay zero / get re-written).
+    std::memcpy(ncb, in.old_leaf + codes_off,
+                static_cast<size_t>(old_nb) * bb);
     float16_t* nbias = nullptr;
     if (params_.has_ip_bias) {
+        const uint32_t nb = scalar_n_blocks(in.new_count);
         nbias = reinterpret_cast<float16_t*>(
-            ncb + static_cast<uint64_t>(in.new_count) * cs);
+            ncb + static_cast<uint64_t>(nb) * bb);
         std::memcpy(nbias,
-                    in.old_leaf + leaf_codes_offset(olh->summary_size) +
-                        static_cast<uint64_t>(in.old_count) * cs,
+                    in.old_leaf + codes_off +
+                        static_cast<uint64_t>(old_nb) * bb,
                     static_cast<size_t>(in.old_count) * sizeof(float16_t));
     }
     std::vector<float> dec(params_.has_ip_bias ? params_.dim : 0);
+    std::vector<uint8_t> code(cs, 0);
     for (uint32_t ai = 0; ai < in.n_vecs; ++ai) {
-        uint8_t* dst = ncb + static_cast<uint64_t>(in.old_count + ai) * cs;
-        quantizer_->encode(in.vecs[ai], dst);
+        const uint32_t gi = in.old_count + ai;
+        quantizer_->encode(in.vecs[ai], code.data());
+        write_code_to_fs_block(ncb + static_cast<uint64_t>(gi / 32) * bb,
+                               gi % 32, dim, 4, cs, code.data());
         if (params_.has_ip_bias) {
-            quantizer_->decode(dst, dec.data());
+            quantizer_->decode(code.data(), dec.data());
             const float* xv = in.vecs[ai];
             double sx = 0, sxh = 0;
             for (uint16_t d = 0; d < params_.dim; ++d) {

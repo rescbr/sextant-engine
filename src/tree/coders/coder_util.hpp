@@ -186,29 +186,42 @@ inline void lloyd_split_f32(const float* vecs, uint32_t count, uint16_t dim,
 }  // namespace sextant::tree::coders
 
 // ===========================================================================
-// Scalar flat-nibble scan kernel (shared by scalar_lm / local_scalar).
-// Moved verbatim from ivf_tree_index.cpp's scan_one_leaf; the family state
-// that used to live in captured locals rides on ScalarScanCtx.
+// Scalar block-scan kernels (scalar_lm / local_scalar).
+//
+// Layout: FastScan PQ4 blocks with m4 = dim (one 4-bit nibble per dim),
+// 32 vectors per block, block layout [dim][16]: byte (d*16 + j%16) holds
+// dim-d nibbles of vectors j<16 (lo nibble) and j>=16 (hi nibble). One
+// vld1q_u8 per (block, dim) feeds 32 vectors — 16x fewer nibble-unpack
+// operations than the old 4-vector-at-a-time flat kernels.
+//
+// The kernels are separate functions ON PURPOSE (same reason as commit 1):
+// one body holding all modes blew up register pressure.
 // ===========================================================================
 
 namespace sextant::tree::coders {
 
 struct ScalarScanCtx {
     // Leaf state
-    const uint8_t* codes = nullptr;   // flat code rows
+    const uint8_t* codes = nullptr;   // FastScan block base (dim*16 B/block)
     uint32_t count = 0;
-    uint32_t cs = 0;                  // bytes per code row
+    uint32_t block_bytes = 0;         // dim * 16
     const float16_t* ip_bias = nullptr;  // count entries or null
-    // Query transform (arith kernels)
-    const float* a_uni = nullptr;     // padded to 16 dims
+    // Query transform (arith / i8 kernels)
+    const float* a_uni = nullptr;     // dim entries (kernels loop d < dim)
     float c0 = 0.f;
     const float* query = nullptr;     // raw query (LM gather kernel)
     uint16_t dim = 0;
-    // Kernel selection
+    // Kernel selection. i8_mode > 0 selects the LUT FastScan kernel
+    // (1 = single LUT, 2 = dual hi/lo LUT); mode 0 = block-arith f32.
     int i8_mode = 0;                  // 0/1/2
-    const int8_t* a8 = nullptr;       // i8 operands (mode >= 1 / 2)
-    const int8_t* a8_lo = nullptr;
-    float i8_inv = 0.f;
+    // LUT FastScan operands (mode >= 1). lut rows are [dim][16], the exact
+    // layout simd::pq4_block32 consumes (m4 = dim, one 4-bit code per dim).
+    const uint8_t* lut_hi = nullptr;  // dim*16 bytes
+    const uint8_t* lut_lo = nullptr;  // dim*16 bytes (mode 2 only)
+    float lut_inv_ah = 0.f;           // dots = acc_hi*inv_ah
+    float lut_inv_al = 0.f;           //     + (acc_lo - lut_lo_off)*inv_al
+    float lut_lo_off = 0.f;           //     + lut_b
+    float lut_b = 0.f;
     bool slm_arith = true;
     bool slm_shaped = false;
     // Lloyd-Max gather kernel inputs
@@ -219,297 +232,376 @@ struct ScalarScanCtx {
     const float* shape_f32 = nullptr;   // scalar fallback
 };
 
-/// Scan one scalar leaf into `heap` (bounded top-W max-heap). The zero
-/// code row used by tail batches is a thread-local scratch (per-worker, so
-/// parallel leaf scans never share mutable state).
-///
-/// The three kernels are separate functions ON PURPOSE: one body holding
-/// all three blew up register pressure (accumulator spills around the
-/// fmla/zip loop cost ~20% on the arith path).
 namespace detail {
 
-struct ScalarRowPtrs {
-    const uint8_t* cp[4];
-    uint32_t nv = 0;
-};
-
-inline ScalarRowPtrs scalar_rows(const ScalarScanCtx& c, uint32_t i,
-                                 const uint8_t* pad_row) {
-    ScalarRowPtrs r;
-    r.nv = std::min(4u, c.count - i);
-    for (uint32_t v = 0; v < r.nv; ++v)
-        r.cp[v] = c.codes + (uint64_t)(i + v) * c.cs;
-    for (uint32_t v = r.nv; v < 4; ++v) r.cp[v] = pad_row;
-    return r;
-}
-
-inline void scalar_heap_push4(RawScanHeap& heap, const ScalarScanCtx& c,
-                              const uint32_t i, const uint32_t nv,
-                              const float* dots) {
-    // Heap push — real vectors only (padding never enters).
-    for (uint32_t v = 0; v < nv; ++v) {
-        const float score = dots[v] + c.c0;
-        float dist = c.ip_bias
-            ? -(score * static_cast<float>(c.ip_bias[i + v]))
+/// Heap-push one block's 32 scores. Padding lanes beyond `count` never
+/// enter the heap (their code nibbles are zero, but they are simply not
+/// pushed).
+inline void scalar_block_heap_push(RawScanHeap& heap, const ScalarScanCtx& c,
+                                   uint32_t base, const float* dots) {
+    const uint32_t nv = std::min(32u, c.count - base);
+    for (uint32_t j = 0; j < nv; ++j) {
+        const float score = dots[j] + c.c0;
+        const float dist = c.ip_bias
+            ? -(score * static_cast<float>(c.ip_bias[base + j]))
             : -score;
         const uint32_t pq_dist = f32_to_dist_key(dist);
-        if (!heap_full(heap)) {
-            heap_push(heap, pq_dist, i + v);
-        } else if (pq_dist < heap_front(heap)) {
-            heap_replace_top(heap, pq_dist, i + v);
-        }
+        if (!heap_full(heap)) heap_push(heap, pq_dist, base + j);
+        else if (pq_dist < heap_front(heap))
+            heap_replace_top(heap, pq_dist, base + j);
     }
 }
 
 }  // namespace detail
 
-inline void scalar_scan_i8(const ScalarScanCtx& c, RawScanHeap& heap) {
-    const uint32_t dim = c.dim;
-    const uint32_t cs = c.cs;
-    static thread_local std::vector<uint8_t> pad_row_buf;
-    if (pad_row_buf.size() < cs) pad_row_buf.assign(cs, 0);
-    const uint8_t* pad_row = pad_row_buf.data();
-#if defined(__ARM_FEATURE_DOTPROD)
-    const uint32_t padded = (dim + 15) / 16 * 16;
-    const bool fully_padded_i8 = padded / 2 <= cs;
-    const uint32_t d16i = fully_padded_i8 ? padded : dim / 16 * 16;
-    const int8_t* a8p = c.a8;
-    const int8_t* a8lop = c.i8_mode >= 2 ? c.a8_lo : nullptr;
-    const float lo_w = a8lop ? (1.0f / 127.0f) : 0.f;
-    for (uint32_t i = 0; i < c.count; i += 4) {
-        const auto r = detail::scalar_rows(c, i, pad_row);
-        float dots[4] = {0, 0, 0, 0};
-        int32x4_t acc8[4];
-        int32x4_t acc8lo[4];
-        for (auto& x : acc8) x = vdupq_n_s32(0);
-        if (a8lop) for (auto& x : acc8lo) x = vdupq_n_s32(0);
-        for (uint32_t d = 0; d < d16i; d += 16) {
-            const int8x16_t a8v = vld1q_s8(a8p + d);
-            const int8x16_t a8lov = a8lop ? vld1q_s8(a8lop + d) : a8v;
-            for (uint32_t v = 0; v < 4; ++v) {
-                const uint8x8_t b = vld1_u8(r.cp[v] + d / 2);
-                const uint8x8_t lo = vand_u8(b, vdup_n_u8(0x0F));
-                const uint8x8_t hi = vshr_n_u8(b, 4);
-                const uint8x8x2_t z = vzip_u8(lo, hi);
-                const int8x16_t c8 = vreinterpretq_s8_u8(
-                    vcombine_u8(z.val[0], z.val[1]));
-                acc8[v] = vdotq_s32(acc8[v], a8v, c8);
-                if (a8lop)
-                    acc8lo[v] = vdotq_s32(acc8lo[v], a8lov, c8);
-            }
-        }
-        for (uint32_t v = 0; v < 4; ++v)
-            dots[v] = (static_cast<float>(vaddvq_s32(acc8[v]))
-                       + lo_w * static_cast<float>(vaddvq_s32(acc8lo[v])))
-                      * c.i8_inv;
-        if (!fully_padded_i8) {
-            for (uint32_t d = d16i; d < dim; ++d) {
-                const float a8d = static_cast<float>(c.a8[d])
-                    + (a8lop ? static_cast<float>(c.a8_lo[d]) / 127.0f : 0.f);
-                for (uint32_t v = 0; v < 4; ++v) {
-                    const uint8_t byte = r.cp[v][d / 2];
-                    const uint8_t nib = (d % 2 == 0)
-                        ? (byte & 0xF) : ((byte >> 4) & 0xF);
-                    dots[v] += a8d * nib * c.i8_inv;
-                }
-            }
-        }
-        detail::scalar_heap_push4(heap, c, i, r.nv, dots);
-    }
-#else
-    (void)heap;
-#endif
-}
+// ===========================================================================
+// LUT FastScan scan (the codebase's proven pattern).
+//
+// The scalar block layout (m4 = dim, one 4-bit nibble per dim) is
+// structurally identical to a PQ4 FastScan layout with dim subquantizers,
+// so the scan is a per-(query|leaf) dim x 16 byte LUT + simd::pq4_block32:
+//
+//   term(d,n) = a_d * f(n)      a_d = q_d*step_d, f = nibble value
+//                               (identity, or the LM shape table)
+//   LUT_hi[d][n] = round((term - min_d(term)) * A_h),  A_h = E / T
+//   resid        = (term - min_d) - LUT_hi/A_h,       |resid| <= 0.5/A_h
+//   LUT_lo[d][n] = round(resid * A_l) + E/2,           A_l = E * A_h
+//   dots = acc_hi/A_h + (acc_lo - dim*E/2)/A_l + sum_d(min_d)
+//
+// E = 65535/dim caps each LUT entry so pq4_block32's internal u16
+// accumulators (per-lane max = dim * E) cannot overflow at any dim. The
+// +E/2 offset keeps lo entries unsigned; it is subtracted once per vector.
+// The per-dim min sum (lut_b) is NOT droppable: the per-vector ip_bias
+// multiplies the score, so a constant offset shifts IPs with unequal bias.
+//
+// Dual (mode 2) leaves ~0.5/A_l per-dim rounding noise (~0.4*T worst-case
+// over dim=1536 dims); single (mode 1) leaves ~0.5/A_h (~18*T worst-case) —
+// the hi/lo split mirrors the flat dual-SDOT decomposition.
+// ===========================================================================
 
-inline void scalar_scan_arith(const ScalarScanCtx& c, RawScanHeap& heap) {
-    const uint32_t dim = c.dim;
-    const uint32_t cs = c.cs;
-    static thread_local std::vector<uint8_t> pad_row_buf;
-    if (pad_row_buf.size() < cs) pad_row_buf.assign(cs, 0);
-    const uint8_t* pad_row = pad_row_buf.data();
-    std::vector<HeapEntry>& h = *heap.h;
-    const uint32_t W = heap.w;
-    const uint32_t leaf_slot = heap.leaf_slot;
-    const float* a_uni = c.a_uni;
-    const float16_t* ip_bias = c.ip_bias;
-    const float c0 = c.c0;
-    const uint32_t count = c.count;
-    const uint8_t* codes = c.codes;
+struct ScalarLut {
+    std::vector<uint8_t> hi, lo;  // dim*16 each (lo empty unless dual)
+    float inv_ah = 0.f;
+    float inv_al = 0.f;
+    float lo_off = 0.f;  // dim * (E/2), subtracted from the lo accumulator
+    float b = 0.f;       // sum of per-dim minima (added back exactly)
+    bool dual = false;
+};
+
+
+/// SIMD LUT builder (NEON). Validated against the scalar reference
+/// (deleted afterwards): hi tables BIT-IDENTICAL (same op order — mul+add,
+/// never fused FMA, floor(x+0.5) via vrndm — and the same constants); lo
+/// entries may flip by ±1 when the residual lands exactly on a rounding
+/// boundary (a compiler-contraction last-bit difference; one lo unit is
+/// 1/(E·A_h) of a hi unit, i.e. score noise 3 orders below hi resolution);
+/// b may differ by 1 ulp (lane-tree summation order — runtime-only
+/// constant, never persisted). `a` must be zero-padded to a multiple of 4
+/// (both coders already pad a_uni to the 16-dim kernel width); padding
+/// lanes contribute mn = span = 0 and are inert. Full batches only —
+/// no scalar tail.
+inline bool scalar_build_lut(const float* a, uint32_t dim, const float* shape,
+                             bool dual, ScalarLut& out) {
+    if (dim == 0 || dim > 65535) return false;
+    const uint32_t E = std::min(255u, 65535u / dim);
+    const float half = static_cast<float>(E) * 0.5f;
+    out.hi.assign(static_cast<size_t>(dim) * 16, 0);
+    out.dual = dual;
+    if (dual) out.lo.assign(static_cast<size_t>(dim) * 16, 0);
+
+    // Shape extrema (closed form): per-dim min/max term = a_d·s_min/s_max
+    // for a_d >= 0, swapped for a_d < 0. Null shape = identity f(n) = n.
+    float s_min = 0.f, s_max = 15.f;
+    if (shape) {
+        s_min = shape[0];
+        s_max = shape[0];
+        for (uint32_t n = 1; n < 16; ++n) {
+            s_min = std::min(s_min, shape[n]);
+            s_max = std::max(s_max, shape[n]);
+        }
+    }
+    [[maybe_unused]] const float span_k = s_max - s_min;
+
 #if defined(__aarch64__)
-    const uint8x16_t f_tbl = c.slm_shaped
-        ? vld1q_u8(c.shape_u8) : vdupq_n_u8(0);
-    const uint32_t padded = (dim + 15) / 16 * 16;
-    const bool fully_padded = padded / 2 <= cs;
-    const uint32_t d16 = fully_padded ? padded : dim / 16 * 16;
-    for (uint32_t i = 0; i < count; i += 4) {
-        const uint32_t nv = std::min(4u, count - i);
-        const uint8_t* cp[4];
-        for (uint32_t v = 0; v < nv; ++v)
-            cp[v] = codes + (uint64_t)(i + v) * cs;
-        for (uint32_t v = nv; v < 4; ++v) cp[v] = pad_row;
+    // ---- Pass 1 (batches of 4 dims; padded lanes are inert):
+    // B = sum of per-dim minima, T = max per-dim span.
+    float T = 0.f, B = 0.f;
+    {
+        const uint32_t pd = (dim + 3) & ~3u;
+        float32x4_t acc_b = vdupq_n_f32(0.f);
+        float32x4_t acc_t = vdupq_n_f32(0.f);
+        for (uint32_t d = 0; d < pd; d += 4) {
+            const float32x4_t ad = vld1q_f32(a + d);
+            const float32x4_t lo_t = vmulq_n_f32(ad, s_min);
+            const float32x4_t hi_t = vmulq_n_f32(ad, s_max);
+            const float32x4_t mn = vbslq_f32(vcltzq_f32(ad), hi_t, lo_t);
+            // span computed as (ad*s_max) - (ad*s_min) with the sign
+            // folded into the subtract order — same two products and one
+            // subtract as the reference, so T (and thus A_h) matches
+            // bit-for-bit; the closed form |ad|*(s_max-s_min) differs by
+            // 1 ulp and shifted every downstream constant.
+            const float32x4_t span = vabsq_f32(
+                vsubq_f32(vmulq_n_f32(ad, s_min), vmulq_n_f32(ad, s_max)));
+            acc_b = vaddq_f32(acc_b, mn);
+            acc_t = vmaxq_f32(acc_t, span);
+        }
+        B = vaddvq_f32(acc_b);
+        T = vmaxvq_f32(acc_t);
+    }
+    out.b = B;
+    if (T <= 0.f) {
+        out.inv_ah = out.inv_al = 0.f;
+        out.lo_off = 0.f;
+        return true;
+    }
+    const float A_h = static_cast<float>(E) / T;
+    const float inv_ah_h = 1.0f / A_h;
+    const float A_l = static_cast<float>(E) * A_h;
+    out.inv_ah = 1.0f / A_h;
+    out.inv_al = dual ? 1.0f / A_l : 0.f;
+    out.lo_off = dual ? static_cast<float>(dim) * half : 0.f;
 
-        float dots[4] = {0, 0, 0, 0};
-        // Arithmetic decode: dot += (q·step)·f[code] — no gather.
-        // NEON: 4 vectors × 16 dims per iteration. 8 code bytes unpack
-        // to 16 dim-ordered nibbles (vzip lo/hi); for the shared-shape
-        // quantizer they index the 16-byte f table via one TBL, then
-        // widen to f32 and FMLA against a_uni.
-        float32x4_t acc[4][4];
-        for (auto& row : acc)
-            for (auto& x : row) x = vdupq_n_f32(0);
-        for (uint32_t d = 0; d < d16; d += 16) {
-            const float32x4_t a0 = vld1q_f32(&a_uni[d]);
-            const float32x4_t a1 = vld1q_f32(&a_uni[d + 4]);
-            const float32x4_t a2 = vld1q_f32(&a_uni[d + 8]);
-            const float32x4_t a3 = vld1q_f32(&a_uni[d + 12]);
-            for (uint32_t v = 0; v < 4; ++v) {
-                const uint8x8_t b = vld1_u8(cp[v] + d / 2);
-                const uint8x8_t lo = vand_u8(b, vdup_n_u8(0x0F));
-                const uint8x8_t hi = vshr_n_u8(b, 4);
-                const uint8x8x2_t z = vzip_u8(lo, hi);
-                if (c.slm_shaped) {
-                    const uint8x16_t fv = vqtbl1q_u8(
-                        f_tbl, vcombine_u8(z.val[0], z.val[1]));
-                    const uint16x8_t w0 = vmovl_u8(vget_low_u8(fv));
-                    const uint16x8_t w1 = vmovl_u8(vget_high_u8(fv));
-                    acc[v][0] = vfmaq_f32(acc[v][0], a0,
-                        vcvtq_f32_u32(vmovl_u16(vget_low_u16(w0))));
-                    acc[v][1] = vfmaq_f32(acc[v][1], a1,
-                        vcvtq_f32_u32(vmovl_u16(vget_high_u16(w0))));
-                    acc[v][2] = vfmaq_f32(acc[v][2], a2,
-                        vcvtq_f32_u32(vmovl_u16(vget_low_u16(w1))));
-                    acc[v][3] = vfmaq_f32(acc[v][3], a3,
-                        vcvtq_f32_u32(vmovl_u16(vget_high_u16(w1))));
-                } else {
-                    const uint16x8_t w0 = vmovl_u8(z.val[0]);
-                    const uint16x8_t w1 = vmovl_u8(z.val[1]);
-                    acc[v][0] = vfmaq_f32(acc[v][0], a0,
-                        vcvtq_f32_u32(vmovl_u16(vget_low_u16(w0))));
-                    acc[v][1] = vfmaq_f32(acc[v][1], a1,
-                        vcvtq_f32_u32(vmovl_u16(vget_high_u16(w0))));
-                    acc[v][2] = vfmaq_f32(acc[v][2], a2,
-                        vcvtq_f32_u32(vmovl_u16(vget_low_u16(w1))));
-                    acc[v][3] = vfmaq_f32(acc[v][3], a3,
-                        vcvtq_f32_u32(vmovl_u16(vget_high_u16(w1))));
+    // ---- Pass 2: 16 entries per dim — four f32x4 quadrants per row,
+    // narrowed to one u8x16 store per (row, LUT).
+    {
+        const float32x4_t vAh = vdupq_n_f32(A_h);
+        const float32x4_t vHlf = vdupq_n_f32(half);
+        const float32x4_t vC05 = vdupq_n_f32(0.5f);
+        const float32x4_t vInvAh = vdupq_n_f32(inv_ah_h);
+        const float32x4_t vAl = vdupq_n_f32(A_l);
+        alignas(16) static const float nid[16] = {0,1,2,3,4,5,6,7,
+                                                  8,9,10,11,12,13,14,15};
+        for (uint32_t d = 0; d < dim; ++d) {
+            const float ad = a[d];
+            const float mn = ad < 0.f ? ad * s_max : ad * s_min;
+            uint8_t* hrow = out.hi.data() + static_cast<size_t>(d) * 16;
+            uint8_t* lrow = dual ? out.lo.data() + static_cast<size_t>(d) * 16
+                                 : nullptr;
+            const float32x4_t vAd = vdupq_n_f32(ad);
+            const float32x4_t vMn = vdupq_n_f32(mn);
+            int32x4_t hq[4];
+            int32x4_t lq[4];
+            for (uint32_t g = 0; g < 4; ++g) {
+                const float32x4_t nf = shape
+                    ? vld1q_f32(shape + g * 4)
+                    : vld1q_f32(nid + g * 4);
+                // v = ad*f(n) - mn ; h = floor(v*Ah + 0.5)
+                const float32x4_t v = vsubq_f32(vmulq_f32(vAd, nf), vMn);
+                const float32x4_t hf = vrndmq_f32(
+                    vaddq_f32(vmulq_f32(v, vAh), vC05));
+                hq[g] = vcvtq_s32_f32(hf);
+                if (dual) {
+                    // l = floor((v - h*invAh)*Al + half + 0.5)
+                    const float32x4_t r0 = vsubq_f32(v,
+                        vmulq_f32(hf, vInvAh));
+                    const float32x4_t r2 = vaddq_f32(vaddq_f32(
+                        vmulq_f32(r0, vAl), vHlf), vC05);
+                    lq[g] = vcvtq_s32_f32(vrndmq_f32(r2));
+
                 }
             }
-        }
-        for (uint32_t v = 0; v < 4; ++v) {
-            dots[v] = vaddvq_f32(acc[v][0]) + vaddvq_f32(acc[v][1]) +
-                      vaddvq_f32(acc[v][2]) + vaddvq_f32(acc[v][3]);
-        }
-        if (!fully_padded) {
-            const float* ftbl = c.shape_f32;
-            for (uint32_t d = d16; d < dim; ++d) {
-                for (uint32_t v = 0; v < 4; ++v) {
-                    const uint8_t byte = cp[v][d / 2];
-                    const uint8_t nib =
-                        (d % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
-                    dots[v] += a_uni[d] *
-                        (c.slm_shaped ? ftbl[nib] : float(nib));
-                }
-            }
-        }
-        // Heap push — real vectors only (padding never enters).
-        for (uint32_t v = 0; v < nv; ++v) {
-            const float score = dots[v] + c0;
-            float dist = ip_bias
-                ? -(score * static_cast<float>(ip_bias[i + v]))
-                : -score;
-            uint32_t dist_bits;
-            std::memcpy(&dist_bits, &dist, sizeof(dist_bits));
-            uint32_t pq_dist = (dist_bits & 0x80000000u)
-                ? ~dist_bits : (dist_bits | 0x80000000u);
-            if (h.size() < W) {
-                h.push_back({pq_dist, leaf_slot, i + v});
-                if (h.size() == W)
-                    std::make_heap(h.begin(), h.end(), heap_entry_less);
-            } else if (pq_dist < h[0].pq_dist) {
-                heap_replace(h, pq_dist, leaf_slot, i + v);
+            const uint16x8_t h01 = vcombine_u16(vqmovun_s32(hq[0]),
+                                                vqmovun_s32(hq[1]));
+            const uint16x8_t h23 = vcombine_u16(vqmovun_s32(hq[2]),
+                                                vqmovun_s32(hq[3]));
+            vst1q_u8(hrow, vcombine_u8(vqmovn_u16(h01),
+                                       vqmovn_u16(h23)));
+            if (dual) {
+                const uint16x8_t l01 = vcombine_u16(vqmovun_s32(lq[0]),
+                                                    vqmovun_s32(lq[1]));
+                const uint16x8_t l23 = vcombine_u16(vqmovun_s32(lq[2]),
+                                                    vqmovun_s32(lq[3]));
+                vst1q_u8(lrow, vcombine_u8(vqmovn_u16(l01),
+                                           vqmovn_u16(l23)));
             }
         }
     }
+    return true;
 #else
-    const uint32_t d4 = dim / 4 * 4;
-    for (uint32_t i = 0; i < count; i += 4) {
-        const uint32_t nv = std::min(4u, count - i);
-        const uint8_t* cp[4];
-        for (uint32_t v = 0; v < nv; ++v)
-            cp[v] = codes + (uint64_t)(i + v) * cs;
-        for (uint32_t v = nv; v < 4; ++v) cp[v] = pad_row;
-        float dots[4] = {0, 0, 0, 0};
-        for (uint32_t d = 0; d < d4; d += 4) {
-            const float a4[4] = {a_uni[d], a_uni[d + 1],
-                                 a_uni[d + 2], a_uni[d + 3]};
-            const float* ftbl = c.shape_f32;
-            for (uint32_t v = 0; v < nv; ++v) {
-                const uint8_t b0 = cp[v][d / 2], b1 = cp[v][d / 2 + 1];
-                if (c.slm_shaped) {
-                    dots[v] += a4[0] * ftbl[b0 & 0xF]
-                             + a4[1] * ftbl[(b0 >> 4) & 0xF]
-                             + a4[2] * ftbl[b1 & 0xF]
-                             + a4[3] * ftbl[(b1 >> 4) & 0xF];
-                } else {
-                    dots[v] += a4[0] * (b0 & 0xF)
-                             + a4[1] * ((b0 >> 4) & 0xF)
-                             + a4[2] * (b1 & 0xF)
-                             + a4[3] * ((b1 >> 4) & 0xF);
-                }
+    // Portable fallback for non-NEON builds (same algorithm).
+    float T = 0.f, B = 0.f;
+    for (uint32_t d = 0; d < dim; ++d) {
+        const float ad = a[d];
+        const float mn = ad < 0.f ? ad * s_max : ad * s_min;
+        B += mn;
+        const float span = std::fabs(ad) * span_k;
+        if (span > T) T = span;
+    }
+    out.b = B;
+    if (T <= 0.f) {
+        out.inv_ah = out.inv_al = 0.f;
+        out.lo_off = 0.f;
+        return true;
+    }
+    const float A_h = static_cast<float>(E) / T;
+    const float A_l = static_cast<float>(E) * A_h;
+    out.inv_ah = 1.0f / A_h;
+    out.inv_al = dual ? 1.0f / A_l : 0.f;
+    out.lo_off = dual ? static_cast<float>(dim) * half : 0.f;
+    for (uint32_t d = 0; d < dim; ++d) {
+        const float ad = a[d];
+        const float mn = ad < 0.f ? ad * s_max : ad * s_min;
+        uint8_t* hrow = out.hi.data() + static_cast<size_t>(d) * 16;
+        uint8_t* lrow = dual ? out.lo.data() + static_cast<size_t>(d) * 16
+                             : nullptr;
+        for (uint32_t n = 0; n < 16; ++n) {
+            const float t = ad * (shape ? shape[n]
+                                        : static_cast<float>(n));
+            const float v = t - mn;
+            const float h = std::floor(v * A_h + 0.5f);
+            hrow[n] = static_cast<uint8_t>(h);
+            if (dual)
+                lrow[n] = static_cast<uint8_t>(std::floor(
+                    (v - h * (1.0f / A_h)) * A_l + half + 0.5f));
+        }
+    }
+    return true;
+#endif
+}
+
+/// LUT FastScan kernel: one simd::pq4_block32 per (block, LUT) — 2 table
+/// lookups per (dim, vector) with u8 entries (dual: two 32-lane passes).
+inline void scalar_scan_block_lut(const ScalarScanCtx& c,
+                                  RawScanHeap& heap) {
+    const uint32_t dim = c.dim;
+    const uint32_t n_blocks = (c.count + 31) / 32;
+    const uint32_t bb = c.block_bytes;
+    const bool dual = c.i8_mode >= 2 && c.lut_lo;
+    alignas(16) float dots[32];
+    uint32_t acc_h[32], acc_l[32];
+    for (uint32_t b = 0; b < n_blocks; ++b) {
+        const uint8_t* blk = c.codes + static_cast<uint64_t>(b) * bb;
+        simd::pq4_block32(blk, c.lut_hi, dim, acc_h);
+        if (dual) {
+            simd::pq4_block32(blk, c.lut_lo, dim, acc_l);
+            for (uint32_t j = 0; j < 32; ++j)
+                dots[j] = static_cast<float>(acc_h[j]) * c.lut_inv_ah +
+                          (static_cast<float>(acc_l[j]) - c.lut_lo_off) *
+                              c.lut_inv_al +
+                          c.lut_b;
+        } else {
+            for (uint32_t j = 0; j < 32; ++j)
+                dots[j] =
+                    static_cast<float>(acc_h[j]) * c.lut_inv_ah + c.lut_b;
+        }
+        detail::scalar_block_heap_push(heap, c, b * 32, dots);
+    }
+}
+
+/// BLOCK-ARITH f32: per dim, one 16-byte load unpacks the dim-d nibbles of
+/// all 32 vectors (lo nibble = vectors 0..15, hi = 16..31). Nibbles widen
+/// u8->u16->u32->f32 and FMLA against a broadcast a_uni[d]. Accumulators
+/// are 8 x float32x4 (4 even + 4 odd quads, lane = vector) — comfortably
+/// inside the register budget, no spills.
+inline void scalar_scan_block_arith(const ScalarScanCtx& c,
+                                    RawScanHeap& heap) {
+    const uint32_t dim = c.dim;
+    const uint32_t n_blocks = (c.count + 31) / 32;
+    const uint8_t* codes = c.codes;
+    const uint32_t bb = c.block_bytes;
+    const float* a_uni = c.a_uni;
+    alignas(16) float dots[32];
+#if defined(__aarch64__)
+    const uint8x16_t mask4 = vdupq_n_u8(0x0F);
+    const bool shaped = c.slm_shaped;
+    const uint8x16_t f_tbl = shaped ? vld1q_u8(c.shape_u8) : vdupq_n_u8(0);
+    for (uint32_t b = 0; b < n_blocks; ++b) {
+        const uint8_t* blk = codes + static_cast<uint64_t>(b) * bb;
+        float32x4_t ae[4], ao[4];
+        for (int r = 0; r < 4; ++r) {
+            ae[r] = vdupq_n_f32(0.f);
+            ao[r] = vdupq_n_f32(0.f);
+        }
+        for (uint32_t d = 0; d < dim; ++d) {
+            const uint8x16_t cv = vld1q_u8(blk + d * 16);
+            const uint8x16_t clo = vandq_u8(cv, mask4);
+            const uint8x16_t chi = vshrq_n_u8(cv, 4);
+            const uint8x16_t ne = shaped ? vqtbl1q_u8(f_tbl, clo) : clo;
+            const uint8x16_t no = shaped ? vqtbl1q_u8(f_tbl, chi) : chi;
+            const float32x4_t a = vdupq_n_f32(a_uni[d]);
+            const uint16x8_t e0 = vmovl_u8(vget_low_u8(ne));
+            const uint16x8_t e1 = vmovl_u8(vget_high_u8(ne));
+            const uint16x8_t o0 = vmovl_u8(vget_low_u8(no));
+            const uint16x8_t o1 = vmovl_u8(vget_high_u8(no));
+            ae[0] = vfmaq_f32(ae[0], a,
+                vcvtq_f32_u32(vmovl_u16(vget_low_u16(e0))));
+            ae[1] = vfmaq_f32(ae[1], a,
+                vcvtq_f32_u32(vmovl_u16(vget_high_u16(e0))));
+            ae[2] = vfmaq_f32(ae[2], a,
+                vcvtq_f32_u32(vmovl_u16(vget_low_u16(e1))));
+            ae[3] = vfmaq_f32(ae[3], a,
+                vcvtq_f32_u32(vmovl_u16(vget_high_u16(e1))));
+            ao[0] = vfmaq_f32(ao[0], a,
+                vcvtq_f32_u32(vmovl_u16(vget_low_u16(o0))));
+            ao[1] = vfmaq_f32(ao[1], a,
+                vcvtq_f32_u32(vmovl_u16(vget_high_u16(o0))));
+            ao[2] = vfmaq_f32(ao[2], a,
+                vcvtq_f32_u32(vmovl_u16(vget_low_u16(o1))));
+            ao[3] = vfmaq_f32(ao[3], a,
+                vcvtq_f32_u32(vmovl_u16(vget_high_u16(o1))));
+        }
+        for (int r = 0; r < 4; ++r) {
+            vst1q_f32(dots + 4 * r, ae[r]);
+            vst1q_f32(dots + 16 + 4 * r, ao[r]);
+        }
+        detail::scalar_block_heap_push(heap, c, b * 32, dots);
+    }
+#else
+    // Portable fallback: dim-major scalar walk over the same blocks.
+    const float* ftbl = c.shape_f32;
+    for (uint32_t b = 0; b < n_blocks; ++b) {
+        const uint8_t* blk = codes + static_cast<uint64_t>(b) * bb;
+        std::fill(dots, dots + 32, 0.f);
+        for (uint32_t d = 0; d < dim; ++d) {
+            const uint8_t* row = blk + d * 16;
+            const float a = a_uni[d];
+            for (uint32_t j = 0; j < 16; ++j) {
+                const uint8_t byte = row[j];
+                dots[j] += a * (c.slm_shaped ? ftbl[byte & 0xF]
+                                             : static_cast<float>(byte & 0xF));
+                dots[16 + j] += a *
+                    (c.slm_shaped ? ftbl[byte >> 4]
+                                  : static_cast<float>(byte >> 4));
             }
         }
-        for (uint32_t v = 0; v < nv; ++v) {
-            const float score = dots[v] + c0;
-            float dist = ip_bias
-                ? -(score * static_cast<float>(ip_bias[i + v]))
-                : -score;
-            const uint32_t pq_dist = f32_to_dist_key(dist);
-            if (!heap_full(heap)) heap_push(heap, pq_dist, i + v);
-            else if (pq_dist < heap_front(heap))
-                heap_replace_top(heap, pq_dist, i + v);
-        }
+        detail::scalar_block_heap_push(heap, c, b * 32, dots);
     }
 #endif
 }
 
-inline void scalar_scan_gather(const ScalarScanCtx& c, RawScanHeap& heap) {
+/// BLOCK-GATHER (Lloyd-Max mode 0, the non-arithmetic family): rare path;
+/// dim-major scalar walk over the blocks (sequential 16-byte rows, two
+/// vectors per byte).
+inline void scalar_scan_block_gather(const ScalarScanCtx& c,
+                                     RawScanHeap& heap) {
     const uint32_t dim = c.dim;
-    const uint32_t cs = c.cs;
-    const uint32_t d4 = dim / 4 * 4;
-    static thread_local std::vector<uint8_t> pad_row_buf;
-    if (pad_row_buf.size() < cs) pad_row_buf.assign(cs, 0);
-    const uint8_t* pad_row = pad_row_buf.data();
-    // Lloyd-Max gather kernel: batch-4, amortized query loads.
-    const float* levels = c.levels;
     const uint32_t K = c.K;
-    const float* query = c.query;
-    for (uint32_t i = 0; i < c.count; i += 4) {
-        const auto r = detail::scalar_rows(c, i, pad_row);
-        float dots[4] = {0, 0, 0, 0};
-        for (uint32_t d = 0; d < d4; d += 4) {
-            float q4[4] = {query[d], query[d+1], query[d+2], query[d+3]};
-            for (uint32_t v = 0; v < 4; ++v) {
-                uint8_t b0 = r.cp[v][d/2], b1 = r.cp[v][d/2+1];
-                dots[v] += q4[0]*levels[d*K+(b0&0xF)]
-                         + q4[1]*levels[(d+1)*K+((b0>>4)&0xF)]
-                         + q4[2]*levels[(d+2)*K+(b1&0xF)]
-                         + q4[3]*levels[(d+3)*K+((b1>>4)&0xF)];
+    const float* q = c.query;
+    const float* levels = c.levels;
+    const uint32_t n_blocks = (c.count + 31) / 32;
+    alignas(16) float dots[32];
+    for (uint32_t b = 0; b < n_blocks; ++b) {
+        const uint8_t* blk = c.codes + static_cast<uint64_t>(b) * c.block_bytes;
+        std::fill(dots, dots + 32, 0.f);
+        for (uint32_t d = 0; d < dim; ++d) {
+            const uint8_t* row = blk + d * 16;
+            const float qd = q[d];
+            const float* lrow = levels + static_cast<size_t>(d) * K;
+            for (uint32_t j = 0; j < 16; ++j) {
+                const uint8_t byte = row[j];
+                dots[j] += qd * lrow[byte & 0xF];
+                dots[16 + j] += qd * lrow[byte >> 4];
             }
         }
-        for (uint32_t d = d4; d < dim; ++d) {
-            for (uint32_t v = 0; v < 4; ++v) {
-                uint8_t byte = r.cp[v][d/2];
-                uint8_t nib = (d % 2 == 0) ? (byte & 0xF) : (byte >> 4);
-                dots[v] += query[d] * levels[d*K + nib];
-            }
-        }
-        detail::scalar_heap_push4(heap, c, i, r.nv, dots);
+        detail::scalar_block_heap_push(heap, c, b * 32, dots);
     }
 }
 
+/// Scan one scalar leaf (FastScan blocks, m4 = dim) into `heap`.
 inline void scalar_scan_leaf(const ScalarScanCtx& c, RawScanHeap& heap) {
-    if (c.i8_mode) scalar_scan_i8(c, heap);
-    else if (c.slm_arith) scalar_scan_arith(c, heap);
-    else scalar_scan_gather(c, heap);
+    if (c.i8_mode) scalar_scan_block_lut(c, heap);
+    else if (c.slm_arith) scalar_scan_block_arith(c, heap);
+    else scalar_scan_block_gather(c, heap);
 }
 
 /// Order-preserving u32 encoding of a float score (the old heap path's

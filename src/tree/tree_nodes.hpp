@@ -205,24 +205,47 @@ inline uint64_t lsc_levels_offset(uint32_t summary_size) {
     return leaf_codes_offset(summary_size);
 }
 
-/// Byte offset of the flat packed-nibble codes in a CodedLocalScalar leaf.
+/// Byte offset of the flat packed-nibble source code in a CodedLocalScalar
+/// leaf (the FastScan block region starts here; m4 = dim nibbles/vector).
 inline uint64_t lsc_codes_offset(uint32_t summary_size, uint16_t dim) {
     return leaf_codes_offset(summary_size) + 2ull * dim * sizeof(float16_t);
 }
 
-/// Scalar leaves (flat packed-nibble layout) in InnerProduct trees carry a
-/// per-vector fp16 IP bias (||x|| / ||x̂||, RaBitQ-style) between the codes
-/// and row_ids: the scan multiplies ⟨q, x̂⟩ by it to cancel the per-vector
-/// reconstruction norm shrinkage. Absent in L2Sq trees (no effect there).
+/// Scalar leaves are PQ4 FastScan blocks with m4 = dim (one 4-bit nibble
+/// per dim): 32 vectors/block, block_bytes = dim × 16.
+inline uint32_t scalar_codes_per_block() { return 32; }
+inline uint32_t scalar_block_bytes(uint16_t dim) {
+    return static_cast<uint32_t>(dim) * 16;
+}
+inline uint32_t scalar_n_blocks(uint64_t count) {
+    return static_cast<uint32_t>((count + 31) / 32);
+}
+
+/// Scalar leaves (FastScan block layout, InnerProduct trees) carry a
+/// per-vector fp16 IP bias (||x|| / ||x̂||, RaBitQ-style) between the code
+/// blocks and row_ids: the scan multiplies ⟨q, x̂⟩ by it to cancel the
+/// per-vector reconstruction norm shrinkage. Absent in L2Sq trees.
 inline uint64_t scalar_bias_bytes(uint64_t count, bool has_ip_bias) {
     return has_ip_bias ? count * sizeof(float16_t) : 0;
 }
 
-/// Byte offset of the row_ids array within a scalar (flat layout) leaf.
-inline uint64_t scalar_rowids_offset(uint32_t summary_size, uint64_t count,
-                                     uint32_t code_size, bool has_ip_bias) {
-    return leaf_codes_offset(summary_size) +
-           static_cast<uint64_t>(count) * code_size +
+/// Byte offset of the row_ids array in a scalar_lm leaf
+/// ([header][summary][blocks][ip_biases?][row_ids]).
+inline uint64_t scalar_rowids_offset(uint32_t summary_size, uint16_t dim,
+                                     uint64_t count, bool has_ip_bias) {
+    const uint64_t blocks =
+        static_cast<uint64_t>(scalar_n_blocks(count)) * scalar_block_bytes(dim);
+    return leaf_codes_offset(summary_size) + blocks +
+           scalar_bias_bytes(count, has_ip_bias);
+}
+
+/// Byte offset of the row_ids array in a CodedLocalScalar leaf
+/// ([header][summary][lo][steps][blocks][ip_biases?][row_ids]).
+inline uint64_t lsc_rowids_offset(uint32_t summary_size, uint16_t dim,
+                                  uint64_t count, bool has_ip_bias) {
+    const uint64_t blocks =
+        static_cast<uint64_t>(scalar_n_blocks(count)) * scalar_block_bytes(dim);
+    return lsc_codes_offset(summary_size, dim) + blocks +
            scalar_bias_bytes(count, has_ip_bias);
 }
 
@@ -267,7 +290,7 @@ enum class LeafState : uint8_t {
     /// Scalar-coded with per-leaf uniform levels: level_d(c) = lo_d +
     /// step_d·c (fp16 lo/steps stored in the leaf). Arithmetic scan with a
     /// per-leaf query transform; layout [header][summary][lo][steps]
-    /// [codes][ip_biases?][row_ids][filters].
+    /// [code blocks (FastScan, m4=dim)][ip_biases?][row_ids][filters].
     CodedLocalScalar = 3,
 };
 
