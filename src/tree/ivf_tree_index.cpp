@@ -718,14 +718,18 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     // (topic/time-clustered fbins, streamed inserts), and a prefix-trained
     // global ruler is fitted to the wrong distribution — measured
     // dbpedia-933K scalar_uniform decoded ceiling 0.950 (20K prefix) vs
-    // 0.956 (full-corpus stats). Seek-based draw when the source is a file
-    // (O(k) I/O); Algorithm R reservoir over next() otherwise (the source
-    // API's documented fallback for path-less sources).
+    // 0.956 (full-corpus stats). Algorithm R reservoir over next() ONLY:
+    // the engine never opens source files directly (the tree is its only
+    // owned artifact; seek-based file sampling would break the VectorSource
+    // layering and the streaming contract). NOTE: this is a pre-pass over
+    // the replayable source; the cleaner form — reservoir collected
+    // incidentally during the partition pass, train at first flush — is
+    // deferred to the LeafCoder build restructure (flushes interleave with
+    // streaming today, and the global quantizer must exist before the
+    // first encode).
     uint32_t train_n = std::min<uint64_t>(20'000, n);
     std::vector<float> sample;
-    if (!ctx.source.path().empty()) {
-        sample = draw_random_sample(ctx.source.path(), n, dim, train_n);
-    } else {
+    {
         ctx.source.reset();
         Chunk chunk;
         std::vector<float> reservoir(size_t(train_n) * dim);

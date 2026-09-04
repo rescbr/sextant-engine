@@ -85,13 +85,18 @@ inline void add_common_flags(cmdline::parser& p) {
         "(the value is ignored); covariance determines the rotation.",
         false, 0.0f);
     p.add<std::string>("quantizer", 0,
-        "Quantizer type for the IVF-scan codebook: 'pq' (default, standard "
-        "k-means), 'anisotropic-pq' (ScaNN-style anisotropic Lloyd's training; "
-        "search path identical), 'prq' (Product Residual Quantization — "
-        "additive-residual variant of PQ; multiple segments per sub-space sum "
-        "into the distance). See "
-        "docs/plans/metric_per_tier_plan.md Phase 2-3.",
-        false, "pq");
+        "Quantizer type: 'local_scalar' (DEFAULT — per-leaf 4-bit uniform "
+        "ruler, ~0.77 KB/vec; no global training sample, append/rebalance "
+        "safe; best recall-per-byte on embedding corpora), 'local_pq' "
+        "(per-leaf residual codebooks, smallest footprint), 'pq' (global "
+        "k-means), 'anisotropic-pq', 'scalar_uniform'/'scalar_lloydmax' "
+        "(global per-dim rulers), 'prq'. GLOBAL quantizers (pq, slm, sun, "
+        "shape, prq) train on a 20K random reservoir — their rulers/"
+        "codebooks are FROZEN AT BUILD: appended vectors are encoded against "
+        "the build-time distribution, so pick them when the corpus is "
+        "homogeneous and stable; use a local quantizer when data drifts or "
+        "appends are expected. See docs/quantizer-selection.md.",
+        false, "local_scalar");
     p.add<float>("anisotropy-threshold", 0,
         "ScaNN anisotropic threshold T for anisotropic-pq training (default "
         "0.2 → η ≈ 4.125). Higher T weights parallel quantization error more. "

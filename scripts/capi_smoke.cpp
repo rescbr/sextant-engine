@@ -58,7 +58,9 @@ int main(int argc, char** argv) {
     bo.metric = (m && m[0] == "l"[0]) ? SEXTANT_METRIC_L2SQ : SEXTANT_METRIC_IP;
     bo.num_threads = 8;
     char err[512] = {0};
-    const std::string tree_path = tree_override ? tree_override : "/tmp/capi_smoke.tree";
+    const char* tree_out = getenv("TREEOUT");
+    const std::string tree_path = tree_override ? tree_override
+        : (tree_out ? tree_out : "/tmp/capi_smoke.tree");
     auto t0 = std::chrono::steady_clock::now();
     if (!tree_override) {
         const char* mb = getenv("MEMBUILD");

@@ -27,7 +27,10 @@ extern "C" {
 
 sextant_build_opts sextant_default_build_opts(void) {
     sextant_build_opts o{};
-    o.quantizer = "pq";
+    // local_scalar is the product default: best recall-per-byte on
+    // embedding corpora (~0.77 KB/vec at 4 bits), no global training
+    // sample, and append/rebalance-safe (rulers re-fit per leaf at flush).
+    o.quantizer = "local_scalar";
     o.pq_m = 0;
     o.k_root = 0;
     o.leaf_capacity = 0;
