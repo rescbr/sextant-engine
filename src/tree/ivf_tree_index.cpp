@@ -315,12 +315,6 @@ namespace {
 /// pq4 profiles showed as 16% of scan CPU (weak ranking -> many replaces).
 /// row_id/leaf_ptr are re-derived AFTER the scan for the <=W survivors
 /// (materialized into HeapEntryFull) — one load each, negligible.
-struct HeapEntry {
-    uint32_t pq_dist;
-    uint32_t leaf_slot;        // index into the scan candidate list
-    uint32_t local_idx;        // vector index within the leaf
-};
-
 /// Post-scan form: everything the extraction/rerank/filter paths need.
 /// Produced from HeapEntry by a <=W-entry materialization pass.
 struct HeapEntryFull {
@@ -2302,57 +2296,6 @@ void set_scan_i8_override(int v) { scan_detail::set_override(v); }
 
 namespace {
 
-/// Sift-down replacement of the heap root (max-pq_dist). Parameterized on
-/// the heap so it can drive both the shared heap and per-thread heaps.
-inline void heap_replace(std::vector<HeapEntry>& h, uint32_t new_d,
-                         uint32_t leaf_slot, uint32_t local_idx) {
-    h[0] = {new_d, leaf_slot, local_idx};
-    uint32_t pos = 0;
-    const uint32_t n = h.size();
-    while (true) {
-        const uint32_t left = 2 * pos + 1;
-        const uint32_t right = 2 * pos + 2;
-        uint32_t largest = pos;
-        if (left < n && h[left].pq_dist > h[largest].pq_dist)
-            largest = left;
-        if (right < n && h[right].pq_dist > h[largest].pq_dist)
-            largest = right;
-        if (largest == pos) break;
-        std::swap(h[pos], h[largest]);
-        pos = largest;
-    }
-}
-
-inline bool heap_entry_less(const HeapEntry& a, const HeapEntry& b) {
-    return a.pq_dist < b.pq_dist;
-}
-
-/// ScanSink over the bounded top-W max-heap. Reproduces the original inline
-/// heap logic exactly: push-back until W, make_heap at W, then sift-down
-/// replace of the front.
-class HeapScanSink final : public ScanSink {
-public:
-    void bind(std::vector<HeapEntry>* h, uint32_t w, uint32_t leaf_slot) {
-        h_ = h;
-        w_ = w;
-        leaf_slot_ = leaf_slot;
-    }
-    void push(uint32_t dist_key, uint32_t local_idx) override {
-        h_->push_back({dist_key, leaf_slot_, local_idx});
-        if (h_->size() == w_)
-            std::make_heap(h_->begin(), h_->end(), heap_entry_less);
-    }
-    bool full() const override { return h_->size() >= w_; }
-    uint32_t front() const override { return h_->front().pq_dist; }
-    void replace(uint32_t dist_key, uint32_t local_idx) override {
-        heap_replace(*h_, dist_key, leaf_slot_, local_idx);
-    }
-
-private:
-    std::vector<HeapEntry>* h_ = nullptr;
-    uint32_t w_ = 0;
-    uint32_t leaf_slot_ = 0;
-};
 
 }  // namespace
 
@@ -2849,15 +2792,14 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const bool per_leaf = coder_->per_leaf_setup();
         const bool parallel_scan = config.search_threads > 1
             && candidates.size() >= 2;
-        HeapScanSink sink;
         if (!parallel_scan) {
             for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
                 if (candidates[ci].page == kInvalidPage) continue;
                 const uint8_t* leaf_ptr = mmap_base_ +
                     static_cast<uint64_t>(candidates[ci].page) * kPageSize;
                 if (per_leaf) coder_->bind_leaf(*scan_setup, leaf_ptr);
-                sink.bind(&sheap, W, ci);
-                coder_->scan_leaf(*scan_setup, leaf_ptr, sink);
+                RawScanHeap heap{&sheap, W, ci};
+                coder_->scan_leaf(*scan_setup, leaf_ptr, heap);
             }
         } else {
             const uint32_t T = std::min(config.search_threads,
@@ -2887,15 +2829,14 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                             own_setup = coder_->scan_setup(query);
                             use = own_setup.get();
                         }
-                        HeapScanSink wsink;
                         for (uint32_t c = s; c < e; ++c) {
                             if (candidates[c].page == kInvalidPage) continue;
                             const uint8_t* leaf_ptr = mmap_base_ +
                                 static_cast<uint64_t>(candidates[c].page) *
                                     kPageSize;
                             if (per_leaf) coder_->bind_leaf(*use, leaf_ptr);
-                            wsink.bind(&my, W, c);
-                            coder_->scan_leaf(*use, leaf_ptr, wsink);
+                            RawScanHeap heap{&my, W, c};
+                            coder_->scan_leaf(*use, leaf_ptr, heap);
                         }
                     }, start, end, t));
             }

@@ -192,7 +192,7 @@ void LocalPqCoder::bind_leaf(ScanSetup& setup, const uint8_t* leaf) const {
 }
 
 void LocalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
-                             ScanSink& sink) {
+                             RawScanHeap& heap) {
     const auto& s = static_cast<const Setup&>(setup);
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
     const uint32_t count = lh->count;
@@ -226,19 +226,19 @@ void LocalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
             simd::fastscan_block16(blk, lut_ptr, m,
                                     static_cast<uint16_t>(valid_mask), out);
             const uint32_t base = b * 16;
-            if (!sink.full()) {
+            if (!heap_full(heap)) {
                 for (uint32_t j = 0; j < 16; ++j) {
                     if (out[j] == 0xFFFFFFFFu) continue;
-                    sink.push(out[j], base + j);
-                    if (sink.full()) break;
+                    heap_push(heap, out[j], base + j);
+                    if (heap_full(heap)) break;
                 }
-                if (!sink.full()) continue;
+                if (!heap_full(heap)) continue;
             }
             const uint32_t block_min = u32_min16(out);
-            if (block_min >= sink.front()) continue;
+            if (block_min >= heap_front(heap)) continue;
             for (uint32_t j = 0; j < 16; ++j) {
-                if (out[j] == 0xFFFFFFFFu || out[j] >= sink.front()) continue;
-                sink.replace(out[j], base + j);
+                if (out[j] == 0xFFFFFFFFu || out[j] >= heap_front(heap)) continue;
+                heap_replace_top(heap, out[j], base + j);
             }
         } else {
             uint32_t out[32];
@@ -246,18 +246,18 @@ void LocalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
             if (valid_mask != 0xFFFFFFFFu)
                 u32_mask_sentinel32(out, valid_mask);
             const uint32_t base = b * 32;
-            if (!sink.full()) {
+            if (!heap_full(heap)) {
                 for (uint32_t j = 0; j < 32; ++j) {
                     if (out[j] == 0xFFFFFFFFu) continue;
-                    sink.push(out[j], base + j);
-                    if (sink.full()) break;
+                    heap_push(heap, out[j], base + j);
+                    if (heap_full(heap)) break;
                 }
-                if (!sink.full()) continue;
+                if (!heap_full(heap)) continue;
             }
-            if (u32_min32(out) >= sink.front()) continue;
+            if (u32_min32(out) >= heap_front(heap)) continue;
             for (uint32_t j = 0; j < 32; ++j) {
-                if (out[j] >= sink.front()) continue;
-                sink.replace(out[j], base + j);
+                if (out[j] >= heap_front(heap)) continue;
+                heap_replace_top(heap, out[j], base + j);
             }
         }
     }

@@ -48,7 +48,7 @@ public:
     bool per_leaf_setup() const override { return false; }
     void bind_leaf(ScanSetup& setup, const uint8_t* leaf) const override;
     void scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
-                   ScanSink& sink) override;
+                   RawScanHeap& heap) override;
     float rerank(const float* query, const uint8_t* leaf, uint32_t local_idx,
                  float* scratch_decoded) override;
 

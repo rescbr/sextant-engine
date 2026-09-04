@@ -250,7 +250,7 @@ void LocalScalarCoder::bind_leaf(ScanSetup& setup, const uint8_t* leaf) const {
 }
 
 void LocalScalarCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
-                                 ScanSink& sink) {
+                                 RawScanHeap& heap) {
     const auto& s = static_cast<const Setup&>(setup);
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
     const uint32_t count = lh->count;
@@ -277,7 +277,7 @@ void LocalScalarCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
     c.slm_arith = true;   // local levels are always arithmetic (uniform)
     c.slm_shaped = false;
     c.K = 16;
-    scalar_scan_leaf(c, sink);
+    scalar_scan_leaf(c, heap);
 }
 
 float LocalScalarCoder::rerank(const float* query, const uint8_t* leaf,

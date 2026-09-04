@@ -184,7 +184,7 @@ std::unique_ptr<ScanSetup> ScalarLmCoder::scan_setup(const float* query) {
 void ScalarLmCoder::bind_leaf(ScanSetup&, const uint8_t*) const {}
 
 void ScalarLmCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
-                              ScanSink& sink) {
+                              RawScanHeap& heap) {
     const auto& s = static_cast<const Setup&>(setup);
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
     const uint32_t count = lh->count;
@@ -214,7 +214,7 @@ void ScalarLmCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
     c.K = quantizer_->K();
     c.shape_u8 = quantizer_->shape_u8();
     c.shape_f32 = quantizer_->shape();
-    scalar_scan_leaf(c, sink);
+    scalar_scan_leaf(c, heap);
 }
 
 float ScalarLmCoder::rerank(const float* query, const uint8_t* leaf,

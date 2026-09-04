@@ -24,7 +24,9 @@
 #include "tree/tree_nodes.hpp"
 #include "sextant/types.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -66,24 +68,73 @@ struct LeafGeometry {
     uint64_t extent_bytes = 0;   // header..rowids end, EXCLUDING filter cols
 };
 
-/// Candidate sink for scan kernels — the bounded top-W max-heap. `dist_key`
-/// It preserves float score order as an order-preserving u32 (same encoding the
-/// current heap path uses); `local_idx` is the vector's index within the leaf.
-/// The heap lives in the search path; coders drive it through the four
-/// operations below, which reproduce the original inline heap logic exactly
-/// (push-back until W, make_heap at W, then sift-down replace of the front).
-class ScanSink {
-public:
-    virtual ~ScanSink() = default;
-    /// Fill-phase push (valid only while !full()).
-    virtual void push(uint32_t dist_key, uint32_t local_idx) = 0;
-    /// Heap has reached capacity W.
-    virtual bool full() const = 0;
-    /// Current worst (max) dist_key in the heap; valid when full().
-    virtual uint32_t front() const = 0;
-    /// Replace the heap front with a better candidate (only when full()).
-    virtual void replace(uint32_t dist_key, uint32_t local_idx) = 0;
+/// One scan candidate in the bounded top-W heap. `dist_key` preserves
+/// float score order as an order-preserving u32; `leaf_slot` indexes the
+/// scan candidate list; `local_idx` is the vector's index within the leaf.
+struct HeapEntry {
+    uint32_t pq_dist;
+    uint32_t leaf_slot;
+    uint32_t local_idx;
 };
+
+inline bool heap_entry_less(const HeapEntry& a, const HeapEntry& b) {
+    return a.pq_dist < b.pq_dist;
+}
+
+/// Sift-down replacement of the heap root (max-pq_dist).
+inline void heap_replace(std::vector<HeapEntry>& h, uint32_t new_d,
+                         uint32_t leaf_slot, uint32_t local_idx) {
+    h[0] = {new_d, leaf_slot, local_idx};
+    uint32_t pos = 0;
+    const uint32_t n = static_cast<uint32_t>(h.size());
+    while (true) {
+        const uint32_t left = 2 * pos + 1;
+        const uint32_t right = 2 * pos + 2;
+        uint32_t largest = pos;
+        if (left < n && h[left].pq_dist > h[largest].pq_dist)
+            largest = left;
+        if (right < n && h[right].pq_dist > h[largest].pq_dist)
+            largest = right;
+        if (largest == pos) break;
+        std::swap(h[pos], h[largest]);
+        pos = largest;
+    }
+}
+
+/// The bounded top-W max-heap the scan kernels push into, passed as a plain
+/// struct (NOT virtually — per-candidate calls sit in the hottest loop; a
+/// virtual sink measurably regressed the arith kernel via register
+/// pressure). The free functions below reproduce the original inline heap
+/// logic exactly: push-back until W, make_heap at W, then sift-down
+/// replace of the front.
+struct RawScanHeap {
+    std::vector<HeapEntry>* h = nullptr;
+    uint32_t w = 0;
+    uint32_t leaf_slot = 0;
+};
+
+inline bool heap_full(const RawScanHeap& s) {
+    return s.h->size() >= s.w;
+}
+inline void heap_push(RawScanHeap& s, uint32_t dist_key, uint32_t local_idx) {
+    s.h->push_back({dist_key, s.leaf_slot, local_idx});
+    if (s.h->size() == s.w)
+        std::make_heap(s.h->begin(), s.h->end(), heap_entry_less);
+}
+inline uint32_t heap_front(const RawScanHeap& s) {
+    return s.h->front().pq_dist;
+}
+inline void heap_replace_top(RawScanHeap& s, uint32_t dist_key,
+                             uint32_t local_idx) {
+    heap_replace(*s.h, dist_key, s.leaf_slot, local_idx);
+}
+
+/// Order-preserving u32 encoding of a float score.
+inline uint32_t f32_to_dist_key(float dist) {
+    uint32_t bits;
+    std::memcpy(&bits, &dist, sizeof(bits));
+    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
 
 /// Per-query, per-leaf scan context produced by scan_setup(). Family-owned
 /// (the concrete coder casts to its derived setup); holds whatever the
@@ -188,7 +239,7 @@ public:
     /// Scan one leaf, pushing candidates into the sink. `leaf` points at
     /// the TreeLeafHeader. Must be thread-safe given per-worker setups.
     virtual void scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
-                           ScanSink& sink) = 0;
+                           RawScanHeap& heap) = 0;
     /// Exact(ish) rerank of one candidate: returns the refined distance.
     /// When `scratch_decoded` != nullptr it receives the decoded vector
     /// (dim floats); families whose rerank never materializes a decode may
