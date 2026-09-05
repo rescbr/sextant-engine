@@ -1,8 +1,25 @@
 # Adaptive Routing Plane — design document
 
-Status: proposed (v1). Grounded in measurements from
-[routing-decomposition-report.md](routing-decomposition-report.md);
-verification milestones in §9. Owner: sextant engine.
+Status: REVISED (v2) — plane DEMOTED to a documented option, not for
+merge. Grounded in measurements from
+[routing-decomposition-report.md](routing-decomposition-report.md).
+
+> **CONSTRAINT (governs everything below): sextant's objective function
+> is recall, latency, DRAM usage, and excess storage per dollar, at
+> 100M–1B vectors with LOW DRAM (routing budget ≈ ≤4 B/vec; the codes
+> live on NAND).** A 128 B/vec always-resident plane is 128 GB of DRAM
+> at 1B — a no-go — and a global stage-1 sweep carries an O(N)
+> per-query read floor from whatever tier it lives in. v1 of this
+> document was written against the retrievalbench (warm-resident)
+> framing and is superseded on this point. The plane survives ONLY as
+> §2's NAND-tier option for the mid-scale (250K–few M) regime on
+> spectrally-gapped corpora, and as the measured frontier data that
+> informs the tree-shaped levers: coverage-vs-N, finer leaves/depth,
+> and best-first subtree probing (the tree-native sequential
+> mechanism — graphs are settled-against project history: aisaq →
+> trees because graphs don't scale under this budget). Milestones 1–2
+> (§4.2, §6.1) remain valid measurements. Verification milestones in
+> §9; owner: sextant engine.
 
 ---
 
@@ -31,7 +48,7 @@ Rank comes from the corpus spectrum; recall promises come from the
 monitor; both are re-derived as the corpus moves. (Same principle as
 the 2.7σ correction — see the blog draft §2.)
 
-## 2. Architecture
+## 2. Architecture (OPTION — mid-scale only; see constraint above)
 
 Two-stage search replacing centroid routing:
 
