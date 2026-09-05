@@ -697,6 +697,13 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("topk", 0, "K nearest neighbors", false, 10);
     p.add<uint32_t>("n-probe", 0, "Root probe count (0=manifest default)", false, 0);
     p.add<uint32_t>("n-probe-ln", 0, "Leaf probe count per root child (0=manifest)", false, 0);
+    p.add<float>("probe-fraction", 0,
+        "Probe budget as a corpus fraction (0=manifest default, new trees 0.5): "
+        "select root children nearest-first until their cumulative subtree "
+        "extent reaches this fraction, then probe all their leaves. "
+        "Scale-stable where counts are not (measured dbpedia 100K→933K: "
+        "f=0.25 ≈0.96, f=0.5 ≈0.99 recall@10). Ignored when --n-probe > 0.",
+        false, 0.0f);
     p.add<uint32_t>("fastscan-w", 0, "Rerank shortlist per shard (0=300)", false, 0);
     p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
@@ -817,6 +824,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.k = k;
     scfg.n_probe = p.get<uint32_t>("n-probe");
     scfg.n_probe_ln = p.get<uint32_t>("n-probe-ln");
+    scfg.probe_fraction = p.get<float>("probe-fraction");
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
     scfg.rerank = !p.exist("no-rerank");
     scfg.adaptive_w_gap = p.get<float>("adaptive-w-gap");
@@ -1130,6 +1138,11 @@ int cmd_sweep(int argc, char* argv[]) {
         true);
     p.add<uint32_t>("n-probe-ln", 0,
         "Leaf probe count per root child (0=manifest default)", false, 0);
+    p.add<std::string>("probe-fraction", 0,
+        "Comma-separated corpus fractions swept as an extra row set, e.g. "
+        "\"0.25,0.5\" (empty = none; fraction rows probe root children "
+        "nearest-first to this cumulative extent, all their leaves)",
+        false, "");
     p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)",
                  false, 0.0f);
@@ -1268,6 +1281,7 @@ int cmd_sweep(int argc, char* argv[]) {
     SearchConfig scfg;
     scfg.k = k;
     scfg.n_probe_ln = p.get<uint32_t>("n-probe-ln");
+    scfg.probe_fraction = 0.0f;  // np sweep rows; fraction rows set it per-row
     scfg.rerank = !p.exist("no-rerank");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
     scfg.search_threads = p.get<uint32_t>("search-threads");
@@ -1284,8 +1298,31 @@ int cmd_sweep(int argc, char* argv[]) {
     std::cerr << "sweep: " << n_probes.size() << " n-probe x " << w_vals.size()
               << " W values, " << scored << " queries\n";
 
+    // Optional fraction rows extend the grid: the same sweep body runs
+    // with scfg.probe_fraction set and n_probe = 0 so the fraction path
+    // is active. Labelled f<f> in the n_probe column.
+    std::vector<std::pair<float, std::string>> frac_rows;
+    {
+        const std::string fs = p.get<std::string>("probe-fraction");
+        if (!fs.empty()) {
+            std::string item;
+            std::istringstream iss(fs);
+            while (std::getline(iss, item, ',')) {
+                if (item.empty()) continue;
+                const float f = std::stof(item);
+                if (f <= 0.0f || f > 1.0f) {
+                    std::cerr << "sweep: --probe-fraction values must be in "
+                                 "(0, 1] (got " << item << ")\n";
+                    return 1;
+                }
+                frac_rows.emplace_back(f, item);
+            }
+        }
+    }
+
     for (uint32_t np : n_probes) {
         scfg.n_probe = np;
+        scfg.probe_fraction = 0.0f;
         std::vector<std::atomic<uint64_t>> hits(w_vals.size());
         for (auto& h : hits) h.store(0, std::memory_order_relaxed);
         std::vector<std::vector<Candidate>> dump_rows;
@@ -1354,6 +1391,65 @@ int cmd_sweep(int argc, char* argv[]) {
                     std::cerr << "dump\t" << qi << '\t' << c.row_id << '\t'
                               << c.dist << '\n';
         }
+    }
+
+    for (const auto& [frac, label] : frac_rows) {
+        scfg.n_probe = 0;             // fraction path requires no absolute np
+        scfg.probe_fraction = frac;
+        std::vector<std::atomic<uint64_t>> hits(w_vals.size());
+        for (auto& h : hits) h.store(0, std::memory_order_relaxed);
+
+        auto score = [&](uint32_t qi,
+                         const std::vector<std::vector<Candidate>>& so) {
+            std::unordered_set<RowId> gt_set(
+                gt[qi].begin(),
+                gt[qi].begin() + std::min(recall_k,
+                                          static_cast<uint32_t>(gt[qi].size())));
+            for (size_t wi = 0; wi < w_vals.size(); ++wi) {
+                if (wi >= so.size()) break;
+                for (const auto& c : so[wi])
+                    if (gt_set.count(c.row_id))
+                        hits[wi].fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+
+        const auto t0 = std::chrono::steady_clock::now();
+        if (num_threads <= 1) {
+            for (uint32_t qi = 0; qi < qcount; ++qi) {
+                std::vector<std::vector<Candidate>> sweep_out;
+                idx->search(&queries[static_cast<size_t>(qi) * qdim], k, scfg,
+                            nullptr, &w_vals, &sweep_out);
+                if (qi < scored) score(qi, sweep_out);
+            }
+        } else {
+            std::vector<std::future<void>> futs;
+            std::atomic<uint32_t> next_qi{0};
+            for (uint32_t t = 0; t < num_threads; ++t) {
+                futs.push_back(std::async(std::launch::async, [&]() {
+                    while (true) {
+                        const uint32_t qi = next_qi.fetch_add(1);
+                        if (qi >= qcount) break;
+                        std::vector<std::vector<Candidate>> sweep_out;
+                        idx->search(&queries[static_cast<size_t>(qi) * qdim],
+                                    k, scfg, nullptr, &w_vals, &sweep_out);
+                        if (qi < scored) score(qi, sweep_out);
+                    }
+                }));
+            }
+            for (auto& f : futs) f.get();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        const double qps = (secs > 0) ? qcount / secs : 0;
+
+        for (size_t wi = 0; wi < w_vals.size(); ++wi) {
+            const float recall = static_cast<float>(hits[wi].load())
+                                 / (static_cast<double>(scored) * k);
+            *out << "f" << label << '\t' << w_vals[wi] << '\t' << recall
+                 << '\t' << qps << '\n';
+        }
+        std::cerr << "probe_fraction=" << frac << ": " << secs << "s ("
+                  << qps << " shared QPS)\n";
     }
     return 0;
 }
