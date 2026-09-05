@@ -130,6 +130,22 @@ int main(int argc, char** argv) {
         const size_t m = members[l].size();
         if (m) for (uint32_t d = 0; d < db; ++d) centroid[l * db + d] /= m;
     }
+    // Per-leaf RADIUS: max member distance to the leaf mean — pairs with
+    // the centroid into an admissible lower bound d(q,c) - r on the
+    // distance to the nearest member (ball-tree pruning, no noise).
+    std::vector<float> radius(L, 0.0f);
+    for (uint32_t l = 0; l < L; ++l) {
+        const double* c = &centroid[l * db];
+        for (RowId rid : members[l]) {
+            const float* v = &base[static_cast<size_t>(rid) * db];
+            double d2 = 0;
+            for (uint32_t d = 0; d < db; ++d) {
+                const double diff = v[d] - c[d];
+                d2 += diff * diff;
+            }
+            radius[l] = std::max(radius[l], static_cast<float>(std::sqrt(d2)));
+        }
+    }
     {
         // Sanity: GT ids must resolve into the home map.
         uint64_t found = 0, tot = 0, distinct = 0, oob = 0;
@@ -160,7 +176,7 @@ int main(int argc, char** argv) {
     // NOT FPS members — peripheral anchors underperform the plain mean
     // (measured); dense-mode sub-means are the deployable approximation
     // of member-min. A leaf ranks by min L2 to its anchors.
-    const uint32_t ANCHORS[] = {2, 4, 8};
+    const uint32_t ANCHORS[] = {4, 16, 64, 256};
     constexpr size_t NA = 3;
     std::vector<std::vector<float>> anchor_sets[NA];  // [a][leaf][k*db]
     for (size_t ai = 0; ai < NA; ++ai) {
@@ -280,7 +296,7 @@ int main(int argc, char** argv) {
     // Prefix fractions at which to report containment (by page weight).
     const double fracs[] = {0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.0};
     constexpr size_t NF = sizeof(fracs) / sizeof(fracs[0]);
-    std::vector<std::vector<double>> hit(4 + NA, std::vector<double>(NF, 0.0));
+    std::vector<std::vector<double>> hit(4 + NA + 3, std::vector<double>(NF, 0.0));
     uint32_t q_used = std::min(nq, nqt);
     std::vector<uint32_t> leaf_order;
 
@@ -320,6 +336,14 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> centroid_order(L);
         for (uint32_t i = 0; i < L; ++i) centroid_order[i] = cd[i].second;
 
+        // --- bb. admissible bound order: d(q,c) - r (ball-tree) ---
+        std::vector<std::pair<float, uint32_t>> bo(L);
+        for (uint32_t l = 0; l < L; ++l)
+            bo[l] = {std::sqrt(cd[l].first) - radius[l], l};
+        std::sort(bo.begin(), bo.end());
+        std::vector<uint32_t> bound_order(L);
+        for (uint32_t i = 0; i < L; ++i) bound_order[i] = bo[i].second;
+
         // --- a. random order (deterministic per query) ---
         leaf_order.resize(L);
         std::iota(leaf_order.begin(), leaf_order.end(), 0u);
@@ -358,6 +382,7 @@ int main(int argc, char** argv) {
 
         walk(leaf_order, 0);
         walk(centroid_order, 1);
+        walk(bound_order, 6 + NA);  // bound column (every query)
 
         // --- z. oracle order (GT leaves first) — harness self-check:
         // must read ~1.0 from the smallest fraction onward.
@@ -369,17 +394,49 @@ int main(int argc, char** argv) {
             walk(order, 3);
         }
 
-        // --- c. member-min (ideal) on a query subset ---
+        // --- c. member-min (ideal) + PARTIAL-DIM variants, on a subset.
+        // partial-D is plan D's proxy: rank leaves by the best IP over
+        // members restricted to the first PD dims — what a coarse 4-bit
+        // code sweep over PD dims would approximate (codes exist for
+        // every member; here we use fp32 vectors as the ceiling).
         if (qi < mm_q) {
             std::vector<float> best(L, -std::numeric_limits<float>::max());
+            const uint32_t PD1 = db / 12;   // 128 at 1536
+            const uint32_t PD2 = db / 4;    // 384 at 1536
+            std::vector<float> pbest1(L, -std::numeric_limits<float>::max());
+            std::vector<float> pbest2(L, -std::numeric_limits<float>::max());
             for (uint32_t l = 0; l < L; ++l) {
                 for (RowId rid : members[l]) {
                     const float* v = &base[static_cast<size_t>(rid) * db];
-                    float ip = 0;
-                    for (uint32_t d = 0; d < db; ++d) ip += q[d] * v[d];
-                    // normalized fixture: nearest member = max IP.
+                    float ip = 0, ip1 = 0, ip2 = 0;
+                    for (uint32_t d = 0; d < db; ++d) {
+                        const float qq = q[d] * v[d];
+                        ip += qq;
+                        if (d < PD1) ip1 += qq;
+                        if (d < PD2) ip2 += qq;
+                    }
                     best[l] = std::max(best[l], ip);
+                    pbest1[l] = std::max(pbest1[l], ip1);
+                    pbest2[l] = std::max(pbest2[l], ip2);
                 }
+            }
+            // partial-1/12 order (plan D target)
+            {
+                std::vector<std::pair<float, uint32_t>> po(L);
+                for (uint32_t l = 0; l < L; ++l) po[l] = {-pbest1[l], l};
+                std::sort(po.begin(), po.end());
+                std::vector<uint32_t> order(L);
+                for (uint32_t i = 0; i < L; ++i) order[i] = po[i].second;
+                walk(order, 4 + NA);
+            }
+            // partial-1/4 order (fallback resolution)
+            {
+                std::vector<std::pair<float, uint32_t>> po(L);
+                for (uint32_t l = 0; l < L; ++l) po[l] = {-pbest2[l], l};
+                std::sort(po.begin(), po.end());
+                std::vector<uint32_t> order(L);
+                for (uint32_t i = 0; i < L; ++i) order[i] = po[i].second;
+                walk(order, 5 + NA);
             }
             std::vector<std::pair<float, uint32_t>> mo(L);
             for (uint32_t l = 0; l < L; ++l) mo[l] = {-best[l], l};
@@ -485,18 +542,22 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("\n%-8s %8s %8s %8s %8s %8s %8s %8s  (ideal rows over %u queries)\n",
+    std::printf("\n%-8s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s  (ideal rows over %u queries)\n",
                 "frac", "random", "centrd", "mbrmin", "oracle",
-                "anc2", "anc4", "anc8", mm_q);
+                "an04", "an16", "an64", "a256", "bound", "p1/12", "p1/4", mm_q);
     for (size_t fi = 0; fi < NF; ++fi) {
-        std::printf("%-8.2f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f\n",
+        std::printf("%-8.2f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f\n",
                     fracs[fi],
                     hit[0][fi] / q_used, hit[1][fi] / q_used,
                     hit[2][fi] / std::min(mm_q, q_used),
                     hit[3][fi] / q_used,
                     hit[4][fi] / std::min(mm_q, q_used),
                     hit[5][fi] / std::min(mm_q, q_used),
-                    hit[6][fi] / std::min(mm_q, q_used));
+                    hit[6][fi] / std::min(mm_q, q_used),
+                    hit[7][fi] / std::min(mm_q, q_used),
+                    hit[6 + NA][fi] / q_used,
+                    hit[4 + NA][fi] / std::min(mm_q, q_used),
+                    hit[5 + NA][fi] / std::min(mm_q, q_used));
     }
     return 0;
 }
