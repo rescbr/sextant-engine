@@ -40,6 +40,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <fstream>
 #include <limits>
 #include <numeric>
@@ -90,9 +94,31 @@ int main(int argc, char** argv) {
     }
     const uint32_t nq = argc > 5 ? std::atoi(argv[5]) : 200;
     const uint32_t mm_q = argc > 6 ? std::atoi(argv[6]) : 50;
+    int base_err = 0;
 
     uint32_t nb, db, nqt, dq, gtk;
-    auto base = load_fbin(argv[2], nb, db);
+    // Base is mmap'd read-only: 10M-scale corpora (29 GB at cohere-10m)
+    // must not live on the heap next to the plane projections.
+    const float* base = [](const char* path, uint32_t& n, uint32_t& d,
+                           int& err) -> const float* {
+        int fd = ::open(path, O_RDONLY);
+        if (fd < 0) { err = 1; return nullptr; }
+        struct stat st;
+        if (::fstat(fd, &st) != 0 || st.st_size < 8) {
+            ::close(fd); err = 1; return nullptr;
+        }
+        void* m = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (m == MAP_FAILED) { err = 1; return nullptr; }
+        const auto* hdr = static_cast<const uint32_t*>(m);
+        n = hdr[0]; d = hdr[1];
+        if (static_cast<uint64_t>(n) * d * 4 + 8 >
+            static_cast<uint64_t>(st.st_size)) { err = 1; return nullptr; }
+        return reinterpret_cast<const float*>(hdr + 2);
+    }(argv[2], nb, db, base_err);
+    if (base_err) {
+        std::fprintf(stderr, "base mmap failed\n"); return 1;
+    }
     auto query = load_fbin(argv[3], nqt, dq);
     std::vector<int32_t> gt;
     if (!load_gtmm(argv[4], gt, gtk) || gtk < 10) {
@@ -137,17 +163,24 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> weight(L, 0);
     uint64_t total_w = 0, stored = 0;
     std::unordered_map<int64_t, std::vector<uint32_t>> home;
+    std::vector<uint64_t> stored_per_leaf(L, 0);
+#pragma omp parallel for schedule(dynamic)
     for (uint32_t l = 0; l < L; ++l) {
         if (leaf_info[l].page == kInvalidPage) continue;
         members[l] = index->debug_leaf_row_ids(l);
         weight[l] = leaf_info[l].pages;
-        total_w += weight[l];
-        stored += members[l].size();
+        stored_per_leaf[l] = members[l].size();
+        double* c = &centroid[l * db];
         for (RowId rid : members[l]) {
             const float* v = &base[static_cast<size_t>(rid) * db];
-            for (uint32_t d = 0; d < db; ++d) centroid[l * db + d] += v[d];
-            home[rid].push_back(l);
+            for (uint32_t d = 0; d < db; ++d) c[d] += v[d];
         }
+    }
+    for (uint32_t l = 0; l < L; ++l) {
+        if (leaf_info[l].page == kInvalidPage) continue;
+        total_w += weight[l];
+        stored += stored_per_leaf[l];
+        for (RowId rid : members[l]) home[rid].push_back(l);
     }
     for (uint32_t l = 0; l < L; ++l) {
         const size_t m = members[l].size();
@@ -237,6 +270,7 @@ int main(int argc, char** argv) {
                 if (mem.empty()) continue;
                 auto& store = proj_members[pi][l];
                 store.resize(mem.size() * P);
+#pragma omp parallel for schedule(dynamic)
                 for (size_t i = 0; i < mem.size(); ++i) {
                     const float* v = &base[static_cast<size_t>(mem[i]) * db];
                     for (uint32_t e = 0; e < P; ++e) {
@@ -274,6 +308,7 @@ int main(int argc, char** argv) {
             for (uint32_t e = 0; e < P; ++e)
                 i8_scale[ii][e] = 127.0f / i8_scale[ii][e];
             proj_i8[ii].resize(L);
+#pragma omp parallel for schedule(dynamic)
             for (uint32_t l = 0; l < L; ++l) {
                 const auto& pm = proj_members[SRC][l];
                 const size_t cnt = pm.size() / 128;
@@ -295,7 +330,12 @@ int main(int argc, char** argv) {
     // Per-leaf RADIUS: max member distance to the leaf mean — pairs with
     // the centroid into an admissible lower bound d(q,c) - r on the
     // distance to the nearest member (ball-tree pruning, no noise).
+    // SPIKE_NO_BOUND skips this leaf-ordered pass (the one random-access
+    // mmap phase left); the bound column is falsified anyway.
     std::vector<float> radius(L, 0.0f);
+    if (std::getenv("SPIKE_NO_BOUND")) {
+        std::fprintf(stderr, "[bound] skipped (SPIKE_NO_BOUND)\n");
+    } else
     for (uint32_t l = 0; l < L; ++l) {
         const double* c = &centroid[l * db];
         for (RowId rid : members[l]) {
@@ -474,6 +514,52 @@ int main(int argc, char** argv) {
     uint32_t q_scored_mm = 0; // ... and inside the member-min subset
     std::vector<uint32_t> leaf_order;
 
+    // Batched member-min / partial-dim precompute: one pass over the
+    // mmap'd base in ROW order (sequential readahead) scoring ALL mm
+    // queries at once. Per-query leaf-ordered scans are random-access
+    // page-fault storms at 10M scale (~20x slower). home is the exact
+    // inverse of the per-leaf member lists, so the max is identical.
+    const uint32_t MMQ = std::min(mm_q, nqt);
+    const uint32_t PD1 = db / 12;   // 128 at 1536
+    const uint32_t PD2 = db / 4;    // 384 at 1536
+    std::vector<float> mm_best((size_t)L * MMQ,
+        -std::numeric_limits<float>::max());
+    std::vector<float> mm_p1((size_t)L * MMQ,
+        -std::numeric_limits<float>::max());
+    std::vector<float> mm_p2((size_t)L * MMQ,
+        -std::numeric_limits<float>::max());
+    {
+        std::vector<const float*> mq(MMQ);
+        for (uint32_t qi2 = 0; qi2 < MMQ; ++qi2)
+            mq[qi2] = &query[static_cast<size_t>(qi2) * db];
+        std::fprintf(stderr, "[mm] batched member-min pass (%u queries)\n", MMQ);
+#pragma omp parallel for schedule(dynamic, 2048)
+        for (size_t r = 0; r < nb; ++r) {
+            auto it = home.find(static_cast<int64_t>(r));
+            if (it == home.end() || it->second.empty()) continue;
+            const float* v = &base[r * db];
+            for (uint32_t l : it->second) {
+                float* b1 = &mm_best[(size_t)l * MMQ];
+                float* b2 = &mm_p1[(size_t)l * MMQ];
+                float* b3 = &mm_p2[(size_t)l * MMQ];
+                for (uint32_t qi2 = 0; qi2 < MMQ; ++qi2) {
+                    const float* qv = mq[qi2];
+                    float ip = 0, ip1 = 0, ip2 = 0;
+                    for (uint32_t d = 0; d < db; ++d) {
+                        const float qq = qv[d] * v[d];
+                        ip += qq;
+                        if (d < PD1) ip1 += qq;
+                        if (d < PD2) ip2 += qq;
+                    }
+                    if (ip > b1[qi2]) b1[qi2] = ip;
+                    if (ip1 > b2[qi2]) b2[qi2] = ip1;
+                    if (ip2 > b3[qi2]) b3[qi2] = ip2;
+                }
+            }
+        }
+        std::fprintf(stderr, "[mm] batched member-min done\n");
+    }
+
     for (uint32_t qi = 0; qi < q_used; ++qi) {
         const float* q = &query[static_cast<size_t>(qi) * db];
         // GT leaves for this query, weighted per NEIGHBOR (the engine's
@@ -595,26 +681,14 @@ int main(int argc, char** argv) {
         // members restricted to the first PD dims — what a coarse 4-bit
         // code sweep over PD dims would approximate (codes exist for
         // every member; here we use fp32 vectors as the ceiling).
-        if (qi < mm_q) {
-            std::vector<float> best(L, -std::numeric_limits<float>::max());
-            const uint32_t PD1 = db / 12;   // 128 at 1536
-            const uint32_t PD2 = db / 4;    // 384 at 1536
-            std::vector<float> pbest1(L, -std::numeric_limits<float>::max());
-            std::vector<float> pbest2(L, -std::numeric_limits<float>::max());
+        if (qi < MMQ) {
+            // per-leaf member-min / partial-dim scores for this query,
+            // precomputed in the batched row-order pass above
+            std::vector<float> best(L), pbest1(L), pbest2(L);
             for (uint32_t l = 0; l < L; ++l) {
-                for (RowId rid : members[l]) {
-                    const float* v = &base[static_cast<size_t>(rid) * db];
-                    float ip = 0, ip1 = 0, ip2 = 0;
-                    for (uint32_t d = 0; d < db; ++d) {
-                        const float qq = q[d] * v[d];
-                        ip += qq;
-                        if (d < PD1) ip1 += qq;
-                        if (d < PD2) ip2 += qq;
-                    }
-                    best[l] = std::max(best[l], ip);
-                    pbest1[l] = std::max(pbest1[l], ip1);
-                    pbest2[l] = std::max(pbest2[l], ip2);
-                }
+                best[l] = mm_best[(size_t)l * MMQ + qi];
+                pbest1[l] = mm_p1[(size_t)l * MMQ + qi];
+                pbest2[l] = mm_p2[(size_t)l * MMQ + qi];
             }
             // PCA-P member orders (plane proxy): max projected IP
             for (size_t pi = 0; pi < NP; ++pi) {
@@ -628,6 +702,7 @@ int main(int argc, char** argv) {
                     qp[e] = static_cast<float>(acc);
                 }
                 std::vector<float> pbest(L, -std::numeric_limits<float>::max());
+#pragma omp parallel for schedule(dynamic)
                 for (uint32_t l = 0; l < L; ++l) {
                     const auto& pm = proj_members[pi][l];
                     const size_t cnt = pm.size() / P;
@@ -656,6 +731,7 @@ int main(int argc, char** argv) {
                     }
                     std::vector<float> rbest(
                         L, -std::numeric_limits<float>::max());
+#pragma omp parallel for schedule(dynamic)
                     for (uint32_t l = 0; l < L; ++l) {
                         const auto& pm = proj_i8[ii][l];
                         const size_t cnt = pm.size() / P;
@@ -683,6 +759,7 @@ int main(int argc, char** argv) {
                     for (uint32_t RANK : {48u, 64u, 96u}) {
                         std::vector<float> rbest(
                             L, -std::numeric_limits<float>::max());
+#pragma omp parallel for schedule(dynamic)
                         for (uint32_t l = 0; l < L; ++l) {
                             const auto& pm = proj_members[pi][l];
                             const size_t cnt = pm.size() / 128;
@@ -714,7 +791,7 @@ int main(int argc, char** argv) {
                 std::sort(po.begin(), po.end());
                 std::vector<uint32_t> order(L);
                 for (uint32_t i = 0; i < L; ++i) order[i] = po[i].second;
-                walk(order, 9);
+                walk(order, 9);;
             }
             // partial-1/4 order (fallback resolution)
             {
@@ -767,7 +844,7 @@ int main(int argc, char** argv) {
         for (uint32_t l = 0; l < L; ++l)
             if (leaf_info[l].page != kInvalidPage)
                 page_weight[leaf_info[l].page] = weight[l];
-        for (uint32_t np : {1u, 2u, 4u, 8u}) {
+        for (uint32_t np : {1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u}) {
             SearchConfig cfg;
             cfg.k = 10;
             cfg.n_probe = np;

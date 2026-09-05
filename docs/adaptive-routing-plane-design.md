@@ -1,8 +1,22 @@
 # Adaptive Routing Plane — design document
 
-Status: REVISED (v2) — plane DEMOTED to a documented option, not for
-merge. Grounded in measurements from
-[routing-decomposition-report.md](routing-decomposition-report.md).
+Status: REVISED (v3) — plane CUT at billion scale on 10M measurement;
+NAND-tier mid-scale option retained. Grounded in measurements from
+[routing-decomposition-report.md](routing-decomposition-report.md)
+(§4.3 for the scale result).
+
+> **v3 UPDATE (10M decomposition, cohere-10M / 2864 leaves):** at fixed
+> corpus-fraction coverage, centroid routing IMPROVES with leaf count
+> (0.77 → 0.893 containment @5%, 246 → 2864 leaves), while the i8-128
+> plane's edge shrinks to +2pp @5% (0.914 vs 0.893). Under the ≤4 B/vec
+> routing budget the plane is now a measured negative at scale — 128 GB
+> DRAM at 1B buys ~2pp. The engine's PCA-32 routing tracks the
+> centroid curve at matched coverage to np=256 (0.996 routing @25%
+> probed); past np64 the binding constraint is scan/rerank (W,
+> quantizer, τ), not routing. Consequences: leaf granularity is the
+> free routing lever (build-time sizing rule: ≥2K leaves at N ≥ 10M,
+> calibration in report §5), and this document's remaining live
+> content is the mid-scale option (§2) plus the milestone measurements.
 
 > **CONSTRAINT (governs everything below): sextant's objective function
 > is recall, latency, DRAM usage, and excess storage per dollar, at

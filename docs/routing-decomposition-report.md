@@ -146,24 +146,63 @@ target selects a corpus-appropriate plane (and, on arxiv-like data,
 correctly indicates the plane buys ~nothing over centroid routing).
 Corpus-dependence measured, not assumed.
 
+### 4.3 Ten million vectors (cohere-10M, 2864 leaves) — coverage vs N
+
+The scale question the 933K run could not answer: does containment at a
+fixed *corpus fraction* degrade as N grows? It does not — it improves.
+
+| ordering (B/vec) | 5% | 10% | 20% | (933K @5%) |
+|---|---|---|---|---|
+| centroid (0) | 0.893 | 0.956 | 0.987 | 0.77 |
+| member-min (ideal) | 1.000 | 1.000 | 1.000 | 1.00 |
+| i8 PCA-128 (128) | 0.914 | 0.960 | 0.992 | 0.92 (dbpedia) |
+| i8 PCA-64 (64) | 0.832 | 0.930 | 0.984 | 0.83 |
+| PCA-32 fp (engine proxy) | 0.776 | 0.906 | 0.968 | 0.74 |
+
+Finer leaves make centroid ranking *more* discriminative (2864 vs 246
+leaves), and the plane's edge over free centroids shrinks from ~15pp
+(dbpedia) to +2pp @5% here. Engine-side sweep on the same tree confirms
+the engine's PCA-32 routing sits on the exact-centroid curve at matched
+coverage:
+
+| np | probed frac | routing containment |
+|---|---|---|
+| 16 | 0.016 | 0.715 |
+| 32 | 0.032 | 0.827 |
+| 64 | 0.064 | 0.918 |
+| 128 | 0.128 | 0.970 |
+| 256 | 0.255 | 0.996 |
+
+Delivered recall at np256 plateaus at 0.66 with routing at 0.996 — the
+binding constraint past np64 is the scan/rerank side (W, quantizer,
+adaptive-τ), not routing. Logs:
+`gs://.../cohere/spike_routing_ceiling_10m.log`, `spike_engine_sweep_10m.log`.
+
 ## 5. Consequences for the architecture
 
 1. **The current design is validated, not indicted**: centroid-family
    routing is within a few points of the best query-independent
    structure, and the scan + fraction + exact-rerank stack is the
-   mechanism the decomposition says matters.
-2. **The one cheap upgrade with measured headroom is a resident PCA
-   plane** at adaptive rank (96–128 on this corpus): stage 1 sweeps a
-   128–256 B/vec resident projection ranking leaves by per-member max
-   IP (containment 0.99 @ 10%), stage 2 fraction-scans the winners.
-   Total ≈ 0.4× flat-scan at 0.99 recall vs probe-fraction's 0.5×
-   (fp16 plane; an i8 plane halves stage 1). At billion scale, where
-   the system is bytes-bound and the plane is the DRAM tier of a
-   cold-store design, this is the compounding win.
+   mechanism the decomposition says matters. At 10M this strengthens:
+   centroid routing *improves* with leaf count (§4.3) and the engine
+   tracks it at matched coverage through np=256 (0.996 routing).
+2. **Leaf granularity is the free routing lever; the resident plane is
+   cut at billion scale.** §4.3: finer leaves (246→2864) buy +12pp
+   containment @5% at 0 B/vec, while the 128 B/vec plane's edge shrinks
+   to +2pp — 128 GB DRAM at 1B for 2pp is not a trade, it is a
+   rejection. The plane survives only as the mid-scale (250K–fewM,
+   spectrally-gapped, NAND-tier) option, and §5 of the design doc now
+   records it as a measured negative at scale.
 3. **Rank must be adaptive** (explained-variance from the build
    reservoir), per F6 — a hard-coded plane rank repeats the 2.7σ
-   mistake at larger stakes.
-4. Sequential probing (probe-then-decide using scan feedback) is the
+   mistake at larger stakes. (Now largely moot for 1B per (2).)
+4. **Build-time leaf-count sizing rule** (new, from §4.3): pick
+   k_root/depth so leaves stay fine enough that centroid routing holds
+   containment ≥ target at probe_fraction f. Calibration points:
+   246 leaves → 0.77 @5% (dbpedia-933K), 2864 leaves → 0.89 @5%
+   (cohere-10M). One intermediate f-grid point (option 2) completes
+   the curve; until then, ≥2K leaves at N ≥ 10M is the working rule.
+5. Sequential probing (probe-then-decide using scan feedback) is the
    one mechanism class not tested here; it sits between routing and
    scanning and is the natural next question.
 
