@@ -139,14 +139,29 @@ int main(int argc, char** argv) {
     std::vector<std::vector<double>> pca_basis;
     std::vector<double> pca_mean;
     {
+        // Basis-training window knobs (milestone-2 drift sim):
+        //   SPIKE_BASIS_PREFIX  fraction of the sample that trains the
+        //                       basis (0.05 = early ingest prefix)
+        //   SPIKE_BASIS_OFFSET  fraction of nb where the window starts
+        //                       (0.5 = mid-corpus ingest window)
+        const float bf = [] { const char* e = std::getenv("SPIKE_BASIS_PREFIX");
+                              return e ? std::atof(e) : 1.0f; }();
+        const float bo = [] { const char* e = std::getenv("SPIKE_BASIS_OFFSET");
+                              return e ? std::atof(e) : 0.0f; }();
         const uint32_t SAMPLE = std::min<uint32_t>(20000, nb);
+        const uint32_t off = static_cast<uint32_t>(
+            std::min<double>(bo, 0.99) * (nb - SAMPLE));
+        const uint32_t TRAIN = std::max(1000u,
+            static_cast<uint32_t>(bf * SAMPLE));
+        std::fprintf(stderr, "[pca] basis trains on rows [%u, %u) of %u\n",
+                     off, off + TRAIN, nb);
         pca_mean.assign(db, 0.0);
         auto& mean = pca_mean;
-        for (uint32_t i = 0; i < SAMPLE; ++i)
+        for (uint32_t i = 0; i < TRAIN; ++i)
             for (uint32_t d = 0; d < db; ++d)
-                mean[d] += base[static_cast<size_t>(i) * db + d] / SAMPLE;
+                mean[d] += base[static_cast<size_t>(off + i) * db + d] / TRAIN;
         std::vector<double> cov(db * db, 0.0);
-        for (uint32_t i = 0; i < SAMPLE; ++i) {
+        for (uint32_t i = 0; i < TRAIN; ++i) {
             const float* v = &base[static_cast<size_t>(i) * db];
             for (uint32_t r = 0; r < db; ++r) {
                 const double vr = v[r] - mean[r];
