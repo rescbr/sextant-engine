@@ -254,9 +254,19 @@ int main(int argc, char** argv) {
     // NOT FPS members — peripheral anchors underperform the plain mean
     // (measured); dense-mode sub-means are the deployable approximation
     // of member-min. A leaf ranks by min L2 to its anchors.
-    const uint32_t ANCHORS[] = {4, 16, 64, 256};
-    constexpr size_t NA = 3;
-    std::vector<std::vector<float>> anchor_sets[NA];  // [a][leaf][k*db]
+    // Anchor family already measured+falsified; SPIKE_NO_ANCHORS=1
+    // skips the (expensive) k-means precompute for corpus-2 runs that
+    // only need the plane/rank columns.
+    static const bool no_anchors = std::getenv("SPIKE_NO_ANCHORS") != nullptr;
+    const uint32_t ANCHORS_arr[] = {4, 16, 64, 256};
+    std::vector<uint32_t> ANCHORS_v(
+        no_anchors ? ANCHORS_arr : ANCHORS_arr,
+        no_anchors ? ANCHORS_arr : ANCHORS_arr + 4);
+    if (no_anchors) ANCHORS_v.clear();
+    const auto& ANCHORS = ANCHORS_v;
+    constexpr size_t NA_MAX = 4;
+    const size_t NA = ANCHORS.size();
+    std::vector<std::vector<float>> anchor_sets[NA_MAX];  // [a][leaf][k*db]
     for (size_t ai = 0; ai < NA; ++ai) {
         const uint32_t A = ANCHORS[ai];
         anchor_sets[ai].resize(L);
@@ -681,17 +691,21 @@ int main(int argc, char** argv) {
 
     std::printf("\n%-8s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s  (ideal rows over %u queries)\n",
                 "frac", "random", "centrd", "mbrmin", "oracle",
-                "an04", "an16", "an64", "a256", "bound", "p1/12", "p1/4", "pca32", "p128", "p048", "p064", "p096", mm_q);
+                no_anchors ? "  --" : "an04",
+                no_anchors ? "  --" : "an16",
+                no_anchors ? "  --" : "an64",
+                no_anchors ? "  --" : "a256",
+                "bound", "p1/12", "p1/4", "pca32", "p128", "p048", "p064", "p096", mm_q);
     for (size_t fi = 0; fi < NF; ++fi) {
         std::printf("%-8.2f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f\n",
                     fracs[fi],
                     hit[0][fi] / q_used, hit[1][fi] / q_used,
                     hit[2][fi] / std::min(mm_q, q_used),
                     hit[3][fi] / q_used,
-                    hit[4][fi] / std::min(mm_q, q_used),
-                    hit[5][fi] / std::min(mm_q, q_used),
-                    hit[6][fi] / std::min(mm_q, q_used),
-                    hit[7][fi] / std::min(mm_q, q_used),
+                    NA > 0 ? hit[4][fi] / std::min(mm_q, q_used) : 0.0,
+                    NA > 1 ? hit[5][fi] / std::min(mm_q, q_used) : 0.0,
+                    NA > 2 ? hit[6][fi] / std::min(mm_q, q_used) : 0.0,
+                    NA > 3 ? hit[7][fi] / std::min(mm_q, q_used) : 0.0,
                     hit[6 + NA][fi] / q_used,
                     hit[4 + NA][fi] / std::min(mm_q, q_used),
                     hit[5 + NA][fi] / std::min(mm_q, q_used),

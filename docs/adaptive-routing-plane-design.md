@@ -60,8 +60,10 @@ stage 2 (fraction):  existing scan path over the f-fraction winners
 
 - **Rule**: smallest P with explained variance ≥ target (default
   ~0.90, configurable) on the current reservoir spectrum. dbpedia-1536
-  lands at 96–128; other corpora will differ (arxiv-768 expected
-  lower; measure, don't assume).
+  lands at 96–128; **arxiv-768 measured: no plane gap at any rank**
+  (centroid ≈ member-min ≈ plane) — the rule must also be allowed to
+  answer "no plane" (variance target met at low P ⇒ centroid routing
+  suffices), which the measured second corpus confirms matters.
 - **Rank is a property of the data, re-derived at every basis
   refresh.** No hard-coded P anywhere in the serving path; the manifest
   records (P, basis version, variance curve).
@@ -146,7 +148,7 @@ The estimator pattern promoted from build step to running service.
 
 | risk | status |
 |---|---|
-| rank curve unverified on 2nd corpus | arxiv run queued; report F6 notes |
+| rank curve on 2nd corpus | DONE: arxiv-768 has NO plane gap (centroid ≈ member-min ≈ plane) — adaptive rule correctly de-emphasizes the plane there; report §4.1 |
 | i8-quantized plane containment loss | unmeasured — spike before commit |
 | stage-1 sweep latency at small N | plane may lose to probe-all below ~250K; auto-fallback by N |
 | dual-basis window complexity | bounded by vacuum cadence; measure mixture recall in prototype |
