@@ -110,6 +110,12 @@ spike_routing = executable('spike_routing',
     link_with: sextant_lib,
 )
 
+spike_routing_ceiling = executable('spike_routing_ceiling',
+    'spike_routing_ceiling.cpp',
+    include_directories: [engine_inc, src_inc, third_party_inc],
+    link_with: sextant_lib,
+)
+
 spike_slm_roundtrip = executable('spike_slm_roundtrip',
     'spike_slm_roundtrip.cpp',
     include_directories: [engine_inc, src_inc],
