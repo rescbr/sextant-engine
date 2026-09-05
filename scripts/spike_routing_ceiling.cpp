@@ -130,6 +130,84 @@ int main(int argc, char** argv) {
         const size_t m = members[l].size();
         if (m) for (uint32_t d = 0; d < db; ++d) centroid[l * db + d] /= m;
     }
+    // --- PCA projections of members (plan-D plane proxy): rank leaves
+    // by max over members of IP in the top-P PCA directions. Basis via
+    // power iteration + deflation on a 20K-row sample covariance.
+    const uint32_t PW[] = {32, 128};
+    constexpr size_t NP = 2;
+    std::vector<std::vector<float>> proj_members[NP];  // [p][leaf][m*P]
+    std::vector<std::vector<double>> pca_basis;
+    std::vector<double> pca_mean;
+    {
+        const uint32_t SAMPLE = std::min<uint32_t>(20000, nb);
+        pca_mean.assign(db, 0.0);
+        auto& mean = pca_mean;
+        for (uint32_t i = 0; i < SAMPLE; ++i)
+            for (uint32_t d = 0; d < db; ++d)
+                mean[d] += base[static_cast<size_t>(i) * db + d] / SAMPLE;
+        std::vector<double> cov(db * db, 0.0);
+        for (uint32_t i = 0; i < SAMPLE; ++i) {
+            const float* v = &base[static_cast<size_t>(i) * db];
+            for (uint32_t r = 0; r < db; ++r) {
+                const double vr = v[r] - mean[r];
+                for (uint32_t c2 = r; c2 < db; ++c2)
+                    cov[r * db + c2] += vr * (v[c2] - mean[c2]) / SAMPLE;
+            }
+        }
+        for (uint32_t r = 0; r < db; ++r)
+            for (uint32_t c2 = 0; c2 < r; ++c2)
+                cov[r * db + c2] = cov[c2 * db + r];
+        auto& basis = pca_basis;
+        std::vector<double> resid = cov;
+        const uint32_t PMAX = 128;
+        for (uint32_t e = 0; e < PMAX; ++e) {
+            std::vector<double> v(db, 1.0 / std::sqrt((double)db));
+            for (int it = 0; it < 40; ++it) {
+                std::vector<double> w(db, 0.0);
+                for (uint32_t r = 0; r < db; ++r) {
+                    double acc = 0;
+                    for (uint32_t c2 = 0; c2 < db; ++c2) acc += resid[r * db + c2] * v[c2];
+                    w[r] = acc;
+                }
+                double nrm = 1e-30;
+                for (uint32_t d = 0; d < db; ++d) nrm += w[d] * w[d];
+                nrm = std::sqrt(nrm);
+                for (uint32_t d = 0; d < db; ++d) v[d] = w[d] / nrm;
+            }
+            basis.push_back(v);
+            for (uint32_t r = 0; r < db; ++r)
+                for (uint32_t c2 = 0; c2 < db; ++c2)
+                    resid[r * db + c2] -= v[r] * v[c2] * 0;  // deflate below
+            // deflate: resid -= lambda * v v^T (lambda = v^T resid v)
+            double lambda = 0;
+            for (uint32_t r = 0; r < db; ++r)
+                for (uint32_t c2 = 0; c2 < db; ++c2) lambda += v[r] * resid[r * db + c2] * v[c2];
+            for (uint32_t r = 0; r < db; ++r)
+                for (uint32_t c2 = 0; c2 < db; ++c2)
+                    resid[r * db + c2] -= lambda * v[r] * v[c2];
+        }
+        for (size_t pi = 0; pi < NP; ++pi) {
+            const uint32_t P = PW[pi];
+            proj_members[pi].resize(L);
+            for (uint32_t l = 0; l < L; ++l) {
+                const auto& mem = members[l];
+                if (mem.empty()) continue;
+                auto& store = proj_members[pi][l];
+                store.resize(mem.size() * P);
+                for (size_t i = 0; i < mem.size(); ++i) {
+                    const float* v = &base[static_cast<size_t>(mem[i]) * db];
+                    for (uint32_t e = 0; e < P; ++e) {
+                        const auto& b = basis[e];
+                        double acc = 0;
+                        for (uint32_t d = 0; d < db; ++d) acc += (v[d] - mean[d]) * b[d];
+                        store[i * P + e] = static_cast<float>(acc);
+                    }
+                }
+            }
+        }
+        std::fprintf(stderr, "[pca] basis ready (32/128 of %u dims)\n", db);
+    }
+
     // Per-leaf RADIUS: max member distance to the leaf mean — pairs with
     // the centroid into an admissible lower bound d(q,c) - r on the
     // distance to the nearest member (ball-tree pruning, no noise).
@@ -296,7 +374,7 @@ int main(int argc, char** argv) {
     // Prefix fractions at which to report containment (by page weight).
     const double fracs[] = {0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.0};
     constexpr size_t NF = sizeof(fracs) / sizeof(fracs[0]);
-    std::vector<std::vector<double>> hit(4 + NA + 3, std::vector<double>(NF, 0.0));
+    std::vector<std::vector<double>> hit(4 + NA + 3 + NP, std::vector<double>(NF, 0.0));
     uint32_t q_used = std::min(nq, nqt);
     std::vector<uint32_t> leaf_order;
 
@@ -420,6 +498,35 @@ int main(int argc, char** argv) {
                     pbest2[l] = std::max(pbest2[l], ip2);
                 }
             }
+            // PCA-P member orders (plane proxy): max projected IP
+            for (size_t pi = 0; pi < NP; ++pi) {
+                const uint32_t P = PW[pi];
+                std::vector<float> qp(P);
+                for (uint32_t e = 0; e < P; ++e) {
+                    const auto& b = pca_basis[e];
+                    double acc = 0;
+                    for (uint32_t d = 0; d < db; ++d)
+                        acc += (q[d] - pca_mean[d]) * b[d];
+                    qp[e] = static_cast<float>(acc);
+                }
+                std::vector<float> pbest(L, -std::numeric_limits<float>::max());
+                for (uint32_t l = 0; l < L; ++l) {
+                    const auto& pm = proj_members[pi][l];
+                    const size_t cnt = pm.size() / P;
+                    for (size_t i = 0; i < cnt; ++i) {
+                        float ip = 0;
+                        for (uint32_t e = 0; e < P; ++e)
+                            ip += qp[e] * pm[i * P + e];
+                        pbest[l] = std::max(pbest[l], ip);
+                    }
+                }
+                std::vector<std::pair<float, uint32_t>> po(L);
+                for (uint32_t l = 0; l < L; ++l) po[l] = {-pbest[l], l};
+                std::sort(po.begin(), po.end());
+                std::vector<uint32_t> order(L);
+                for (uint32_t i = 0; i < L; ++i) order[i] = po[i].second;
+                walk(order, 6 + NA + 1 + pi);
+            }
             // partial-1/12 order (plan D target)
             {
                 std::vector<std::pair<float, uint32_t>> po(L);
@@ -542,11 +649,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("\n%-8s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s  (ideal rows over %u queries)\n",
+    std::printf("\n%-8s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s  (ideal rows over %u queries)\n",
                 "frac", "random", "centrd", "mbrmin", "oracle",
-                "an04", "an16", "an64", "a256", "bound", "p1/12", "p1/4", mm_q);
+                "an04", "an16", "an64", "a256", "bound", "p1/12", "p1/4", "pca32", "pca128", mm_q);
     for (size_t fi = 0; fi < NF; ++fi) {
-        std::printf("%-8.2f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f\n",
+        std::printf("%-8.2f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f\n",
                     fracs[fi],
                     hit[0][fi] / q_used, hit[1][fi] / q_used,
                     hit[2][fi] / std::min(mm_q, q_used),
@@ -557,7 +664,9 @@ int main(int argc, char** argv) {
                     hit[7][fi] / std::min(mm_q, q_used),
                     hit[6 + NA][fi] / q_used,
                     hit[4 + NA][fi] / std::min(mm_q, q_used),
-                    hit[5 + NA][fi] / std::min(mm_q, q_used));
+                    hit[5 + NA][fi] / std::min(mm_q, q_used),
+                    hit[6 + NA + 1][fi] / std::min(mm_q, q_used),
+                    hit[6 + NA + 2][fi] / std::min(mm_q, q_used));
     }
     return 0;
 }
