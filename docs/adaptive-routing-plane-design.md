@@ -137,6 +137,25 @@ The estimator pattern promoted from build step to running service.
   *exact-truth-verified to N rows; snapshot-consistent beyond; proxy
   signals continuous.* No static recall claims.
 
+### 6.1 Milestone 2 measured: clustered-ingest drift and refresh recovery
+
+Cluster-ordered dbpedia ingest (sort by leading 4 PCA components; artifacts
+on GCS — perm/invperm/clustered base + README). i8@128 containment
+@5/10/20%, queries split by neighbor tercile in the clustered order:
+
+| basis | early tercile (seen) | late tercile (unseen) |
+|---|---|---|
+| 2%-prefix (clustered ingest) | 0.89 / 0.94 / 0.95 | **0.67 / 0.83 / 0.91** |
+| full-sample (≈ refresh) | 0.92 / 0.95 / 0.98 | **0.81 / 0.86 / 0.96** |
+
+- Clustered ingest costs **14pp @ 5% on unseen clusters** (~3pp on seen);
+  the refresh operation recovers it (0.67 → 0.81 @ 5%). member-min = 1.0
+  in both terciles (geometry unchanged — the damage is purely the basis).
+- Homogeneous ingest (§5 measurements, previous): ~nil drift even with a
+  0.1%-of-corpus training prefix. So the drift signal and basis
+  versioning have a measured job precisely in the clustered case, and
+  the bootstrap threshold can stay low for homogeneous streams.
+
 ## 7. Billion-scale posture
 
 - Plane = DRAM tier (128–256 GB at 1B for P=128; i8/P=64 halves it)
@@ -162,9 +181,9 @@ The estimator pattern promoted from build step to running service.
 ## 9. Verification milestones
 
 1. Spike: i8 plane + PCA-64 points on the bytes curve (dbpedia + arxiv).
-2. Spike: basis-refresh simulation — train basis on first 20% of a
-   shuffled-vs-clustered ingest, measure containment decay and refresh
-   recovery (validates §4/§5 offline).
+2. DONE (§6.1): clustered-ingest drift measured — 14pp @5% on unseen
+   clusters from a 2%-prefix basis; refresh recovers it. Artifacts:
+   GCS clustered perm/invperm/base + README.
 3. Engine prototype: plane blob at build; stage-1 in search; f as
    stage-2 cut; verify via the rb auto-row grid (recipe:
    probe-fraction-shipped memory; target 0.99 @ total ≤ 0.4× flat,

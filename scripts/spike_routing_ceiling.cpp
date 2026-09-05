@@ -103,6 +103,29 @@ int main(int argc, char** argv) {
     std::printf("base=%u dim=%u queries=%u(used %u) gt_k=10 mm_queries=%u\n",
                 nb, db, nqt, nq, mm_q);
 
+    // Clustered-ingest artifacts (milestone-2): SPIKE_BASIS_ORDER (row
+    // order file, i32) makes the basis train along that ingest order;
+    // SPIKE_INVORDER maps row_id -> position in that order, enabling
+    // query filtering by neighbor ingest position (SPIKE_GT_POS tercile).
+    std::vector<int32_t> basis_order, inv_order;
+    if (const char* o = std::getenv("SPIKE_BASIS_ORDER")) {
+        std::ifstream f(o, std::ios::binary);
+        if (!f) { std::fprintf(stderr, "open %s failed\n", o); return 1; }
+        basis_order.resize(nb);
+        f.read(reinterpret_cast<char*>(basis_order.data()),
+               static_cast<std::streamsize>(nb * 4));
+        std::fprintf(stderr, "[order] loaded %u-row ingest order\n", nb);
+    }
+    if (const char* o = std::getenv("SPIKE_INVORDER")) {
+        std::ifstream f(o, std::ios::binary);
+        if (!f) { std::fprintf(stderr, "open %s failed\n", o); return 1; }
+        inv_order.resize(nb);
+        f.read(reinterpret_cast<char*>(inv_order.data()),
+               static_cast<std::streamsize>(nb * 4));
+    }
+    const int gt_pos = [] { const char* e = std::getenv("SPIKE_GT_POS");
+                            return e ? std::atoi(e) : -1; }();
+
     auto index = IVFTreeIndex::open(argv[1]);
     const auto leaf_info = index->debug_leaf_info();
     const uint32_t L = static_cast<uint32_t>(leaf_info.size());
@@ -157,12 +180,17 @@ int main(int argc, char** argv) {
                      off, off + TRAIN, nb);
         pca_mean.assign(db, 0.0);
         auto& mean = pca_mean;
+        auto train_row = [&](uint32_t i) {
+            const uint32_t r = basis_order.empty() ? off + i
+                : static_cast<uint32_t>(basis_order[off + i]);
+            return static_cast<size_t>(r) * db;
+        };
         for (uint32_t i = 0; i < TRAIN; ++i)
             for (uint32_t d = 0; d < db; ++d)
-                mean[d] += base[static_cast<size_t>(off + i) * db + d] / TRAIN;
+                mean[d] += base[train_row(i) + d] / TRAIN;
         std::vector<double> cov(db * db, 0.0);
         for (uint32_t i = 0; i < TRAIN; ++i) {
-            const float* v = &base[static_cast<size_t>(i) * db];
+            const float* v = &base[train_row(i)];
             for (uint32_t r = 0; r < db; ++r) {
                 const double vr = v[r] - mean[r];
                 for (uint32_t c2 = r; c2 < db; ++c2)
@@ -442,6 +470,8 @@ int main(int argc, char** argv) {
     constexpr size_t NF = sizeof(fracs) / sizeof(fracs[0]);
     std::vector<std::vector<double>> hit(18, std::vector<double>(NF, 0.0));
     uint32_t q_used = std::min(nq, nqt);
+    uint32_t q_scored = 0;    // queries passing the GT_POS filter
+    uint32_t q_scored_mm = 0; // ... and inside the member-min subset
     std::vector<uint32_t> leaf_order;
 
     for (uint32_t qi = 0; qi < q_used; ++qi) {
@@ -462,6 +492,28 @@ int main(int argc, char** argv) {
         const uint32_t n_nb =
             static_cast<uint32_t>(gt_offsets.size() - 1);
         if (gt_leaf_sets.empty()) continue;
+        // Tercile filter: score only queries whose neighbors' mean
+        // position in the clustered ingest order falls in tercile
+        // gt_pos (0=early ... 2=late). Requires the inverse order.
+        if (gt_pos >= 0) {
+            if (inv_order.empty()) {
+                std::fprintf(stderr, "SPIKE_GT_POS needs SPIKE_INVORDER\n");
+                return 1;
+            }
+            double meanpos = 0; uint32_t cnt = 0;
+            for (uint32_t g = 0; g < 10; ++g) {
+                const int32_t rid =
+                    gt[static_cast<size_t>(qi) * gt_stride + g];
+                if (rid >= 0 && rid < static_cast<int32_t>(nb)) {
+                    meanpos += inv_order[rid]; ++cnt;
+                }
+            }
+            if (cnt) meanpos /= cnt * nb;  // in [0,1)
+            const int tercile = static_cast<int>(meanpos * 3.0);
+            if (tercile != gt_pos) continue;
+        }
+        ++q_scored;
+        if (qi < mm_q) ++q_scored_mm;
         std::vector<char> is_gt(L, 0);
         for (uint32_t l : gt_leaf_sets) is_gt[l] = 1;
 
@@ -706,6 +758,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    std::fprintf(stderr, "[gt] scored %u of %u presented queries\n", q_scored, q_used);
+
     // --- Engine points: (probed page fraction, per-neighbor routing
     // containment) under the engine's own PCA routing, np = 1/2/4/8.
     {
@@ -787,23 +841,23 @@ int main(int argc, char** argv) {
     for (size_t fi = 0; fi < NF; ++fi) {
         std::printf("%-8.2f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f\n",
                     fracs[fi],
-                    hit[0][fi] / q_used, hit[1][fi] / q_used,
-                    hit[2][fi] / std::min(mm_q, q_used),
-                    hit[3][fi] / q_used,
-                    NA > 0 ? hit[4][fi] / std::min(mm_q, q_used) : 0.0,
-                    NA > 1 ? hit[5][fi] / std::min(mm_q, q_used) : 0.0,
-                    NA > 2 ? hit[6][fi] / std::min(mm_q, q_used) : 0.0,
-                    NA > 3 ? hit[7][fi] / std::min(mm_q, q_used) : 0.0,
-                    hit[8][fi] / q_used,
-                    hit[9][fi] / std::min(mm_q, q_used),
-                    hit[10][fi] / std::min(mm_q, q_used),
-                    hit[11][fi] / std::min(mm_q, q_used),
-                    hit[12][fi] / std::min(mm_q, q_used),
-                    hit[13][fi] / std::min(mm_q, q_used),
-                    hit[14][fi] / std::min(mm_q, q_used),
-                    hit[15][fi] / std::min(mm_q, q_used),
-                    hit[16][fi] / std::min(mm_q, q_used),
-                    hit[17][fi] / std::min(mm_q, q_used));
+                    hit[0][fi] / q_scored, hit[1][fi] / q_scored,
+                    hit[2][fi] / std::min(mm_q, q_scored_mm),
+                    hit[3][fi] / q_scored,
+                    NA > 0 ? hit[4][fi] / std::min(mm_q, q_scored_mm) : 0.0,
+                    NA > 1 ? hit[5][fi] / std::min(mm_q, q_scored_mm) : 0.0,
+                    NA > 2 ? hit[6][fi] / std::min(mm_q, q_scored_mm) : 0.0,
+                    NA > 3 ? hit[7][fi] / std::min(mm_q, q_scored_mm) : 0.0,
+                    hit[8][fi] / q_scored,
+                    hit[9][fi] / std::min(mm_q, q_scored_mm),
+                    hit[10][fi] / std::min(mm_q, q_scored_mm),
+                    hit[11][fi] / std::min(mm_q, q_scored_mm),
+                    hit[12][fi] / std::min(mm_q, q_scored_mm),
+                    hit[13][fi] / std::min(mm_q, q_scored_mm),
+                    hit[14][fi] / std::min(mm_q, q_scored_mm),
+                    hit[15][fi] / std::min(mm_q, q_scored_mm),
+                    hit[16][fi] / std::min(mm_q, q_scored_mm),
+                    hit[17][fi] / std::min(mm_q, q_scored_mm));
     }
     return 0;
 }
