@@ -374,7 +374,7 @@ int main(int argc, char** argv) {
     // Prefix fractions at which to report containment (by page weight).
     const double fracs[] = {0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.0};
     constexpr size_t NF = sizeof(fracs) / sizeof(fracs[0]);
-    std::vector<std::vector<double>> hit(4 + NA + 3 + NP, std::vector<double>(NF, 0.0));
+    std::vector<std::vector<double>> hit(4 + NA + 3 + NP + 3, std::vector<double>(NF, 0.0));
     uint32_t q_used = std::min(nq, nqt);
     std::vector<uint32_t> leaf_order;
 
@@ -526,6 +526,36 @@ int main(int argc, char** argv) {
                 std::vector<uint32_t> order(L);
                 for (uint32_t i = 0; i < L; ++i) order[i] = po[i].second;
                 walk(order, 6 + NA + 1 + pi);
+                // Rank sweep from the NESTED 128-d projections: prefix
+                // sums give every rank <= 128 for free.
+                if (pi == 1) {
+                    for (uint32_t RANK : {48u, 64u, 96u}) {
+                        std::vector<float> rbest(
+                            L, -std::numeric_limits<float>::max());
+                        for (uint32_t l = 0; l < L; ++l) {
+                            const auto& pm = proj_members[pi][l];
+                            const size_t cnt = pm.size() / 128;
+                            for (size_t i = 0; i < cnt; ++i) {
+                                float ip = 0;
+                                for (uint32_t e = 0; e < RANK; ++e)
+                                    ip += qp[e] * pm[i * 128 + e];
+                                rbest[l] = std::max(rbest[l], ip);
+                            }
+                        }
+                        std::vector<std::pair<float, uint32_t>> ro(L);
+                        for (uint32_t l = 0; l < L; ++l)
+                            ro[l] = {-rbest[l], l};
+                        std::sort(ro.begin(), ro.end());
+                        std::vector<uint32_t> rorder(L);
+                        for (uint32_t i = 0; i < L; ++i)
+                            rorder[i] = ro[i].second;
+                        // slot by rank: 48->+3, 64->+4, 96->+5 past the
+                        // two plane columns
+                        walk(rorder, 6 + NA + 3 +
+                                          (RANK == 48u ? 0
+                                           : RANK == 64u ? 1 : 2));
+                    }
+                }
             }
             // partial-1/12 order (plan D target)
             {
@@ -649,11 +679,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("\n%-8s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s  (ideal rows over %u queries)\n",
+    std::printf("\n%-8s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s  (ideal rows over %u queries)\n",
                 "frac", "random", "centrd", "mbrmin", "oracle",
-                "an04", "an16", "an64", "a256", "bound", "p1/12", "p1/4", "pca32", "pca128", mm_q);
+                "an04", "an16", "an64", "a256", "bound", "p1/12", "p1/4", "pca32", "p128", "p048", "p064", "p096", mm_q);
     for (size_t fi = 0; fi < NF; ++fi) {
-        std::printf("%-8.2f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f\n",
+        std::printf("%-8.2f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f\n",
                     fracs[fi],
                     hit[0][fi] / q_used, hit[1][fi] / q_used,
                     hit[2][fi] / std::min(mm_q, q_used),
@@ -666,7 +696,10 @@ int main(int argc, char** argv) {
                     hit[4 + NA][fi] / std::min(mm_q, q_used),
                     hit[5 + NA][fi] / std::min(mm_q, q_used),
                     hit[6 + NA + 1][fi] / std::min(mm_q, q_used),
-                    hit[6 + NA + 2][fi] / std::min(mm_q, q_used));
+                    hit[6 + NA + 2][fi] / std::min(mm_q, q_used),
+                    hit[6 + NA + 3][fi] / std::min(mm_q, q_used),
+                    hit[6 + NA + 4][fi] / std::min(mm_q, q_used),
+                    hit[6 + NA + 5][fi] / std::min(mm_q, q_used));
     }
     return 0;
 }
