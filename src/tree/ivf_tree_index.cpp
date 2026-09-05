@@ -496,7 +496,11 @@ void resolve_build_params(TreeBuildContext& ctx) {
     // PCA dimensions: project to this many components for routing.
     // Default: 32 (captures meaningful variance without being too large
     // for k-means to find structure). For d_eff≈2 data, even 8-16 PCs suffice.
-    ctx.pca_dims = std::min(ctx.dim, cfg.pca_dims > 0 ? cfg.pca_dims : 32u);
+    // pca_dims == 0 is HONORED: disables PCA routing entirely (full-dim
+    // fp16 centroid routing — the phase-0 path of the adaptive-routing
+    // design and the no-PCA A/B baseline). Previously 0 silently coerced
+    // to 32, which made PCA impossible to turn off from the CLI.
+    ctx.pca_dims = cfg.pca_dims == 0 ? 0 : std::min(ctx.dim, cfg.pca_dims);
     ctx.metric = params.metric;
 
     // Construct the per-family leaf coder (the ONLY quantizer_type

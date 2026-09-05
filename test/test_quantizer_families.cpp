@@ -340,6 +340,48 @@ TEST(QuantizerFamilies, LocalScalarInnerProductBias) {
     std::filesystem::remove(tree);
 }
 
+// PCA-off builds (pca_dims == 0, previously silently coerced to 32):
+// must build, open WITHOUT PCA state, and search at sane recall via
+// full-dim fp16 centroid routing (spike-measured: within a few pp of
+// the PCA path at matched coverage).
+TEST(QuantizerFamilies, PcaDisabledBuild) {
+    const MiniData& m = mini();
+    const std::string tree = temp_tree();
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.quantizer_type = "local_scalar";
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 2000;
+    cfg.adaptive_probe_gap = 0.0f;
+    cfg.pca_dims = 0;  // the previously-ignored "disable" request
+    {
+        FbinSource s(datasets_dir() + "/mini10k_base.fbin");
+        IVFTreeIndex::build_streaming_pca(s, tree, cfg);
+    }
+    auto idx = IVFTreeIndex::open(tree);
+    ASSERT_TRUE(idx);
+    EXPECT_EQ(idx->pca_dims_default(), 0u);
+    SearchConfig sc;
+    sc.k = 10;
+    sc.n_probe = 8;  // probe-all
+    sc.fastscan_W = 1000;
+    sc.adaptive_probe_gap = 0.0f;
+    sc.rerank = true;
+    double r = 0;
+    for (uint32_t q = 0; q < 100; ++q)
+        r += recall_at_10(idx->search(&m.query[q * m.dim], 10, sc), m.gt[q]);
+    r /= 100;
+    if (const char* v = std::getenv("QFAM_VERBOSE"); v && *v)
+        fprintf(stderr, "[qfam] pca-off recall@10 = %.4f\n", r);
+    // Measured 0.812 vs 0.941 for the PCA-32 build on this fixture:
+    // with PCA off, k-means runs in full dim where mini10k's noise
+    // coordinates dilute the clustering — a fixture-dependent build-
+    // quality difference (dbpedia-100K spike: PCA vs full-dim LEAF
+    // RANKING differ by only ~3pp), not a routing bug. The contract
+    // under test is that 0 is honored and the fp16 path is functional.
+    EXPECT_GE(r, 0.78) << "pca-off build regressed";
+    std::filesystem::remove(tree);
+}
+
 // Probe-fraction routing (leaf-coverage contract). Invariants:
 //   - new builds persist the 0.5 manifest default;
 //   - f = 1.0 selects every root child → identical results to probe-all;

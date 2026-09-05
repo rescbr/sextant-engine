@@ -82,6 +82,8 @@ public:
         float median_lid = 0.0f;
         uint32_t num_threads = 0;
         uint32_t pca_dims = 32;      // PCA dimensions for build_streaming_pca
+                                      // (0 = DISABLE PCA routing: full-dim
+                                      //  fp16 centroid routing)
         uint32_t max_lloyd_passes = 10;  // max streaming Lloyd refinement passes
         uint32_t k_root_max_depth2 = 2048;  // k_root above this forces depth-3
         float closure_multiplier = 0.15f;  // closure epsilon = multiplier × mean_gap
@@ -180,6 +182,7 @@ public:
     uint32_t n_probe_l0_default() const { return manifest_.n_probe_l0; }
     uint32_t n_probe_ln_default() const { return manifest_.n_probe_ln; }
     float probe_fraction_default() const { return manifest_.probe_fraction; }
+    uint32_t pca_dims_default() const { return manifest_.pca_dims; }
     const std::string& quantizer_type() const { return manifest_.quantizer_type; }
     /// Global PQ quantizer view (global-codebook families only). Callers
     /// must not invoke this on local/scalar families.
