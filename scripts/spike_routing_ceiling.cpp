@@ -155,10 +155,132 @@ int main(int argc, char** argv) {
                 static_cast<double>(stored) / nb,
                 static_cast<unsigned long long>(total_w));
 
+    // --- Per-leaf ANCHOR SETS (plan A, rev 2): A sub-MEANS per leaf from
+    // a recursive 2-means split (dominant-direction seed + reassignment),
+    // NOT FPS members — peripheral anchors underperform the plain mean
+    // (measured); dense-mode sub-means are the deployable approximation
+    // of member-min. A leaf ranks by min L2 to its anchors.
+    const uint32_t ANCHORS[] = {2, 4, 8};
+    constexpr size_t NA = 3;
+    std::vector<std::vector<float>> anchor_sets[NA];  // [a][leaf][k*db]
+    for (size_t ai = 0; ai < NA; ++ai) {
+        const uint32_t A = ANCHORS[ai];
+        anchor_sets[ai].resize(L);
+        for (uint32_t l = 0; l < L; ++l) {
+            const auto& mem = members[l];
+            if (mem.size() < 2) continue;
+            const double* c = &centroid[l * db];
+            std::vector<float> pts(mem.size() * db);
+            for (size_t i = 0; i < mem.size(); ++i)
+                std::memcpy(&pts[i * db],
+                            &base[static_cast<size_t>(mem[i]) * db],
+                            db * sizeof(float));
+            // Dominant direction of this leaf (power iteration on the
+            // centered members), used to seed the first split.
+            auto dom_dir = [&](const std::vector<double>& m) {
+                std::vector<double> dir(db, 0.0);
+                for (uint32_t d = 0; d < db; ++d)
+                    dir[d] = pts[db + d] - m[d];
+                for (int it = 0; it < 8; ++it) {
+                    std::vector<double> nd(db, 0.0);
+                    for (size_t i = 0; i < mem.size(); ++i)
+                        for (uint32_t d = 0; d < db; ++d)
+                            nd[d] += (pts[i * db + d] - m[d]) * dir[d];
+                    double nrm = 1e-30;
+                    for (uint32_t d = 0; d < db; ++d) nrm += nd[d] * nd[d];
+                    nrm = std::sqrt(nrm);
+                    for (uint32_t d = 0; d < db; ++d) dir[d] = nd[d] / nrm;
+                }
+                return dir;
+            };
+            std::vector<uint32_t> assign(mem.size(), 0);
+            {
+                const auto dir = dom_dir(std::vector<double>(c, c + db));
+                for (size_t i = 0; i < mem.size(); ++i) {
+                    double proj = 0;
+                    for (uint32_t d = 0; d < db; ++d)
+                        proj += (pts[i * db + d] - c[d]) * dir[d];
+                    assign[i] = proj > 0 ? 1 : 0;
+                }
+            }
+            // Grow to A clusters by splitting the largest along its
+            // dominant direction.
+            while (std::accumulate(assign.begin(), assign.end(), 0u,
+                                   [&](uint32_t acc, uint32_t) { return acc + 1; }) >= 0) {
+                uint32_t ncl = 0;
+                for (uint32_t a : assign) ncl = std::max(ncl, a + 1);
+                if (ncl >= A) break;
+                std::vector<uint64_t> cnt(ncl, 0);
+                for (uint32_t a : assign) ++cnt[a];
+                uint32_t big = 0;
+                for (uint32_t ci = 0; ci < ncl; ++ci)
+                    if (cnt[ci] > cnt[big]) big = ci;
+                std::vector<double> bm(db, 0.0);
+                for (size_t i = 0; i < mem.size(); ++i)
+                    if (assign[i] == big)
+                        for (uint32_t d = 0; d < db; ++d) bm[d] += pts[i * db + d];
+                for (uint32_t d = 0; d < db; ++d) bm[d] /= cnt[big];
+                const auto dir = dom_dir(bm);
+                for (size_t i = 0; i < mem.size(); ++i)
+                    if (assign[i] == big) {
+                        double proj = 0;
+                        for (uint32_t d = 0; d < db; ++d)
+                            proj += (pts[i * db + d] - bm[d]) * dir[d];
+                        if (proj > 0) assign[i] = ncl;
+                    }
+            }
+            // Two Lloyd passes that actually update the assignment.
+            for (int it = 0; it < 2; ++it) {
+                uint32_t ncl = 0;
+                for (uint32_t a : assign) ncl = std::max(ncl, a + 1);
+                std::vector<std::vector<double>> cs(
+                    ncl, std::vector<double>(db, 0.0));
+                std::vector<uint64_t> cnt(ncl, 0);
+                for (size_t i = 0; i < mem.size(); ++i) {
+                    ++cnt[assign[i]];
+                    for (uint32_t d = 0; d < db; ++d)
+                        cs[assign[i]][d] += pts[i * db + d];
+                }
+                for (uint32_t ci = 0; ci < ncl; ++ci)
+                    if (cnt[ci])
+                        for (uint32_t d = 0; d < db; ++d) cs[ci][d] /= cnt[ci];
+                for (size_t i = 0; i < mem.size(); ++i) {
+                    double bd2 = 1e30; uint32_t ba = 0;
+                    for (uint32_t ci = 0; ci < ncl; ++ci) {
+                        double d2 = 0;
+                        for (uint32_t d = 0; d < db; ++d) {
+                            const double diff = pts[i * db + d] - cs[ci][d];
+                            d2 += diff * diff;
+                        }
+                        if (d2 < bd2) { bd2 = d2; ba = ci; }
+                    }
+                    assign[i] = ba;
+                }
+            }
+            uint32_t ncl = 0;
+            for (uint32_t a : assign) ncl = std::max(ncl, a + 1);
+            std::vector<std::vector<double>> cs(ncl,
+                                                std::vector<double>(db, 0.0));
+            std::vector<uint64_t> cnt(ncl, 0);
+            for (size_t i = 0; i < mem.size(); ++i) {
+                ++cnt[assign[i]];
+                for (uint32_t d = 0; d < db; ++d)
+                    cs[assign[i]][d] += pts[i * db + d];
+            }
+            auto& store = anchor_sets[ai][l];
+            store.reserve(ncl * db);
+            for (uint32_t ci = 0; ci < ncl; ++ci) {
+                if (!cnt[ci]) continue;
+                for (uint32_t d = 0; d < db; ++d)
+                    store.push_back(static_cast<float>(cs[ci][d] / cnt[ci]));
+            }
+        }
+    }
+
     // Prefix fractions at which to report containment (by page weight).
     const double fracs[] = {0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.0};
     constexpr size_t NF = sizeof(fracs) / sizeof(fracs[0]);
-    std::vector<std::vector<double>> hit(4, std::vector<double>(NF, 0.0));
+    std::vector<std::vector<double>> hit(4 + NA, std::vector<double>(NF, 0.0));
     uint32_t q_used = std::min(nq, nqt);
     std::vector<uint32_t> leaf_order;
 
@@ -265,6 +387,30 @@ int main(int argc, char** argv) {
             std::vector<uint32_t> order(L);
             for (uint32_t i = 0; i < L; ++i) order[i] = mo[i].second;
             walk(order, 2);
+
+            // --- anchors: min L2 over the leaf's A anchors ---
+            for (size_t ai = 0; ai < NA; ++ai) {
+                std::vector<std::pair<float, uint32_t>> ao(L);
+                for (uint32_t l = 0; l < L; ++l) {
+                    const auto& anc = anchor_sets[ai][l];
+                    float bestd = std::numeric_limits<float>::max();
+                    const size_t cnt = anc.size() / db;
+                    for (size_t aidx = 0; aidx < cnt; ++aidx) {
+                        const float* v = &anc[aidx * db];
+                        float d2 = 0;
+                        for (uint32_t d = 0; d < db; ++d) {
+                            const float diff = q[d] - v[d];
+                            d2 += diff * diff;
+                        }
+                        bestd = std::min(bestd, d2);
+                    }
+                    ao[l] = {bestd, l};
+                }
+                std::sort(ao.begin(), ao.end());
+                std::vector<uint32_t> aorder(L);
+                for (uint32_t i = 0; i < L; ++i) aorder[i] = ao[i].second;
+                walk(aorder, 4 + ai);
+            }
         }
     }
 
@@ -339,13 +485,18 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("\n%-8s %10s %10s %10s %10s  (member-min over %u queries)\n",
-                "frac", "random", "centroid", "member-min", "oracle", mm_q);
+    std::printf("\n%-8s %8s %8s %8s %8s %8s %8s %8s  (ideal rows over %u queries)\n",
+                "frac", "random", "centrd", "mbrmin", "oracle",
+                "anc2", "anc4", "anc8", mm_q);
     for (size_t fi = 0; fi < NF; ++fi) {
-        std::printf("%-8.2f %10.4f %10.4f %10.4f %10.4f\n", fracs[fi],
+        std::printf("%-8.2f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f\n",
+                    fracs[fi],
                     hit[0][fi] / q_used, hit[1][fi] / q_used,
                     hit[2][fi] / std::min(mm_q, q_used),
-                    hit[3][fi] / q_used);
+                    hit[3][fi] / q_used,
+                    hit[4][fi] / std::min(mm_q, q_used),
+                    hit[5][fi] / std::min(mm_q, q_used),
+                    hit[6][fi] / std::min(mm_q, q_used));
     }
     return 0;
 }
