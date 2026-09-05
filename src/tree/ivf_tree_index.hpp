@@ -73,6 +73,8 @@ public:
         uint32_t leaf_capacity = 5000; // max vectors per leaf
         uint16_t n_probe_l0 = 0;       // probe count at level 0 (0 = auto)
         uint16_t n_probe_ln = 0;       // probe count at deeper levels (0 = auto)
+        float probe_fraction = 0.0f;   // corpus-fraction probe budget to bake
+                                       // into the manifest (0 = default 0.5)
         ResolvedParams params;         // PQ/PRQ config
         float adaptive_probe_gap = 0.0f;  // geometric gap pruning (0=off default;
                                           // see ResolvedParams note — 1.5 silently
@@ -177,6 +179,7 @@ public:
     uint64_t n_pages() const { return superblock_.n_pages(); }
     uint32_t n_probe_l0_default() const { return manifest_.n_probe_l0; }
     uint32_t n_probe_ln_default() const { return manifest_.n_probe_ln; }
+    float probe_fraction_default() const { return manifest_.probe_fraction; }
     const std::string& quantizer_type() const { return manifest_.quantizer_type; }
     /// Global PQ quantizer view (global-codebook families only). Callers
     /// must not invoke this on local/scalar families.

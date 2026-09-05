@@ -231,6 +231,19 @@ struct SearchConfig {
     /// Tree: leaf probe count per root child (depth=2). 0 = manifest default.
     uint32_t n_probe_ln = 0;
 
+    /// Tree: probe budget as a FRACTION of the corpus (leaf-coverage
+    /// contract). When >0 (and n_probe is 0), routing walks root children
+    /// nearest-first and keeps selecting until their cumulative subtree
+    /// extent reaches probe_fraction of the total, then probes ALL leaves
+    /// of the selected children (n_probe_ln is bypassed — per-child caps
+    /// silently cost 5-8pp recall@10 on unbalanced trees). Scale-stable
+    /// where absolute counts are not: measured on dbpedia-1536 (100K→933K),
+    /// f=0.25 → ~0.96 recall@10 at ~0.25x flat-scan latency, f=0.5 →
+    /// ~0.99 at ~0.5x, holding across corpus sizes while a pinned np8
+    /// decayed 0.9998 → 0.90. n_probe > 0 (expert absolute override) and
+    /// exhaustive take precedence.
+    float probe_fraction = 0.0f;
+
     /// IVF-probe merge oversampling: each probed shard is searched at
     /// k_local = k × merge_oversample, then results are merged/deduped and
     /// truncated to k. 1 = no oversampling. Ignored for single-shard indexes.

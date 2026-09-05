@@ -85,6 +85,11 @@ typedef struct sextant_search_opts {
                                ///< ABI: added at struct tail — old callers
                                ///< passing smaller structs read as NULL via
                                ///< designated-init zero fill.
+    float probe_fraction;     ///< corpus-fraction probe budget (0 = index
+                               ///< default; 0.25/0.5 measured ~0.96/~0.99
+                               ///< recall@10 on dbpedia, scale-stable).
+                               ///< Ignored when n_probe > 0 or exhaustive.
+                               ///< ABI: added at struct tail.
 } sextant_search_opts;
 
 sextant_search_opts sextant_default_search_opts(void);

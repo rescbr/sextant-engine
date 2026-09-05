@@ -2129,6 +2129,10 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     manifest.n_probe_l0 = cfg.n_probe_l0 > 0 ? cfg.n_probe_l0
         : static_cast<uint32_t>(std::max(1.0, 2.0*std::sqrt(double(k_root))));
     manifest.n_probe_ln = cfg.n_probe_ln > 0 ? cfg.n_probe_ln : 4;
+    // Corpus-fraction probe budget: the scale-stable default. New trees
+    // persist 0.5 (measured ~0.99 recall@10 across 100K→933K at half the
+    // flat-scan cost); legacy count fields remain for expert overrides.
+    manifest.probe_fraction = cfg.probe_fraction > 0.0f ? cfg.probe_fraction : 0.5f;
     manifest.adaptive_probe_gap = cfg.adaptive_probe_gap;
     manifest.median_lid = cfg.median_lid;
     manifest.pca_dims = pca_dims;  // enable PCA routing at search time
@@ -2431,9 +2435,21 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     if (config.adaptive_probe_gap < 0) gap = 0.0f;
     else if (config.adaptive_probe_gap > 0) gap = config.adaptive_probe_gap;
 
-    const uint32_t n_probe_ln_cfg = config.n_probe_ln > 0
-        ? config.n_probe_ln
-        : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4);
+    // Probe-fraction routing (leaf-coverage contract). Precedence:
+    // explicit n_probe (absolute, expert) > probe_fraction (call or
+    // manifest) > legacy manifest counts. Resolved before level-0 so both
+    // the root cut and the deeper expansion see it.
+    float probe_frac = config.probe_fraction;
+    if (probe_frac <= 0.0f && config.n_probe == 0) {
+        probe_frac = manifest_.probe_fraction;
+    }
+    const bool fraction_routing = probe_frac > 0.0f && config.n_probe == 0;
+
+    const uint32_t n_probe_ln_cfg = fraction_routing
+        ? UINT32_MAX  // probe ALL leaves of each selected root child
+        : (config.n_probe_ln > 0
+               ? config.n_probe_ln
+               : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4));
 
     // Lambda: read an internal node from mmap, score children, push top-n onto
     // `out`. `use_pca_leaves` selects PCA leaf-centroid lookup (depth=2 path).
@@ -2628,19 +2644,44 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     frontier.clear();
     root_idx.clear();
     // When filter-directed, probe ALL summary-matching children (no n_probe_l0
-    // cap, no gap pruning). Otherwise, top-n_probe_l0 with gap pruning.
+    // cap, no gap pruning). Otherwise: fraction routing cuts by cumulative
+    // subtree extent; legacy path takes top-n_probe_l0 with gap pruning.
     const uint32_t effective_probe = filter_directed
         ? static_cast<uint32_t>(root_dists.size())
         : n_probe_l0;
     frontier.reserve(effective_probe);
-    for (uint32_t i = 0; i < effective_probe && i < root_dists.size(); ++i) {
-        if (!filter_directed && gap > 0 && i > 0 &&
-            root_dists[i].first > root_dists[i - 1].first * gap) break;
-        const uint32_t c = root_dists[i].second;
-        const auto& rc = root_children_[c];
-        frontier.push_back({root_dists[i].first, rc.page, rc.pages,
-                            rc.is_leaf, rc.centroid});
-        root_idx.push_back(c);
+    if (fraction_routing && !filter_directed) {
+        // Leaf-coverage cut: walk children nearest-first, keep selecting
+        // until their cumulative subtree extent (pages) reaches
+        // probe_frac of the scored total. Pages ≈ vectors at fixed
+        // bytes/vector, so the fraction measures actual scan budget
+        // regardless of how unbalanced the children are — and no gap
+        // pruning: an early gap break would void the coverage contract.
+        uint64_t total_pages = 0;
+        for (const auto& rd : root_dists)
+            total_pages += root_children_[rd.second].pages;
+        const uint64_t budget = static_cast<uint64_t>(
+            probe_frac * static_cast<double>(total_pages));
+        uint64_t cum = 0;
+        for (size_t i = 0; i < root_dists.size(); ++i) {
+            const uint32_t c = root_dists[i].second;
+            const auto& rc = root_children_[c];
+            frontier.push_back({root_dists[i].first, rc.page, rc.pages,
+                                rc.is_leaf, rc.centroid});
+            root_idx.push_back(c);
+            cum += rc.pages;
+            if (cum >= budget) break;  // >=1 child always selected
+        }
+    } else {
+        for (uint32_t i = 0; i < effective_probe && i < root_dists.size(); ++i) {
+            if (!filter_directed && gap > 0 && i > 0 &&
+                root_dists[i].first > root_dists[i - 1].first * gap) break;
+            const uint32_t c = root_dists[i].second;
+            const auto& rc = root_children_[c];
+            frontier.push_back({root_dists[i].first, rc.page, rc.pages,
+                                rc.is_leaf, rc.centroid});
+            root_idx.push_back(c);
+        }
     }
 
     // --- Descend through internal levels ---

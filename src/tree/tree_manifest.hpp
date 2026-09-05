@@ -43,6 +43,9 @@ struct TreeManifest {
     float adaptive_probe_gap = 0.0f;  // 0 = disabled, >0 = gap threshold
     float median_lid = 0.0f;          // median local intrinsic dimensionality
     uint32_t pca_dims = 0;            // PCA routing dims (0 = no PCA routing)
+    float probe_fraction = 0.0f;      // default probe budget as a corpus
+                                     // fraction (0 = legacy count routing;
+                                     // new builds persist 0.5)
 
     // [partition]
     float balance_factor = 4.0f;

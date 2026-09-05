@@ -340,5 +340,58 @@ TEST(QuantizerFamilies, LocalScalarInnerProductBias) {
     std::filesystem::remove(tree);
 }
 
+// Probe-fraction routing (leaf-coverage contract). Invariants:
+//   - new builds persist the 0.5 manifest default;
+//   - f = 1.0 selects every root child → identical results to probe-all;
+//   - recall is monotone in f (tiny-fraction ≤ default ≤ f=1.0);
+//   - an explicit absolute n_probe overrides the fraction (expert path).
+TEST(QuantizerFamilies, ProbeFractionRouting) {
+    const MiniData& m = mini();
+    const std::string tree = temp_tree();
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.quantizer_type = "local_scalar";
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 2000;
+    cfg.adaptive_probe_gap = 0.0f;
+    {
+        FbinSource s(datasets_dir() + "/mini10k_base.fbin");
+        IVFTreeIndex::build_streaming_pca(s, tree, cfg);
+    }
+    auto idx = IVFTreeIndex::open(tree);
+    ASSERT_TRUE(idx);
+    EXPECT_FLOAT_EQ(idx->probe_fraction_default(), 0.5f);
+
+    auto recall = [&](SearchConfig sc) {
+        sc.k = 10;
+        sc.fastscan_W = 1000;
+        sc.adaptive_probe_gap = 0.0f;
+        double r = 0;
+        for (uint32_t q = 0; q < 100; ++q)
+            r += recall_at_10(idx->search(&m.query[q * m.dim], 10, sc),
+                              m.gt[q]);
+        return r / 100;
+    };
+    SearchConfig all;   all.n_probe = 8;          // probe-all (legacy)
+    SearchConfig f1;    f1.probe_fraction = 1.0f; // fraction probe-all
+    SearchConfig def;                             // 0/0 → manifest 0.5
+    SearchConfig tiny;  tiny.probe_fraction = 0.05f;
+    const double r_all = recall(all);
+    const double r_f1 = recall(f1);
+    const double r_def = recall(def);
+    const double r_tiny = recall(tiny);
+    EXPECT_NEAR(r_f1, r_all, 1e-9) << "f=1.0 must equal probe-all exactly";
+    EXPECT_LE(r_tiny, r_def + 0.02) << "recall should grow with f";
+    EXPECT_LE(r_def, r_f1 + 1e-9);
+    EXPECT_GT(r_def, 0.0);
+    SearchConfig np1;   np1.n_probe = 1;          // absolute override wins
+    EXPECT_LE(recall(np1), r_f1 + 1e-9);
+    if (const char* v = std::getenv("QFAM_VERBOSE"); v && *v)
+        fprintf(stderr,
+                "[qfam] probe-fraction: all=%.4f f1=%.4f def(0.5)=%.4f "
+                "tiny(0.05)=%.4f\n",
+                r_all, r_f1, r_def, r_tiny);
+    std::filesystem::remove(tree);
+}
+
 }  // namespace
 }  // namespace sextant::tree

@@ -154,6 +154,7 @@ sextant_search_opts sextant_default_search_opts(void) {
     o.int8_scan = -1;  // env decides (SEXTANT_SCAN_I8); 0 here previously
                         // force-disabled the i8 kernel for default callers
     o.exhaustive = 0;
+    o.probe_fraction = 0.0f;
     return o;
 }
 
@@ -182,6 +183,7 @@ int32_t sextant_search(void* index, const float* query,
         } else {
             cfg.n_probe = opts->n_probe;
             cfg.n_probe_ln = opts->n_probe_ln;
+            cfg.probe_fraction = opts->probe_fraction;
             cfg.adaptive_probe_gap = opts->adaptive_probe_gap;
             cfg.scan_code_budget = opts->scan_code_budget;
         }
