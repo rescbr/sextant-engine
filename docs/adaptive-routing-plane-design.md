@@ -42,12 +42,16 @@ stage 2 (fraction):  existing scan path over the f-fraction winners
                      (dual-SDOT codes, τ-rerank, exact_rerank intact)
 ```
 
-- **Plane layout**: per-row P×i8 (preferred) or P×fp16 projections,
-  row-id keyed, resident. 128–256 B/vec at P=128.
+- **Plane layout**: per-row P×i8 projections (MEASURED: i8 costs ~2pp
+  containment vs fp32 — report §4.2), row-id keyed, resident.
+  i8@128 = 128 B/vec → containment 0.92/0.98/1.00 @ 5/10/20%; i8@64 =
+  64 B/vec → 0.83/0.97/0.99.
 - **Stage 1 kernel**: the plane is `N × P` contiguous — a plain SDOT
   sweep with a per-leaf max-reduction; i8 variant uses the existing
-  dual-SDOT machinery. Expected stage-1 cost ≈ (P·2)/690 of the 4-bit
-  code scan (i8: ~0.19× at P=128; fp16: ~0.37×).
+  dual-SDOT machinery. Stage-1 cost ≈ 0.15× the 4-bit code scan at i8@128
+  (128 of 866 B/vec). Target operating point: 0.98 recall at
+  ~0.25× flat total (sweep + f=0.10 stage-2) vs probe-fraction's
+  0.99 at 0.5×.
 - **Stage 2**: unchanged scan; `probe_fraction` is re-interpreted as
   the stage-2 cut over the stage-1 ranking. Hierarchy remains for
   filtered search and payload locality; it stops being the recall
@@ -148,12 +152,12 @@ The estimator pattern promoted from build step to running service.
 
 | risk | status |
 |---|---|
-| rank curve on 2nd corpus | DONE: arxiv-768 has NO plane gap (centroid ≈ member-min ≈ plane) — adaptive rule correctly de-emphasizes the plane there; report §4.1 |
-| i8-quantized plane containment loss | unmeasured — spike before commit |
+| rank curve on 2nd corpus (arxiv) | DONE: arxiv-768 has NO plane gap (centroid ≈ member-min ≈ plane) — adaptive rule correctly de-emphasizes the plane there; report §4.1 |
+| i8 plane containment loss | MEASURED: ~2pp vs fp32 (0.92 vs 0.94 @5%; report §4.2) — i8@128 adopted as the layout |
 | stage-1 sweep latency at small N | plane may lose to probe-all below ~250K; auto-fallback by N |
 | dual-basis window complexity | bounded by vacuum cadence; measure mixture recall in prototype |
 | monitor bias under adversarial workloads | per-tenant slicing; document |
-| PCA-64 sweet spot | map bytes curve (48/64/96 done at fp32; i8 pending) |
+| PCA-64 sweet spot | DONE: i8@64 0.83/0.97/0.99; i8@128 dominates at +64 B/vec |
 
 ## 9. Verification milestones
 

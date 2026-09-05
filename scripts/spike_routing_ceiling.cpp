@@ -208,6 +208,47 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[pca] basis ready (32/128 of %u dims)\n", db);
     }
 
+    // i8-quantized plane variants (deployable bytes points): global
+    // per-dim scales over sampled members, int8 projections, integer
+    // dot. i8@128 = 128 B/vec; i8@64 = 64 B/vec.
+    const uint32_t I8R[] = {128, 64};
+    constexpr size_t NI8 = 2;
+    std::vector<std::vector<float>> i8_scale(NI8);
+    std::vector<std::vector<std::vector<int8_t>>> proj_i8(NI8);
+    {
+        const size_t SRC = 1;  // the 128-d projections (prefix for 64)
+        for (size_t ii = 0; ii < NI8; ++ii) {
+            const uint32_t P = I8R[ii];
+            i8_scale[ii].assign(P, 1e-30f);
+            for (uint32_t l = 0; l < L; l += std::max(1u, L / 32)) {
+                const auto& pm = proj_members[SRC][l];
+                const size_t cnt = pm.size() / 128;
+                for (size_t i = 0; i < cnt; i += std::max<size_t>(1, cnt / 64))
+                    for (uint32_t e = 0; e < P; ++e)
+                        i8_scale[ii][e] = std::max(
+                            i8_scale[ii][e], std::abs(pm[i * 128 + e]));
+            }
+            for (uint32_t e = 0; e < P; ++e)
+                i8_scale[ii][e] = 127.0f / i8_scale[ii][e];
+            proj_i8[ii].resize(L);
+            for (uint32_t l = 0; l < L; ++l) {
+                const auto& pm = proj_members[SRC][l];
+                const size_t cnt = pm.size() / 128;
+                if (!cnt) continue;
+                auto& st = proj_i8[ii][l];
+                st.resize(cnt * P);
+                for (size_t i = 0; i < cnt; ++i)
+                    for (uint32_t e = 0; e < P; ++e) {
+                        int v = static_cast<int>(
+                            std::lround(pm[i * 128 + e] * i8_scale[ii][e]));
+                        st[i * P + e] = static_cast<int8_t>(
+                            std::clamp(v, -127, 127));
+                    }
+            }
+        }
+        std::fprintf(stderr, "[pca] i8 planes ready (128/64 dims)\n");
+    }
+
     // Per-leaf RADIUS: max member distance to the leaf mean — pairs with
     // the centroid into an admissible lower bound d(q,c) - r on the
     // distance to the nearest member (ball-tree pruning, no noise).
@@ -384,7 +425,7 @@ int main(int argc, char** argv) {
     // Prefix fractions at which to report containment (by page weight).
     const double fracs[] = {0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.0};
     constexpr size_t NF = sizeof(fracs) / sizeof(fracs[0]);
-    std::vector<std::vector<double>> hit(4 + NA + 3 + NP + 3, std::vector<double>(NF, 0.0));
+    std::vector<std::vector<double>> hit(18, std::vector<double>(NF, 0.0));
     uint32_t q_used = std::min(nq, nqt);
     std::vector<uint32_t> leaf_order;
 
@@ -470,7 +511,7 @@ int main(int argc, char** argv) {
 
         walk(leaf_order, 0);
         walk(centroid_order, 1);
-        walk(bound_order, 6 + NA);  // bound column (every query)
+        walk(bound_order, 8);  // bound column (every query)
 
         // --- z. oracle order (GT leaves first) — harness self-check:
         // must read ~1.0 from the smallest fraction onward.
@@ -535,8 +576,41 @@ int main(int argc, char** argv) {
                 std::sort(po.begin(), po.end());
                 std::vector<uint32_t> order(L);
                 for (uint32_t i = 0; i < L; ++i) order[i] = po[i].second;
-                walk(order, 6 + NA + 1 + pi);
+                walk(order, 11 + pi);
+                if (pi == 1) {  // i8 uses the 128-d projections
+                for (size_t ii = 0; ii < NI8; ++ii) {
+                    const uint32_t P = I8R[ii];
+                    std::vector<int8_t> qpi(P);
+                    for (uint32_t e = 0; e < P; ++e) {
+                        int v = static_cast<int>(
+                            std::lround(qp[e] * i8_scale[ii][e]));
+                        qpi[e] = static_cast<int8_t>(
+                            std::clamp(v, -127, 127));
+                    }
+                    std::vector<float> rbest(
+                        L, -std::numeric_limits<float>::max());
+                    for (uint32_t l = 0; l < L; ++l) {
+                        const auto& pm = proj_i8[ii][l];
+                        const size_t cnt = pm.size() / P;
+                        for (size_t i = 0; i < cnt; ++i) {
+                            int32_t acc = 0;
+                            for (uint32_t e = 0; e < P; ++e)
+                                acc += qpi[e] * pm[i * P + e];
+                            rbest[l] = std::max(rbest[l],
+                                                static_cast<float>(acc));
+                        }
+                    }
+                    std::vector<std::pair<float, uint32_t>> ro(L);
+                    for (uint32_t l = 0; l < L; ++l)
+                        ro[l] = {-rbest[l], l};
+                    std::sort(ro.begin(), ro.end());
+                    std::vector<uint32_t> rorder(L);
+                    for (uint32_t i = 0; i < L; ++i)
+                        rorder[i] = ro[i].second;
+                    walk(rorder, 16 + ii);
+                }
                 // Rank sweep from the NESTED 128-d projections: prefix
+                }
                 // sums give every rank <= 128 for free.
                 if (pi == 1) {
                     for (uint32_t RANK : {48u, 64u, 96u}) {
@@ -561,9 +635,8 @@ int main(int argc, char** argv) {
                             rorder[i] = ro[i].second;
                         // slot by rank: 48->+3, 64->+4, 96->+5 past the
                         // two plane columns
-                        walk(rorder, 6 + NA + 3 +
-                                          (RANK == 48u ? 0
-                                           : RANK == 64u ? 1 : 2));
+                        walk(rorder, RANK == 48u ? 13
+                                          : RANK == 64u ? 14 : 15);
                     }
                 }
             }
@@ -574,7 +647,7 @@ int main(int argc, char** argv) {
                 std::sort(po.begin(), po.end());
                 std::vector<uint32_t> order(L);
                 for (uint32_t i = 0; i < L; ++i) order[i] = po[i].second;
-                walk(order, 4 + NA);
+                walk(order, 9);
             }
             // partial-1/4 order (fallback resolution)
             {
@@ -583,7 +656,7 @@ int main(int argc, char** argv) {
                 std::sort(po.begin(), po.end());
                 std::vector<uint32_t> order(L);
                 for (uint32_t i = 0; i < L; ++i) order[i] = po[i].second;
-                walk(order, 5 + NA);
+                walk(order, 10);
             }
             std::vector<std::pair<float, uint32_t>> mo(L);
             for (uint32_t l = 0; l < L; ++l) mo[l] = {-best[l], l};
@@ -689,15 +762,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("\n%-8s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s  (ideal rows over %u queries)\n",
+    std::printf("\n%-8s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s  (ideal rows over %u queries)\n",
                 "frac", "random", "centrd", "mbrmin", "oracle",
                 no_anchors ? "  --" : "an04",
                 no_anchors ? "  --" : "an16",
                 no_anchors ? "  --" : "an64",
                 no_anchors ? "  --" : "a256",
-                "bound", "p1/12", "p1/4", "pca32", "p128", "p048", "p064", "p096", mm_q);
+                "bound", "p1/12", "p1/4", "pca32", "p128", "p048", "p064", "p096", "i8-128", "i8-064", mm_q);
     for (size_t fi = 0; fi < NF; ++fi) {
-        std::printf("%-8.2f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f\n",
+        std::printf("%-8.2f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f %7.4f\n",
                     fracs[fi],
                     hit[0][fi] / q_used, hit[1][fi] / q_used,
                     hit[2][fi] / std::min(mm_q, q_used),
@@ -706,14 +779,16 @@ int main(int argc, char** argv) {
                     NA > 1 ? hit[5][fi] / std::min(mm_q, q_used) : 0.0,
                     NA > 2 ? hit[6][fi] / std::min(mm_q, q_used) : 0.0,
                     NA > 3 ? hit[7][fi] / std::min(mm_q, q_used) : 0.0,
-                    hit[6 + NA][fi] / q_used,
-                    hit[4 + NA][fi] / std::min(mm_q, q_used),
-                    hit[5 + NA][fi] / std::min(mm_q, q_used),
-                    hit[6 + NA + 1][fi] / std::min(mm_q, q_used),
-                    hit[6 + NA + 2][fi] / std::min(mm_q, q_used),
-                    hit[6 + NA + 3][fi] / std::min(mm_q, q_used),
-                    hit[6 + NA + 4][fi] / std::min(mm_q, q_used),
-                    hit[6 + NA + 5][fi] / std::min(mm_q, q_used));
+                    hit[8][fi] / q_used,
+                    hit[9][fi] / std::min(mm_q, q_used),
+                    hit[10][fi] / std::min(mm_q, q_used),
+                    hit[11][fi] / std::min(mm_q, q_used),
+                    hit[12][fi] / std::min(mm_q, q_used),
+                    hit[13][fi] / std::min(mm_q, q_used),
+                    hit[14][fi] / std::min(mm_q, q_used),
+                    hit[15][fi] / std::min(mm_q, q_used),
+                    hit[16][fi] / std::min(mm_q, q_used),
+                    hit[17][fi] / std::min(mm_q, q_used));
     }
     return 0;
 }

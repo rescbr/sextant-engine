@@ -113,6 +113,25 @@ The scan is not a workaround for weak routing; it *is* the only
 content-aware mechanism at full rank. This bounds every IVF routing
 proposal, including ours.
 
+### 4.1b The deployable bytes curve (i8 plane)
+
+Global-scale int8 quantization of the PCA-128/64 projections (dbpedia-933K):
+
+| structure | B/vec | @5% | @10% | @20% |
+|---|---|---|---|---|
+| centroid | 0 | 0.77 | 0.88 | 0.94 |
+| anchors A=64 | ~1 | 0.84 | 0.92 | 0.97 |
+| i8 PCA-64 | 64 | 0.83 | 0.97 | 0.99 |
+| **i8 PCA-128** | **128** | **0.92** | **0.98** | **1.00** |
+| fp32 PCA-128 | 512 | 0.94 | 0.99 | 1.00 |
+
+i8 quantization costs ~2pp of containment at a quarter of the bytes.
+End-to-end implication for the two-stage design: an i8@128 sweep costs
+~0.15× a full code scan, so **0.98 recall at ~0.25× flat total
+(sweep + f=0.10 stage-2)** versus probe-fraction's 0.99 at 0.5× —
+roughly a 2× scan reduction at matched recall, with the 1.00@20%
+ceiling point available.
+
 ### 4.1 Second corpus: arxiv-nomic (100K × 768, 25 leaves)
 
 Containment @ 5/10/20/30%: centroid 0.55/0.73/0.89/0.95 · member-min
