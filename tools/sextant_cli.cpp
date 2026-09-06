@@ -37,6 +37,10 @@
 #include "storage/node_store.hpp"
 
 #include <cmdline/cmdline.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <spdlog/spdlog.h>
 
@@ -710,6 +714,13 @@ int cmd_tree_search(int argc, char* argv[]) {
         false, 0.0f);
     p.add<uint32_t>("fastscan-w", 0, "Rerank shortlist per shard (0=300)", false, 0);
     p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
+    p.add<std::string>("exact-rerank-base", 0,
+        "Original base .fbin (mmap'd read-only): rerank against the TRUE "
+        "vectors instead of decoded quantized codes — removes the "
+        "quantization ranking error entirely (harness-measured: perfect "
+        "recall AND faster than decode-rerank). Implies rerank. Must be "
+        "the corpus this tree was built from, in build row order.",
+        false, "");
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
     p.add<float>("adaptive-w-gap", 0,
         "Adaptive shortlist cut: truncate results at the first reranked "
@@ -834,6 +845,50 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.adaptive_w_gap = p.get<float>("adaptive-w-gap");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
     scfg.search_threads = p.get<uint32_t>("search-threads");
+
+    // Exact-rerank base: mmap the original corpus read-only and hand the
+    // engine a pointer (caller-owned, per the SearchConfig contract). The
+    // mapping outlives all searches below.
+    int erb_fd = -1;
+    void* erb_map = nullptr;
+    size_t erb_map_len = 0;
+    {
+        const std::string erb = p.get<std::string>("exact-rerank-base");
+        if (!erb.empty()) {
+            FbinHeader bh{};
+            if (!read_fbin_header(erb, bh)) {
+                std::cerr << "tree-search: cannot read '" << erb << "'\n";
+                return 1;
+            }
+            if (bh.dim != idx->dim()) {
+                std::cerr << "tree-search: exact-rerank-base dim " << bh.dim
+                          << " != index dim " << idx->dim() << "\n";
+                return 1;
+            }
+            erb_fd = ::open(erb.c_str(), O_RDONLY);
+            if (erb_fd < 0) {
+                std::cerr << "tree-search: open '" << erb << "' failed\n";
+                return 1;
+            }
+            struct stat st{};
+            if (::fstat(erb_fd, &st) != 0 ||
+                static_cast<uint64_t>(st.st_size) <
+                    8 + static_cast<uint64_t>(bh.n) * bh.dim * 4) {
+                std::cerr << "tree-search: exact-rerank-base truncated\n";
+                return 1;
+            }
+            erb_map_len = static_cast<size_t>(st.st_size);
+            erb_map = ::mmap(nullptr, erb_map_len, PROT_READ, MAP_PRIVATE,
+                             erb_fd, 0);
+            if (erb_map == MAP_FAILED) {
+                std::cerr << "tree-search: mmap of '" << erb << "' failed\n";
+                return 1;
+            }
+            scfg.exact_rerank_base = reinterpret_cast<const float*>(
+                static_cast<const uint8_t*>(erb_map) + 8);
+            scfg.rerank = true;
+        }
+    }
 
     // Parse every collected --filter predicate (AND-composed).
     for (const std::string& fs : filter_strings) {
@@ -1101,6 +1156,8 @@ int cmd_tree_search(int argc, char* argv[]) {
         const float recall = float(total_hits) / (total_queries * k);
         std::cerr << "recall@" << k << ": " << recall << "\n";
     }
+    if (erb_map && erb_map != MAP_FAILED) ::munmap(erb_map, erb_map_len);
+    if (erb_fd >= 0) ::close(erb_fd);
     return 0;
 }
 
