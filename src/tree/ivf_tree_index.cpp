@@ -370,7 +370,8 @@ struct TreeBuildContext {
     uint32_t k_root = 0;
     uint16_t depth = 2;
     uint32_t k_l1 = 0;
-    uint32_t pca_dims = 0;
+    uint32_t pca_dims = 0;   // working width: dim when pca_disabled
+    bool pca_disabled = false;  // cfg requested 0 → full-dim fp16 routing
     MetricKind metric = MetricKind::L2Sq;
     bool has_filter = false;
     bool has_payload = false;
@@ -496,11 +497,18 @@ void resolve_build_params(TreeBuildContext& ctx) {
     // PCA dimensions: project to this many components for routing.
     // Default: 32 (captures meaningful variance without being too large
     // for k-means to find structure). For d_eff≈2 data, even 8-16 PCs suffice.
-    // pca_dims == 0 is HONORED: disables PCA routing entirely (full-dim
-    // fp16 centroid routing — the phase-0 path of the adaptive-routing
-    // design and the no-PCA A/B baseline). Previously 0 silently coerced
-    // to 32, which made PCA impossible to turn off from the CLI.
-    ctx.pca_dims = cfg.pca_dims == 0 ? 0 : std::min(ctx.dim, cfg.pca_dims);
+    // pca_dims == 0 is HONORED: disables PCA routing — the build's
+    // k-means then runs in FULL dimension via an identity rotation
+    // (distance-preserving, so assignments equal raw-space k-means) and
+    // the manifest records 0, keeping search on the full-dim fp16
+    // centroid-summaries path. Previously 0 silently coerced to 32,
+    // which made PCA impossible to turn off from the CLI; honoring it
+    // WITHOUT the full-dim working space collapsed k-means to 0 dims
+    // (15/16 empty root clusters, Depth3Split regression).
+    ctx.pca_disabled = cfg.pca_dims == 0;
+    ctx.pca_dims = ctx.pca_disabled
+        ? ctx.dim
+        : std::min(ctx.dim, cfg.pca_dims);
     ctx.metric = params.metric;
 
     // Construct the per-family leaf coder (the ONLY quantizer_type
@@ -602,8 +610,19 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     // the old code. Since we removed that, sample is still the raw FP32 sample.
     // Good — the function handles centering internally.
     std::vector<double> eigvals;
-    std::vector<float> rotation = compute_pca_rotation_public(
-        sample.data(), train_n, dim, &eigvals);
+    std::vector<float> rotation;
+    if (ctx.pca_disabled) {
+        // Identity rotation: k-means works in centered full-dim space
+        // (equivalent to raw-space k-means); no eigendecomposition, no
+        // pca blob to store. mean_proj[k] = mean[k] falls out below.
+        rotation.assign(size_t(dim) * dim, 0.0f);
+        for (uint32_t d = 0; d < dim; ++d) rotation[d * dim + d] = 1.0f;
+        spdlog::info("[sextant] build_streaming_pca: PCA disabled — "
+                     "full-dim ({}) centroid routing", dim);
+    } else {
+        rotation = compute_pca_rotation_public(
+            sample.data(), train_n, dim, &eigvals);
+    }
 
     if (rotation.empty()) {
         throw Error(ErrorCode::InvalidParam,
@@ -629,13 +648,16 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     }
 
     double var_explained = 0.0, var_total = 0.0;
-    for (uint16_t i = 0; i < dim; ++i) var_total += eigvals[i];
-    for (uint32_t k = 0; k < pca_dims; ++k) var_explained += eigvals[k];
-    spdlog::info("[sextant] build_streaming_pca: PCA {}→{} dims, "
-                 "variance explained: {:.1f}% in {:.2f}s",
-                 dim, pca_dims, 100.0 * var_explained / std::max(var_total, 1.0),
-                 std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - t_pca).count());
+    if (!ctx.pca_disabled) {
+        for (uint16_t i = 0; i < dim; ++i) var_total += eigvals[i];
+        for (uint32_t k = 0; k < pca_dims; ++k) var_explained += eigvals[k];
+        spdlog::info("[sextant] build_streaming_pca: PCA {}→{} dims, "
+                     "variance explained: {:.1f}% in {:.2f}s",
+                     dim, pca_dims,
+                     100.0 * var_explained / std::max(var_total, 1.0),
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t_pca).count());
+    }
 
     // Project the sample for k-means (parallelized across threads).
     // Each vector: pca_dims dot products of length dim.
@@ -1854,6 +1876,7 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     const uint32_t k_l1 = ctx.k_l1;
     const uint16_t depth = ctx.depth;
     const uint32_t pca_dims = ctx.pca_dims;
+    const bool pca_disabled = ctx.pca_disabled;
     const uint32_t summary_size = ctx.summary_size;
     const uint32_t n_leaves_total = ctx.n_leaves_total;
     const auto& mean = ctx.mean;
@@ -2142,7 +2165,7 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     manifest.probe_fraction = cfg.probe_fraction > 0.0f ? cfg.probe_fraction : 0.5f;
     manifest.adaptive_probe_gap = cfg.adaptive_probe_gap;
     manifest.median_lid = cfg.median_lid;
-    manifest.pca_dims = pca_dims;  // enable PCA routing at search time
+    manifest.pca_dims = ctx.pca_disabled ? 0 : pca_dims;  // search-side PCA
     manifest.balance_factor = params.partition_balance_factor;
     manifest.schema = cfg.filter_schema;
     manifest.summary_size = summary_size;
@@ -2153,7 +2176,7 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     //         [leaf_centroids:n_leaves×pca_dims f32]
     PageId pca_page = kInvalidPage;
     uint32_t pca_npg = 0;
-    if (pca_dims > 0) {
+    if (pca_dims > 0 && !pca_disabled) {
         std::vector<float> pca_blob;
         // Projection matrix (pca_dims × dim).
         for (uint32_t k = 0; k < pca_dims; ++k)
@@ -4017,10 +4040,24 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
     uint32_t grandparent_pages = 0;
     uint32_t grandparent_slot = UINT32_MAX;  // child slot in grandparent → parent
 
+    // Node scan helper: read via the FILE, not mmap_base_. Splits in this
+    // insert_batch may already have relocated nodes (and truncated/rewritten
+    // the file); the build-time mmap is stale past the original EOF and old
+    // pages may have been freed and rewritten — walking it reads garbage
+    // headers (measured: depth-3 split cascades segfaulted on stale L1/L2).
+    std::vector<uint8_t> node_buf_a, node_buf_b, node_buf_c;
+    auto read_node = [&](PageId page, uint32_t pages,
+                         std::vector<uint8_t>& buf) -> const uint8_t* {
+        buf.resize(static_cast<size_t>(pages) * kPageSize);
+        file_.read_pages(page, pages, buf.data());
+        return buf.data();
+    };
+
     if (manifest_.depth == 1) {
         parent_page = superblock_.root_node_page();
         parent_pages = superblock_.root_node_pages();
-        const uint8_t* root_ptr = mmap_base_ + parent_page * kPageSize;
+        const uint8_t* root_ptr = read_node(parent_page, parent_pages,
+                                             node_buf_a);
         const auto* rh = reinterpret_cast<const TreeNodeHeader*>(root_ptr);
         const uint8_t* p = root_ptr + sizeof(TreeNodeHeader);
         for (uint32_t i = 0; i < rh->n_children; ++i) {
@@ -4038,10 +4075,12 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
         for (uint32_t c = 0; c < root_children_.size(); ++c) {
             const auto& rc = root_children_[c];
             if (rc.is_leaf || rc.page == kInvalidPage) continue;
-            const uint8_t* node_ptr = mmap_base_ + rc.page * kPageSize;
+            const uint8_t* node_ptr = read_node(rc.page, rc.pages,
+                                                node_buf_a);
             const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
             const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
-            for (uint32_t j = 0; j < nh->n_children; ++j) {
+            const uint32_t n_ch = nh->n_children;
+            for (uint32_t j = 0; j < n_ch; ++j) {
                 const auto* ce = reinterpret_cast<const ChildEntry*>(p);
                 if (ce->is_leaf && ce->child_page == leaf_id) {
                     parent_page = rc.page;
@@ -4061,22 +4100,24 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
         for (uint32_t c = 0; c < root_children_.size(); ++c) {
             const auto& rc = root_children_[c];
             if (rc.is_leaf || rc.page == kInvalidPage) continue;
-            const uint8_t* l1_ptr = mmap_base_ + rc.page * kPageSize;
+            const uint8_t* l1_ptr = read_node(rc.page, rc.pages, node_buf_a);
             const auto* l1h = reinterpret_cast<const TreeNodeHeader*>(l1_ptr);
             const uint8_t* lp = l1_ptr + sizeof(TreeNodeHeader);
-            for (uint32_t j = 0; j < l1h->n_children; ++j) {
+            const uint32_t l1_n = l1h->n_children;
+            for (uint32_t j = 0; j < l1_n; ++j) {
                 const auto* l1ce = reinterpret_cast<const ChildEntry*>(lp);
                 if (l1ce->is_leaf || l1ce->child_page == kInvalidPage) {
                     lp += cesize;
                     continue;
                 }
                 // l1ce->child_page is an L2 node. Scan its children for leaf_id.
-                const uint8_t* l2_ptr =
-                    mmap_base_ + l1ce->child_page * kPageSize;
+                const uint8_t* l2_ptr = read_node(
+                    l1ce->child_page, l1ce->child_pages, node_buf_b);
                 const auto* l2h =
                     reinterpret_cast<const TreeNodeHeader*>(l2_ptr);
                 const uint8_t* p2 = l2_ptr + sizeof(TreeNodeHeader);
-                for (uint32_t k = 0; k < l2h->n_children; ++k) {
+                const uint32_t l2_n = l2h->n_children;
+                for (uint32_t k = 0; k < l2_n; ++k) {
                     const auto* ce = reinterpret_cast<const ChildEntry*>(p2);
                     if (ce->is_leaf && ce->child_page == leaf_id) {
                         parent_page = l1ce->child_page;

@@ -111,16 +111,25 @@ void PageAllocator::grow_bitmap(uint64_t n_pages) {
 }
 
 PageId PageAllocator::alloc_page(PageFile& file) {
-    // 1. Try the free list (explicitly freed pages).
+    // 1. Try the free list (explicitly freed pages). The list is a HINT;
+    //    the bitmap is the source of truth. alloc_extent(count>1) can
+    //    reallocate free-listed pages via a bitmap run scan WITHOUT
+    //    unlinking them; such pages get rewritten with leaf/node data,
+    //    so their stored "next" is data, not a pointer (measured: depth-3
+    //    split cascades crashed reading a garbage page id from a stale
+    //    entry). On any stale entry, discard the whole chain and rebuild
+    //    from the bitmap — correct, and the list repopulates on frees.
     while (free_list_head_ != kInvalidPage) {
         const PageId page = free_list_head_;
+        if (bit_get(bitmap_, page)) {
+            // Stale entry: page is allocated and may have been rewritten.
+            clear_free_list();
+            break;
+        }
         free_list_head_ = read_free_next(file, page);
         --n_free_pages_;
-        if (!bit_get(bitmap_, page)) {
-            bit_set(bitmap_, page);
-            return page;
-        }
-        // Stale entry — skip.
+        bit_set(bitmap_, page);
+        return page;
     }
 
     // 2. No free list entries. Scan the bitmap for the first zero bit.
