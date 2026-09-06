@@ -194,10 +194,13 @@ made the 9888-leaf tree look 17pp worse until corrected to 64).
 
 The engine's PCA-32 routing sits on the exact-centroid curve at matched
 coverage on all three trees (np sweep to 256: 0.996 routing @25.5%
-probed). Delivered recall at np256 plateaus at ~0.61-0.66 with routing
-at 0.996 — the binding constraint past np64 is the scan/rerank side
-(W, quantizer, adaptive-τ), not routing. End-to-end with adaptive-w-gap
-2.0 the harness reaches 0.989 @f=0.50 (2864-leaf tree). Logs:
+probed). The spike's `delivered` column plateaus at ~0.61-0.66 with
+routing at 0.996 — that is the 4-bit PQ-ordering ceiling, not a scan
+defect: the spike's `SearchConfig` leaves `rerank` off (engine default),
+and `tree-search --n-probe 256 --n-probe-ln 64 --no-rerank` reproduces
+0.6611 bit-identically. With rerank + adaptive-w-gap 2.0 the CLI reaches
+0.989 @f=0.50 (2864-leaf tree). The binding constraint past np64 is
+scan/rerank ordering (W, quantizer, adaptive-τ), not routing. Logs:
 `gs://.../cohere/spike_routing_ceiling_10m.log`, `spike_engine_sweep_10m.log`.
 
 | np | probed frac | routing containment |

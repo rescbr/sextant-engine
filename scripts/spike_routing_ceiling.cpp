@@ -948,6 +948,10 @@ int main(int argc, char** argv) {
             uint32_t used = 0;
             for (uint32_t qi = 0; qi < q_used; ++qi) {
                 const float* q = &query[static_cast<size_t>(qi) * db];
+                // NOTE: cfg below leaves rerank OFF (engine default), so
+                // `delivered` measures 4-bit PQ-ordering quality — the
+                // quantization ceiling, verified bit-identical to
+                // `tree-search --no-rerank` (0.6611 @np256, 10M shape).
                 // recompute per-neighbor homes for this query
                 std::vector<std::vector<uint32_t>> nb_homes;
                 for (uint32_t g = 0; g < 10; ++g) {
