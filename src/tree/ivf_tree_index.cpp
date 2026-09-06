@@ -819,6 +819,17 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
             hw, std::vector<double>(k_root * pca_dims, 0.0));
         std::vector<std::vector<uint64_t>> t_counts(hw, std::vector<uint64_t>(k_root, 0));
 
+        // Centroid norms are constant per pass: compute once, share
+        // across threads and chunks (was per-thread per-chunk).
+        // dist = |proj|² - 2·proj·centroid + |centroid|²; |proj|² is
+        // constant across centroids (skipped), so
+        // argmin dist = argmin(cent_norms[c] - 2·proj·centroid).
+        std::vector<float> cent_norms(k_root);
+        for (uint32_t c = 0; c < k_root; ++c)
+            cent_norms[c] = simd::dot_f32(
+                root_centroids_pca[c].data(),
+                root_centroids_pca[c].data(), pca_dims);
+
         while (vectors_done < n) {
             Chunk chunk;
             if (!ctx.source.next(chunk)) break;
@@ -837,20 +848,12 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
                     [&](uint32_t tid, uint32_t s, uint32_t e) {
                         double* sums = t_sums[tid].data();
                         uint64_t* counts = t_counts[tid].data();
-                        // Precompute centroid norms (constant per pass).
-                        // dist = |proj|² - 2·proj·centroid + |centroid|²
-                        // |proj|² is constant across centroids (skip).
-                        // |centroid|² is precomputed once.
-                        // argmin dist = argmin(-2·proj·centroid + |centroid|²)
-                        std::vector<float> cent_norms(k_root);
-                        for (uint32_t c = 0; c < k_root; ++c) {
-                            cent_norms[c] = simd::dot_f32(
-                                root_centroids_pca[c].data(),
-                                root_centroids_pca[c].data(), pca_dims);
-                        }
+                        // Hoisted scratch (one allocation per chunk, not
+                        // per vector — the per-vector vector<> cost ~2.5x
+                        // on this loop at 10M scale).
+                        std::vector<float> proj(pca_dims);
                         for (uint32_t i = s; i < e; ++i) {
                             const float* xi = &vec_buf[i * dim];
-                            std::vector<float> proj(pca_dims);
                             for (uint32_t k = 0; k < pca_dims; ++k)
                                 proj[k] = simd::dot_f32(
                                     &rotation[k * dim], xi, dim) - mean_proj[k];

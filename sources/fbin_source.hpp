@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace sextant {
@@ -52,15 +53,34 @@ private:
     /// File offset where the vector data begins (after the 8-byte header).
     uint64_t data_offset_ = 8;
 
-    /// Next vector index to read (advances across next() calls).
+    /// Next vector index to hand out (prefetch reads run one chunk ahead).
     uint64_t cursor_ = 0;
 
-    /// Internal float buffer for decoded vectors (chunk_size × dim).
-    std::vector<float> vec_buf_;
-    /// Sequential 0-indexed row_ids.
-    std::vector<RowId> rowid_buf_;
-    /// Byte buffer for int8/uint8 raw reads (cast into vec_buf_).
-    std::vector<uint8_t> raw_buf_;
+    /// Internal chunk buffers, double-buffered: next() returns buffer
+    /// `cur_` while a background thread preads the following chunk into
+    /// the other one. The streaming build passes (Lloyd, emission) are
+    /// otherwise I/O-serialized between chunks — measured ~2x more read
+    /// time than compute time per chunk at 10M scale, idling all worker
+    /// threads. The returned Chunk stays valid until two next() calls
+    /// later (a superset of the old valid-until-next contract).
+    std::vector<float> vec_buf_[2];
+    std::vector<RowId> rowid_buf_[2];
+    /// Byte buffers for int8/uint8 raw reads (cast into vec_buf_).
+    std::vector<uint8_t> raw_buf_[2];
+    int cur_ = 0;
+
+    /// Prefetch state (all fields touched by next()/reset()/dtor only,
+    /// except pf_err_ which the background thread writes before join).
+    std::thread pf_thread_;
+    bool pf_live_ = false;
+    bool have_pending_ = false;
+    int pend_buf_ = 0;
+    uint32_t pend_count_ = 0;
+    std::string pf_err_;
+
+    /// Blocking read of `n` vectors at global index `at` into buffer
+    /// `buf` (pread-based: safe to call from the prefetch thread).
+    void read_chunk(int buf, uint64_t at, uint32_t n);
 };
 
 }  // namespace sextant

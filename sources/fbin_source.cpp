@@ -67,14 +67,14 @@ FbinSource::FbinSource(const std::string& path, uint32_t chunk_size)
     data_offset_ = 8;
     cursor_ = 0;
 
-    // Pre-size the internal buffers for one chunk.
-    vec_buf_.resize(static_cast<size_t>(chunk_size_) * dim_);
-    rowid_buf_.resize(chunk_size_);
-    for (uint32_t i = 0; i < chunk_size_; i++) {
-        rowid_buf_[i] = static_cast<RowId>(i);
+    // Pre-size the internal buffers for one chunk (double-buffered).
+    for (int b = 0; b < 2; ++b) {
+        vec_buf_[b].resize(static_cast<size_t>(chunk_size_) * dim_);
+        rowid_buf_[b].resize(chunk_size_);
     }
     if (type_ != ElemType::Float32) {
-        raw_buf_.resize(static_cast<size_t>(chunk_size_) * dim_);
+        for (int b = 0; b < 2; ++b)
+            raw_buf_[b].resize(static_cast<size_t>(chunk_size_) * dim_);
     }
 
     spdlog::debug("FbinSource: opened '{}' n={} dim={} type={}", path, n, d,
@@ -84,82 +84,105 @@ FbinSource::FbinSource(const std::string& path, uint32_t chunk_size)
 }
 
 FbinSource::~FbinSource() {
+    if (pf_live_) {
+        pf_thread_.join();
+        pf_live_ = false;
+    }
     if (fd_ >= 0) {
         ::close(fd_);
     }
 }
 
 void FbinSource::reset() {
+    if (pf_live_) {
+        pf_thread_.join();
+        pf_live_ = false;
+    }
+    have_pending_ = false;
+    pf_err_.clear();
     cursor_ = 0;
-    if (::lseek(fd_, static_cast<off_t>(data_offset_), SEEK_SET) < 0) {
-        throw Error(ErrorCode::IoError,
-                    "FbinSource::reset: lseek failed on '" + path_ + "': " +
-                        std::strerror(errno));
+}
+
+void FbinSource::read_chunk(int buf, uint64_t at, uint32_t n) {
+    const bool f32 = type_ == ElemType::Float32;
+    const size_t want_bytes = f32
+        ? static_cast<size_t>(n) * dim_ * sizeof(float)
+        : static_cast<size_t>(n) * dim_;
+    const uint64_t off = data_offset_ + at * dim_ * (f32 ? 4ULL : 1ULL);
+    uint8_t* dst = f32
+        ? reinterpret_cast<uint8_t*>(vec_buf_[buf].data())
+        : raw_buf_[buf].data();
+    size_t got = 0;
+    while (got < want_bytes) {
+        ssize_t r = ::pread(fd_, dst + got, want_bytes - got,
+                            static_cast<off_t>(off + got));
+        if (r <= 0) {
+            throw Error(ErrorCode::CorruptIndex,
+                        "FbinSource: unexpected EOF on '" + path_ + "'");
+        }
+        got += static_cast<size_t>(r);
+    }
+    if (!f32) {
+        const size_t elems = static_cast<size_t>(n) * dim_;
+        if (type_ == ElemType::Int8) {
+            for (size_t i = 0; i < elems; i++)
+                vec_buf_[buf][i] = static_cast<float>(
+                    static_cast<int8_t>(raw_buf_[buf][i]));
+        } else {
+            for (size_t i = 0; i < elems; i++)
+                vec_buf_[buf][i] = static_cast<float>(raw_buf_[buf][i]);
+        }
     }
 }
 
 bool FbinSource::next(Chunk& out) {
-    if (cursor_ >= count_) {
-        out.count = 0;
-        return false;
+    // Collect any in-flight prefetch before handing out a buffer.
+    if (pf_live_) {
+        pf_thread_.join();
+        pf_live_ = false;
+        if (!pf_err_.empty())
+            throw Error(ErrorCode::CorruptIndex, pf_err_);
     }
 
-    const uint32_t remaining =
-        static_cast<uint32_t>(count_ - cursor_);
-    const uint32_t this_chunk = std::min(chunk_size_, remaining);
-
-    if (type_ == ElemType::Float32) {
-        // Direct read into the float buffer.
-        const size_t want_bytes =
-            static_cast<size_t>(this_chunk) * dim_ * sizeof(float);
-        size_t got = 0;
-        while (got < want_bytes) {
-            ssize_t r = ::read(fd_, vec_buf_.data() + got / sizeof(float),
-                               want_bytes - got);
-            if (r <= 0) {
-                throw Error(ErrorCode::CorruptIndex,
-                            "FbinSource::next: unexpected EOF on '" + path_ +
-                                "'");
-            }
-            got += static_cast<size_t>(r);
-        }
+    int buf;
+    uint32_t n;
+    if (have_pending_) {
+        have_pending_ = false;
+        buf = pend_buf_;
+        n = pend_count_;
     } else {
-        // Read raw bytes, cast element-by-element into the float buffer.
-        const size_t want_bytes = static_cast<size_t>(this_chunk) * dim_;
-        size_t got = 0;
-        while (got < want_bytes) {
-            ssize_t r = ::read(fd_, raw_buf_.data() + got, want_bytes - got);
-            if (r <= 0) {
-                throw Error(ErrorCode::CorruptIndex,
-                            "FbinSource::next: unexpected EOF on '" + path_ +
-                                "'");
-            }
-            got += static_cast<size_t>(r);
-        }
-        const size_t elems = static_cast<size_t>(this_chunk) * dim_;
-        if (type_ == ElemType::Int8) {
-            for (size_t i = 0; i < elems; i++) {
-                vec_buf_[i] =
-                    static_cast<float>(static_cast<int8_t>(raw_buf_[i]));
-            }
-        } else {  // Uint8
-            for (size_t i = 0; i < elems; i++) {
-                vec_buf_[i] = static_cast<float>(raw_buf_[i]);
-            }
-        }
+        if (cursor_ >= count_) { out.count = 0; return false; }
+        n = std::min(chunk_size_, static_cast<uint32_t>(count_ - cursor_));
+        buf = cur_ ^ 1;  // sync read into the buffer not in use
+        read_chunk(buf, cursor_, n);
     }
 
-    // Shift row_ids so they track the global cursor. We reuse a fixed buffer
-    // and rewrite the leading this_chunk entries.
-    for (uint32_t i = 0; i < this_chunk; i++) {
-        rowid_buf_[i] = static_cast<RowId>(cursor_ + i);
+    for (uint32_t i = 0; i < n; i++)
+        rowid_buf_[buf][i] = static_cast<RowId>(cursor_ + i);
+    out.vectors = vec_buf_[buf].data();
+    out.row_ids = rowid_buf_[buf].data();
+    out.count = n;
+    cursor_ += n;
+    cur_ = buf;
+
+    // Kick off the following chunk's read in the background.
+    if (cursor_ < count_) {
+        const uint32_t nn = std::min(
+            chunk_size_, static_cast<uint32_t>(count_ - cursor_));
+        const int nb = buf ^ 1;
+        pend_buf_ = nb;
+        pend_count_ = nn;
+        pf_live_ = true;
+        const uint64_t at = cursor_;
+        pf_thread_ = std::thread([this, nb, at, nn] {
+            try {
+                read_chunk(nb, at, nn);
+            } catch (const std::exception& e) {
+                pf_err_ = e.what();
+            }
+        });
+        have_pending_ = true;
     }
-
-    out.vectors = vec_buf_.data();
-    out.row_ids = rowid_buf_.data();
-    out.count = this_chunk;
-
-    cursor_ += this_chunk;
     return true;
 }
 
