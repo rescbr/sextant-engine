@@ -149,21 +149,56 @@ Corpus-dependence measured, not assumed.
 ### 4.3 Ten million vectors (cohere-10M, 2864 leaves) — coverage vs N
 
 The scale question the 933K run could not answer: does containment at a
-fixed *corpus fraction* degrade as N grows? It does not — it improves.
+fixed *corpus fraction* degrade as N grows? It does not — but the
+follow-up granularity sweep shows the reason is NOT leaf count
+(§4.3b): the same-corpus curve is flat, so the 933K→10M improvement
+(0.77 → 0.89) is a corpus effect (dbpedia-1536 vs cohere-768), not a
+scale or granularity effect.
 
 | ordering (B/vec) | 5% | 10% | 20% | (933K @5%) |
 |---|---|---|---|---|
-| centroid (0) | 0.893 | 0.956 | 0.987 | 0.77 |
+| centroid (0) | 0.893 | 0.956 | 0.987 | 0.77 (dbpedia) |
 | member-min (ideal) | 1.000 | 1.000 | 1.000 | 1.00 |
 | i8 PCA-128 (128) | 0.914 | 0.960 | 0.992 | 0.92 (dbpedia) |
 | i8 PCA-64 (64) | 0.832 | 0.930 | 0.984 | 0.83 |
 | PCA-32 fp (engine proxy) | 0.776 | 0.906 | 0.968 | 0.74 |
 
-Finer leaves make centroid ranking *more* discriminative (2864 vs 246
-leaves), and the plane's edge over free centroids shrinks from ~15pp
-(dbpedia) to +2pp @5% here. Engine-side sweep on the same tree confirms
-the engine's PCA-32 routing sits on the exact-centroid curve at matched
-coverage:
+### 4.3b Granularity sweep: routing is invariant to leaf size
+
+Three trees on the SAME corpus (cohere-10M, k_root=1024, leaf-capacity
+20000 / auto(5000) / 1250):
+
+| leaves | avg vectors/leaf | centroid @5/10/20% | engine routing @np64 |
+|---|---|---|---|
+| 1025 | 9756 | 0.892/0.952/0.986 | 0.917 @6.4% probed |
+| 2864 | 3492 | 0.893/0.956/0.987 | 0.918 @6.4% |
+| 9888 | 1011 | 0.893/0.952/0.987 | 0.917 @6.4% |
+
+Containment at a fixed corpus fraction is INVARIANT across a 10× range
+of leaf counts — routing is determined by the root partition (identical
+k-means at k_root=1024 in all three builds); leaf capacity only changes
+scan granularity. End-to-end (tree-search, probe-fraction grid,
+adaptive-w-gap 2.0, 4 threads, recall@10 at f = 0.05/0.10/0.20/0.50):
+
+| tree | recall@10 | QPS @f=0.10 | QPS @f=0.50 |
+|---|---|---|---|
+| 1025 leaves | 0.878/0.937/0.965/0.973 | 56.8 (8t) | 11.6 (8t) |
+| 2864 leaves | 0.881/0.948/0.979/0.989 | 28.5 (4t) | 5.4 (4t) |
+| 9888 leaves | 0.879/0.938/0.965/0.973 | 25.5 (4t) | 4.6 (4t) |
+
+Leaf size is a SCAN-economics knob, not a routing knob: recall stays
+within ~1.5pp across the range with a mild optimum at the default
+(~3.5K vectors/leaf); finer leaves only add per-leaf probe overhead
+(n_probe_ln must scale with leaves-per-root-child — a hardcoded ln=8
+made the 9888-leaf tree look 17pp worse until corrected to 64).
+
+The engine's PCA-32 routing sits on the exact-centroid curve at matched
+coverage on all three trees (np sweep to 256: 0.996 routing @25.5%
+probed). Delivered recall at np256 plateaus at ~0.61-0.66 with routing
+at 0.996 — the binding constraint past np64 is the scan/rerank side
+(W, quantizer, adaptive-τ), not routing. End-to-end with adaptive-w-gap
+2.0 the harness reaches 0.989 @f=0.50 (2864-leaf tree). Logs:
+`gs://.../cohere/spike_routing_ceiling_10m.log`, `spike_engine_sweep_10m.log`.
 
 | np | probed frac | routing containment |
 |---|---|---|
@@ -173,35 +208,33 @@ coverage:
 | 128 | 0.128 | 0.970 |
 | 256 | 0.255 | 0.996 |
 
-Delivered recall at np256 plateaus at 0.66 with routing at 0.996 — the
-binding constraint past np64 is the scan/rerank side (W, quantizer,
-adaptive-τ), not routing. Logs:
-`gs://.../cohere/spike_routing_ceiling_10m.log`, `spike_engine_sweep_10m.log`.
-
 ## 5. Consequences for the architecture
 
 1. **The current design is validated, not indicted**: centroid-family
    routing is within a few points of the best query-independent
    structure, and the scan + fraction + exact-rerank stack is the
-   mechanism the decomposition says matters. At 10M this strengthens:
-   centroid routing *improves* with leaf count (§4.3) and the engine
-   tracks it at matched coverage through np=256 (0.996 routing).
-2. **Leaf granularity is the free routing lever; the resident plane is
-   cut at billion scale.** §4.3: finer leaves (246→2864) buy +12pp
-   containment @5% at 0 B/vec, while the 128 B/vec plane's edge shrinks
-   to +2pp — 128 GB DRAM at 1B for 2pp is not a trade, it is a
-   rejection. The plane survives only as the mid-scale (250K–fewM,
-   spectrally-gapped, NAND-tier) option, and §5 of the design doc now
-   records it as a measured negative at scale.
-3. **Rank must be adaptive** (explained-variance from the build
-   reservoir), per F6 — a hard-coded plane rank repeats the 2.7σ
-   mistake at larger stakes. (Now largely moot for 1B per (2).)
-4. **Build-time leaf-count sizing rule** (new, from §4.3): pick
-   k_root/depth so leaves stay fine enough that centroid routing holds
-   containment ≥ target at probe_fraction f. Calibration points:
-   246 leaves → 0.77 @5% (dbpedia-933K), 2864 leaves → 0.89 @5%
-   (cohere-10M). One intermediate f-grid point (option 2) completes
-   the curve; until then, ≥2K leaves at N ≥ 10M is the working rule.
+   mechanism the decomposition says matters. At 10M the engine's
+   PCA-32 routing tracks the exact-centroid curve at matched coverage
+   through np=256 (0.996 routing).
+2. **Leaf size is a scan-economics knob, NOT a routing lever; the
+   resident plane is cut at billion scale.** §4.3b: same-corpus
+   containment is invariant across a 10× leaf-size range (routing is
+   the root partition), and end-to-end recall stays within ~1.5pp with
+   a mild optimum at the ~3.5K vectors/leaf default. The i8-128 plane
+   buys +2pp @5% on cohere-10M for 128 GB DRAM at 1B — not a trade, a
+   rejection. (Its larger edge on dbpedia-933K, ~15pp, is a corpus
+   effect — and still does not fit the ≤4 B/vec budget.) The plane
+   survives only as the mid-scale (250K–fewM, spectrally-gapped,
+   NAND-tier) option.
+3. **The 933K→10M containment gain is corpus, not scale** (§4.3b):
+   dbpedia-1536 (0.77 @5%) vs cohere-768 (0.89) at near-identical
+   vectors/leaf. Corpus-adaptive expectations, not N-adaptive, is the
+   right frame — consistent with the adaptive-rank finding (F6).
+4. **Sizing guidance (revised):** keep the default leaf capacity
+   (~3.5-5K vectors/leaf); size `n_probe_ln` to leaves-per-root-child
+   (a stale ln truncation masquerades as a routing regression); expect
+   routing containment to be a property of corpus + k_root, roughly
+   invariant from 1K to 10K leaves.
 5. Sequential probing (probe-then-decide using scan feedback) is the
    one mechanism class not tested here; it sits between routing and
    scanning and is the natural next question.

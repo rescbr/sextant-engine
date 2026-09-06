@@ -848,7 +848,8 @@ int main(int argc, char** argv) {
             SearchConfig cfg;
             cfg.k = 10;
             cfg.n_probe = np;
-            cfg.n_probe_ln = 8;
+            cfg.n_probe_ln = 64;  // cover all leaves per root child on
+                                  // fine trees (cap-1250 has ~10/child)
             cfg.fastscan_W = 1000;
             double cont_sum = 0, frac_sum = 0, delivered_sum = 0;
             uint32_t used = 0;
