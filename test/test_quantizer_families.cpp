@@ -435,5 +435,56 @@ TEST(QuantizerFamilies, ProbeFractionRouting) {
     std::filesystem::remove(tree);
 }
 
+// n_probe_ln auto-sizing: the manifest default must cover all leaves of
+// a probed root child. A default below the real leaves-per-child (the old
+// hardcoded 4) silently truncates probing and masquerades as a routing
+// regression — measured 17pp containment loss on a 9888-leaf cohere-10M
+// tree. Build with few root children and many leaves per child; probing
+// ALL children via the count path must then match fraction probe-all.
+TEST(QuantizerFamilies, ProbeLnAutoSizing) {
+    const MiniData& m = mini();
+    const std::string tree = temp_tree();
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.quantizer_type = "local_scalar";
+    cfg.k_root = 4;
+    cfg.leaf_capacity = 400;  // ~25 leaves → ~6+ per root child (> 4)
+    cfg.adaptive_probe_gap = 0.0f;
+    {
+        FbinSource s(datasets_dir() + "/mini10k_base.fbin");
+        IVFTreeIndex::build_streaming_pca(s, tree, cfg);
+    }
+    auto idx = IVFTreeIndex::open(tree);
+    ASSERT_TRUE(idx);
+    ASSERT_GT(idx->n_leaves(), 4u * 4u)
+        << "fixture should force more than 4 leaves per root child";
+    EXPECT_GE(idx->n_probe_ln_default(),
+              (idx->n_leaves() + idx->k_root() - 1) /
+                  idx->k_root())
+        << "manifest ln default must cover the average leaves-per-child";
+
+    auto recall = [&](SearchConfig sc) {
+        sc.k = 10;
+        sc.fastscan_W = 1000;
+        sc.adaptive_probe_gap = 0.0f;
+        double r = 0;
+        for (uint32_t q = 0; q < 100; ++q)
+            r += recall_at_10(idx->search(&m.query[q * m.dim], 10, sc),
+                              m.gt[q]);
+        return r / 100;
+    };
+    SearchConfig np_all;  np_all.n_probe = 4;  // count path, manifest ln
+    SearchConfig f1;      f1.probe_fraction = 1.0f;
+    const double r_np = recall(np_all);
+    const double r_f1 = recall(f1);
+    EXPECT_NEAR(r_np, r_f1, 0.01)
+        << "np=k_root with auto ln must match fraction probe-all "
+           "(truncation would cost recall)";
+    if (const char* v = std::getenv("QFAM_VERBOSE"); v && *v)
+        fprintf(stderr, "[qfam] ln-auto: np=%d leaves=%u ln=%u r=%.4f "
+                        "f1=%.4f\n",
+                4, idx->n_leaves(), idx->n_probe_ln_default(), r_np, r_f1);
+    std::filesystem::remove(tree);
+}
+
 }  // namespace
 }  // namespace sextant::tree

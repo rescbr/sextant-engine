@@ -2158,7 +2158,21 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     manifest.leaf_capacity = leaf_cap; manifest.n_leaves = n_leaves_total;
     manifest.n_probe_l0 = cfg.n_probe_l0 > 0 ? cfg.n_probe_l0
         : static_cast<uint32_t>(std::max(1.0, 2.0*std::sqrt(double(k_root))));
-    manifest.n_probe_ln = cfg.n_probe_ln > 0 ? cfg.n_probe_ln : 4;
+    // n_probe_ln default: cover ALL leaves of a probed root child (max
+    // per-child leaf count), not a hardcoded 4. A stale ln below the
+    // real leaves-per-child silently truncates probing and masquerades
+    // as a routing regression — measured 17pp containment loss on a
+    // 9888-leaf cohere-10M tree (ln=8 vs ~10 leaves/child). Experts can
+    // still cap explicitly via BuildConfig; the fraction path is
+    // unaffected (it already probes all leaves of selected children).
+    {
+        uint32_t max_leaves_per_child = 1;
+        for (uint32_t c = 0; c < root_to_leaves.size(); ++c)
+            max_leaves_per_child = std::max(max_leaves_per_child,
+                static_cast<uint32_t>(root_to_leaves[c].size()));
+        manifest.n_probe_ln = cfg.n_probe_ln > 0 ? cfg.n_probe_ln
+                                                 : max_leaves_per_child;
+    }
     // Corpus-fraction probe budget: the scale-stable default. New trees
     // persist 0.5 (measured ~0.99 recall@10 across 100K→933K at half the
     // flat-scan cost); legacy count fields remain for expert overrides.
