@@ -514,6 +514,19 @@ int main(int argc, char** argv) {
     uint32_t q_scored_mm = 0; // ... and inside the member-min subset
     std::vector<uint32_t> leaf_order;
 
+    // --- adaptive (best-first) stopping study (SPIKE_ADAPTIVE): probe
+    // leaves in descending i8-plane score (the observable stage-1 sweep
+    // estimate) and stop when the next leaf's best-member IP estimate
+    // falls below alpha x the best score seen. No GT in the rule — GT
+    // only scores the outcome. Fixed-fraction rows on the same ordering
+    // are the control: the gap is what per-query adaptivity buys.
+    static const bool adaptive = std::getenv("SPIKE_ADAPTIVE") != nullptr;
+    const float AD_ALPHAS[] = {0.0f, 0.3f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f};
+    constexpr size_t NAL = 7;
+    constexpr size_t NAFF = 3;
+    const double AFF_FR[NAFF] = {0.05, 0.10, 0.20};
+    std::vector<std::vector<double>> ad_frac(NAL + NAFF), ad_cont(NAL + NAFF);
+
     // Batched member-min / partial-dim precompute: one pass over the
     // mmap'd base in ROW order (sequential readahead) scoring ALL mm
     // queries at once. Per-query leaf-ordered scans are random-access
@@ -665,6 +678,86 @@ int main(int argc, char** argv) {
         walk(leaf_order, 0);
         walk(centroid_order, 1);
         walk(bound_order, 8);  // bound column (every query)
+
+        if (adaptive) {
+            const uint32_t P = I8R[0];
+            std::vector<int8_t> qpi(P);
+            {
+                std::vector<float> qp(P);
+                for (uint32_t e = 0; e < P; ++e) {
+                    double acc = 0;
+                    const auto& bvec = pca_basis[e];
+                    for (uint32_t d = 0; d < db; ++d)
+                        acc += (q[d] - pca_mean[d]) * bvec[d];
+                    qp[e] = static_cast<float>(acc);
+                }
+                for (uint32_t e = 0; e < P; ++e) {
+                    int v = static_cast<int>(
+                        std::lround(qp[e] * i8_scale[0][e]));
+                    qpi[e] = static_cast<int8_t>(std::clamp(v, -127, 127));
+                }
+            }
+            std::vector<float> score(L, -std::numeric_limits<float>::max());
+#pragma omp parallel for schedule(dynamic)
+            for (uint32_t l = 0; l < L; ++l) {
+                const auto& pm = proj_i8[0][l];
+                const size_t cnt = pm.size() / P;
+                if (!cnt) continue;
+                int32_t best = -0x7fffffff;
+                for (size_t i = 0; i < cnt; ++i) {
+                    int32_t acc = 0;
+                    for (uint32_t e = 0; e < P; ++e)
+                        acc += qpi[e] * pm[i * P + e];
+                    if (acc > best) best = acc;
+                }
+                score[l] = static_cast<float>(best);
+            }
+            std::vector<std::pair<float, uint32_t>> so(L);
+            for (uint32_t l = 0; l < L; ++l) so[l] = {-score[l], l};
+            std::sort(so.begin(), so.end());
+            // one ordered walk: cumulative weight per position, and each
+            // neighbor's first-covered position
+            std::vector<uint64_t> cumw(L);
+            std::vector<uint32_t> first_pos(n_nb, L);
+            uint64_t cw = 0;
+            for (uint32_t pos = 0; pos < L; ++pos) {
+                const uint32_t l = so[pos].second;
+                cw += weight[l];
+                cumw[pos] = cw;
+                if (is_gt[l])
+                    for (uint32_t i = 0; i < n_nb; ++i) {
+                        if (first_pos[i] != L) continue;
+                        for (uint32_t j = gt_offsets[i];
+                             j < gt_offsets[i + 1]; ++j)
+                            if (gt_leaf_sets[j] == l) { first_pos[i] = pos; break; }
+                    }
+            }
+            const double s0 = score[so[0].second];
+            auto cont_at = [&](uint32_t cut) {
+                uint32_t c = 0;
+                for (uint32_t i = 0; i < n_nb; ++i)
+                    if (first_pos[i] <= cut) ++c;
+                return static_cast<double>(c) / n_nb;
+            };
+            auto frac_at = [&](uint32_t cut) {
+                return cut >= L ? 1.0
+                    : static_cast<double>(cumw[cut]) / total_w;
+            };
+            for (size_t ai = 0; ai < NAL; ++ai) {
+                uint32_t cut = 0;
+                while (cut < L && score[so[cut].second] >= AD_ALPHAS[ai] * s0)
+                    ++cut;
+                if (cut) --cut;
+                ad_frac[ai].push_back(frac_at(cut));
+                ad_cont[ai].push_back(cont_at(cut));
+            }
+            for (size_t fi = 0; fi < NAFF; ++fi) {
+                uint32_t cut = 0;
+                while (cut < L - 1 && frac_at(cut) < AFF_FR[fi]) ++cut;
+                ad_frac[NAL + fi].push_back(frac_at(cut));
+                ad_cont[NAL + fi].push_back(cont_at(cut));
+            }
+        }
 
         // --- z. oracle order (GT leaves first) — harness self-check:
         // must read ~1.0 from the smallest fraction onward.
@@ -936,6 +1029,26 @@ int main(int argc, char** argv) {
                     hit[15][fi] / std::min(mm_q, q_scored_mm),
                     hit[16][fi] / std::min(mm_q, q_scored_mm),
                     hit[17][fi] / std::min(mm_q, q_scored_mm));
+    }
+    if (adaptive && !ad_frac[0].empty()) {
+        std::printf("\n[adaptive] i8-128 score-ordered probing, per-query stop rule\n");
+        std::printf("%-12s %10s %12s\n", "rule", "mean frac", "mean cont");
+        for (size_t ai = 0; ai < NAL; ++ai) {
+            double mf = 0, mc = 0;
+            for (double v : ad_frac[ai]) mf += v;
+            for (double v : ad_cont[ai]) mc += v;
+            const size_t n = ad_frac[ai].size();
+            std::printf("alpha=%-6.2f %10.4f %12.4f  (%zu queries)\n",
+                        AD_ALPHAS[ai], mf / n, mc / n, n);
+        }
+        for (size_t fi = 0; fi < NAFF; ++fi) {
+            double mf = 0, mc = 0;
+            for (double v : ad_frac[NAL + fi]) mf += v;
+            for (double v : ad_cont[NAL + fi]) mc += v;
+            const size_t n = ad_frac[NAL + fi].size();
+            std::printf("fixed=%-6.2f %10.4f %12.4f  (%zu queries)\n",
+                        AFF_FR[fi], mf / n, mc / n, n);
+        }
     }
     return 0;
 }

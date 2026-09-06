@@ -235,9 +235,20 @@ at 0.996 — the binding constraint past np64 is the scan/rerank side
    (a stale ln truncation masquerades as a routing regression); expect
    routing containment to be a property of corpus + k_root, roughly
    invariant from 1K to 10K leaves.
-5. Sequential probing (probe-then-decide using scan feedback) is the
-   one mechanism class not tested here; it sits between routing and
-   scanning and is the natural next question.
+5. **Sequential probing (probe-then-decide) — first family member
+   measured, negative.** SPIKE_ADAPTIVE in the spike: probe leaves in
+   descending i8-128 plane score and stop when the next leaf's score
+   drops below α × the best score (an observable rule — the stage-1
+   sweep score; GT only scores outcomes). On cohere-10M (1000 queries,
+   same ordering as the fixed-fraction control): α=0.70 → mean frac
+   0.052 @ 0.926 containment vs fixed 0.05 → 0.937; α=0.60 → 0.152 @
+   0.987 ≈ the fixed curve at 0.15 (interp). Score-relative stopping
+   buys nothing at matched mean fraction — the score gap does not
+   localize GT leaves beyond what the ranking already encodes. The
+   untested remainder of the family is scan-feedback stopping (stop
+   when the reranked kth result stops improving), which needs real
+   per-leaf scans and remains open. Log:
+   `gs://.../cohere/spike_adaptive_10m.log`.
 
 ## 6. Reproducing
 
