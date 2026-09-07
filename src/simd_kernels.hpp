@@ -1023,6 +1023,22 @@ inline void argmin_scaled(uint32_t n, uint32_t k, uint32_t k_simd,
                 float32x4_t r = vld1q_f32(row + c);
                 float32x4_t vals = vsubq_f32(s, vmulq_f32(two, r));
                 uint32x4_t idx = vaddq_u32(vdupq_n_u32(base), lane_idx);
+                // BUGFIX (2026-09-07): the zero-padded tail columns [k,
+                // k_simd) evaluate to 0 - 2*0 = 0, which won the argmin
+                // whenever every real column was positive — points were
+                // assigned to nonexistent centroids. Poison padded lanes
+                // with +inf so they can never win.
+                if (c + kBatch > k) {
+                    alignas(16) uint32_t idx_buf[4];
+                    vst1q_u32(idx_buf, idx);
+                    alignas(16) float vals_buf0[4];
+                    vst1q_f32(vals_buf0, vals);
+                    for (int t = 0; t < 4; t++)
+                        if (idx_buf[t] >= k)
+                            vals_buf0[t] =
+                                std::numeric_limits<float>::infinity();
+                    vals = vld1q_f32(vals_buf0);
+                }
                 // Compare + select across 4 lanes. vcltq_f32/vbslq_*/vreinterpretq_*
                 // mask-type signatures drift across NEON/SVE-enabled toolchains
                 // (clang-18 + -march=armv9-a types vcltq_f32's result as
@@ -1087,6 +1103,14 @@ inline void argmin_scaled(uint32_t n, uint32_t k, uint32_t k_simd,
                 __m256 vals = _mm256_sub_ps(s, _mm256_mul_ps(two, r));
                 __m256i idx = _mm256_add_epi32(_mm256_set1_epi32(base),
                                                lane_idx);
+                if (c + kBatch > k) {
+                    const __m256 pad = _mm256_castsi256_ps(
+                        _mm256_cmpgt_epi32(idx, _mm256_set1_epi32(k - 1)));
+                    vals = _mm256_blendv_ps(
+                        vals, _mm256_set1_ps(
+                                  std::numeric_limits<float>::infinity()),
+                        pad);
+                }
                 __m256 mask = _mm256_cmp_ps(vals, best_val, _CMP_LT_OQ);
                 best_val = _mm256_blendv_ps(best_val, vals, mask);
                 best_idx = _mm256_blendv_epi8(best_idx, idx,

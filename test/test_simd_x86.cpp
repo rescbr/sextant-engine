@@ -195,3 +195,39 @@ TEST(SimdX86, U4DecodeDotMatchesRef) {
 }
 
 }  // namespace
+
+// Regression (2026-09-07): argmin_scaled SIMD paths iterated the zero-padded
+// tail columns [k, k_simd); a padded column's value 0 - 2*0 = 0 won the
+// argmin whenever every real column was positive, assigning points to
+// nonexistent centroids. k=13 -> k_simd=16 on AVX2 (8-wide), 16 on NEON
+// (4-wide) reproduces on both.
+TEST(SimdX86, ArgminScaledPaddingPoisoned) {
+    const uint32_t k = 13, n = 64;
+    const uint32_t ks = simd::gemv_k_simd(k);
+    ASSERT_GT(ks, k) << "fixture requires a padded tail";
+    std::vector<float> scale(ks, 0.f), dots((size_t)n * ks, 0.f);
+    for (uint32_t c = 0; c < k; ++c) scale[c] = 10.f + (float)c;
+    for (auto& d : dots) d = -1.f;  // all real vals positive
+    std::vector<uint32_t> got(n, 999), want(n, 0);
+    uint64_t changed = 0;
+    simd::argmin_scaled(n, k, ks, scale.data(), dots.data(), got.data(),
+                        changed);
+    for (uint32_t i = 0; i < n; ++i) {
+        EXPECT_LT(got[i], k) << "assigned to a padded (nonexistent) centroid";
+        EXPECT_EQ(got[i], want[i]);
+    }
+    // And the normal case still agrees with the scalar reference.
+    std::mt19937 rng(1);
+    for (auto& d : dots) d = rng() % 1000 / 1000.f - 0.5f;
+    for (uint32_t c = 0; c < k; ++c) scale[c] = rng() % 1000 / 1000.f;
+    uint64_t ch2 = 0;
+    simd::argmin_scaled(n, k, ks, scale.data(), dots.data(), got.data(), ch2);
+    for (uint32_t i = 0; i < n; ++i) {
+        float best = 1e30f; uint32_t bc = 0;
+        for (uint32_t c = 0; c < k; ++c) {
+            const float v = scale[c] - 2.f * dots[(size_t)i * ks + c];
+            if (v < best) { best = v; bc = c; }
+        }
+        EXPECT_EQ(got[i], bc) << "argmin diverged from scalar reference";
+    }
+}

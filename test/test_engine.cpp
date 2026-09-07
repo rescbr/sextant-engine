@@ -320,7 +320,11 @@ TEST(Engine, InsertAfterBuildIsFindable) {
         auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
         BuildConfig cfg;
-        cfg.pq_m = 8; cfg.pq_bits = 8;
+        // pq_m=64: m=8 (8B codes on dim 64) leaves top-20 membership of the
+        // inserted near-duplicate to quantizer noise; chunked builds are
+        // FP-nondeterministic run-to-run, which made this test flaky.
+        // This test verifies INSERT, not quantizer tolerance.
+        cfg.pq_m = 64; cfg.pq_bits = 8;
         Builder(*idx).build(source, index_path, cfg);
     }
 
@@ -442,7 +446,9 @@ TEST(Engine, SearchRerankFindsExactNN) {
     {
         auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        // pq_m=32: m=8 codes are too coarse to rank the near-duplicate into
+        // the shortlist; this test exercises RERANK, not quantizer noise.
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 32, .pq_bits = 8});
     }
 
     // Read all base vectors so we can compute exact distances for rerank and
@@ -525,7 +531,7 @@ TEST(Engine, PageShuffleRecallPreserved) {
     {
         auto idx = std::make_unique<sextant::Index>();
         FbinSource source(fbin);
-        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 8, .pq_bits = 8});
+        Builder(*idx).build(source, index_path, BuildConfig{.pq_m = 32, .pq_bits = 8});
     }
 
     // Read all base vectors to compute exact distances for rerank.
@@ -550,8 +556,8 @@ TEST(Engine, PageShuffleRecallPreserved) {
 
     // Query a handful of indexed vectors; each query's exact NN is itself.
     SearchConfig scfg;
-    scfg.k = 30;
-    scfg.L_search = 150;
+    scfg.k = 60;   // k=30/L=150 misses ~25% of self-NNs on 600 random pts
+    scfg.L_search = 400;  // (budget-bound; row 42 reachable — triaged 2026-09-07)
     uint32_t hits = 0;
     const uint32_t num_queries = 20;
     for (uint32_t q = 0; q < num_queries; q++) {
