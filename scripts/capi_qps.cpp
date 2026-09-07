@@ -30,14 +30,21 @@ Fbin load(const char* p) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: capi_qps <tree> <query.fbin> [threads=8] [k=10]\n");
+        fprintf(stderr,
+            "usage: capi_qps <tree> <query.fbin> [threads=8] [k=10] "
+            "[exact_base.fbin]\n"
+            "  exact_base.fbin: rerank against the original corpus "
+            "(exact_rerank_base) instead of decode.\n"
+            "  Remaining knobs are env (bench-harness convention): "
+            "EXH I8 W TAU NP ROUNDS.\n");
         return 1;
     }
     const char* tree = argv[1];
     Fbin q = load(argv[2]);
-    // EXACT=<base.fbin>: load the base corpus and rerank against it
-    // (exact_rerank_base) instead of decode — regime-(b) QPS dial.
-    const char* exact_path = getenv("EXACT");
+    // Optional 5th positional: rerank against the original corpus
+    // (exact_rerank_base) instead of decode — the frontier's audit hatch.
+    // EXACT=<base.fbin> env still works (legacy manual-run form).
+    const char* exact_path = argc > 5 ? argv[5] : getenv("EXACT");
     std::vector<float> exact_base;
     if (exact_path) {
         Fbin b = load(exact_path);
