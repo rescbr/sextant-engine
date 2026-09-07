@@ -1260,8 +1260,10 @@ int cmd_sweep(int argc, char* argv[]) {
                      "comma-separated list\n";
         return 1;
     }
-    if (n_probes.empty() && p.get<std::string>("feedback").empty()) {
-        std::cerr << "sweep: --n-probe is required unless --feedback is used\n";
+    if (n_probes.empty() && p.get<std::string>("feedback").empty()
+        && p.get<std::string>("probe-fraction").empty()) {
+        std::cerr << "sweep: --n-probe is required unless --probe-fraction "
+                     "or --feedback is used\n";
         return 1;
     }
     // Ascending, deduped W list (the engine evaluates prefix cuts in scan
