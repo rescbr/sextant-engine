@@ -582,6 +582,10 @@ void Builder::construct_into(VamanaCore& core, uint32_t count,
                             const char* label) {
     if (count == 0) return;
     nthreads = std::max(1u, nthreads);
+    // Tiny shards don't need a 32-thread pool (spawn + cond-var chatter
+    // dominates when each worker gets <4 nodes — profiled via phase=shards
+    // util 7% on small builds).
+    nthreads = std::min(nthreads, std::max(1u, count));
     spdlog::info("[sextant] {}: {} nodes across {} threads (PQ-construct)", label, count,
                  nthreads);
 
@@ -633,22 +637,31 @@ void Builder::construct_into(VamanaCore& core, uint32_t count,
     }
 
     // Progress logger: reads the atomic counter periodically. Zero contention.
-    // Wakes promptly when the workers finish (finished flag + short sleeps) —
-    // a fixed 5s sleep here imposed a 5s wall floor on EVERY shard build,
-    // dwarfing the actual construct time (workers finish in <1s on shards).
+    // Wakes promptly when the workers finish: waits on a condvar with a
+    // 250ms timeout (notified at completion), so the logger tail is ~0
+    // instead of up to one full tick. The fixed-sleep versions cost a 5s
+    // (v1) then 250ms (v2) wall floor on EVERY shard build — profiled via
+    // per-phase metrics on small shards (wall 6.4s / cpu 0.45s / util 7%
+    // for 64 tiny shards, phase=shards).
     std::atomic<bool> finished{false};
+    std::mutex logger_mu;
+    std::condition_variable logger_cv;
     std::thread logger([&]() {
         const auto t_start = std::chrono::steady_clock::now();
         auto t_last = t_start;
         uint32_t last_done = lo;
         while (!finished.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::unique_lock<std::mutex> lk(logger_mu);
+            logger_cv.wait_for(lk, std::chrono::milliseconds(250), [&] {
+                return finished.load(std::memory_order_relaxed);
+            });
+            if (finished.load(std::memory_order_relaxed)) break;
             const auto now = std::chrono::steady_clock::now();
             const uint32_t done = std::min(
                 next_id.load(std::memory_order_relaxed), hi);
             const double elapsed = std::chrono::duration<double>(
                 now - t_start).count();
-            if (done <= last_done && !finished.load(std::memory_order_relaxed))
+            if (done <= last_done)
                 continue;
             const double interval = std::chrono::duration<double>(
                 now - t_last).count();
@@ -668,7 +681,11 @@ void Builder::construct_into(VamanaCore& core, uint32_t count,
     for (auto& f : futs) {
         f.get();
     }
-    finished.store(true, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(logger_mu);
+        finished.store(true, std::memory_order_relaxed);
+    }
+    logger_cv.notify_all();
     logger.join();
     core.set_build_progress(nullptr);
 
