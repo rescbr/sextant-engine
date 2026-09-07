@@ -2835,7 +2835,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
     // --- Scan leaves ---
     // Adaptive W driven by predicate selectivity (computed above, before routing).
-    uint32_t W = std::max(config.fastscan_W > 0 ? config.fastscan_W : 300u, k);
+    uint32_t W = std::max(config.fastscan_W > 0 ? config.fastscan_W : 1000u, k);
     if (sweep) {
         // One scan at W_max serves every W in the sweep (prefix cut below).
         W = std::max(W, *std::max_element(sweep_Ws->begin(), sweep_Ws->end()));

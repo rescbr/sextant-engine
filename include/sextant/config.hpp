@@ -278,9 +278,10 @@ struct SearchConfig {
     /// top-W candidates by 4-bit PQ distance; the database layer does exact
     /// rerank + top-k outside sextant-engine. W replaces the `k ×
     /// merge_oversample` shortlist the graph path uses — directly sets the
-    /// candidate-list size handed back to the caller. 0 = default (300, the
-    /// recall-0.99 point on arxiv-nomic per the hybrid-IVF spike). Ignored
-    /// for graph-mode indexes.
+    /// candidate-list size handed back to the caller. 0 = default (1000,
+    /// the τ×W grid winner: +0.4–0.7pp recall over 300 at ~zero QPS cost,
+    /// cohere-10M; W is per-shard and leaf-capacity-bound, scale-invariant).
+    /// Ignored for graph-mode indexes.
     uint32_t fastscan_W = 0;
 
     /// Adaptive probe early-exit (B): after scanning each shard, check if the
