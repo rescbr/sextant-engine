@@ -18,8 +18,10 @@ namespace {
 // ---------------------------------------------------------------------------
 // Helper: create a unique temp file path
 // ---------------------------------------------------------------------------
+// mkstemp requires exactly 6 X's at the END of the template (glibc rejects
+// suffixes after XXXXXX; BSD/macOS tolerate them - caught on Gentoo/glibc).
 std::string temp_path(const char* suffix) {
-    auto tmpl = std::string("/tmp/sextant_tree_test_XXXXXX") + suffix;
+    auto tmpl = std::string("/tmp/sextant_tree_test") + suffix + "_XXXXXX";
     std::vector<char> buf(tmpl.begin(), tmpl.end());
     buf.push_back('\0');
     int fd = ::mkstemp(buf.data());

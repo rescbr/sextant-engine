@@ -264,11 +264,11 @@ inline void scalar_heap_push4(RawScanHeap& heap, const ScalarScanCtx& c,
 }  // namespace detail
 
 inline void scalar_scan_i8(const ScalarScanCtx& c, RawScanHeap& heap) {
-    const uint32_t dim = c.dim;
+    [[maybe_unused]] const uint32_t dim = c.dim;
     const uint32_t cs = c.cs;
     static thread_local std::vector<uint8_t> pad_row_buf;
     if (pad_row_buf.size() < cs) pad_row_buf.assign(cs, 0);
-    const uint8_t* pad_row = pad_row_buf.data();
+    [[maybe_unused]] const uint8_t* pad_row = pad_row_buf.data();
 #if defined(__ARM_FEATURE_DOTPROD)
     const uint32_t padded = (dim + 15) / 16 * 16;
     const bool fully_padded_i8 = padded / 2 <= cs;
@@ -327,9 +327,9 @@ inline void scalar_scan_arith(const ScalarScanCtx& c, RawScanHeap& heap) {
     static thread_local std::vector<uint8_t> pad_row_buf;
     if (pad_row_buf.size() < cs) pad_row_buf.assign(cs, 0);
     const uint8_t* pad_row = pad_row_buf.data();
-    std::vector<HeapEntry>& h = *heap.h;
-    const uint32_t W = heap.w;
-    const uint32_t leaf_slot = heap.leaf_slot;
+    [[maybe_unused]] std::vector<HeapEntry>& h = *heap.h;
+    [[maybe_unused]] const uint32_t W = heap.w;
+    [[maybe_unused]] const uint32_t leaf_slot = heap.leaf_slot;
     const float* a_uni = c.a_uni;
     const float16_t* ip_bias = c.ip_bias;
     const float c0 = c.c0;

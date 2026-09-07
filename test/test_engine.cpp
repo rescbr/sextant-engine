@@ -330,10 +330,10 @@ TEST(Engine, InsertAfterBuildIsFindable) {
         FILE* fp = std::fopen(fbin.c_str(), "rb");
         ASSERT_NE(fp, nullptr);
         uint32_t hn, hd;
-        std::fread(&hn, sizeof(hn), 1, fp);
-        std::fread(&hd, sizeof(hd), 1, fp);
+        EXPECT_EQ(std::fread(&hn, sizeof(hn), 1, fp), 1u);
+        EXPECT_EQ(std::fread(&hd, sizeof(hd), 1, fp), 1u);
         std::fseek(fp, static_cast<long>(8 + 0 * dim * sizeof(float)), SEEK_SET);
-        std::fread(base0.data(), sizeof(float), dim, fp);
+        EXPECT_EQ(std::fread(base0.data(), sizeof(float), dim, fp), dim);
         std::fclose(fp);
     }
     std::vector<float> new_vec(dim);
@@ -452,12 +452,13 @@ TEST(Engine, SearchRerankFindsExactNN) {
         FILE* fp = std::fopen(fbin.c_str(), "rb");
         ASSERT_NE(fp, nullptr);
         uint32_t hdr_n = 0, hdr_dim = 0;
-        std::fread(&hdr_n, sizeof(hdr_n), 1, fp);
-        std::fread(&hdr_dim, sizeof(hdr_dim), 1, fp);
+        ASSERT_EQ(std::fread(&hdr_n, sizeof(hdr_n), 1, fp), 1u);
+        ASSERT_EQ(std::fread(&hdr_dim, sizeof(hdr_dim), 1, fp), 1u);
         ASSERT_EQ(hdr_n, n);
         ASSERT_EQ(hdr_dim, dim);
-        std::fread(base.data(), sizeof(float),
-                   static_cast<size_t>(n) * dim, fp);
+        ASSERT_EQ(std::fread(base.data(), sizeof(float),
+                             static_cast<size_t>(n) * dim, fp),
+                  static_cast<size_t>(n) * dim);
         std::fclose(fp);
     }
 
@@ -533,12 +534,13 @@ TEST(Engine, PageShuffleRecallPreserved) {
         FILE* fp = std::fopen(fbin.c_str(), "rb");
         ASSERT_NE(fp, nullptr);
         uint32_t hdr_n = 0, hdr_dim = 0;
-        std::fread(&hdr_n, sizeof(hdr_n), 1, fp);
-        std::fread(&hdr_dim, sizeof(hdr_dim), 1, fp);
+        ASSERT_EQ(std::fread(&hdr_n, sizeof(hdr_n), 1, fp), 1u);
+        ASSERT_EQ(std::fread(&hdr_dim, sizeof(hdr_dim), 1, fp), 1u);
         ASSERT_EQ(hdr_n, n);
         ASSERT_EQ(hdr_dim, dim);
-        std::fread(base.data(), sizeof(float),
-                   static_cast<size_t>(n) * dim, fp);
+        ASSERT_EQ(std::fread(base.data(), sizeof(float),
+                             static_cast<size_t>(n) * dim, fp),
+                  static_cast<size_t>(n) * dim);
         std::fclose(fp);
     }
 

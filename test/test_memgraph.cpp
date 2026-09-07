@@ -214,9 +214,9 @@ TEST(MemGraph, EngineOpenInstallsMemGraphAndMaintainsRecall) {
         FILE* fp = std::fopen(fbin.c_str(), "rb");
         ASSERT_NE(fp, nullptr);
         uint32_t hn, hd;
-        std::fread(&hn, sizeof(hn), 1, fp);
-        std::fread(&hd, sizeof(hd), 1, fp);
-        std::fread(base.data(), sizeof(float), base.size(), fp);
+        ASSERT_EQ(std::fread(&hn, sizeof(hn), 1, fp), 1u);
+        ASSERT_EQ(std::fread(&hd, sizeof(hd), 1, fp), 1u);
+        ASSERT_EQ(std::fread(base.data(), sizeof(float), base.size(), fp), base.size());
         std::fclose(fp);
     }
 

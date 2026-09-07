@@ -42,9 +42,12 @@ endif
 # --- SIMD target detection ---------------------------------------------------
 # Determines which scalar-dot kernel tier is compiled in. Stored as
 # SEXTANT_SIMD_TARGET in version.h alongside the git SHA.
-# Based on compiler-predefined __ARM_FEATURE_* macros (set by -march).
+# Based on compiler-predefined __ARM_FEATURE_* / __AVX* macros (set by
+# -march). Probes always use -march=native to match the build flags below.
 # On M4: -march=native → neon+i8mm (+ sme via __ARM_FEATURE_SME).
 # On c4a: -march=armv8-a+sve2 → sve2.
+# On Zen5 (9950X): -march=native → avx512 (+vnni+vbmi, the x86 analog of
+# SVE2 SDOT gather-dot for the i8/u4 scan kernels).
 if cpp.compiles('''
     #ifndef __ARM_FEATURE_SVE
     #error no sve
@@ -52,6 +55,20 @@ if cpp.compiles('''
     int main() { return 0; }
 ''', args: ['-march=native'])
     simd_target = 'sve2'
+elif cpp.compiles('''
+    #if !(defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__))
+    #error no avx512 suite
+    #endif
+    int main() { return 0; }
+''', args: ['-march=native'])
+    simd_target = 'avx512'
+elif cpp.compiles('''
+    #ifndef __AVX2__
+    #error no avx2
+    #endif
+    int main() { return 0; }
+''', args: ['-march=native'])
+    simd_target = 'avx2'
 elif cpp.compiles('''
     #ifndef __ARM_FEATURE_MATMUL_INT8
     #error no i8mm
@@ -130,6 +147,9 @@ endif
 # We DETECT support but do NOT force-add -mf16c. If the user passes -march=native
 # or -mcpu=neoverse-v2 (which enable F16C implicitly on capable hardware), the
 # detection passes. Forcing -mf16c would conflict with architecture-specific flags.
+# Note the probe uses -march=native to match the build flags: on x86 the
+# compiler baseline has no F16C, so probing without it fails on every
+# Haswell+ machine (caught on the 9950X port).
 fp16_ok = cpp.compiles('''
     #if defined(__x86_64__) || defined(__i386__)
     #include <immintrin.h>
@@ -150,7 +170,7 @@ fp16_ok = cpp.compiles('''
     #else
     #error unsupported architecture
     #endif
-''')
+''', args: ['-march=native'])
 if not fp16_ok
     error('Sextant requires hardware FP16 support (NEON on ARM, F16C on x86). ' +
           'Ensure -march=native or -mf16c is enabled, or build on AArch64.')

@@ -60,10 +60,10 @@ std::vector<RowId> brute_force_knn(const std::string& fbin_path,
                                    uint32_t k) {
     FILE* f = std::fopen(fbin_path.c_str(), "rb");
     uint32_t header[2];
-    std::fread(header, sizeof(uint32_t), 2, f);
+    if (std::fread(header, sizeof(uint32_t), 2, f) != 2) return {};
     const uint64_t n = header[0];
     std::vector<float> data(n * dim);
-    std::fread(data.data(), sizeof(float), n * dim, f);
+    if (std::fread(data.data(), sizeof(float), n * dim, f) != n * dim) return {};
     std::fclose(f);
 
     std::vector<std::pair<float, RowId>> dists(n);

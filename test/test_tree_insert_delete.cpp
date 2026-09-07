@@ -67,11 +67,12 @@ std::vector<float> read_fbin(const std::string& path, uint64_t& n_out,
                               uint32_t& dim_out) {
     FILE* f = std::fopen(path.c_str(), "rb");
     uint32_t header[2];
-    std::fread(header, sizeof(uint32_t), 2, f);
+    if (std::fread(header, sizeof(uint32_t), 2, f) != 2) return {};
     n_out = header[0];
     dim_out = header[1];
     std::vector<float> data(n_out * dim_out);
-    std::fread(data.data(), sizeof(float), n_out * dim_out, f);
+    if (std::fread(data.data(), sizeof(float), n_out * dim_out, f)
+        != static_cast<uint64_t>(n_out) * dim_out) return {};
     std::fclose(f);
     return data;
 }
@@ -561,27 +562,30 @@ bool load_siftsmall(SiftData& sd) {
 
     FILE* fp = std::fopen(base_path.c_str(), "rb");
     if (!fp) return false;
-    std::fread(&sd.n, 4, 1, fp);
-    std::fread(&sd.dim, 4, 1, fp);
+    if (std::fread(&sd.n, 4, 1, fp) != 1) { std::fclose(fp); return false; }
+    if (std::fread(&sd.dim, 4, 1, fp) != 1) { std::fclose(fp); return false; }
     sd.base.resize(static_cast<size_t>(sd.n) * sd.dim);
-    std::fread(sd.base.data(), sizeof(float), sd.base.size(), fp);
+    if (std::fread(sd.base.data(), sizeof(float), sd.base.size(), fp)
+        != sd.base.size()) { std::fclose(fp); return false; }
     std::fclose(fp);
 
     fp = std::fopen(query_path.c_str(), "rb");
     if (!fp) return false;
-    std::fread(&sd.nq, 4, 1, fp);
+    if (std::fread(&sd.nq, 4, 1, fp) != 1) { std::fclose(fp); return false; }
     uint32_t qdim;
-    std::fread(&qdim, 4, 1, fp);
+    if (std::fread(&qdim, 4, 1, fp) != 1) { std::fclose(fp); return false; }
     sd.queries.resize(static_cast<size_t>(sd.nq) * sd.dim);
-    std::fread(sd.queries.data(), sizeof(float), sd.queries.size(), fp);
+    if (std::fread(sd.queries.data(), sizeof(float), sd.queries.size(), fp)
+        != sd.queries.size()) { std::fclose(fp); return false; }
     std::fclose(fp);
 
     fp = std::fopen(gt_path.c_str(), "rb");
     if (!fp) return false;
-    std::fread(&sd.gtn, 4, 1, fp);
-    std::fread(&sd.gtk, 4, 1, fp);
+    if (std::fread(&sd.gtn, 4, 1, fp) != 1) { std::fclose(fp); return false; }
+    if (std::fread(&sd.gtk, 4, 1, fp) != 1) { std::fclose(fp); return false; }
     sd.gt_ids.resize(static_cast<size_t>(sd.gtn) * sd.gtk);
-    std::fread(sd.gt_ids.data(), sizeof(uint32_t), sd.gt_ids.size(), fp);
+    if (std::fread(sd.gt_ids.data(), sizeof(uint32_t), sd.gt_ids.size(), fp)
+        != sd.gt_ids.size()) { std::fclose(fp); return false; }
     std::fclose(fp);
 
     return true;

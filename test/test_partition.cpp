@@ -65,10 +65,10 @@ static std::vector<float> read_fbin_vectors(const std::string& path,
                                             uint32_t& dim_out) {
     FILE* fp = std::fopen(path.c_str(), "rb");
     EXPECT_NE(fp, nullptr);
-    std::fread(&n_out, sizeof(n_out), 1, fp);
-    std::fread(&dim_out, sizeof(dim_out), 1, fp);
+    if (std::fread(&n_out, sizeof(n_out), 1, fp) != 1) return {};
+    if (std::fread(&dim_out, sizeof(dim_out), 1, fp) != 1) return {};
     std::vector<float> data(static_cast<size_t>(n_out) * dim_out);
-    std::fread(data.data(), sizeof(float), data.size(), fp);
+    if (std::fread(data.data(), sizeof(float), data.size(), fp) != data.size()) return {};
     std::fclose(fp);
     return data;
 }

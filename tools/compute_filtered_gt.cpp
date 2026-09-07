@@ -149,14 +149,20 @@ int main(int argc, char* argv[]) {
     FILE* bf = std::fopen(base_path.c_str(), "rb");
     if (!bf) { std::cerr << "cannot open " << base_path << "\n"; return 1; }
     uint32_t header[2];
-    std::fread(header, 4, 2, bf);
+    if (std::fread(header, 4, 2, bf) != 2) {
+        std::cerr << "short read on base header\n";
+        return 1;
+    }
     const uint32_t dim = header[1];
     // Read matching vectors into RAM (only the ones we need).
     std::vector<float> match_vecs(matching.size() * dim);
     std::vector<float> buf(dim);
     for (size_t i = 0; i < matching.size(); ++i) {
         std::fseek(bf, 8 + static_cast<long>(matching[i]) * dim * 4, SEEK_SET);
-        std::fread(match_vecs.data() + i * dim, 4, dim, bf);
+        if (std::fread(match_vecs.data() + i * dim, 4, dim, bf) != dim) {
+            std::cerr << "short read on base row " << matching[i] << "\n";
+            return 1;
+        }
     }
     std::fclose(bf);
 
@@ -164,7 +170,10 @@ int main(int argc, char* argv[]) {
     FILE* qf = std::fopen(query_path.c_str(), "rb");
     if (!qf) { std::cerr << "cannot open " << query_path << "\n"; return 1; }
     uint32_t qheader[2];
-    std::fread(qheader, 4, 2, qf);
+    if (std::fread(qheader, 4, 2, qf) != 2) {
+        std::cerr << "short read on query header\n";
+        return 1;
+    }
     const uint32_t nq = qheader[0];
     const uint32_t qdim = qheader[1];
     if (qdim != dim) {
@@ -172,7 +181,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::vector<float> queries(static_cast<uint64_t>(nq) * dim);
-    std::fread(queries.data(), 4, static_cast<size_t>(nq) * dim, qf);
+    if (std::fread(queries.data(), 4, static_cast<size_t>(nq) * dim, qf)
+        != static_cast<size_t>(nq) * dim) {
+        std::cerr << "short read on queries\n";
+        return 1;
+    }
     std::fclose(qf);
 
     // --- Compute exact top-k for each query among matching vectors ---

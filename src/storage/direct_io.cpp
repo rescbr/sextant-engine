@@ -116,13 +116,63 @@ size_t DirectFile::pread_aligned(void* buf, size_t count, uint64_t offset) {
 }
 
 size_t DirectFile::pwrite_aligned(const void* buf, size_t count, uint64_t offset) {
-    ssize_t n = ::pwrite(fd_, buf, count, static_cast<off_t>(offset));
+    if (count == 0) return 0;
+
+    // Mirror of pread_aligned: O_DIRECT requires buf, count, AND offset
+    // aligned. macOS never enforces this (F_NOCACHE is advisory), and the
+    // VM test coverage never hit an unaligned write — ZFS on Linux rejects
+    // it with EINVAL (caught on the 9950X workstation).
+    const uint64_t off_misalign = offset & (kDiskAlign - 1);
+    const size_t count_misalign = count & (kDiskAlign - 1);
+    const bool buf_aligned =
+        (reinterpret_cast<uintptr_t>(buf) & (kDiskAlign - 1)) == 0;
+
+    if (off_misalign == 0 && count_misalign == 0 && buf_aligned) {
+        ssize_t n = ::pwrite(fd_, buf, count, static_cast<off_t>(offset));
+        if (n < 0) {
+            throw Error(ErrorCode::IoError,
+                        "DirectFile::pwrite failed on '" + path_ + "': " +
+                            std::strerror(errno));
+        }
+        return static_cast<size_t>(n);
+    }
+
+    // Slow path: align the window down/up and read-modify-write through a
+    // staging buffer so neighboring bytes in the head/tail blocks survive.
+    const uint64_t aligned_off = offset - off_misalign;
+    const uint64_t end = offset + count;
+    const uint64_t aligned_end =
+        (end + kDiskAlign - 1) & ~static_cast<uint64_t>(kDiskAlign - 1);
+    const size_t aligned_count = static_cast<size_t>(aligned_end - aligned_off);
+    // Loud by design: unaligned direct writes defeat O_DIRECT (extra read +
+    // staging copy, RMW races with concurrent writers). The call sites that
+    // land here are being migrated to aligned writes or BufferedFile; once
+    // the list is empty this path becomes a hard error.
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+        spdlog::warn("DirectFile::pwrite unaligned (off={}, count={}) on '{}' "
+                     "- staging through {}B buffer; align the caller",
+                     offset, count, path_, aligned_count);
+    }
+    AlignedBuf stage(kDiskAlign, aligned_count);
+    // Preserve existing head/tail bytes; a short read is fine when the write
+    // extends the file (bytes past old EOF are zero-filled in the stage).
+    ssize_t n = ::pread(fd_, stage.get(), aligned_count,
+                        static_cast<off_t>(aligned_off));
+    if (n < 0) {
+        throw Error(ErrorCode::IoError,
+                    "DirectFile::pwrite staging read failed on '" + path_ +
+                        "': " + std::strerror(errno));
+    }
+    std::memcpy(stage.as<uint8_t>() + off_misalign, buf, count);
+    n = ::pwrite(fd_, stage.get(), aligned_count,
+                 static_cast<off_t>(aligned_off));
     if (n < 0) {
         throw Error(ErrorCode::IoError,
                     "DirectFile::pwrite failed on '" + path_ + "': " +
                         std::strerror(errno));
     }
-    return static_cast<size_t>(n);
+    return count;
 }
 
 uint64_t DirectFile::size() const {

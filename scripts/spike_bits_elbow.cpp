@@ -27,6 +27,10 @@
 #include "simd_kernels.hpp"
 #include "util/fp16.hpp"
 
+// float16_t is a NEON type on ARM (pulled in via simd_kernels.hpp) but a
+// sextant typedef on x86 — unify the spelling for this TU.
+using sextant::float16_t;
+
 namespace {
 
 struct Fbin {

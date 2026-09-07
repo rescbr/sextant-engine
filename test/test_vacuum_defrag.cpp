@@ -80,9 +80,10 @@ TestTree build_test_tree(uint64_t n, uint32_t dim, uint32_t n_clusters,
     // Read base data for queries.
     FILE* f = std::fopen(tt.fbin_path.c_str(), "rb");
     uint32_t hdr[2];
-    std::fread(hdr, sizeof(uint32_t), 2, f);
+    if (std::fread(hdr, sizeof(uint32_t), 2, f) != 2) return tt;
     tt.base_data.resize(n * dim);
-    std::fread(tt.base_data.data(), sizeof(float), n * dim, f);
+    if (std::fread(tt.base_data.data(), sizeof(float), n * dim, f)
+        != static_cast<uint64_t>(n) * dim) return tt;
     std::fclose(f);
 
     // int32 filter column: category = i % 10.

@@ -131,7 +131,8 @@ inline void install_crash_handler() {
     int cdf = ::open("/proc/self/coredump_filter", O_WRONLY);
     if (cdf >= 0) {
         const char filter[] = "0x3";
-        ::write(cdf, filter, sizeof(filter) - 1);
+        // Best-effort: the filter only affects crash dump contents.
+        if (::write(cdf, filter, sizeof(filter) - 1) < 0) {}
         ::close(cdf);
     }
 #endif

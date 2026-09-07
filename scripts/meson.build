@@ -1,6 +1,11 @@
 # Microbenchmarks and exploratory scripts. Not installed; built on demand
 # (ninja -C build bench_preprocess_query). Each is a standalone executable.
 
+# NEON-intrinsic spikes/microbenches: ARM-only sources (bare #include
+# <arm_neon.h>, no guards — they are archival measurement code). Excluded
+# from x86 builds; port via the simd:: kernel API if ever needed again.
+is_aarch64 = host_machine.cpu_family() == 'aarch64'
+
 bench_preprocess_query = executable('bench_preprocess_query',
     'bench_preprocess_query.cpp',
     dependencies: sextant_dep,
@@ -8,12 +13,15 @@ bench_preprocess_query = executable('bench_preprocess_query',
     install: false,
 )
 
+if is_aarch64
 bench_fastscan = executable('bench_fastscan',
     'bench_fastscan.cpp',
     dependencies: sextant_dep,
     install: false,
 )
+endif
 
+if is_aarch64
 spike_pq4_recall = executable('spike_pq4_recall',
     'spike_pq4_recall.cpp',
     dependencies: sextant_dep,
@@ -43,6 +51,7 @@ bench_mem = executable('bench_mem',
     dependencies: sextant_dep,
     install: false,
 )
+endif
 
 spike_colocated = executable('spike_colocated',
     'spike_colocated.cpp',
@@ -50,6 +59,7 @@ spike_colocated = executable('spike_colocated',
     install: false,
 )
 
+if is_aarch64
 spike_margin_rerank = executable('spike_margin_rerank',
     'spike_margin_rerank.cpp',
     dependencies: sextant_dep,
@@ -61,6 +71,7 @@ spike_graph_coarse_router = executable('spike_graph_coarse_router',
     dependencies: sextant_dep,
     install: false,
 )
+endif
 
 spike_pq_bounds = executable('spike_pq_bounds',
     'spike_pq_bounds.cpp',
@@ -74,11 +85,13 @@ spike_panorama_rerank = executable('spike_panorama_rerank',
     install: false,
 )
 
+if is_aarch64
 bench_kernel = executable('bench_kernel',
     'bench_kernel.cpp',
     dependencies: sextant_dep,
     install: false,
 )
+endif
 
 spike_lm_recall = executable('spike_lm_recall',
     'spike_lm_recall.cpp',

@@ -129,7 +129,7 @@ std::unique_ptr<ScanSetup> ScalarLmCoder::scan_setup(const float* query) {
     s->query_copy.assign(query, query + params_.dim);
     const uint32_t dim = params_.dim;
     const bool slm_arith = quantizer_->arithmetic_scan();
-    const bool slm_shaped = slm_arith && !quantizer_->is_uniform();
+    [[maybe_unused]] const bool slm_shaped = slm_arith && !quantizer_->is_uniform();
     if (slm_arith) {
         // Zero-pad a_uni to the 16-dim kernel width: tail dims read garbage
         // nibbles but multiply by 0. c0 = Σ q_d·lo_d — NOT droppable once the

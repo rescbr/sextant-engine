@@ -87,10 +87,11 @@ static float siftsmall_recall(const std::string& index_path,
     {
         FILE* fp = std::fopen(fbin.c_str(), "rb");
         EXPECT_NE(fp, nullptr);
-        std::fread(&n, sizeof(n), 1, fp);
-        std::fread(&dim, sizeof(dim), 1, fp);
+        EXPECT_EQ(std::fread(&n, sizeof(n), 1, fp), 1u);
+        EXPECT_EQ(std::fread(&dim, sizeof(dim), 1, fp), 1u);
         base.resize(static_cast<size_t>(n) * dim);
-        std::fread(base.data(), sizeof(float), base.size(), fp);
+        EXPECT_EQ(std::fread(base.data(), sizeof(float), base.size(), fp),
+                  base.size());
         std::fclose(fp);
     }
 
@@ -99,11 +100,12 @@ static float siftsmall_recall(const std::string& index_path,
     {
         FILE* fp = std::fopen(query_path.c_str(), "rb");
         EXPECT_NE(fp, nullptr);
-        std::fread(&nq, sizeof(nq), 1, fp);
-        std::fread(&qdim, sizeof(qdim), 1, fp);
+        EXPECT_EQ(std::fread(&nq, sizeof(nq), 1, fp), 1u);
+        EXPECT_EQ(std::fread(&qdim, sizeof(qdim), 1, fp), 1u);
         EXPECT_EQ(qdim, dim);
         queries.resize(static_cast<size_t>(nq) * dim);
-        std::fread(queries.data(), sizeof(float), queries.size(), fp);
+        EXPECT_EQ(std::fread(queries.data(), sizeof(float), queries.size(), fp),
+                  queries.size());
         std::fclose(fp);
     }
 
@@ -112,11 +114,12 @@ static float siftsmall_recall(const std::string& index_path,
     {
         FILE* fp = std::fopen(gt_path.c_str(), "rb");
         EXPECT_NE(fp, nullptr);
-        std::fread(&gtn, sizeof(gtn), 1, fp);
-        std::fread(&gtk, sizeof(gtk), 1, fp);
+        EXPECT_EQ(std::fread(&gtn, sizeof(gtn), 1, fp), 1u);
+        EXPECT_EQ(std::fread(&gtk, sizeof(gtk), 1, fp), 1u);
         EXPECT_EQ(gtn, nq);
         gt_ids.resize(static_cast<size_t>(gtn) * gtk);
-        std::fread(gt_ids.data(), sizeof(uint32_t), gt_ids.size(), fp);
+        EXPECT_EQ(std::fread(gt_ids.data(), sizeof(uint32_t), gt_ids.size(), fp),
+                  gt_ids.size());
         std::fclose(fp);
     }
 
@@ -218,9 +221,10 @@ TEST(PagedSearch, FindsExactNN) {
         FILE* fp = std::fopen(fbin.c_str(), "rb");
         ASSERT_NE(fp, nullptr);
         uint32_t hn, hd;
-        std::fread(&hn, sizeof(hn), 1, fp);
-        std::fread(&hd, sizeof(hd), 1, fp);
-        std::fread(base.data(), sizeof(float), base.size(), fp);
+        EXPECT_EQ(std::fread(&hn, sizeof(hn), 1, fp), 1u);
+        EXPECT_EQ(std::fread(&hd, sizeof(hd), 1, fp), 1u);
+        EXPECT_EQ(std::fread(base.data(), sizeof(float), base.size(), fp),
+                  base.size());
         std::fclose(fp);
     }
 

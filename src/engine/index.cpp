@@ -148,12 +148,18 @@ std::unique_ptr<Index> Index::read(const std::string& index_path,
             entry_points.push_back(ep);
         }
 
-        // ResolvedParams POD block.
+        // ResolvedParams POD block. LEGACY (graph) path: this type-puns a
+        // serialized blob over a non-trivially-copyable struct. The layout
+        // is frozen by on-disk compatibility; do not "fix" without a format
+        // migration. Suppressed for -Wnontrivial-memcall (clang >= 19).
         if (static_cast<size_t>(p - payload.data()) + sizeof(params) > avail) {
             throw Error(ErrorCode::CorruptIndex,
                         "Index::read: .meta params truncated");
         }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnontrivial-memcall"
         std::memcpy(&params, p, sizeof(params));
+#pragma clang diagnostic pop
     }
 
     // Remember the loaded params so Builder::flush can persist post-insert state.
