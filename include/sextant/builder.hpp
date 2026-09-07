@@ -14,6 +14,8 @@
 
 #include "sextant/config.hpp"
 #include "sextant/index.hpp"
+#include "sextant/metrics.hpp"
+#include "sextant/phase_timer.hpp"
 #include "sextant/vector_source.hpp"
 
 #include <cstdint>
@@ -97,6 +99,15 @@ public:
 
 private:
     Index& index_;
+
+    // --- Build instrumentation (metrics.hpp / phase_timer.hpp) ---
+    // Always logs per-phase lines; build(BuildConfig) fans an optional
+    // external sink (e.g. --metrics-file JSONL) alongside.
+    metrics::LogMetricsSink metrics_log_sink_;
+    metrics::MultiMetricsSink metrics_multi_sink_;
+    metrics::MetricsSink* metrics_extra_ = nullptr;
+    metrics::MetricsCollector metrics_;
+    void init_metrics_(VectorSource& source, metrics::MetricsSink* extra);
 
     // Build-only scratch: FP32 k-means centroids for entry-point selection.
     // Empty outside pass1 → snap_entry_points_ → write_sidecars_.

@@ -5,8 +5,10 @@
 
 #include <sextant/types.hpp>
 #include <sextant/schema.hpp>
+#include <sextant/metrics.hpp>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -250,6 +252,10 @@ struct BuildConfig {
     /// Graph construction distance source (see GraphBuildMetric).
     GraphBuildMetric graph_build_metric = GraphBuildMetric::PqConstruct;
 
+    /// Optional metrics sink (metrics.hpp). When null, phase records still
+    /// accumulate into BuildResult::phases and emit via the default log line.
+    metrics::MetricsSink* metrics_sink = nullptr;
+
     /// Adaptive probe gap (0 = auto, derived from LID by the estimator).
     float adaptive_probe_gap = 0.0f;
     /// Median LID (0 = unmeasured; set by the estimator).
@@ -266,6 +272,70 @@ struct BuildResult {
     uint16_t L_build = 0;
     uint16_t pq_m = 0;
     uint8_t pq_bits = 8;
+
+    // --- Instrumentation (see metrics.hpp; totals + per-phase records) ---
+    /// Thread-sum CPU across the build (getrusage RUSAGE_SELF deltas).
+    double cpu_time_sec = 0;
+    /// Seconds the build spent blocked in VectorSource::next() (I/O waits).
+    double source_wait_sec = 0;
+    /// Bytes read through the VectorSource during the build.
+    uint64_t bytes_read = 0;
+    /// Process peak RSS over the build (ru_maxrss; monotone upper bound).
+    uint64_t peak_rss_bytes = 0;
+    /// Per-phase records (sample/pca/kmeans/lloyd/stream/write or graph
+    /// passes), in emission order. Empty only for paths not yet wired.
+    std::vector<metrics::PhaseMetrics> phases;
+};
+
+/// Aggregated search counters (window semantics). The engine accumulates
+/// relaxed atomics per query; callers take windows via snapshot_and_reset()
+/// and derive rates/means. CPU attribution is deliberately NOT here:
+/// process-wide rusage under concurrent search misattributes other threads'
+/// cycles — windows get CPU at the harness boundary (see phase_timer.hpp).
+/// All fields except wall are pure counts; wall is summed per-query span.
+struct SearchStats {
+    /// Plain snapshot of a window (all deltas since the last snapshot).
+    struct Snapshot {
+        uint64_t queries = 0;
+        uint64_t leaves_probed = 0;
+        uint64_t bytes_touched = 0;   ///< leaf pages × page size (the currency)
+        uint64_t rerank_count = 0;    ///< candidates decoded+reranked
+        uint64_t cache_hits = 0;      ///< BlockCache stub (zero until wired)
+        uint64_t cache_misses = 0;    ///< BlockCache stub
+        double wall_seconds = 0;
+    };
+
+    void on_query(double wall_s, uint64_t leaves, uint64_t bytes,
+                  uint64_t reranked) const {
+        queries_.fetch_add(1, std::memory_order_relaxed);
+        wall_ns_.fetch_add(static_cast<uint64_t>(wall_s * 1e9),
+                           std::memory_order_relaxed);
+        leaves_probed_.fetch_add(leaves, std::memory_order_relaxed);
+        bytes_touched_.fetch_add(bytes, std::memory_order_relaxed);
+        rerank_count_.fetch_add(reranked, std::memory_order_relaxed);
+    }
+
+    Snapshot snapshot_and_reset() const {
+        Snapshot s;
+        s.queries = queries_.exchange(0, std::memory_order_relaxed);
+        s.leaves_probed = leaves_probed_.exchange(0, std::memory_order_relaxed);
+        s.bytes_touched = bytes_touched_.exchange(0, std::memory_order_relaxed);
+        s.rerank_count = rerank_count_.exchange(0, std::memory_order_relaxed);
+        s.cache_hits = cache_hits_.exchange(0, std::memory_order_relaxed);
+        s.cache_misses = cache_misses_.exchange(0, std::memory_order_relaxed);
+        s.wall_seconds = static_cast<double>(
+            wall_ns_.exchange(0, std::memory_order_relaxed)) / 1e9;
+        return s;
+    }
+
+private:
+    mutable std::atomic<uint64_t> queries_{0};
+    mutable std::atomic<uint64_t> wall_ns_{0};
+    mutable std::atomic<uint64_t> leaves_probed_{0};
+    mutable std::atomic<uint64_t> bytes_touched_{0};
+    mutable std::atomic<uint64_t> rerank_count_{0};
+    mutable std::atomic<uint64_t> cache_hits_{0};
+    mutable std::atomic<uint64_t> cache_misses_{0};
 };
 
 /// Search configuration.

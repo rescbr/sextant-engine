@@ -22,6 +22,7 @@
 #include "sidecar_io.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
+#include "sextant/metrics.hpp"
 
 #include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
@@ -123,6 +124,7 @@ BuildResult Builder::build(VectorSource& source, const std::string& index_path,
     // the count/dim/path setup, build_partitioned, and timing.
     index_.count = source.count();
     index_.dim = source.dim();
+    init_metrics_(source, config.metrics_sink);
     return build(source, index_path,
                  resolve_params(index_.count, index_.dim, config),
                  config.graph_build_metric);
@@ -132,6 +134,10 @@ BuildResult Builder::build(VectorSource& source, const std::string& index_path,
                           const ResolvedParams& params,
                           GraphBuildMetric graph_build_metric) {
     const auto t0 = std::chrono::steady_clock::now();
+    // Rebind instrumentation to this source (keeps the external sink a
+    // previous build(BuildConfig) call registered via metrics_extra_).
+    init_metrics_(source, metrics_extra_);
+    auto m_total = metrics_.start("total");
 
     index_.count = source.count();
     index_.dim = source.dim();
@@ -154,7 +160,25 @@ BuildResult Builder::build(VectorSource& source, const std::string& index_path,
         std::chrono::duration<double>(t1 - t0).count() + result.build_time_sec;
     spdlog::info("[sextant] build complete (K={}) in {:.2f}s", params.partition_count,
                  result.build_time_sec);
+    const metrics::PhaseMetrics sums = metrics_.totals("total");
+    result.cpu_time_sec = sums.cpu_seconds;
+    result.source_wait_sec = sums.source_wait_seconds;
+    result.bytes_read = sums.bytes_read;
+    result.peak_rss_bytes = metrics::MetricsCollector::peak_rss_bytes();
+    metrics_.stop(m_total);
+    result.phases = metrics_.records();
     return result;
+}
+
+void Builder::init_metrics_(VectorSource& source, metrics::MetricsSink* extra) {
+    // Log line always; the external sink (e.g. --metrics-file JSONL) fans
+    // out alongside. Re-runnable per build (Estimator mini-builds reuse one
+    // Builder).
+    metrics_extra_ = extra;
+    metrics_multi_sink_.clear();
+    metrics_multi_sink_.add(&metrics_log_sink_);
+    if (extra) metrics_multi_sink_.add(extra);
+    metrics_ = metrics::MetricsCollector(&source, &metrics_multi_sink_, "fbin");
 }
 
 Builder::PqSelection Builder::probe_pq_config(const float* sample, uint64_t n,
@@ -682,7 +706,9 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     // pass1 fills the reservoir, runs the global probe if pq_bits==0, then
     // constructs + trains the quantizer. After it, index_.code_size is valid.
     // prepare_codes also runs pass2_encode and loads raw_vecs_buffer (FP16).
+    auto m_prepare = metrics_.start("prepare");
     prepare_codes(source, params);
+    metrics_.stop(m_prepare);
 
     // node_size for the build buffer (flat neighbor lists).
     // Shards build at R_shard, but the merged result lands in index_.nodes_buffer
@@ -735,6 +761,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
                          fp32_bytes / 1e6);
         }
         source.reset();
+        auto m_load = metrics_.start("load_raw");
         Chunk chunk{};
         uint64_t loaded = 0;
         while (source.next(chunk)) {
@@ -756,6 +783,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
             }
         }
         spdlog::info("[sextant] loaded {} raw vectors as FP16", loaded);
+        metrics_.stop(m_load);
         index_.raw_vecs_buffer = vecs.as<float16_t>(); vecs.release();
         if (fp32_build) {
             index_.fp32_vecs_buffer = fp32_vecs.as<float>(); fp32_vecs.release();
@@ -792,7 +820,9 @@ BuildResult Builder::build_partitioned(VectorSource& source,
         }
         VamanaCore::BuildVecLoan build_vec_loan(*index_.core);
 
+        auto m_construct = metrics_.start("construct");
         parallel_construct(params);
+        metrics_.stop(m_construct);
         // Raw vectors cleared by build_vec_loan destructor (K=1 no longer needs them).
     } else {
     // =====================================================================
@@ -800,6 +830,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     // =====================================================================
 
     // --- 2. Partition via k-means on PQ codes ---
+    auto m_partition = metrics_.start("partition");
     auto assignment = partition_codes(*index_.quantizer, index_.codes_buffer, n,
                                       index_.code_size, params.partition_count,
                                       params.closure_factor, /*iterations=*/10,
@@ -807,6 +838,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
                                       /*seed=*/0xC0DE1234ULL,
                                       /*balance_factor=*/0.0f,
                                       /*closure_epsilon=*/params.closure_epsilon);
+    metrics_.stop(m_partition);
     const uint32_t K = static_cast<uint32_t>(assignment.shards.size());
 
     // --- 3. Per-shard build ---
@@ -829,6 +861,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     VamanaParams vp_shard =
         VamanaParams::from_resolved(params, index_.dim, R_shard);
 
+    auto m_shards = metrics_.start("shards");
     for (uint32_t k = 0; k < K; k++) {
         auto& members = assignment.shards[k];
         const uint32_t shard_n = static_cast<uint32_t>(members.size());
@@ -893,6 +926,9 @@ BuildResult Builder::build_partitioned(VectorSource& source,
             shard_lut_sz, nthreads, shard_label.c_str());
         // Shard built; node buffer retained in shard_node_bufs[k].
     }
+    metrics_.stop(m_shards);
+
+    auto m_merge = metrics_.start("merge");
 
     // --- 4. Merge ---
     // For each global node, collect neighbor lists from all shards that
@@ -1130,6 +1166,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     }
 
     spdlog::info("[sextant] merge complete; flushing sidecars");
+    metrics_.stop(m_merge);
 
     // Set up the master VamanaCore (full R) over the merged index_.nodes_buffer for
     // entry-point computation during flush. (K==1 already has index_.core set up

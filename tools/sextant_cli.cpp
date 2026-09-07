@@ -28,6 +28,7 @@
 #include "sextant/index.hpp"
 #include "sextant/logging.hpp"
 #include "sextant/searcher.hpp"
+#include "sextant/metrics.hpp"
 #include "tree/fsck.hpp"
 #include "tree/filter_data_io.hpp"
 #include "tree/ivf_tree_index.hpp"
@@ -41,6 +42,7 @@
 #include <cmdline/cmdline.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -58,6 +60,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -78,6 +81,9 @@ int cmd_build(int argc, char* argv[]) {
     cmdline::parser p;
     add_common_flags(p);
     add_mode_extras(p, Mode::Build);
+    p.add<std::string>("metrics-file", 0,
+        "Append build phase metrics as JSON lines (build.* field names)",
+        false, "");
     p.parse_check(argc, argv);
     apply_log_level(p);
 
@@ -101,6 +107,18 @@ int cmd_build(int argc, char* argv[]) {
     cfg.build_ram_budget = p.get<uint64_t>("build-ram");
     cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
 
+    const std::string metrics_path = p.get<std::string>("metrics-file");
+    std::unique_ptr<sextant::metrics::JsonlMetricsSink> metrics_json;
+    sextant::metrics::LogMetricsSink metrics_log;
+    sextant::metrics::MultiMetricsSink metrics_sink;
+    metrics_sink.add(&metrics_log);
+    if (!metrics_path.empty()) {
+        metrics_json =
+            std::make_unique<sextant::metrics::JsonlMetricsSink>(metrics_path);
+        metrics_sink.add(metrics_json.get());
+    }
+    cfg.metrics_sink = &metrics_sink;
+
     sextant::Index idx;
     sextant::Builder builder(idx);
     const sextant::BuildResult result =
@@ -112,7 +130,13 @@ int cmd_build(int argc, char* argv[]) {
               << " L_build=" << result.L_build
               << " pq_m=" << static_cast<int>(result.pq_m)
               << " pq_bits=" << static_cast<int>(result.pq_bits)
-              << " in " << result.build_time_sec << "s\n";
+              << " in " << result.build_time_sec << "s"
+              << " (cpu " << result.cpu_time_sec << "s, util "
+              << (result.build_time_sec > 0
+                      ? 100.0 * result.cpu_time_sec / result.build_time_sec : 0.0)
+              << "%, src_wait " << result.source_wait_sec << "s, read "
+              << result.bytes_read << "B, peak rss " << result.peak_rss_bytes
+              << "B)\n";
     return 0;
 }
 
@@ -439,6 +463,9 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<std::string>("filter-data", 0, "Filter column data sidecar (.fdat)", false, "");
     p.add<std::string>("label-file", 0, "Parquet file with filter columns (joined by row position)", false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
+    p.add<std::string>("metrics-file", 0,
+        "Append build phase metrics as JSON lines (build.* field names)",
+        false, "");
     p.parse_check(argc, argv);
 
     {
@@ -516,6 +543,12 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
         }
     }
 
+    const std::string metrics_path = p.get<std::string>("metrics-file");
+    std::unique_ptr<metrics::JsonlMetricsSink> metrics_json;
+    if (!metrics_path.empty())
+        metrics_json = std::make_unique<metrics::JsonlMetricsSink>(metrics_path);
+    cfg.metrics_sink = metrics_json.get();  // null = default log line only
+
     BuildResult result;
     if (is_parquet) {
         auto shard_paths = expand_glob(input_path);
@@ -557,7 +590,13 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
               << "': n=" << result.n_vectors
               << " dim=" << result.dim
               << " m4=" << static_cast<int>(result.pq_m)
-              << " in " << result.build_time_sec << "s\n";
+              << " in " << result.build_time_sec << "s"
+              << " (cpu " << result.cpu_time_sec << "s, util "
+              << (result.build_time_sec > 0
+                      ? 100.0 * result.cpu_time_sec / result.build_time_sec : 0.0)
+              << "%, src_wait " << result.source_wait_sec << "s, read "
+              << result.bytes_read << "B, peak rss " << result.peak_rss_bytes
+              << "B)\n";
     return 0;
 }
 
@@ -730,6 +769,8 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
     p.add<uint32_t>("search-threads", 0,
         "Within-query leaf-parallel scan threads (0=serial; orthorgonal to --threads)", false, 0);
+    p.add<std::string>("metrics-file", 0,
+        "Append search window metrics as one JSON line (search.* field names)", false, "");
     p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
     p.add<std::string>("filter", 0,
         "Filter predicate (repeatable: pass --filter multiple times for AND). "
@@ -1065,6 +1106,12 @@ int cmd_tree_search(int argc, char* argv[]) {
     if (with_payload) all_payload_locs.resize(qcount);
 
     const auto t0 = std::chrono::steady_clock::now();
+    struct rusage ru0{};
+    getrusage(RUSAGE_SELF, &ru0);
+    const auto cpu0 = static_cast<double>(ru0.ru_utime.tv_sec) +
+                      1e-6 * static_cast<double>(ru0.ru_utime.tv_usec) +
+                      static_cast<double>(ru0.ru_stime.tv_sec) +
+                      1e-6 * static_cast<double>(ru0.ru_stime.tv_usec);
 
     if (num_threads <= 1) {
         for (uint32_t qi = 0; qi < qcount; ++qi) {
@@ -1141,6 +1188,41 @@ int cmd_tree_search(int argc, char* argv[]) {
     const auto t1 = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(t1 - t0).count();
     const double qps = (secs > 0) ? qcount / secs : 0;
+
+    // Search window metrics: engine counters (queries/leaves/bytes_touched/
+    // rerank) + window CPU via rusage (accurate at window granularity;
+    // per-query rusage under concurrency would misattribute).
+    struct rusage ru1{};
+    getrusage(RUSAGE_SELF, &ru1);
+    const double cpu1 = static_cast<double>(ru1.ru_utime.tv_sec) +
+                        1e-6 * static_cast<double>(ru1.ru_utime.tv_usec) +
+                        static_cast<double>(ru1.ru_stime.tv_sec) +
+                        1e-6 * static_cast<double>(ru1.ru_stime.tv_usec);
+    SearchStats::Snapshot st = idx->search_stats().snapshot_and_reset();
+    const double cpu_win = cpu1 - cpu0;
+    const double util = secs > 0 ? cpu_win / secs : 0.0;
+    std::cerr << "metrics: queries=" << st.queries
+              << " leaves/query=" << (st.queries ? double(st.leaves_probed) / st.queries : 0.0)
+              << " bytes/query=" << (st.queries ? double(st.bytes_touched) / st.queries : 0.0)
+              << " shortlist/query=" << (st.queries ? double(st.rerank_count) / st.queries : 0.0)
+              << " cpu=" << cpu_win << "s util=" << (100.0 * util) << "%\n";
+    {
+        const std::string mf = p.get<std::string>("metrics-file");
+        if (!mf.empty()) {
+            metrics::JsonlMetricsSink sink(mf);
+            metrics::PhaseMetrics w;
+            w.phase = "window";
+            w.source = "tree-search";
+            w.wall_seconds = st.wall_seconds;
+            w.cpu_seconds = cpu_win;
+            // bytes_touched is the window's leaf traffic; wait counters n/a.
+            w.bytes_read = st.bytes_touched;
+            w.wait_count = st.queries;
+            w.timestamp = std::chrono::duration<double>(
+                t0.time_since_epoch()).count();
+            sink.emit(w);
+        }
+    }
 
     std::cerr << "\n═══ Tree Search Results ═══\n";
     std::cerr << "queries: " << qcount << "\n";

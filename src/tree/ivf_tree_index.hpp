@@ -103,7 +103,19 @@ public:
         /// this; the other build paths ignore it.
         const uint8_t* payload_data = nullptr;
         const uint32_t* payload_offsets = nullptr;  // N+1 entries
+
+        /// Optional metrics sink (metrics.hpp). When null, phase records
+        /// still accumulate into BuildResult::phases but emit only via the
+        /// default log line created inside the build.
+        metrics::MetricsSink* metrics_sink = nullptr;
     };
+
+    // --- Search observability ---
+
+    /// Aggregated search counters (queries, leaves probed, bytes touched,
+    /// rerank count, BlockCache stubs). Window semantics: accumulate across
+    /// searches, take deltas via search_stats().snapshot_and_reset().
+    const SearchStats& search_stats() const { return search_stats_; }
 
     /// PCA-preconditioned streaming build: project vectors onto top-k PCs
     /// before routing. On high-LID data (d_eff≈2), this exposes the manifold
@@ -288,6 +300,7 @@ public:
 private:
     // --- Open state ---
     std::string path_;
+    mutable SearchStats search_stats_;  // relaxed atomics; search() is const
     int fd_ = -1;
     const uint8_t* mmap_base_ = nullptr;  // mmap'd file base (read-only)
     uint64_t mmap_size_ = 0;

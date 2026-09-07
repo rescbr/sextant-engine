@@ -40,6 +40,17 @@ public:
     /// Filter schema for this source. Default: empty (no filter columns).
     /// Sources that provide filter data override this.
     virtual Schema schema() const { return {}; }
+
+    // --- I/O observability (monotone across the source's lifetime; used
+    //     by metrics::MetricsCollector for per-phase attribution). All
+    //     default to 0; sources with real backing I/O override. ---
+    /// Seconds consumers spent blocked in next() waiting for I/O (relaxed
+    /// atomics inside implementers — safe under concurrent readers).
+    virtual double wait_seconds() const { return 0; }
+    /// Number of consumer-side blocking waits (waits long enough to matter).
+    virtual uint64_t wait_count() const { return 0; }
+    /// Bytes actually read from the backing store (raw, pre-cast).
+    virtual uint64_t bytes_read() const { return 0; }
 };
 
 }  // namespace sextant

@@ -122,6 +122,7 @@ void FbinSource::read_chunk(int buf, uint64_t at, uint32_t n) {
         }
         got += static_cast<size_t>(r);
     }
+    bytes_read_.fetch_add(want_bytes, std::memory_order_relaxed);
     if (!f32) {
         const size_t elems = static_cast<size_t>(n) * dim_;
         if (type_ == ElemType::Int8) {
@@ -136,12 +137,25 @@ void FbinSource::read_chunk(int buf, uint64_t at, uint32_t n) {
 }
 
 bool FbinSource::next(Chunk& out) {
-    // Collect any in-flight prefetch before handing out a buffer.
+    // Collect any in-flight prefetch before handing out a buffer. This
+    // join is the consumer-side I/O wait: if compute ran ahead of the
+    // prefetch thread, the block here is exactly the worker-idle signal
+    // the metrics attribute as source_wait_seconds (a finished prefetch
+    // makes the join return in ~0 time and adds nothing).
+    const auto wait_t0 = std::chrono::steady_clock::now();
+    const bool was_live = pf_live_;
     if (pf_live_) {
         pf_thread_.join();
         pf_live_ = false;
         if (!pf_err_.empty())
             throw Error(ErrorCode::CorruptIndex, pf_err_);
+    }
+    if (was_live) {
+        const double waited = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wait_t0).count();
+        wait_seconds_.fetch_add(waited, std::memory_order_relaxed);
+        if (waited > 0.0005)  // ~syscall noise floor: count real stalls only
+            wait_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
     int buf;

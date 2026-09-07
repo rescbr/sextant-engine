@@ -13,6 +13,8 @@
 
 #include "sextant/vector_source.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -81,6 +83,24 @@ private:
     /// Blocking read of `n` vectors at global index `at` into buffer
     /// `buf` (pread-based: safe to call from the prefetch thread).
     void read_chunk(int buf, uint64_t at, uint32_t n);
+
+public:
+    // --- I/O observability (relaxed atomics; monotone counters read by
+    //     metrics::MetricsCollector at phase boundaries) ---
+    double wait_seconds() const override {
+        return wait_seconds_.load(std::memory_order_relaxed);
+    }
+    uint64_t wait_count() const override {
+        return wait_count_.load(std::memory_order_relaxed);
+    }
+    uint64_t bytes_read() const override {
+        return bytes_read_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<double> wait_seconds_{0};
+    std::atomic<uint64_t> wait_count_{0};
+    std::atomic<uint64_t> bytes_read_{0};
 };
 
 }  // namespace sextant

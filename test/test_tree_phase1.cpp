@@ -3,6 +3,7 @@
 #include "fbin_source.hpp"
 #include "tree/ivf_tree_index.hpp"
 #include "sextant/config.hpp"
+#include "sextant/metrics.hpp"
 #include "sextant/types.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <random>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -111,6 +113,60 @@ TEST(IVFTreeIndex, BuildAndSearchPQ) {
     EXPECT_EQ(result.dim, dim);
     EXPECT_TRUE(std::filesystem::exists(tree_path));
 
+    // Instrumentation: per-phase records + totals (metrics.hpp contract).
+    // Wall-clock sanity only — util bounds are loose to stay stable on
+    // loaded machines; bytes_read == n*dim*4 for a single-pass fbin read.
+    {
+        EXPECT_FALSE(result.phases.empty());
+        std::set<std::string> names;
+        for (const auto& m : result.phases) {
+            EXPECT_FALSE(m.phase.empty());
+            EXPECT_GT(m.wall_seconds, 0.0);
+            EXPECT_GE(m.cpu_seconds, 0.0);
+            names.insert(m.phase);
+        }
+        EXPECT_EQ(names.size(), result.phases.size());  // unique phase names
+        EXPECT_GT(names.count("total"), 0u);
+        EXPECT_GT(names.count("lloyd"), 0u);
+        EXPECT_GT(names.count("stream"), 0u);
+        EXPECT_GT(names.count("write"), 0u);
+        EXPECT_GE(result.cpu_time_sec, 0.0);
+        // CPU is thread-sum: bounded by wall × threads (+slack for races).
+        EXPECT_LE(result.cpu_time_sec,
+                  result.build_time_sec * 16.0 + 1.0);
+        EXPECT_GE(result.source_wait_sec, 0.0);
+        // At least the sample pass + one emission pass over the fbin.
+        EXPECT_GE(result.bytes_read,
+                  static_cast<uint64_t>(n) * dim * 4ull * 2ull);
+        EXPECT_GT(result.peak_rss_bytes, 0u);
+    }
+
+    // JSONL wire format: one object per line, stable field names,
+    // round-trip-safe numbers.
+    {
+        metrics::PhaseMetrics m;
+        m.phase = "sample";
+        m.source = "fbin";
+        m.wall_seconds = 0.25;
+        m.cpu_seconds = 1.5;
+        m.source_wait_seconds = 0.125;
+        m.wait_count = 3;
+        m.bytes_read = 123456789;
+        m.rss_bytes = 4096;
+        m.timestamp = 1725715200.5;
+        const std::string json = metrics::to_json(m);
+        EXPECT_EQ(json.front(), '{');
+        EXPECT_EQ(json.back(), '}');
+        for (const char* key : {"\"phase\":\"sample\"", "\"source\":\"fbin\"",
+                                "\"wall_seconds\":0.25", "\"cpu_seconds\":1.5",
+                                "\"source_wait_seconds\":0.125",
+                                "\"wait_count\":3", "\"bytes_read\":123456789",
+                                "\"rss_bytes\":4096",
+                                "\"timestamp\":1725715200.5"}) {
+            EXPECT_NE(json.find(key), std::string::npos) << key;
+        }
+    }
+
     // Open.
     auto idx = IVFTreeIndex::open(tree_path);
     EXPECT_EQ(idx->dim(), dim);
@@ -158,6 +214,18 @@ TEST(IVFTreeIndex, BuildAndSearchPQ) {
     const float recall = float(total_recall) / (10 * 10);
     spdlog::info("IVFTreeIndex::BuildAndSearchPQ: recall@10 = {:.3f}", recall);
     EXPECT_GE(recall, 0.05f);
+
+    // Search stats: every query counted with its leaf traffic; window
+    // snapshot returns the deltas and resets.
+    {
+        const SearchStats::Snapshot snap = idx->search_stats().snapshot_and_reset();
+        EXPECT_EQ(snap.queries, 10u);
+        EXPECT_GE(snap.leaves_probed, snap.queries);
+        EXPECT_GE(snap.bytes_touched, snap.leaves_probed * 4096ull);
+        EXPECT_GT(snap.wall_seconds, 0.0);
+        const SearchStats::Snapshot after = idx->search_stats().snapshot_and_reset();
+        EXPECT_EQ(after.queries, 0u);  // reset semantics
+    }
 
     std::filesystem::remove(base_path);
     std::filesystem::remove(tree_path);

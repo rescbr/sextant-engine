@@ -15,6 +15,7 @@
 #include "sextant/engine_trace.hpp"
 #include "sextant/vector_source.hpp"
 #include "sextant/filter_column_data.hpp"
+#include "sextant/phase_timer.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -357,7 +358,10 @@ struct TreeBuildContext {
 
     TreeBuildContext(VectorSource& src, const std::string& op,
                      const IVFTreeIndex::BuildConfig& c)
-        : source(src), output_path(op), cfg(c) {}
+        : source(src), output_path(op), cfg(c), metrics(&src, nullptr) {}
+
+    // --- Instrumentation: per-phase wall/CPU/RSS/source records ---
+    metrics::MetricsCollector metrics;
 
     // --- Header / schema ---
     uint64_t n = 0;
@@ -543,6 +547,7 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
 
     // --- 1. Sample + train quantizer ---
     const auto t_sample = std::chrono::steady_clock::now();
+    auto m_sample = ctx.metrics.start("sample");
     // RANDOM sample, not a sequential prefix: embeddings arrive ordered
     // (topic/time-clustered fbins, streamed inserts), and a prefix-trained
     // global ruler is fitted to the wrong distribution — measured
@@ -596,9 +601,11 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
                      "global quantizer training",
                      ctx.coder->family_name());
     }
+    ctx.metrics.stop(m_sample);
 
     // --- 2. Compute PCA (reuse existing compute_pca_rotation_public) ---
     const auto t_pca = std::chrono::steady_clock::now();
+    auto m_pca = ctx.metrics.start("pca");
 
     // compute_pca_rotation_public returns the full dim×dim rotation R,
     // with rows sorted by descending eigenvalue. We take the top pca_dims rows.
@@ -659,6 +666,7 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
                      std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - t_pca).count());
     }
+    ctx.metrics.stop(m_pca);
 
     // Project the sample for k-means (parallelized across threads).
     // Each vector: pca_dims dot products of length dim.
@@ -693,6 +701,7 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
 
     // --- 3. K-means in PCA space (root centroids) ---
     const auto t_kmeans = std::chrono::steady_clock::now();
+    auto m_kmeans = ctx.metrics.start("kmeans");
     std::vector<std::vector<float>> root_centroids_pca(k_root);
     for (uint32_t c = 0; c < k_root; ++c) {
         const uint32_t src = (c * train_n) / k_root;
@@ -751,6 +760,7 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     spdlog::info("[sextant] build_streaming_pca: k-means done in {:.2f}s",
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t_kmeans).count());
+    ctx.metrics.stop(m_kmeans);
 
     // --- 4. Compute closure epsilon in PCA space ---
     float closure_epsilon = 0.0f;
@@ -815,6 +825,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
     // After refinement, do one final emission pass: assign + closure + encode +
     // write leaves.
     const auto t_lloyd = std::chrono::steady_clock::now();
+    auto m_lloyd = ctx.metrics.start("lloyd");
     const uint32_t max_lloyd_passes = cfg.max_lloyd_passes > 0 ? cfg.max_lloyd_passes : 10;
 
     // Per-cluster accumulators (double for numerical stability).
@@ -985,6 +996,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
     spdlog::info("[sextant] build_streaming_pca: Lloyd refinement done in {:.2f}s",
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t_lloyd).count());
+    ctx.metrics.stop(m_lloyd);
 
     // --- Phase I: measure per-cluster d_eff (mean gap to 2nd-nearest) ---
     // Uses the training sample (already in PCA space). For each sample vector,
@@ -1048,6 +1060,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
     if (ctx.depth == 3) {
         const uint32_t k_l1 = ctx.k_l1;
         const auto t_super = std::chrono::steady_clock::now();
+        auto m_super = ctx.metrics.start("super");
         std::vector<std::vector<float>> super_centroids_pca(k_l1, std::vector<float>(pca_dims, 0.0f));
         // Initialize: k-means++-like even pick from the fine centroids.
         for (uint32_t g = 0; g < k_l1; ++g) {
@@ -1107,6 +1120,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
                      "({} fine → {} groups) in {:.2f}s", k_root, k_l1,
                      std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - t_super).count());
+        ctx.metrics.stop(m_super);
         ctx.super_group = std::move(super_group);
         ctx.super_centroids_pca = std::move(super_centroids_pca);
     }
@@ -1142,6 +1156,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     const auto& per_cluster_eps = ctx.cluster_closure_eps;
     // --- 6. Emission pass: assign + encode + write leaves ---
     const auto t_stream = std::chrono::steady_clock::now();
+    auto m_stream = ctx.metrics.start("stream");
     const uint32_t code_size = ctx.coder->code_size();
     // Local families keep the raw FP16 vectors in the buffers; their
     // per-leaf state is fitted at flush time.
@@ -1857,6 +1872,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                  "in {:.2f}s", n, ctx.n_leaves_total,
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t_stream).count());
+    ctx.metrics.stop(m_stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -1899,6 +1915,7 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     // root_to_leaves[c][j] already holds the global leaf_metas index of cluster
     // c's j-th leaf (assigned at flush time, in flush/arrival order).
     const auto t_write = std::chrono::steady_clock::now();
+    auto m_write = ctx.metrics.start("write");
 
     // Write the per-fine-centroid internal nodes (depth=2: these are L1 nodes
     // that the root points to; depth=3: these are L2 nodes grouped under L1).
@@ -2302,6 +2319,7 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     result.pq_bits = scan_bits;
     result.build_time_sec = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_write).count();
+    ctx.metrics.stop(m_write);
     return result;
 }
 
@@ -2387,6 +2405,21 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     const std::vector<uint32_t>* sweep_Ws,
     std::vector<std::vector<Candidate>>* sweep_out,
     std::vector<PageId>* visited_leaf_pages) const {
+    // Per-query observability (SearchStats, config.hpp): wall/leaves/bytes
+    // recorded on EVERY exit path via the guard destructor. Fields are
+    // assigned (not accumulated) once the candidate set is final below.
+    struct QueryGuard {
+        IVFTreeIndex const* idx;
+        std::chrono::steady_clock::time_point t0;
+        uint64_t leaves = 0, bytes = 0, reranked = 0;
+        ~QueryGuard() {
+            idx->search_stats_.on_query(
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count(),
+                leaves, bytes, reranked);
+        }
+    } qguard{this, std::chrono::steady_clock::now()};
+
     // Thread-local arena: buffers keep their capacity across calls on this
     // thread (see SearchScratch above). CLI std::async workers and test
     // threads each get their own instance.
@@ -3106,6 +3139,15 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     }
     }  // end feedback_active else-branch
 
+    // Final I/O accounting for this query (both probe paths converge here;
+    // `candidates` is final). bytes_touched = leaf pages × page size —
+    // the bytes-touched currency. `reranked` = decoded shortlist size.
+    qguard.leaves = candidates.size();
+    qguard.bytes = 0;
+    for (const auto& c : candidates)
+        qguard.bytes += static_cast<uint64_t>(c.pages) * kPageSize;
+    qguard.reranked = sheap.size();
+
     // --- Materialize full entries for the extraction/rerank paths ---
     // Resolve row_id + leaf_ptr from (leaf_slot, local_idx) for the <=W
     // survivors. Layout mirrors the scan-side row_ids placement.
@@ -3487,7 +3529,22 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
                                                  const BuildConfig& cfg) {
     const auto t0 = std::chrono::steady_clock::now();
 
+    // Metrics: default = human log line; cfg.metrics_sink (e.g. JSONL file)
+    // fans out alongside. Source label from the path extension (closed
+    // vocabulary for the metrics wire format).
+    metrics::LogMetricsSink metrics_log_sink;
+    metrics::MultiMetricsSink metrics_sink;
+    metrics_sink.add(&metrics_log_sink);
+    if (cfg.metrics_sink) metrics_sink.add(cfg.metrics_sink);
+    const std::string src_label =
+        source.path().size() >= 8 &&
+                source.path().compare(source.path().size() - 8, 8, ".parquet") == 0
+            ? "parquet"
+            : "fbin";
+
     TreeBuildContext ctx(source, output_path, cfg);
+    ctx.metrics = metrics::MetricsCollector(&source, &metrics_sink, src_label);
+    auto m_total = ctx.metrics.start("total");
 
     resolve_build_params(ctx);
     train_quantizer_and_pca(ctx);
@@ -3513,6 +3570,16 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
                  ctx.n, ctx.depth, ctx.k_root, ctx.k_l1, ctx.n_leaves_total, secs,
                  file.num_pages());
     result.build_time_sec = secs;
+    // Instrumentation totals + records (per-phase records were emitted as
+    // they completed; "total" wraps the whole build, phases excluded from
+    // the sum to avoid double counting).
+    const metrics::PhaseMetrics sums = ctx.metrics.totals("total");
+    result.cpu_time_sec = sums.cpu_seconds;
+    result.source_wait_sec = sums.source_wait_seconds;
+    result.bytes_read = sums.bytes_read;
+    result.peak_rss_bytes = metrics::MetricsCollector::peak_rss_bytes();
+    ctx.metrics.stop(m_total);
+    result.phases = ctx.metrics.records();
     return result;
 }
 
