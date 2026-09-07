@@ -413,6 +413,34 @@ inline float scalar_dot_u4_float(const float* query,
         s += query[d] * levels[d * K + nib];
     }
     return s;
+#elif defined(__AVX512F__)
+    // AVX-512 analog of the SVE2 gather kernel: scalar nibble decode into
+    // an index buffer, then one 16-lane hardware gather (_mm512_i32gather_ps)
+    // + FMA per tile. The gather is cache-serviced but avoids the per-dim
+    // dependent scalar load of the reference loop.
+    __m512 vacc = _mm512_setzero_ps();
+    uint32_t idx_buf[16];
+    uint32_t d = 0;
+    for (; d + 16 <= dim; d += 16) {
+        for (uint32_t i = 0; i < 16; ++i) {
+            const uint32_t dd = d + i;
+            const uint8_t byte = code[dd >> 1];
+            const uint32_t nib = (dd & 1u) ? (byte >> 4) : (byte & 0x0F);
+            idx_buf[i] = dd * K + nib;
+        }
+        const __m512 idx = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(idx_buf));
+        const __m512 q = _mm512_loadu_ps(query + d);
+        const __m512 lv = _mm512_i32gather_ps(idx, levels, 4);
+        vacc = _mm512_fmadd_ps(q, lv, vacc);
+    }
+    float s = _mm512_reduce_add_ps(vacc);
+    for (; d < dim; ++d) {
+        const uint8_t byte = code[d >> 1];
+        const uint8_t nib = (d & 1u) ? (byte >> 4) : (byte & 0x0F);
+        s += query[d] * levels[d * K + nib];
+    }
+    return s;
 #else
     float acc = 0.0f;
     for (uint32_t d = 0; d < dim; d += 2) {
@@ -1292,6 +1320,84 @@ inline void fastscan_many(const uint8_t* blocks, uint32_t n_blocks,
         vst1q_u32(psum +  4, vbslq_u32(vm1, vld1q_u32(psum +  4), invalid));
         vst1q_u32(psum +  8, vbslq_u32(vm2, vld1q_u32(psum +  8), invalid));
         vst1q_u32(psum + 12, vbslq_u32(vm3, vld1q_u32(psum + 12), invalid));
+    }
+#elif defined(__AVX512F__) && defined(__AVX512VBMI__) && defined(__AVX512BW__)
+    // AVX-512 port of the 4-bank split-table shuffle. One __m512i holds 4
+    // blocks (64 codes). Bank routing: vpermi2b selects its second 64-byte
+    // table via index bit 7, so the per-code index is remapped to
+    // idx' = (c & 63) | ((c & 0x40) << 1)  (bank bit 0 -> bit 7), looked up
+    // against (T0,T1) and (T2,T3), and the two results are blended on the
+    // code's bit 7 (bank bit 1). Widening + accumulation into the u32
+    // partials mirrors the NEON epilogue (integer-exact).
+    std::memset(partial_sums, 0, size_t(n_blocks) * 16 * sizeof(uint32_t));
+    for (uint32_t s = 0; s < m; s++) {
+        const uint8_t* lut_row = lut8 + s * 256;
+        const __m512i T0 = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(lut_row));
+        const __m512i T1 = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(lut_row + 64));
+        const __m512i T2 = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(lut_row + 128));
+        const __m512i T3 = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(lut_row + 192));
+        // VPERMI2B indexes 128 bytes (concat of two 64B tables) with
+        // idx[6:0]: idx bit 6 selects the table, bits [5:0] the byte. So
+        // idx = c & 127 routes bank bit 0; the code's bit 7 (bank bit 1)
+        // picks between the (T0,T1) and (T2,T3) results via blend.
+        const __m512i mask127 = _mm512_set1_epi8(127);
+
+        uint32_t b = 0;
+        for (; b + 3 < n_blocks; b += 4) {
+            const uint8_t* blk0 = blocks + (size_t)b * m * 16 + s * 16;
+            const uint8_t* blk1 = blocks + (size_t)(b + 1) * m * 16 + s * 16;
+            const uint8_t* blk2 = blocks + (size_t)(b + 2) * m * 16 + s * 16;
+            const uint8_t* blk3 = blocks + (size_t)(b + 3) * m * 16 + s * 16;
+            const __m512i c = _mm512_inserti32x4(
+                _mm512_inserti32x4(
+                    _mm512_inserti32x4(
+                        _mm512_castsi128_si512(_mm_loadu_si128(
+                            reinterpret_cast<const __m128i*>(blk0))),
+                        _mm_loadu_si128(
+                            reinterpret_cast<const __m128i*>(blk1)), 1),
+                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk2)),
+                    2),
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk3)), 3);
+
+            const __m512i idx = _mm512_and_si512(c, mask127);
+            const __m512i r01 = _mm512_permutex2var_epi8(T0, idx, T1);
+            const __m512i r23 = _mm512_permutex2var_epi8(T2, idx, T3);
+            const __mmask64 hi = _mm512_movepi8_mask(c);
+            const __m512i r = _mm512_mask_blend_epi8(hi, r01, r23);
+
+            // Widen each block's 16 u8 to 16 u32 and accumulate.
+            const __m128i rq0 = _mm512_extracti32x4_epi32(r, 0);
+            const __m128i rq1 = _mm512_extracti32x4_epi32(r, 1);
+            const __m128i rq2 = _mm512_extracti32x4_epi32(r, 2);
+            const __m128i rq3 = _mm512_extracti32x4_epi32(r, 3);
+            for (uint32_t q = 0; q < 4; q++) {
+                const __m128i rq = q == 0 ? rq0 : q == 1 ? rq1
+                                      : q == 2 ? rq2 : rq3;
+                const __m512i w = _mm512_cvtepu8_epi32(rq);
+                uint32_t* psum = partial_sums + (size_t)(b + q) * 16;
+                _mm512_storeu_si512(reinterpret_cast<__m512i*>(psum),
+                    _mm512_add_epi32(_mm512_loadu_si512(
+                        reinterpret_cast<const __m512i*>(psum)), w));
+            }
+        }
+        // Tail blocks: scalar (same as the reference).
+        for (; b < n_blocks; b++) {
+            const uint8_t* code_row = blocks + (size_t)b * m * 16 + s * 16;
+            uint32_t* psum = partial_sums + (size_t)b * 16;
+            for (uint32_t j = 0; j < 16; j++)
+                psum[j] += lut_row[code_row[j]];
+        }
+    }
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        for (uint32_t j = 0; j < 16; j++) {
+            if (!((valid_masks[b] >> j) & 1u)) {
+                partial_sums[(size_t)b * 16 + j] = 0xFFFFFFFFu;
+            }
+        }
     }
 #else
     // Scalar fallback — correctness only.

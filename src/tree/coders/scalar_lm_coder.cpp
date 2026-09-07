@@ -146,7 +146,7 @@ std::unique_ptr<ScanSetup> ScalarLmCoder::scan_setup(const float* query) {
     // i8 scan-kernel selection: thread-local override, else env-resolved
     // default from CoderParams.scan_i8_mode.
     s->i8_mode = 0;
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(__ARM_FEATURE_DOTPROD) || defined(SEXTANT_HAS_AVX512_SCAN)
     if (slm_arith && !slm_shaped) {
         const int ov = scan_detail::scan_i8_override();
         if (ov > 0) s->i8_mode = ov;

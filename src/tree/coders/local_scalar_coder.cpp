@@ -200,7 +200,7 @@ std::unique_ptr<ScanSetup> LocalScalarCoder::scan_setup(const float* query) {
     const uint32_t padded = (params_.dim + 15) / 16 * 16;
     s->a_uni.assign(padded, 0.f);
     s->i8_mode = 0;
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(__ARM_FEATURE_DOTPROD) || defined(SEXTANT_HAS_AVX512_SCAN)
     {
         const int ov = scan_detail::scan_i8_override();
         if (ov > 0) s->i8_mode = ov;
