@@ -55,6 +55,24 @@ md5-verify all transfers; back-to-back runs, medians; label machine, data,
 threads (16 physical cores for search), and SIMD target (avx512) on every
 table. Exit codes, not output greps.
 
+## Quiesce before measuring
+
+Never benchmark immediately after writing to the same pool: ZFS dirty-data
+write-back (flush of freshly built trees) competes with the reads and can
+depress light-probe cells by 5×+. After any build onto the bench dataset:
+`zpool sync pastry` (or the pool at hand), then a short settle, then
+measure. Caught 2026-09-07: cold f=0.05 measured 271 QPS with write-back in
+flight, 1553 QPS after quiesce, same binaries and tree.
+
+ALSO: the first search per tree, even after sync + settle, runs 4–6× slower
+than steady state (post-build pool transient; recall identical, reruns
+stable across processes, so it is not data-cache warmth). Per tree, run one
+DISCARDED warmup search before the first measured cell. Caught 2026-09-07
+on the cohere-1M grid: first cells showed f=0.05 slower than f=0.10 for
+every quantizer and a phantom "i8 4.5×" result.
+
+
+
 ## History
 
 2026-09-07: rule established after nearly reporting build utilization from
