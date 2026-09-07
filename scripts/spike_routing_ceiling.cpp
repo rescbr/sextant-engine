@@ -36,6 +36,7 @@
 #include "../src/tree/ivf_tree_index.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -43,6 +44,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <fstream>
 #include <limits>
@@ -118,6 +120,34 @@ int main(int argc, char** argv) {
     }(argv[2], nb, db, base_err);
     if (base_err) {
         std::fprintf(stderr, "base mmap failed\n"); return 1;
+    }
+    // Sequential background prefetch: the member passes read rows in LEAF
+    // order (= random 3KB reads across the whole file), which crawls at
+    // IOPS latency on a cold dataset. One fadvise(WILLNEED) sweep at
+    // sequential device speed warms the pages while the pipeline computes
+    // (the centroid/PCA phases only need a prefix, so prefetch wins even
+    // against the first phases).
+    {
+        const int pfd = ::open(argv[2], O_RDONLY);
+        if (pfd >= 0) {
+            struct stat pst;
+            if (::fstat(pfd, &pst) == 0) {
+                const auto psize = static_cast<uint64_t>(pst.st_size);
+                std::thread([pfd, psize] {
+                    const uint64_t kChunk = 256u << 20;
+                    for (uint64_t off = 0; off < psize; off += kChunk) {
+                        ::posix_fadvise(pfd, static_cast<off_t>(off),
+                                        static_cast<off_t>(kChunk),
+                                        POSIX_FADV_WILLNEED);
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(50));
+                    }
+                    ::close(pfd);
+                }).detach();
+            } else {
+                ::close(pfd);
+            }
+        }
     }
     auto query = load_fbin(argv[3], nqt, dq);
     std::vector<int32_t> gt;
