@@ -6,6 +6,9 @@
 #include <sextant/types.hpp>
 #include <sextant/schema.hpp>
 #include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
 
 namespace sextant {
 
@@ -410,6 +413,143 @@ struct ResolvedParams {
     /// BuildConfig::partition_balance_factor.
     float partition_balance_factor = 0.0f;
 };
+
+// ---------------------------------------------------------------------------
+// ResolvedParams serialization (.meta sidecar, graph/flat path)
+//
+// HISTORY: this used to be a raw memcpy of the whole struct. ResolvedParams
+// contains std::string members, so the bytes written to disk included live
+// object pointers; reading them back over a constructed object produced
+// dangling strings → free(): invalid pointer crashes (macOS, c4a VM, and
+// Zen5/ZFS alike; SSO-short strings masked it much of the time). Replaced by
+// explicit field-by-field serialization. Old .meta files (no SPRM magic)
+// are rejected — regenerate any legacy graph indexes.
+//
+// MAINTENANCE RULE: adding a field here is a STOP-AND-RETHINK. This hand-
+// rolled binary codec exists only because the block is embedded at the tail
+// of the binary .meta payload (see Index::read / Builder::write_meta_file).
+// The moment a second field gets added, migrate the params block to TOML
+// (cpptoml is already a dependency; the .manifest files use it) — either as
+// a length-prefixed text section in the payload or by folding params into
+// the .manifest itself. TOML defaults missing keys, which removes the
+// kParamsVersion bump dance this format requires per field.
+// ---------------------------------------------------------------------------
+inline constexpr uint32_t kParamsMagic = 0x5350524D;  // 'SPRM'
+inline constexpr uint16_t kParamsVersion = 1;
+
+inline void serialize_params(const ResolvedParams& p,
+                             std::vector<uint8_t>& out) {
+    auto put_u8 = [&](uint8_t v) { out.push_back(v); };
+    auto put_u16 = [&](uint16_t v) {
+        out.insert(out.end(), reinterpret_cast<uint8_t*>(&v),
+                   reinterpret_cast<uint8_t*>(&v) + 2);
+    };
+    auto put_u32 = [&](uint32_t v) {
+        out.insert(out.end(), reinterpret_cast<uint8_t*>(&v),
+                   reinterpret_cast<uint8_t*>(&v) + 4);
+    };
+    auto put_u64 = [&](uint64_t v) {
+        out.insert(out.end(), reinterpret_cast<uint8_t*>(&v),
+                   reinterpret_cast<uint8_t*>(&v) + 8);
+    };
+    auto put_f32 = [&](float v) {
+        uint32_t bits;
+        std::memcpy(&bits, &v, 4);
+        put_u32(bits);
+    };
+    auto put_str = [&](const std::string& s) {
+        put_u32(static_cast<uint32_t>(s.size()));
+        out.insert(out.end(), s.begin(), s.end());
+    };
+
+    put_u32(kParamsMagic);
+    put_u16(kParamsVersion);
+    put_u16(p.R);                       put_u16(p.L);
+    put_u16(p.L_build);                 put_f32(p.alpha);
+    put_u16(p.pq_m);                    put_u8(p.pq_bits);
+    put_f32(p.pq_max_distortion);       put_u32(p.max_occlusion);
+    put_u8(static_cast<uint8_t>(p.metric));
+    put_u64(p.build_ram_budget);        put_u32(p.num_threads);
+    put_u32(p.partition_count);         put_f32(p.closure_factor);
+    put_f32(p.closure_epsilon);         put_f32(p.adaptive_probe_gap);
+    put_f32(p.median_lid);              put_u16(p.n_entry_points);
+    put_u16(p.n_search_entry_points);   put_f32(p.target_recall);
+    put_u32(p.early_exit_patience);     put_u8(p.pq_anisotropy ? 1 : 0);
+    put_u8(p.pq_opq ? 1 : 0);           put_u8(p.anisotropic_pq ? 1 : 0);
+    put_str(p.quantizer_type);
+    put_u32(p.prq_nsplits);             put_u32(p.prq_beam_size);
+    put_str(p.prq_encode_mode);
+    put_u32(p.prq_icm_iters);           put_u32(p.prq_ils_iters);
+    put_u32(p.prq_ils_perturb);         put_u32(p.prq_lsq_train_iters);
+    put_u8(p.merged_graph ? 1 : 0);     put_u16(p.pq4_m);
+    put_u8(p.scan_pq_bits);             put_f32(p.partition_balance_factor);
+}
+
+/// Returns false on truncated/garbled input (caller throws). `out` keeps its
+/// defaults for any field the format does not cover yet.
+inline bool deserialize_params(const uint8_t* data, size_t len,
+                               ResolvedParams& out) {
+    const uint8_t* p = data;
+    const uint8_t* end = data + len;
+    auto take = [&](void* dst, size_t n) -> bool {
+        if (static_cast<size_t>(end - p) < n) return false;
+        std::memcpy(dst, p, n);
+        p += n;
+        return true;
+    };
+    auto take_f32 = [&](float& v) -> bool {
+        uint32_t bits;
+        if (!take(&bits, 4)) return false;
+        std::memcpy(&v, &bits, 4);
+        return true;
+    };
+    auto take_str = [&](std::string& v) -> bool {
+        uint32_t n;
+        if (!take(&n, 4)) return false;
+        if (static_cast<size_t>(end - p) < n) return false;
+        v.assign(reinterpret_cast<const char*>(p), n);
+        p += n;
+        return true;
+    };
+
+    uint32_t magic;
+    uint16_t version;
+    if (!take(&magic, 4) || !take(&version, 2) || magic != kParamsMagic ||
+        version != kParamsVersion) {
+        return false;
+    }
+    uint8_t u8;
+    bool ok = take(&out.R, 2) && take(&out.L, 2) && take(&out.L_build, 2) &&
+              take_f32(out.alpha) && take(&out.pq_m, 2) && take(&u8, 1);
+    if (!ok) return false;
+    out.pq_bits = u8;
+    if (!take_f32(out.pq_max_distortion) || !take(&out.max_occlusion, 4) ||
+        !take(&u8, 1)) return false;
+    out.metric = static_cast<MetricKind>(u8);
+    if (!take(&out.build_ram_budget, 8) || !take(&out.num_threads, 4) ||
+        !take(&out.partition_count, 4) || !take_f32(out.closure_factor) ||
+        !take_f32(out.closure_epsilon) || !take_f32(out.adaptive_probe_gap) ||
+        !take_f32(out.median_lid) || !take(&out.n_entry_points, 2) ||
+        !take(&out.n_search_entry_points, 2) ||
+        !take_f32(out.target_recall) ||
+        !take(&out.early_exit_patience, 4)) return false;
+    if (!take(&u8, 1)) return false;
+    out.pq_anisotropy = u8 != 0;
+    if (!take(&u8, 1)) return false;
+    out.pq_opq = u8 != 0;
+    if (!take(&u8, 1)) return false;
+    out.anisotropic_pq = u8 != 0;
+    if (!take_str(out.quantizer_type) || !take(&out.prq_nsplits, 4) ||
+        !take(&out.prq_beam_size, 4) || !take_str(out.prq_encode_mode) ||
+        !take(&out.prq_icm_iters, 4) || !take(&out.prq_ils_iters, 4) ||
+        !take(&out.prq_ils_perturb, 4) || !take(&out.prq_lsq_train_iters, 4))
+        return false;
+    if (!take(&u8, 1)) return false;
+    out.merged_graph = u8 != 0;
+    if (!take(&out.pq4_m, 2) || !take(&u8, 1)) return false;
+    out.scan_pq_bits = u8;
+    return take_f32(out.partition_balance_factor);
+}
 
 /// Estimation diagnostics produced by `Engine::estimate_config` (and the
 /// Estimator in the post-refactor world). Display-only — they do NOT influence

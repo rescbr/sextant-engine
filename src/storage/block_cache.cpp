@@ -463,6 +463,12 @@ void BlockCache::maybe_climb() {
 void BlockCache::climb() {
     if (hc_capacity_ == 0) return;
 
+    // Below 3 blocks/shard the W-TinyLFU decomposition (window ≥ 1 +
+    // protected ≥ 0) has no room to move: clamp(v, 1, cap-2) would have
+    // inverted bounds (UB; fatal under _GLIBCXX_ASSERTIONS). Tiny caches
+    // keep the default split.
+    if (hc_per_shard_capacity_ < 3) return;
+
     uint64_t h = hc_hits_in_sample_.exchange(0, std::memory_order_relaxed);
     uint64_t m = hc_misses_in_sample_.exchange(0, std::memory_order_relaxed);
     uint64_t total = h + m;

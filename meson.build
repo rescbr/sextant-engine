@@ -128,6 +128,19 @@ if is_debug
             add_project_arguments(flag, language: 'cpp')
         endif
     endforeach
+    # Debug builds also get -march=native (user call): sanitizers don't change
+    # the ISA requirement, and x86 needs F16C for util/fp16.hpp regardless.
+    march_native = cpp.has_argument('-march=native')
+    if march_native
+        add_project_arguments('-march=native', language: 'cpp')
+    endif
+    # Sanitizer flags must ALSO be on the link line (Gentoo ld.bfd does not
+    # pull the runtime in otherwise; the macOS linker did).
+    foreach flag : debug_flags
+        if cpp.has_link_argument(flag)
+            add_project_link_arguments(flag, language: 'cpp')
+        endif
+    endforeach
 else
     foreach flag : release_flags
         if cpp.has_argument(flag)

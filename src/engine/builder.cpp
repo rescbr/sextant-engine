@@ -1440,12 +1440,9 @@ void Builder::write_meta_file(const ResolvedParams& params,
                        reinterpret_cast<uint8_t*>(&ep) + sizeof(ep));
     }
 
-    // Append the resolved params as a POD block so open() can rebuild the
-    // VamanaCore with the same R/L/alpha/max_occlusion.
-    ResolvedParams p = params;  // copy
-    payload.insert(payload.end(),
-                   reinterpret_cast<uint8_t*>(&p),
-                   reinterpret_cast<uint8_t*>(&p) + sizeof(p));
+    // Append the resolved params (explicit field serialization — the struct
+    // has std::string members and must NOT be memcpy'd; see config.hpp).
+    serialize_params(params, payload);
 
     write_padded(f, payload.data(), payload.size(), sizeof(h));
     f.sync();
