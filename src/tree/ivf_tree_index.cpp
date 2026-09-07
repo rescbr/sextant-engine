@@ -12,6 +12,7 @@
 #include "tree/coders/global_pq_coder.hpp"
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
+#include "sextant/engine_trace.hpp"
 #include "sextant/vector_source.hpp"
 #include "sextant/filter_column_data.hpp"
 
@@ -2489,7 +2490,18 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     }
     const bool fraction_routing = probe_frac > 0.0f && config.n_probe == 0;
 
-    const uint32_t n_probe_ln_cfg = fraction_routing
+    // Scan-feedback probing (FeedbackProbe): root children probed in
+    // routing order one subtree block at a time, stopping on scan feedback
+    // instead of a fixed fraction. Same unit as fraction routing (whole
+    // root-child subtrees) and same probe-all semantics under each —
+    // requires n_probe == 0 and no predicates; depth > 2 falls back to the
+    // normal path (the per-child descent is only wired for depth <= 2).
+    const bool feedback_active =
+        config.feedback.mode != FeedbackProbe::Mode::Off
+        && config.n_probe == 0 && !has_predicates
+        && manifest_.depth <= 2;
+
+    const uint32_t n_probe_ln_cfg = (fraction_routing || feedback_active)
         ? UINT32_MAX  // probe ALL leaves of each selected root child
         : (config.n_probe_ln > 0
                ? config.n_probe_ln
@@ -2865,6 +2877,144 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     sheap.clear();
     sheap.reserve(W + 32);
 
+    if (feedback_active) {
+        // --- Feedback probing: incremental subtree-block scan loop ---
+        // Walk root children in routing (PCA/FP16 distance) order. For each
+        // child: expand its leaves, prefetch the contiguous extent, scan
+        // into the shared bounded heap, evaluate the stop rule on SCAN
+        // FEEDBACK (top-k composition / kth-key improvement). `candidates`
+        // is rebuilt in probe order so downstream leaf_slot addressing is
+        // unchanged. Serial per-query (the CLI parallelizes across
+        // queries); scan-feedback semantics require sequential blocks.
+        auto& fb_candidates = scratch.candidates;
+        fb_candidates.clear();
+        uint64_t total_pages_fb = 0;
+        for (const auto& rd : root_dists)
+            total_pages_fb += root_children_[rd.second].pages;
+        const uint32_t k_eff = std::min(k, W);
+        const bool per_leaf = coder_->per_leaf_setup();
+        static std::atomic<uint32_t> fb_query_seq{0};
+        const uint32_t qid = fb_query_seq.fetch_add(1) + 1;
+        const bool pca_leaves_fb = (pca_dims_ > 0 && manifest_.depth == 2);
+        uint64_t cum_pages = 0;
+        uint32_t n_blocks = 0, stall_run = 0, kth_run = 0;
+        uint32_t prev_kth = UINT32_MAX;
+        std::vector<ProbeEntry> fb_blk;
+        std::vector<HeapEntry> fb_ord;
+        for (const auto& rd : root_dists) {
+            const uint32_t c = rd.second;
+            const auto& rc = root_children_[c];
+            fb_blk.clear();
+            if (rc.is_leaf) {
+                fb_blk.push_back({rd.first, rc.page, rc.pages, rc.is_leaf,
+                                  rc.centroid});
+            } else {
+                expand_internal({rd.first, rc.page, rc.pages, rc.is_leaf,
+                                rc.centroid},
+                                pca_leaves_fb, c, fb_blk);
+            }
+            const uint32_t slot0 =
+                static_cast<uint32_t>(fb_candidates.size());
+            for (const auto& e : fb_blk) {
+                if (e.is_leaf && e.page != kInvalidPage)
+                    fb_candidates.push_back({e.page, e.pages, e.dist,
+                                             e.centroid});
+            }
+            const uint32_t slot1 =
+                static_cast<uint32_t>(fb_candidates.size());
+            // Prefetch this block's extents before scanning it (cold-
+            // storage semantics: one fadvise per subtree, like the batch
+            // path does for its whole selection).
+            for (uint32_t j = slot0; j < slot1; ++j) {
+#ifdef __linux__
+                ::posix_fadvise(fd_,
+                                static_cast<off_t>(fb_candidates[j].page) *
+                                    kPageSize,
+                                static_cast<off_t>(fb_candidates[j].pages) *
+                                    kPageSize,
+                                POSIX_FADV_WILLNEED);
+#endif
+            }
+            for (uint32_t j = slot0; j < slot1; ++j) {
+                const uint8_t* leaf_ptr = mmap_base_ +
+                    static_cast<uint64_t>(fb_candidates[j].page) * kPageSize;
+                if (per_leaf) coder_->bind_leaf(*scan_setup, leaf_ptr);
+                RawScanHeap heap{&sheap, W, j};
+                coder_->scan_leaf(*scan_setup, leaf_ptr, heap);
+            }
+            cum_pages += rc.pages;
+            ++n_blocks;
+
+            // Feedback statistics over the bounded heap: kth-best scan key
+            // and how many current top-k entries came from this block.
+            uint32_t kth = UINT32_MAX, gained = 0;
+            if (sheap.size() >= k_eff) {
+                fb_ord.assign(sheap.begin(), sheap.end());
+                std::nth_element(fb_ord.begin(), fb_ord.begin() + k_eff - 1,
+                                 fb_ord.end(), heap_entry_less);
+                kth = fb_ord[k_eff - 1].pq_dist;
+                for (uint32_t j = 0; j < k_eff; ++j)
+                    if (fb_ord[j].leaf_slot >= slot0 &&
+                        fb_ord[j].leaf_slot < slot1)
+                        ++gained;
+            }
+
+            if (config.trace) {
+                std::string ids;
+                for (uint32_t j = 0; j < k_eff && j < fb_ord.size(); ++j) {
+                    const auto& e = fb_ord[j];
+                    const LeafCandidate& lc = fb_candidates[e.leaf_slot];
+                    const uint8_t* leaf_ptr = mmap_base_ +
+                        static_cast<uint64_t>(lc.page) * kPageSize;
+                    const auto* lh =
+                        reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+                    const RowId* rids = reinterpret_cast<const RowId*>(
+                        leaf_ptr + coder_->geometry(lh).rowids_offset);
+                    if (j) ids += ',';
+                    ids += std::to_string(rids[e.local_idx]);
+                }
+                config.trace->record_fmt(
+                    "FB q={} b={} child={} pages={} cum={} tot={} kth={} "
+                    "g={} topk={}",
+                    qid, n_blocks, c, rc.pages, cum_pages, total_pages_fb,
+                    kth, gained, ids);
+            }
+
+            // --- Stop rules ---
+            bool stop = false;
+            switch (config.feedback.mode) {
+            case FeedbackProbe::Mode::Fixed:
+                if (cum_pages >= static_cast<uint64_t>(
+                        config.feedback.fixed_fraction *
+                        static_cast<double>(total_pages_fb))) {
+                    stop = true;
+                }
+                break;
+            case FeedbackProbe::Mode::Stall:
+                if (n_blocks >= config.feedback.min_blocks) {
+                    if (gained == 0) {
+                        if (++stall_run >= config.feedback.m) stop = true;
+                    } else {
+                        stall_run = 0;
+                    }
+                }
+                break;
+            case FeedbackProbe::Mode::Kth:
+                if (n_blocks >= config.feedback.min_blocks) {
+                    if (kth >= prev_kth) {
+                        if (++kth_run >= config.feedback.m) stop = true;
+                    } else {
+                        kth_run = 0;
+                    }
+                }
+                break;
+            default:
+                break;
+            }
+            prev_kth = kth;
+            if (stop) break;
+        }
+    } else {
     // --- Scan leaves via the family coder ---
     // Within-query leaf-parallel scan. When search_threads <= 1 (default) or
     // fewer than 2 candidate leaves, run the original serial loop into the
@@ -2954,6 +3104,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             }
         }
     }
+    }  // end feedback_active else-branch
 
     // --- Materialize full entries for the extraction/rerank paths ---
     // Resolve row_id + leaf_ptr from (leaf_slot, local_idx) for the <=W

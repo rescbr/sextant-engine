@@ -53,7 +53,9 @@ public:
     /// ResolvedParams. This is the path used by `sextant autobuild` and by
     /// Estimator's mini-builds.
     BuildResult build(VectorSource& source, const std::string& index_path,
-                      const ResolvedParams& params);
+                      const ResolvedParams& params,
+                      GraphBuildMetric graph_build_metric =
+                          GraphBuildMetric::PqConstruct);
 
     /// Insert a single vector into an already-opened Index (live insert).
     /// Grows the flat buffers by one, runs a mini-construct for the new node,
@@ -116,7 +118,9 @@ private:
     /// per-shard build → merge → flush.
     BuildResult build_partitioned(VectorSource& source,
                                    const std::string& index_path,
-                                   const ResolvedParams& params);
+                                   const ResolvedParams& params,
+                                   GraphBuildMetric graph_build_metric =
+                                       GraphBuildMetric::PqConstruct);
 
     /// BFS reorder of build IDs → disk positions (PageShuffle). Pure.
     struct BfsReorder {

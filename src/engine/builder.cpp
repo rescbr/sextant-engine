@@ -123,11 +123,14 @@ BuildResult Builder::build(VectorSource& source, const std::string& index_path,
     // the count/dim/path setup, build_partitioned, and timing.
     index_.count = source.count();
     index_.dim = source.dim();
-    return build(source, index_path, resolve_params(index_.count, index_.dim, config));
+    return build(source, index_path,
+                 resolve_params(index_.count, index_.dim, config),
+                 config.graph_build_metric);
 }
 
 BuildResult Builder::build(VectorSource& source, const std::string& index_path,
-                          const ResolvedParams& params) {
+                          const ResolvedParams& params,
+                          GraphBuildMetric graph_build_metric) {
     const auto t0 = std::chrono::steady_clock::now();
 
     index_.count = source.count();
@@ -144,7 +147,8 @@ BuildResult Builder::build(VectorSource& source, const std::string& index_path,
     spdlog::info("[sextant] build: n={} dim={} → '{}'", index_.count, index_.dim,
                  index_path);
 
-    auto result = build_partitioned(source, index_path, params);
+    auto result = build_partitioned(source, index_path, params,
+                                    graph_build_metric);
     const auto t1 = std::chrono::steady_clock::now();
     result.build_time_sec =
         std::chrono::duration<double>(t1 - t0).count() + result.build_time_sec;
@@ -662,7 +666,8 @@ void Builder::construct_into(VamanaCore& core, uint32_t count,
 
 BuildResult Builder::build_partitioned(VectorSource& source,
                                        const std::string& index_path,
-                                       const ResolvedParams& params) {
+                                       const ResolvedParams& params,
+                                       GraphBuildMetric graph_build_metric) {
     using engine_detail::write_padded;
     using engine_detail::fill_header;
     using engine_detail::read_exact;
@@ -717,11 +722,9 @@ BuildResult Builder::build_partitioned(VectorSource& source,
                       "PQ-construct (FP16 prune)",
                      vecs_bytes / 1e6);
         // FP32 build mode: also load FP32 vectors for exact build distances.
-        // +N×dim×4 bytes RAM (e.g. +4.1GB at 1.34M). Gated by env var.
-        static const bool fp32_build = []() {
-            const char* e = std::getenv("SEXTANT_FP32_BUILD");
-            return e && e[0] == '1';
-        }();
+        // +N×dim×4 bytes RAM (e.g. +4.1GB at 1.34M). Selected via
+        // BuildConfig::graph_build_metric (K=1 path only).
+        const bool fp32_build = graph_build_metric == GraphBuildMetric::Fp32;
         AlignedBuf fp32_vecs;
         if (fp32_build) {
             const size_t fp32_bytes =
@@ -783,6 +786,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
         index_.core->set_store(index_.flat_store.get());
 
         index_.core->set_build_vecs(index_.raw_vecs_buffer);
+        index_.core->set_build_metric(graph_build_metric);
         if (index_.fp32_vecs_buffer) {
             index_.core->set_build_fp32_vecs(index_.fp32_vecs_buffer);
         }
@@ -873,6 +877,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
         core.set_build_codes(shard_codes_ptr, shard_n);
         core.set_build_nodes(shard_nodes);
         core.set_build_vecs(shard_vecs.data());
+        core.set_build_metric(graph_build_metric);
         core.prepare_for_build(shard_n);
 
         // Parallel construct via the canonical loop (chunked work-stealing,

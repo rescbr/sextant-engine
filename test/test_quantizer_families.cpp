@@ -17,6 +17,7 @@
 #include "fbin_source.hpp"
 #include "tree/ivf_tree_index.hpp"
 #include "sextant/config.hpp"
+#include "sextant/engine_trace.hpp"
 #include "sextant/types.hpp"
 
 #include <algorithm>
@@ -433,6 +434,128 @@ TEST(QuantizerFamilies, ProbeFractionRouting) {
                 "tiny(0.05)=%.4f\n",
                 r_all, r_f1, r_def, r_tiny);
     std::filesystem::remove(tree);
+}
+
+// Scan-feedback probing (SearchConfig::feedback):
+//   - Fixed mode at f == a fraction-routing search must match its results
+//     (identical child-selection semantics: same cumulative page budget);
+//   - Fixed f=1.0 == probe-all;
+//   - Stall/Kth modes run, stop no later than probe-all, and their traces
+//     (SearchConfig::trace) are written, versioned, and parseable.
+TEST(QuantizerFamilies, FeedbackProbing) {
+    const MiniData& m = mini();
+    const std::string tree = temp_tree();
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.quantizer_type = "local_scalar";
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 2000;
+    cfg.adaptive_probe_gap = 0.0f;
+    {
+        FbinSource s(datasets_dir() + "/mini10k_base.fbin");
+        IVFTreeIndex::build_streaming_pca(s, tree, cfg);
+    }
+    auto idx = IVFTreeIndex::open(tree);
+    ASSERT_TRUE(idx);
+
+    auto result_ids = [&](SearchConfig sc) {
+        sc.k = 10;
+        sc.fastscan_W = 1000;
+        sc.adaptive_probe_gap = 0.0f;
+        std::vector<std::vector<RowId>> ids(100);
+        for (uint32_t q = 0; q < 100; ++q) {
+            auto res = idx->search(&m.query[q * m.dim], 10, sc);
+            ids[q].reserve(res.size());
+            for (const auto& c : res) ids[q].push_back(c.row_id);
+        }
+        return ids;
+    };
+    auto recall = [&](const std::vector<std::vector<RowId>>& ids) {
+        double r = 0;
+        for (uint32_t q = 0; q < ids.size(); ++q) {
+            std::unordered_set<uint32_t> truth(m.gt[q].begin(),
+                                               m.gt[q].begin() + 10);
+            for (uint32_t i = 0; i < ids[q].size() && i < 10; ++i)
+                r += truth.count(static_cast<uint32_t>(ids[q][i]));
+        }
+        return r / (10.0 * ids.size());
+    };
+
+    // Fixed feedback == fraction routing at the same f (result-set equality
+    // up to ordering; both scan the same leaf set with the same heap).
+    SearchConfig frac;
+    frac.probe_fraction = 0.5f;
+    const auto ids_frac = result_ids(frac);
+    SearchConfig fbfix;
+    fbfix.feedback.mode = FeedbackProbe::Mode::Fixed;
+    fbfix.feedback.fixed_fraction = 0.5f;
+    const auto ids_fbfix = result_ids(fbfix);
+    double r_fix = 0;
+    for (uint32_t q = 0; q < ids_frac.size(); ++q) {
+        std::vector<RowId> a = ids_frac[q], b = ids_fbfix[q];
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        EXPECT_EQ(a, b) << "fixed-feedback top-k must match fraction routing";
+        std::unordered_set<uint32_t> truth(m.gt[q].begin(),
+                                           m.gt[q].begin() + 10);
+        for (uint32_t i = 0; i < b.size() && i < 10; ++i)
+            r_fix += truth.count(static_cast<uint32_t>(b[i]));
+    }
+    r_fix /= 10.0 * ids_frac.size();
+    EXPECT_GT(r_fix, 0.0);
+
+    // Fixed f=1.0 == probe-all.
+    SearchConfig all;
+    all.n_probe = 8;
+    const auto ids_all = result_ids(all);
+    SearchConfig fb1;
+    fb1.feedback.mode = FeedbackProbe::Mode::Fixed;
+    fb1.feedback.fixed_fraction = 1.0f;
+    const auto ids_fb1 = result_ids(fb1);
+    for (uint32_t q = 0; q < ids_all.size(); ++q) {
+        std::vector<RowId> a = ids_all[q], b = ids_fb1[q];
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        EXPECT_EQ(a, b) << "fixed-feedback f=1.0 must equal probe-all";
+    }
+
+    // Stall/Kth: run with a trace sink; results must be a subset-scan of
+    // probe-all (recall ≤ probe-all + noise), trace file well-formed.
+    const std::string trace_path =
+        tree + ".fbtrace";
+    {
+        auto trace = EngineTrace::create(trace_path, "qfam feedback test");
+        ASSERT_TRUE(trace);
+        SearchConfig st;
+        st.feedback.mode = FeedbackProbe::Mode::Stall;
+        st.feedback.m = 1;
+        st.feedback.min_blocks = 1;
+        st.trace = trace.get();
+        const auto ids_stall = result_ids(st);
+        EXPECT_LE(recall(ids_stall), recall(ids_all) + 0.02)
+            << "stall-mode recall must not exceed probe-all";
+
+        SearchConfig kt;
+        kt.feedback.mode = FeedbackProbe::Mode::Kth;
+        kt.feedback.m = 2;
+        kt.feedback.min_blocks = 1;
+        kt.trace = trace.get();
+        const auto ids_kth = result_ids(kt);
+        EXPECT_LE(recall(ids_kth), recall(ids_all) + 0.02)
+            << "kth-mode recall must not exceed probe-all";
+    }
+    {
+        std::ifstream tf(trace_path);
+        ASSERT_TRUE(tf.good());
+        std::string first, line;
+        std::getline(tf, first);
+        EXPECT_EQ(first.substr(0, 18), "# sextant-trace v1");
+        size_t fb_lines = 0;
+        while (std::getline(tf, line))
+            if (line.rfind("FB ", 0) == 0) ++fb_lines;
+        EXPECT_GT(fb_lines, 0u) << "trace must contain FB records";
+    }
+    std::filesystem::remove(tree);
+    std::filesystem::remove(trace_path);
 }
 
 // n_probe_ln auto-sizing: the manifest default must cover all leaves of

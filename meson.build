@@ -264,6 +264,7 @@ engine_sources = [
     'src/tree/cardinality.cpp',
     'src/tree/filter_data_io.cpp',
     'src/tree/fsck.cpp',
+    'src/util/engine_trace.cpp',
     'src/logging.cpp',
     'src/system.cpp',
 ]

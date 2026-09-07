@@ -1055,18 +1055,14 @@ void VamanaCore::insert_build_core(uint32_t internal_id, RowId row_id,
     const float* anchor_lut = nullptr;
     const float16_t* build_query_fp16 = nullptr;
     const float* build_query_fp32 = nullptr;
-    static const bool fp16_build = []() {
-        const char* e = std::getenv("SEXTANT_FP16_BUILD");
-        return e && e[0] == '1';
-    }();
-    static const bool fp32_build = []() {
-        const char* e = std::getenv("SEXTANT_FP32_BUILD");
-        return e && e[0] == '1';
-    }();
-    if (fp32_build && build_ctx_ && build_ctx_->fp32_vecs != nullptr) {
+    const GraphBuildMetric build_metric =
+        build_ctx_ ? build_ctx_->metric : GraphBuildMetric::PqConstruct;
+    if (build_metric == GraphBuildMetric::Fp32 && build_ctx_ &&
+        build_ctx_->fp32_vecs != nullptr) {
         build_query_fp32 = reinterpret_cast<const float*>(
             build_ctx_->fp32_vecs + static_cast<size_t>(internal_id) * params_.dim);
-    } else if (fp16_build && build_ctx_ && build_ctx_->vecs != nullptr) {
+    } else if (build_metric == GraphBuildMetric::Fp16 && build_ctx_ &&
+               build_ctx_->vecs != nullptr) {
         build_query_fp16 = build_vec_ptr(internal_id);
     } else {
         // PQ-construct: LUT from own PQ code. anchor_lut[s*K + cid] =

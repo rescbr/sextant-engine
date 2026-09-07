@@ -21,6 +21,7 @@
 #include "sextant/builder.hpp"
 #include "sextant/config.hpp"
 #include "sextant/crash_handler.hpp"
+#include "sextant/engine_trace.hpp"
 #include "sextant/error.hpp"
 #include "sextant/estimator.hpp"
 #include "sextant/index.hpp"
@@ -1193,7 +1194,8 @@ int cmd_sweep(int argc, char* argv[]) {
     p.add<std::string>("ground-truth", 0, "Ground-truth .gtmm file", true);
     p.add<uint32_t>("topk", 0, "K nearest neighbors", false, 10);
     p.add<std::string>("n-probe", 0,
-        "Comma-separated root probe counts, e.g. \"4,8,16,32\"", true);
+        "Comma-separated root probe counts, e.g. \"4,8,16,32\" (required "
+        "unless --feedback rows are used)", false, "");
     p.add<std::string>("fastscan-w", 0,
         "Comma-separated rerank shortlist widths, e.g. \"100,300,1000,3000\"",
         true);
@@ -1215,6 +1217,17 @@ int cmd_sweep(int argc, char* argv[]) {
         "(first n-probe, forces serial)", false, 0);
     p.add<std::string>("filter", 0,
         "(unsupported — sweep runs unfiltered)", false, "");
+    p.add<std::string>("feedback", 0,
+        "Scan-feedback probing rows: comma-separated specs "
+        "fixed:F | stall:M | kth:M (optional ,min:N suffix), e.g. "
+        "\"stall:2,kth:3\". Each spec is one grid row (labelled fb:<spec>). "
+        "Ignored unless the tree is depth<=2 and --n-probe row is 0-only; "
+        "feedback requires n_probe=0",
+        false, "");
+    p.add<std::string>("trace-file", 0,
+        "EngineTrace output path for feedback rows (one feedback row only "
+        "when tracing). Records are analyzed by `sextant trace`",
+        false, "");
     p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
 
@@ -1241,9 +1254,13 @@ int cmd_sweep(int argc, char* argv[]) {
     const uint32_t k = p.get<uint32_t>("topk");
     std::vector<uint32_t> n_probes = parse_u32_list(p.get<std::string>("n-probe"));
     std::vector<uint32_t> w_vals = parse_u32_list(p.get<std::string>("fastscan-w"));
-    if (n_probes.empty() || w_vals.empty()) {
-        std::cerr << "sweep: --n-probe and --fastscan-w must be non-empty "
-                     "comma-separated lists\n";
+    if (w_vals.empty()) {
+        std::cerr << "sweep: --fastscan-w must be a non-empty "
+                     "comma-separated list\n";
+        return 1;
+    }
+    if (n_probes.empty() && p.get<std::string>("feedback").empty()) {
+        std::cerr << "sweep: --n-probe is required unless --feedback is used\n";
         return 1;
     }
     // Ascending, deduped W list (the engine evaluates prefix cuts in scan
@@ -1346,6 +1363,33 @@ int cmd_sweep(int argc, char* argv[]) {
     scfg.rerank = !p.exist("no-rerank");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
     scfg.search_threads = p.get<uint32_t>("search-threads");
+
+    // Feedback rows (see parse_feedback_spec). When tracing, exactly one
+    // feedback row is allowed (the trace's query sequence maps 1:1 to rows).
+    std::vector<std::pair<std::string, FeedbackProbe>> fb_rows;
+    try {
+        fb_rows = sextant_cli::parse_feedback_list(
+            p.get<std::string>("feedback"));
+    } catch (const std::runtime_error& e) {
+        std::cerr << "sweep: " << e.what() << '\n';
+        return 1;
+    }
+    std::unique_ptr<EngineTrace> trace;
+    if (!p.get<std::string>("trace-file").empty()) {
+        if (fb_rows.size() != 1) {
+            std::cerr << "sweep: --trace-file requires exactly one "
+                         "--feedback spec\n";
+            return 1;
+        }
+        trace = EngineTrace::create(p.get<std::string>("trace-file"),
+                                    "sweep " + p.get<std::string>("index"));
+        if (!trace) {
+            std::cerr << "sweep: cannot open trace file '"
+                      << p.get<std::string>("trace-file") << "'\n";
+            return 1;
+        }
+        scfg.trace = trace.get();
+    }
 
     std::ofstream out_file;
     std::ostream* out = &std::cout;
@@ -1511,6 +1555,71 @@ int cmd_sweep(int argc, char* argv[]) {
         }
         std::cerr << "probe_fraction=" << frac << ": " << secs << "s ("
                   << qps << " shared QPS)\n";
+    }
+
+    // Feedback rows: scan-feedback probing replaces fraction routing
+    // (n_probe=0, probe_fraction=0). One row per spec, labelled fb:<spec>.
+    // Within-query scan is inherently serial in feedback mode (sequential
+    // block decisions); query-level parallelism still applies.
+    for (auto& [spec, fb] : fb_rows) {
+        scfg.n_probe = 0;
+        scfg.probe_fraction = 0.0f;
+        scfg.feedback = fb;
+        std::vector<std::atomic<uint64_t>> hits(w_vals.size());
+        for (auto& h : hits) h.store(0, std::memory_order_relaxed);
+
+        auto score = [&](uint32_t qi,
+                         const std::vector<std::vector<Candidate>>& so) {
+            std::unordered_set<RowId> gt_set(
+                gt[qi].begin(),
+                gt[qi].begin() + std::min(recall_k,
+                                          static_cast<uint32_t>(gt[qi].size())));
+            for (size_t wi = 0; wi < w_vals.size(); ++wi) {
+                if (wi >= so.size()) break;
+                for (const auto& c : so[wi])
+                    if (gt_set.count(c.row_id))
+                        hits[wi].fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+
+        const auto t0 = std::chrono::steady_clock::now();
+        if (num_threads <= 1) {
+            for (uint32_t qi = 0; qi < qcount; ++qi) {
+                std::vector<std::vector<Candidate>> sweep_out;
+                idx->search(&queries[static_cast<size_t>(qi) * qdim], k, scfg,
+                            nullptr, &w_vals, &sweep_out);
+                if (qi < scored) score(qi, sweep_out);
+            }
+        } else {
+            std::vector<std::future<void>> futs;
+            std::atomic<uint32_t> next_qi{0};
+            for (uint32_t t = 0; t < num_threads; ++t) {
+                futs.push_back(std::async(std::launch::async, [&]() {
+                    while (true) {
+                        const uint32_t qi = next_qi.fetch_add(1);
+                        if (qi >= qcount) break;
+                        std::vector<std::vector<Candidate>> sweep_out;
+                        idx->search(&queries[static_cast<size_t>(qi) * qdim],
+                                    k, scfg, nullptr, &w_vals, &sweep_out);
+                        if (qi < scored) score(qi, sweep_out);
+                    }
+                }));
+            }
+            for (auto& f : futs) f.get();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        const double qps = (secs > 0) ? qcount / secs : 0;
+
+        for (size_t wi = 0; wi < w_vals.size(); ++wi) {
+            const float recall = static_cast<float>(hits[wi].load())
+                                 / (static_cast<double>(scored) * k);
+            *out << "fb:" << spec << '\t' << w_vals[wi] << '\t' << recall
+                 << '\t' << qps << '\n';
+        }
+        std::cerr << "feedback=" << spec << ": " << secs << "s ("
+                  << qps << " shared QPS)\n";
+        scfg.feedback = FeedbackProbe{};
     }
     return 0;
 }
@@ -1779,6 +1888,210 @@ int cmd_tree_defrag(int argc, char* argv[]) {
               << result.elapsed_sec << "s\n";
     return 0;
 }
+// trace: read an EngineTrace file and analyze scan-feedback probe traces.
+// Replays stop rules (fixed fractions, stall/kth thresholds) over the
+// per-query block sequences recorded by a full-probe run and reports
+// mean/p50/p99 probed fraction plus pq-level recall@k (with --ground-truth).
+// The replay semantics mirror search()'s feedback loop exactly.
+int cmd_trace(int argc, char* argv[]) {
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("file", 0, "EngineTrace file (FB records)", true);
+    p.add<std::string>("ground-truth", 0,
+        "Ground-truth .gtmm file (enables the pq_recall column)", false, "");
+    p.add<uint32_t>("topk", 0, "K for recall (default 10)", false, 10);
+    p.add<std::string>("fixed", 0,
+        "Comma-separated fixed fractions to replay (default 0.05,0.1,0.2,0.3,0.5)",
+        false, "0.05,0.1,0.2,0.3,0.5");
+    p.add<std::string>("stall", 0,
+        "Comma-separated stall thresholds M to replay (default 1,2,3,4)",
+        false, "1,2,3,4");
+    p.add<std::string>("kth", 0,
+        "Comma-separated kth thresholds M to replay (default 1,2,3,4)",
+        false, "1,2,3,4");
+    p.add<uint32_t>("min-blocks", 0,
+        "Blocks probed before stall/kth rules may fire", false, 1);
+    p.parse_check(argc, argv);
+
+    // --- Parse the trace: FB records grouped by query, in file order ---
+    struct Block {
+        uint64_t cum, tot;
+        uint32_t kth, gained;
+        std::vector<RowId> topk;
+    };
+    std::vector<std::vector<Block>> queries;  // index = q-1
+    std::ifstream in(p.get<std::string>("file"));
+    if (!in) {
+        std::cerr << "trace: cannot open '" << p.get<std::string>("file")
+                  << "'\n";
+        return 1;
+    }
+    std::string line;
+    bool header_ok = false;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '#') {
+            if (line.rfind("# sextant-trace v1", 0) != 0) {
+                std::cerr << "trace: not a sextant-trace v1 file\n";
+                return 1;
+            }
+            header_ok = true;
+            continue;
+        }
+        if (!header_ok || line.rfind("FB ", 0) != 0) continue;
+        // FB q= b= child= pages= cum= tot= kth= g= topk=id,id,...
+        std::map<std::string, std::string> kv;
+        std::istringstream ls(line.substr(3));
+        std::string tok;
+        while (ls >> tok) {
+            const auto eq = tok.find('=');
+            if (eq == std::string::npos) continue;
+            kv[tok.substr(0, eq)] = tok.substr(eq + 1);
+        }
+        const uint32_t q = std::stoul(kv.at("q"));
+        Block b;
+        b.cum = std::stoull(kv.at("cum"));
+        b.tot = std::stoull(kv.at("tot"));
+        b.kth = std::stoul(kv.at("kth"));
+        b.gained = std::stoul(kv.at("g"));
+        std::istringstream ts(kv.at("topk"));
+        std::string id;
+        while (std::getline(ts, id, ',')) {
+            if (!id.empty()) b.topk.push_back(std::stoul(id));
+        }
+        if (q > queries.size()) queries.resize(q);
+        queries[q - 1].push_back(std::move(b));
+    }
+    if (queries.empty()) {
+        std::cerr << "trace: no FB records found\n";
+        return 1;
+    }
+
+    // --- Ground truth (optional) ---
+    const uint32_t k = p.get<uint32_t>("topk");
+    std::vector<std::unordered_set<RowId>> gt;
+    if (!p.get<std::string>("ground-truth").empty()) {
+        std::ifstream gf(p.get<std::string>("ground-truth"),
+                         std::ios::binary);
+        constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
+        uint32_t magic = 0, n = 0, gk = 0;
+        gf.read(reinterpret_cast<char*>(&magic), 4);
+        gf.read(reinterpret_cast<char*>(&n), 4);
+        gf.read(reinterpret_cast<char*>(&gk), 4);
+        char metric = 0; gf.read(&metric, 1); (void)metric;
+        if (magic != kGtMagic || !gf) {
+            std::cerr << "trace: ground truth missing GTMM magic\n";
+            return 1;
+        }
+        const uint32_t gk_eff = std::min(k, gk);
+        gt.resize(n);
+        std::vector<RowId> ids(gk);
+        std::vector<float> dists(gk);
+        for (uint32_t i = 0; i < n; ++i) {
+            gf.read(reinterpret_cast<char*>(ids.data()), gk * 4);
+            gf.read(reinterpret_cast<char*>(dists.data()), gk * 4);
+            gt[i].insert(ids.begin(), ids.begin() + gk_eff);
+        }
+    }
+
+    // --- Replay: run one rule over one query's blocks.
+    // Returns the index of the last-scanned block. Rule kinds mirror
+    // search()'s feedback stop rules exactly ('f' uses val as a fraction;
+    // 's'/'k' as a consecutive-block threshold).
+    const uint32_t min_blocks = p.get<uint32_t>("min-blocks");
+    auto replay = [&](const std::vector<Block>& blocks, char kind,
+                      double val) -> size_t {
+        uint32_t stall_run = 0, kth_run = 0, prev_kth = UINT32_MAX;
+        size_t bi = 0;
+        for (; bi < blocks.size(); ++bi) {
+            const Block& b = blocks[bi];
+            bool stop = false;
+            switch (kind) {
+            case 'f':
+                stop = static_cast<double>(b.cum) >=
+                       val * static_cast<double>(b.tot);
+                break;
+            case 's':
+                if (bi + 1 >= min_blocks) {
+                    if (b.gained == 0) {
+                        if (++stall_run >= (uint32_t)val) stop = true;
+                    } else {
+                        stall_run = 0;
+                    }
+                }
+                break;
+            case 'k':
+                if (bi + 1 >= min_blocks) {
+                    if (b.kth >= prev_kth) {
+                        if (++kth_run >= (uint32_t)val) stop = true;
+                    } else {
+                        kth_run = 0;
+                    }
+                }
+                break;
+            }
+            prev_kth = b.kth;
+            if (stop) break;
+        }
+        return std::min(bi, blocks.size() - 1);
+    };
+
+    // --- Rule grid ---
+    struct RowSpec { std::string label; char kind; double val; };
+    std::vector<RowSpec> rows;
+    auto add_list = [&](const std::string& list, char kind, const char* pfx) {
+        std::string item;
+        std::istringstream iss(list);
+        while (std::getline(iss, item, ',')) {
+            if (item.empty()) continue;
+            rows.push_back({std::string(pfx) + item, kind, std::stod(item)});
+        }
+    };
+    add_list(p.get<std::string>("fixed"), 'f', "fixed:");
+    add_list(p.get<std::string>("stall"), 's', "stall:");
+    add_list(p.get<std::string>("kth"), 'k', "kth:");
+
+    double blocks_mean = 0;
+    for (const auto& qv : queries) blocks_mean += qv.size();
+    blocks_mean /= queries.size();
+    std::cout << "queries=" << queries.size()
+              << " blocks/query(mean)=" << std::fixed << std::setprecision(1)
+              << blocks_mean << '\n';
+    std::cout << "rule\tmean_frac\tp50_frac\tp99_frac\tblocks(mean)\t"
+              << (gt.empty() ? std::string("-") : std::string("pq_recall"))
+              << '\n';
+    for (const auto& r : rows) {
+        std::vector<double> fracs;
+        uint64_t blocks_sum = 0;
+        double hits = 0;
+        for (size_t qi = 0; qi < queries.size(); ++qi) {
+            const size_t bi = replay(queries[qi], r.kind, r.val);
+            const Block& b = queries[qi][bi];
+            fracs.push_back(static_cast<double>(b.cum) /
+                            static_cast<double>(b.tot));
+            blocks_sum += bi + 1;
+            if (!gt.empty() && qi < gt.size())
+                for (RowId id : b.topk)
+                    if (gt[qi].count(id)) ++hits;
+        }
+        std::sort(fracs.begin(), fracs.end());
+        const size_t n = fracs.size();
+        const auto pct = [&](double q) {
+            return fracs[std::min(n - 1, (size_t)(q * (n - 1)))];
+        };
+        double mean = 0;
+        for (double f : fracs) mean += f;
+        mean /= n;
+        std::cout << r.label << '\t' << std::setprecision(4) << mean << '\t'
+                  << pct(0.5) << '\t' << pct(0.99) << '\t'
+                  << (double)blocks_sum / n;
+        if (!gt.empty())
+            std::cout << '\t' << hits / (queries.size() * k);
+        std::cout << '\n';
+    }
+    return 0;
+}
 
 int cmd_fsck(int argc, char* argv[]) {
     cmdline::parser p;
@@ -1825,7 +2138,12 @@ void print_usage() {
               << "  sweep       n-probe × W recall/QPS grid with shared scans\n"
               << "             (one scan per n-probe serves all W)\n"
               << "             --pq-segments --pq-bits --pq-max-distortion --threads\n"
-              << "             --log-level\n"
+              << "             --log-level. Fraction rows via --probe-fraction;\n"
+              << "             scan-feedback rows via --feedback (fixed:F|stall:M|kth:M)\n"
+              << "             with optional --trace-file for probe traces\n"
+              << "  trace      Analyze an EngineTrace file: replay scan-feedback\n"
+              << "             stop rules (fixed/stall/kth grids), report fraction\n"
+              << "             distribution + pq-recall (--ground-truth)\n"
               << "  search     Search an index with query vectors\n"
               << "  insert     Insert a single vector into an index\n"
               << "  tree-insert  Batch-insert vectors (.fbin) into a tree index.\n"
@@ -1884,6 +2202,8 @@ int main(int argc, char* argv[]) {
             return cmd_tree_vacuum(sub_argc, sub_argv.data());
         } else if (cmd == "tree-defrag") {
             return cmd_tree_defrag(sub_argc, sub_argv.data());
+        } else if (cmd == "trace") {
+            return cmd_trace(sub_argc, sub_argv.data());
         } else if (cmd == "fsck") {
             return cmd_fsck(sub_argc, sub_argv.data());
         } else if (cmd == "analyze") {

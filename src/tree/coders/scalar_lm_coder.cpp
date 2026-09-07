@@ -194,9 +194,9 @@ void ScalarLmCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
     c.codes = leaf + leaf_codes_offset(lh->summary_size);
     c.count = count;
     c.cs = quantizer_->code_size();
-    c.ip_bias = getenv("SEXTANT_NO_IP_BIAS")
-        ? nullptr
-        : (params_.metric == MetricKind::InnerProduct
+    // IP queries scan with a per-leaf bias block appended after the codes
+    // (reconstruction shrinkage correction); it is always used when present.
+    c.ip_bias = (params_.metric == MetricKind::InnerProduct
                ? reinterpret_cast<const float16_t*>(
                      c.codes + static_cast<uint64_t>(count) * c.cs)
                : nullptr);

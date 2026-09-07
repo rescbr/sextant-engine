@@ -11,6 +11,7 @@
 
 #include <sextant/types.hpp>
 #include <sextant/sync.hpp>
+#include <sextant/config.hpp>  // GraphBuildMetric (construct-time distance source)
 #include "storage/node_store.hpp"
 #include <vector>
 #include <cstdint>
@@ -124,6 +125,7 @@ struct BuildContext {
     uint8_t* nodes = nullptr;                  // count × node_size
     const float16_t* vecs = nullptr;           // count × dim raw FP16 vectors
     const float* fp32_vecs = nullptr;          // count × dim raw FP32 vectors (FP32 build mode)
+    GraphBuildMetric metric = GraphBuildMetric::PqConstruct;  // construct-time distance source
     std::unique_ptr<Mutex[]> node_locks;       // sharded lock pool
     uint32_t num_locks = 0;
     std::atomic<uint32_t>* progress = nullptr;  // dynamic L_build signal
@@ -327,6 +329,13 @@ public:
     void set_build_fp32_vecs(const float* vecs) {
         if (!build_ctx_) init_build_context();
         build_ctx_->fp32_vecs = vecs;
+    }
+
+    /// Select the construct-time distance source (see GraphBuildMetric).
+    /// Falls back to PQ-construct when the matching buffer is not installed.
+    void set_build_metric(GraphBuildMetric m) {
+        if (!build_ctx_) init_build_context();
+        build_ctx_->metric = m;
     }
 
     void clear_build_buffers() {

@@ -20,15 +20,6 @@ void set_override(int v) { g_scan_i8_override = v; }
 std::unique_ptr<LeafCoder> make_leaf_coder(const std::string& quantizer_type,
                                            CoderParams& params,
                                            bool for_open) {
-    // Resolve the env default for the i8 scan kernel once. The per-thread
-    // C-ABI override (scan_detail::scan_i8_override) still wins per query.
-    if (params.scan_i8_mode == 0) {
-        if (const char* env = getenv("SEXTANT_SCAN_I8")) {
-            const int m = atoi(env);
-            params.scan_i8_mode = m >= 2 ? 2 : 1;
-        }
-    }
-
     if (quantizer_type == "pq") {
         return std::make_unique<GlobalPqCoder>(GlobalPqCoder::Kind::Plain,
                                                params);

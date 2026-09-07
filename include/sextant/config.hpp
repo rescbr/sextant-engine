@@ -12,7 +12,51 @@
 
 namespace sextant {
 
+class EngineTrace;  // engine_trace.hpp — caller-owned diagnostics sink
+
+/// Scan-feedback probing (tree routing, experimental): instead of a fixed
+/// probe fraction, root children are probed in routing (PCA-distance) order
+/// one subtree block at a time, and probing STOPS on scan feedback — the
+/// only untried member of the routing-stopping family (score-relative
+/// thresholds were falsified 2026-09-06: no gain at matched mean fraction).
+/// Per-query cost becomes adaptive: easy queries stop early, hard queries
+/// keep reading — the honest generalization of probe_fraction's page-
+/// weighted contract.
+///
+/// Semantics: each root child's ENTIRE subtree is scanned into the shared
+/// top-W heap before the rule is evaluated (the block is the I/O unit —
+/// contiguous extent, same as fraction routing selects). Rules:
+///   Fixed — stop when cumulative subtree pages >= fixed_fraction × total
+///           (the shipped probe_fraction behavior; the control arm).
+///   Stall — stop after `m` consecutive blocks that contributed no entry
+///           to the current top-k (k = search k).
+///   Kth   — stop after `m` consecutive blocks with no improvement of the
+///           k-th best scan key.
+/// `min_blocks` are always probed before Stall/Kth may fire. Requires
+/// n_probe == 0 and tree depth <= 2; silently ignored otherwise.
+struct FeedbackProbe {
+    enum class Mode : uint8_t { Off = 0, Fixed, Stall, Kth };
+    Mode mode = Mode::Off;
+    float fixed_fraction = 0.0f;   ///< Fixed: page-weighted budget [0,1]
+    uint32_t m = 0;                ///< Stall/Kth: consecutive-block threshold
+    uint32_t min_blocks = 1;       ///< Blocks probed before rules activate
+};
+
 /// Build configuration. Fields set to 0/default are auto-resolved.
+/// Graph construction distance source (build-time only; search always
+/// uses PQ LUTs regardless). Controls which representation the graph
+/// builder's prune/construct distances are computed against.
+/// Measured impact (docs/optimization_levers_and_attribution.md): FP16
+/// build −0.5pp recall (FP16 precision < PQ LUT's FP32 accumulation);
+/// FP32 build −0.6pp (train/serve skew — graph optimized for the wrong
+/// metric). PQ-construct is the default and the RAM-lightest option;
+/// FP32 additionally loads N×dim×4 bytes of raw vectors (K=1 path only).
+enum class GraphBuildMetric : uint8_t {
+    PqConstruct = 0,
+    Fp16,
+    Fp32,
+};
+
 struct BuildConfig {
     uint16_t R = 0;             ///< 0 = auto from N
     uint16_t L = 0;             ///< 0 = auto from R
@@ -203,6 +247,9 @@ struct BuildConfig {
     /// See docs/closure_factor_derivation.md.
     float closure_epsilon = -1.0f;
 
+    /// Graph construction distance source (see GraphBuildMetric).
+    GraphBuildMetric graph_build_metric = GraphBuildMetric::PqConstruct;
+
     /// Adaptive probe gap (0 = auto, derived from LID by the estimator).
     float adaptive_probe_gap = 0.0f;
     /// Median LID (0 = unmeasured; set by the estimator).
@@ -338,6 +385,15 @@ struct SearchConfig {
 
     /// Filter predicates (Phase D). Empty = no filtering (today's behavior).
     std::vector<Predicate> predicates;
+
+    /// Scan-feedback probing (see FeedbackProbe). Off by default — the
+    /// shipped fixed-fraction contract is unchanged.
+    FeedbackProbe feedback;
+
+    /// Optional caller-owned engine trace sink (see engine_trace.hpp).
+    /// When set, instrumented paths write diagnostic records (e.g. per-block
+    /// feedback-probe traces consumed by `sextant trace`). null = off.
+    EngineTrace* trace = nullptr;
 
     /// Whether to return opaque payload blobs with results (Phase E).
     bool with_payload = false;

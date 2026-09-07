@@ -29,7 +29,8 @@ class CacheController {
 public:
     CacheController(BlockCache& graph_cache, BlockCache& code_cache,
                     uint32_t num_shards, uint64_t total_budget_bytes,
-                    uint32_t block_size)
+                    uint32_t block_size,
+                    double rebalance_threshold = 1.5)
         : graph_cache_(graph_cache),
           code_cache_(code_cache),
           num_shards_(num_shards),
@@ -40,15 +41,10 @@ public:
                                         (static_cast<uint64_t>(num_shards) *
                                          block_size)))),
           graph_fraction_(0.5) {
-        // Tunable without recompile: SEXTANT_CACHE_REBALANCE_THRESHOLD
-        // (default 1.5). Raising to 2.0 makes the controller less trigger-happy
-        // under noisy workloads.
-        double thresh = 1.5;
-        if (const char* env = std::getenv("SEXTANT_CACHE_REBALANCE_THRESHOLD")) {
-            double parsed = std::atof(env);
-            if (parsed >= 1.0 && parsed <= 10.0) thresh = parsed;  // sanity clamp
-        }
-        miss_rate_threshold_ = thresh;
+        // Rebalance trigger: raise the threshold (max 10.0) to make the
+        // controller less trigger-happy under noisy workloads.
+        miss_rate_threshold_ =
+            std::clamp(rebalance_threshold, 1.0, 10.0);
     }
 
     /// Seed graph_fraction_ from the caches' actual current per-shard

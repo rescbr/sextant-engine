@@ -12,10 +12,12 @@
 
 #include <cmdline/cmdline.h>
 
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 namespace sextant_cli {
@@ -200,6 +202,10 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             false, 100);
     }
     if (mode == Mode::Build || mode == Mode::Autobuild) {
+        p.add<std::string>("graph-build-metric", 0,
+            "Graph construction distance source: pq (default), fp16, or "
+            "fp32 (K=1 path only; fp32 loads +N*dim*4B of raw vectors)",
+            false, "pq");
         p.add<uint32_t>("prune-candidate-cap", 0,
             "Cap on the robust-prune candidate pool (max-occlusion in "
             "DiskANN). 0 = auto (= max(L_build, R+1)).",
@@ -210,6 +216,63 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             false, 0);
         // (build-ram, partition-count are in add_common_flags now.)
     }
+}
+
+/// Parse one scan-feedback probe spec (SearchConfig::feedback):
+///   fixed:F | stall:M | kth:M   optionally followed by ,min:N
+/// Throws std::runtime_error with the flag name on malformed input.
+inline sextant::FeedbackProbe parse_feedback_spec(const std::string& spec) {
+    sextant::FeedbackProbe fb;
+    std::string main = spec;
+    if (const auto comma = spec.find(','); comma != std::string::npos) {
+        main = spec.substr(0, comma);
+        const std::string mins = spec.substr(comma + 1);
+        if (mins.rfind("min:", 0) != 0)
+            throw std::runtime_error("--feedback: expected ,min:N suffix");
+        uint32_t mv = 0;
+        auto [ptr, ec] = std::from_chars(mins.data() + 4, mins.data() + mins.size(), mv);
+        if (ec != std::errc() || ptr != mins.data() + mins.size() || mv == 0)
+            throw std::runtime_error("--feedback: bad min value");
+        fb.min_blocks = mv;
+    }
+    const auto colon = main.find(':');
+    if (colon == std::string::npos)
+        throw std::runtime_error("--feedback: expected fixed:F | stall:M | kth:M");
+    const std::string name = main.substr(0, colon);
+    const std::string val = main.substr(colon + 1);
+    if (name == "fixed") {
+        float f = 0;
+        auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), f);
+        if (ec != std::errc() || ptr != val.data() + val.size()
+            || f <= 0.0f || f > 1.0f)
+            throw std::runtime_error("--feedback: fixed fraction must be in (0,1]");
+        fb.mode = sextant::FeedbackProbe::Mode::Fixed;
+        fb.fixed_fraction = f;
+    } else {
+        uint32_t m = 0;
+        auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), m);
+        if (ec != std::errc() || ptr != val.data() + val.size() || m == 0)
+            throw std::runtime_error("--feedback: threshold M must be a positive integer");
+        fb.mode = name == "stall" ? sextant::FeedbackProbe::Mode::Stall
+                                  : sextant::FeedbackProbe::Mode::Kth;
+        if (name != "stall" && name != "kth")
+            throw std::runtime_error("--feedback: unknown mode '" + name + "'");
+        fb.m = m;
+    }
+    return fb;
+}
+
+/// Parse a comma-separated list of feedback specs into (spec, parsed) rows.
+inline std::vector<std::pair<std::string, sextant::FeedbackProbe>>
+parse_feedback_list(const std::string& list) {
+    std::vector<std::pair<std::string, sextant::FeedbackProbe>> rows;
+    std::string item;
+    std::istringstream iss(list);
+    while (std::getline(iss, item, ',')) {
+        if (item.empty()) continue;
+        rows.emplace_back(item, parse_feedback_spec(item));
+    }
+    return rows;
 }
 
 /// Parse the common flags into a BuildConfig. Called by all three commands
@@ -237,6 +300,13 @@ inline sextant::BuildConfig build_config_from_parser(const cmdline::parser& p) {
     cfg.pq_opq = (p.get<float>("pq-opq") > 0.0f);
     cfg.quantizer_type = p.get<std::string>("quantizer");
     cfg.anisotropic_pq = (cfg.quantizer_type == "anisotropic-pq");
+    {
+        const std::string gbm = p.get<std::string>("graph-build-metric");
+        if (gbm == "pq")      cfg.graph_build_metric = sextant::GraphBuildMetric::PqConstruct;
+        else if (gbm == "fp16") cfg.graph_build_metric = sextant::GraphBuildMetric::Fp16;
+        else if (gbm == "fp32") cfg.graph_build_metric = sextant::GraphBuildMetric::Fp32;
+        else throw std::runtime_error("--graph-build-metric must be pq, fp16, or fp32");
+    }
     if (p.exist("prq-nsplits")) cfg.prq_nsplits = p.get<uint32_t>("prq-nsplits");
     if (p.exist("prq-beam-size")) cfg.prq_beam_size = p.get<uint32_t>("prq-beam-size");
     if (p.exist("prq-encode-mode")) cfg.prq_encode_mode = p.get<std::string>("prq-encode-mode");
