@@ -1551,16 +1551,19 @@ inline void fastscan_block16(const uint8_t* code_block,
 //   - `out`: 32 uint32 distances. Lanes 0..15 = lo nibbles (vectors 0..15),
 //     lanes 16..31 = hi nibbles (vectors 16..31).
 //
-// LUT quantization (validated, see memory fastscan-spike-2026-07-25):
-//   - Per-segment min subtracted; one GLOBAL scale A = 15 / max_span.
-//   - NO clamp on A (the production temptation). The kernel accumulates into
-//     uint16 *internally* (safe: per-lane max = m×15, e.g. 2880 at m=192) and
-//     widens to uint32 only at extraction. Clamping A crushes precision on
-//     tight LUTs (typical A≈749 for normalized embeddings → near-every entry
-//     quantizes to 0 → recall 0.0006). DO NOT re-introduce a clamp.
-//   - Offset (sum of per-segment mins) is dropped — valid for argmin only.
-//     The scan distance is NOT a directly-interpretable L2; it ranks correctly
-//     within one query's LUT.
+// LUT quantization (see quantize_lut_u4_compander; the
+// production default is the min-focused compander, A = 255/max_span with
+// clamp [0,15] — empirically better for within-LUT ranking than the
+// whole-span 15/max_span the 2026-07-25 spike validated):
+//   - Per-segment min subtracted; one GLOBAL scale.
+//   - The kernel accumulates into uint16 *internally* (safe: per-lane max =
+//     m×15, e.g. 2880 at m=192) and widens to uint32 only at extraction.
+//     (Historical note: a much larger scale with a u8-width range once made
+//     near-every entry collapse → recall 0.0006; the m×15 envelope is the
+//     hard ceiling.)
+//   - Offset (sum of per-segment mins) is dropped by the compander default
+//     — valid for argmin only; the affine variant exposes it via the
+//     builder for cross-LUT comparison (local_pq).
 
 /// Single-block 4-bit FastScan kernel — 32 codes/block.
 ///
@@ -1773,27 +1776,41 @@ inline void quantize_lut_u8_scaled(const float* lut_f32,
 /// `uint8_t` array (each byte holds one 4-bit value in its low nibble; high
 /// nibble 0). Used by the 4-bit FastScan path's LUT builder.
 ///
-/// This is the validated scheme from `scripts/spike_pq4_recall.cpp` (recall
-/// 0.9919 @ 1298 QPS). Critical differences from `quantize_lut_u8`:
-///   - K must be ≤ 16 (2^4). One scale across all segments (A = 15 / max_span).
-///   - **NO clamp on A.** The 4-bit kernel's internal u16 accumulators are
-///     safe up to per-lane m×15 ≪ 65535, and final extraction widens to u32
-///     (headroom to ~1.5M before overflow at m=192). Clamping A crushes
-///     precision on tight LUTs — this was the documented failure mode that
-///     dropped recall to 0.0006. DO NOT re-introduce a clamp here.
-///   - Per-segment min subtracted; offset (sum of mins) dropped (valid for
-///     argmin only). The scan distance is not directly comparable to the float
-///     LUT distance — it ranks correctly within one query.
+/// See `quantize_lut_u4_compander` — the production u4 LUT quantizer
+/// (two knee settings, both measured 2026-09-07 on cohere-1M).
+/// K ≤ 16 (2^4); ONE scale across all segments; per-segment min
+/// subtracted; the kernel's u16 accumulators are safe up to per-lane
+/// m×15 ≪ 65535 (headroom to ~1.5M at m=192 before u32 overflow — do NOT
+/// scale entries beyond 15). Output `lut4[s*K + c]` ∈ [0, 15], one 4-bit
+/// value per byte; `*scale_out` receives A; `seg_min` is caller scratch.
+/// Companding u4 LUT quantizer: A = a_num / max_span, entries clamped to
+/// [0,15]. `a_num` tunes the compander's knee (empirically settled
+/// 2026-09-07 on cohere-1M; both directions measured):
 ///
-/// Output: `lut4[s*K + c]` ∈ [0, 15] (stored in a uint8_t byte). `*scale_out`
-/// receives A (the caller needs it only for cross-LUT comparisons, which the
-/// scan path never does — all shards in one query share one LUT).
-/// `seg_min` is caller-allocated scratch of `m` floats.
-inline void quantize_lut_u4(const float* lut_f32,
-                            uint32_t m, uint32_t K,
-                             uint8_t* lut4,
-                            float* scale_out,
-                            float* seg_min) {
+///   a_num = 255 (default) — min-focused: the bottom 15/255 ≈ 5.9% of each
+///     segment's span carries all 16 levels (the near-min region that
+///     decides top-W ranking); the far tail saturates harmlessly. For
+///     WITHIN-LUT ranking (global PQ: one LUT per query). A whole-span map
+///     measured worse there (pq4m192 recall .755 -> .483).
+///
+///   a_num = 15 — whole-span affine: coarser at the decisive end but
+///     exactly invertible (d_hat = raw/A + sum(seg_min)). Required when
+///     the consumer ranks ACROSS LUTs (local_pq: per-leaf LUTs feed one
+///     shared heap; saturated keys understate distances and the
+///     leaf-specific offset dominates cross-leaf ordering). Measured
+///     local_pq .800 vs .576.
+///
+/// Properties: K ≤ 16 (2^4); ONE scale across all segments; per-segment
+/// min subtracted; the kernel's u16 accumulators are safe up to per-lane
+/// m×15 ≪ 65535 (headroom to ~1.5M at m=192 before u32 overflow — do NOT
+/// scale entries beyond 15). Output `lut4[s*K + c]` ∈ [0, 15], one 4-bit
+/// value per byte; `*scale_out` receives A; `seg_min` is caller scratch.
+inline void quantize_lut_u4_compander(const float* lut_f32,
+                                      uint32_t m, uint32_t K,
+                                      uint8_t* lut4,
+                                      float* scale_out,
+                                      float* seg_min,
+                                      float a_num = 255.0f) {
     // Per-segment min, plus global max_span.
     float max_span = 0.0f;
     for (uint32_t s = 0; s < m; s++) {
@@ -1809,8 +1826,7 @@ inline void quantize_lut_u4(const float* lut_f32,
         }
     }
 
-    // A = 255 / max_span, NO clamp (u32 accumulator has wide headroom).
-    const float A = (max_span > 0.0f) ? 255.0f / max_span : 0.0f;
+    const float A = (max_span > 0.0f) ? a_num / max_span : 0.0f;
 
     for (uint32_t s = 0; s < m; s++) {
         const float* src_row = lut_f32 + s * K;
@@ -1822,8 +1838,6 @@ inline void quantize_lut_u4(const float* lut_f32,
         }
     }
 
-    // `scale_out` is optional — the scan path never needs the scale (all
-    // shards in one query share one LUT; argmin ranking is scale-invariant).
     if (scale_out) *scale_out = A;
 }
 

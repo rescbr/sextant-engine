@@ -30,6 +30,13 @@ struct LocalPqCoder::Setup : public ScanSetup {
     std::vector<uint8_t> lut4, lut8;
     std::vector<float> query_copy;  // query for the residual transform
     std::unique_ptr<PqQuantizer> leaf_q;  // LUT builder (params fixed)
+    // Per-leaf LUT quantization (set by bind_leaf): the fastscan raw sum is
+    // in THIS leaf's quantized units. d_hat = raw / lut_scale + lut_offset
+    // is the comparable-across-leaves distance estimate. Without it the
+    // shared top-W heap mixes incompatible key domains and recall DEGRADES
+    // as more leaves are probed (measured cohere: .675@f=.2 -> .370@f=.5).
+    float lut_scale = 1.0f;
+    float lut_offset = 0.0f;
 };
 
 LocalPqCoder::LocalPqCoder(const CoderParams& params) : params_(params) {}
@@ -182,12 +189,13 @@ void LocalPqCoder::bind_leaf(ScanSetup& setup, const uint8_t* leaf) const {
         leaf + lh->codebook_offset);
     s.leaf_q->set_codebook_data(codebook);
     if (params_.pq_bits == 8) {
-        float lut_scale = 0, lut_offset = 0;
         s.leaf_q->build_fastscan_lut(s.residual.data(), s.lut8.data(),
-                                     &lut_scale, &lut_offset);
+                                     &s.lut_scale, &s.lut_offset);
     } else {
+        // a_num=15: whole-span affine — cross-leaf comparable after
+        // inversion (see quantize_lut_u4_compander docs).
         s.leaf_q->build_fastscan_lut4(s.residual.data(), s.lut4.data(),
-                                      nullptr);
+                                      &s.lut_scale, &s.lut_offset, 15.0f);
     }
 }
 
@@ -206,6 +214,17 @@ void LocalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
     const uint8_t* codes = leaf + local_codes_offset(lh->summary_size,
         params_.dim, lh->m4, lh->pq_bits);
     const uint8_t* lut_ptr = scan_8bit ? s.lut8.data() : s.lut4.data();
+    // Map this leaf's raw quantized sums to the shared heap's key domain:
+    // order-preserving u32 encoding of the per-leaf dequantized estimate
+    // d_hat = raw / lut_scale + lut_offset (see Setup). Valid lanes only;
+    // 0xFFFFFFFF sentinel lanes stay untouched.
+    const auto to_key = [&s](uint32_t raw) {
+        if (raw == 0xFFFFFFFFu) return raw;
+        // Degenerate LUT (A=0, untrained): fall back to raw ordering.
+        const float sc = s.lut_scale > 0.0f ? s.lut_scale : 1.0f;
+        const float d = static_cast<float>(raw) / sc + s.lut_offset;
+        return f32_to_dist_key(d);
+    };
 
     const uint32_t full_blocks = count / codes_per_block;
     const uint32_t tail_count = count - full_blocks * codes_per_block;
@@ -225,6 +244,7 @@ void LocalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
             uint32_t out[16];
             simd::fastscan_block16(blk, lut_ptr, m,
                                     static_cast<uint16_t>(valid_mask), out);
+            for (uint32_t j = 0; j < 16; ++j) out[j] = to_key(out[j]);
             const uint32_t base = b * 16;
             if (!heap_full(heap)) {
                 for (uint32_t j = 0; j < 16; ++j) {
@@ -245,6 +265,7 @@ void LocalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
             simd::pq4_block32(blk, lut_ptr, m, out);
             if (valid_mask != 0xFFFFFFFFu)
                 u32_mask_sentinel32(out, valid_mask);
+            for (uint32_t j = 0; j < 32; ++j) out[j] = to_key(out[j]);
             const uint32_t base = b * 32;
             if (!heap_full(heap)) {
                 for (uint32_t j = 0; j < 32; ++j) {

@@ -1128,7 +1128,9 @@ void PqQuantizer::build_fastscan_lut(const float* query,
 
 void PqQuantizer::build_fastscan_lut4(const float* query,
                                       uint8_t* lut4,
-                                      float* scale_out) const {
+                                      float* scale_out,
+                                      float* offset_out,
+                                      float a_num) const {
     // 4-bit FastScan LUT (Option A scan path). The 4-bit kernel needs K=16
     // entries per segment; misuse catches any other bits_ configuration.
     if (bits_ != 4 || K_ != 16) {
@@ -1145,8 +1147,15 @@ void PqQuantizer::build_fastscan_lut4(const float* query,
     // with m > 257 (e.g. m=768 scalar Lloyd-Max), 0-255 values overflow
     // uint16 (m × 255 > 65535). The u4 scheme (max m × 15 = 11520 at m=768)
     // is always safe.
-    simd::quantize_lut_u4(lut_f32.data(), m_, K_, lut4, scale_out,
-                           seg_min.data());
+    simd::quantize_lut_u4_compander(lut_f32.data(), m_, K_, lut4, scale_out,
+                                    seg_min.data(), a_num);
+    // Cross-leaf inversion (local_pq): d_hat = raw/A + sum(seg_min). The
+    // global-PQ caller never needs it (one LUT per query); optional.
+    if (offset_out) {
+        float b = 0.0f;
+        for (uint32_t s = 0; s < m_; s++) b += seg_min[s];
+        *offset_out = b;
+    }
 }
 
 // ---------------------------------------------------------------------------

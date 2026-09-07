@@ -176,9 +176,14 @@ public:
     ///     LUT). May be nullptr to skip.
     ///
     /// Requires `bits_ == 4` (K_ == 16). Throws on misuse.
+    /// `a_num` is the compander knee (simd::quantize_lut_u4_compander):
+    /// 255 = min-focused default (within-LUT ranking, global PQ);
+    /// 15 = whole-span affine (cross-LUT ranking, local_pq).
     void build_fastscan_lut4(const float* query,
                              uint8_t* lut4,
-                             float* scale_out) const;
+                             float* scale_out,
+                             float* offset_out = nullptr,
+                             float a_num = 255.0f) const;
 
     /// Estimate distance from a query LUT to a PQ code.
     float lut_distance(const uint8_t* code, const float* lut) const;
