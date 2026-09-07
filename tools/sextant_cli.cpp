@@ -22,6 +22,7 @@
 #include "sextant/config.hpp"
 #include "sextant/crash_handler.hpp"
 #include "sextant/engine_trace.hpp"
+#include "sextant/ground_truth.hpp"
 #include "sextant/error.hpp"
 #include "sextant/estimator.hpp"
 #include "sextant/index.hpp"
@@ -1912,6 +1913,8 @@ int cmd_trace(int argc, char* argv[]) {
         false, "1,2,3,4");
     p.add<uint32_t>("min-blocks", 0,
         "Blocks probed before stall/kth rules may fire", false, 1);
+    p.add("debug-join", 0,
+        "Dump the gt/topk join for the first 5 queries (stderr)");
     p.parse_check(argc, argv);
 
     // --- Parse the trace: FB records grouped by query, in file order ---
@@ -1970,28 +1973,29 @@ int cmd_trace(int argc, char* argv[]) {
 
     // --- Ground truth (optional) ---
     const uint32_t k = p.get<uint32_t>("topk");
+    // Scored positions per query: the trace's top-k list length (what the
+    // engine recorded), clamped by --topk — never the raw --topk, which
+    // may exceed the traced list and silently deflate the denominator.
+    uint32_t k_scored = k;
+    for (const auto& qv : queries)
+        if (!qv.empty()) {
+            k_scored = std::min(k, static_cast<uint32_t>(qv[0].topk.size()));
+            break;
+        }
     std::vector<std::unordered_set<RowId>> gt;
     if (!p.get<std::string>("ground-truth").empty()) {
-        std::ifstream gf(p.get<std::string>("ground-truth"),
-                         std::ios::binary);
-        constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
-        uint32_t magic = 0, n = 0, gk = 0;
-        gf.read(reinterpret_cast<char*>(&magic), 4);
-        gf.read(reinterpret_cast<char*>(&n), 4);
-        gf.read(reinterpret_cast<char*>(&gk), 4);
-        char metric = 0; gf.read(&metric, 1); (void)metric;
-        if (magic != kGtMagic || !gf) {
-            std::cerr << "trace: ground truth missing GTMM magic\n";
+        GroundTruth g;
+        try {
+            g = GroundTruth::load(p.get<std::string>("ground-truth"));
+        } catch (const std::runtime_error& e) {
+            std::cerr << "trace: " << e.what() << '\n';
             return 1;
         }
-        const uint32_t gk_eff = std::min(k, gk);
-        gt.resize(n);
-        std::vector<RowId> ids(gk);
-        std::vector<float> dists(gk);
-        for (uint32_t i = 0; i < n; ++i) {
-            gf.read(reinterpret_cast<char*>(ids.data()), gk * 4);
-            gf.read(reinterpret_cast<char*>(dists.data()), gk * 4);
-            gt[i].insert(ids.begin(), ids.begin() + gk_eff);
+        const uint32_t gk_eff = std::min(k, g.k());
+        gt.resize(g.n());
+        for (uint32_t i = 0; i < g.n(); ++i) {
+            const auto ids = g.top(i, gk_eff);
+            gt[i].insert(ids.begin(), ids.end());
         }
     }
 
@@ -2055,6 +2059,23 @@ int cmd_trace(int argc, char* argv[]) {
     double blocks_mean = 0;
     for (const auto& qv : queries) blocks_mean += qv.size();
     blocks_mean /= queries.size();
+    if (p.exist("debug-join")) {
+        // Per-query join debug: replicate the fixed:0.05 join for the
+        // first 5 queries and dump the gt set + hits.
+        for (size_t qi = 0; qi < std::min<size_t>(5, queries.size()); ++qi) {
+            const size_t bi = replay(queries[qi], 'f', 0.05);
+            const Block& b = queries[qi][bi];
+            uint32_t hits = 0;
+            std::cerr << "dbg q=" << (qi + 1) << " bi=" << bi << " gt=";
+            if (!gt.empty() && qi < gt.size())
+                for (RowId id : gt[qi]) std::cerr << id << ',';
+            for (RowId id : b.topk)
+                if (!gt.empty() && qi < gt.size() && gt[qi].count(id)) ++hits;
+            std::cerr << " hits=" << hits << " topk=";
+            for (RowId id : b.topk) std::cerr << id << ',';
+            std::cerr << '\n';
+        }
+    }
     std::cout << "queries=" << queries.size()
               << " blocks/query(mean)=" << std::fixed << std::setprecision(1)
               << blocks_mean << '\n';
@@ -2071,9 +2092,15 @@ int cmd_trace(int argc, char* argv[]) {
             fracs.push_back(static_cast<double>(b.cum) /
                             static_cast<double>(b.tot));
             blocks_sum += bi + 1;
-            if (!gt.empty() && qi < gt.size())
-                for (RowId id : b.topk)
+            if (!gt.empty() && qi < gt.size()) {
+                // Dedupe the top-k ids: closure replication stores a
+                // vector in multiple leaves, so the same row_id can occupy
+                // several heap slots (delivered recall dedupes too).
+                std::unordered_set<RowId> uniq(b.topk.begin(),
+                                               b.topk.end());
+                for (RowId id : uniq)
                     if (gt[qi].count(id)) ++hits;
+            }
         }
         std::sort(fracs.begin(), fracs.end());
         const size_t n = fracs.size();
@@ -2087,7 +2114,7 @@ int cmd_trace(int argc, char* argv[]) {
                   << pct(0.5) << '\t' << pct(0.99) << '\t'
                   << (double)blocks_sum / n;
         if (!gt.empty())
-            std::cout << '\t' << hits / (queries.size() * k);
+            std::cout << '\t' << hits / (queries.size() * k_scored);
         std::cout << '\n';
     }
     return 0;
