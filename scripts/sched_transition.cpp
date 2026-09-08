@@ -15,6 +15,8 @@
 //   SCHED_THREADS   search_threads inside search_batch (default 8)
 //   SCHED_RATES     comma-separated rate ladder (QPS)
 //   SCHED_DUR_US    per-rate measurement duration in seconds x1e6 (default 6s)
+//   SCHED_MIX_PCT   mixed-class mode: % of requests URGENT (max_delay_us
+//                   = 1ms); rest batchable (2s). Per-class latencies.
 //
 // usage: sched_transition <tree> <queries.fbin> [warmup-rate]
 //
@@ -44,6 +46,7 @@ using Clock = std::chrono::steady_clock;
 
 struct Submitted {
     Clock::time_point t;
+    bool urgent = false;
     std::future<std::vector<sextant::Candidate>> fut;
 };
 
@@ -157,7 +160,7 @@ int main(int argc, char* argv[]) {
         std::mutex qmu;
         std::deque<Submitted> pending;   // generator → collector
         std::atomic<bool> gen_done{false};
-        std::vector<uint64_t> latencies_ns;
+        std::vector<uint64_t> latencies_ns, lat_urgent_ns, lat_batch_ns;
         std::mutex lat_mu;
         std::atomic<uint64_t> submitted{0}, completed{0};
         // Completions counted only inside the measurement window — the
@@ -188,6 +191,8 @@ int main(int argc, char* argv[]) {
                 {
                     std::lock_guard<std::mutex> lk(lat_mu);
                     latencies_ns.push_back(lat);
+                    (s.urgent ? lat_urgent_ns : lat_batch_ns)
+                        .push_back(lat);
                 }
                 if (!deadline_passed.load(std::memory_order_relaxed))
                     completed.fetch_add(1, std::memory_order_relaxed);
@@ -205,6 +210,10 @@ int main(int argc, char* argv[]) {
             deadline_passed.store(true, std::memory_order_relaxed);
         });
         watch.detach();
+        // Mixed-class mode (SCHED_MIX_PCT): every ~100/pct-th request is
+        // urgent (1 ms tolerance); the rest are batchable (2 s).
+        const int mix_pct = std::getenv("SCHED_MIX_PCT")
+                                ? std::atoi(std::getenv("SCHED_MIX_PCT")) : 0;
         uint32_t qi = 0;
         const auto step = std::chrono::nanoseconds(
             static_cast<uint64_t>(1e9 / rate));
@@ -216,9 +225,14 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_until(target);
             {
                 std::lock_guard<std::mutex> lk(qmu);
-                pending.push_back({Clock::now(),
-                                   sched.submit(
-                                       &queries[(qi % qn) * qdim], 10)});
+                const bool is_urgent =
+                    mix_pct > 0 &&
+                    (static_cast<uint64_t>(qi) * mix_pct) % 100 <
+                        static_cast<uint64_t>(mix_pct);
+                pending.push_back(
+                    {Clock::now(), is_urgent,
+                     sched.submit(&queries[(qi % qn) * qdim], 10, nullptr,
+                                  is_urgent ? 1000ull : 2'000'000ull)});
             }
             submitted.fetch_add(1, std::memory_order_relaxed);
             ++qi;
@@ -229,6 +243,37 @@ int main(int argc, char* argv[]) {
         const auto st = sched.stats();
         const auto bst = idx->batch_stats().snapshot_and_reset();
         (void)idx->search_stats().snapshot_and_reset();
+        if (mix_pct > 0) {
+            const double achieved =
+                static_cast<double>(completed.load()) / dur_s;
+            std::cout << std::fixed << std::setprecision(1) << rate
+                      << " urgent%=" << mix_pct
+                      << " achieved=" << achieved
+                      << " urgent_n=" << lat_urgent_ns.size()
+                      << " batch_n=" << lat_batch_ns.size()
+                      << std::setprecision(1)
+                      << " URGENT p50/p95/p99="
+                      << percentile_ns(lat_urgent_ns, 0.50) << "/"
+                      << percentile_ns(lat_urgent_ns, 0.95) << "/"
+                      << percentile_ns(lat_urgent_ns, 0.99) << "ms"
+                      << " BATCH p50/p95/p99="
+                      << percentile_ns(lat_batch_ns, 0.50) << "/"
+                      << percentile_ns(lat_batch_ns, 0.95) << "/"
+                      << percentile_ns(lat_batch_ns, 0.99) << "ms"
+                      << " windows=" << st.windows << " avg_win="
+                      << (st.windows
+                              ? static_cast<double>(st.queries) / st.windows
+                              : 0.0)
+                      << " fanout="
+                      << (st.windows
+                              ? static_cast<double>(bst.leaf_scans) /
+                                    std::max<uint64_t>(1, bst.leaves_unique)
+                              : 0.0)
+                      << "\n";
+            std::cout.flush();
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
         const double achieved =
             static_cast<double>(completed.load()) / dur_s;
         std::ostringstream fanout;
