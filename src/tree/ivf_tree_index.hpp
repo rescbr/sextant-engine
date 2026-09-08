@@ -197,18 +197,28 @@ public:
     ///
     /// `queries` holds nq row-major vectors of dim() floats. results[i]
     /// receives query i's top-k, produced by the SAME per-query
-    /// materialize/filter/rerank/dedup pipeline as search() — identical
-    /// inputs yield the same candidates modulo pq_dist tie order under
-    /// parallelism (the same contract as search()'s parallel scan path).
+    /// selection semantics as search() — identical inputs yield the same
+    /// candidates modulo pq_dist tie order under parallelism (the same
+    /// contract as search()'s parallel scan path).
     ///
-    /// Read layer: with a leaf cache configured (open cache_bytes > 0) the
-    /// sweep pins each unique leaf once (cross-window hot set); without one,
-    /// leaves are streamed through mmap with page-ordered readahead (the
-    /// batch controls access order, so faults are sequential). Feedback
-    /// probing is not supported (per-query adaptive probe sets cannot be
-    /// coalesced) — such configs are rejected with an error. Queries whose
-    /// predicate selectivity triggers the brute-force filtered fallback are
-    /// served by the per-query search() path individually.
+    /// Predicates: per-query overrides via `per_query_predicates` (entry
+    /// i is query i's predicate list; an empty list = unfiltered query).
+    /// Null = the base config's predicates apply to every query. Each
+    /// query routes (selectivity, summary pruning, adaptive W) and
+    /// evaluates (harvest-time column checks) against its OWN predicate
+    /// set — mixed filters in one batch are fine.
+    ///
+    /// Read layer (one path, two backends): without a leaf cache the
+    /// sweep reads each unique leaf with a direct page-ordered pread;
+    /// with one it pins, scans, and unpins per leaf (cross-window hot
+    /// set). Everything finalize needs from a leaf (row_id, rerank
+    /// distance, predicate verdict) is harvested into W-bounded pools
+    /// right after the (query, leaf) scan — provably containing every
+    /// final-heap entry (pool and heap share the same total order), so
+    /// there is no overflow path and no mmap dependency. Feedback
+    /// probing is rejected (adaptive probe sets cannot be coalesced).
+    /// Queries whose predicate selectivity triggers the brute-force
+    /// filtered fallback are served by the per-query search() path.
     ///
     /// Concurrency: config.search_threads > 1 parallelizes both the route
     /// phase and the sweep (threads claim contiguous page-ordered chunks of
@@ -216,7 +226,9 @@ public:
     /// and merged deterministically).
     void search_batch(const float* queries, uint32_t nq, uint32_t k,
                                               const SearchConfig& config,
-                                              std::vector<std::vector<Candidate>>& results) const;
+                                              std::vector<std::vector<Candidate>>& results,
+                                              const std::vector<std::vector<Predicate>>*
+                                                  per_query_predicates = nullptr) const;
 
 
     // --- Routing diagnostics (loss-decomposition harness) ---

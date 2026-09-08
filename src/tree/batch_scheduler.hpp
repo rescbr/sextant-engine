@@ -86,9 +86,12 @@ public:
 
     /// Submit one query (dim() floats, copied). The returned future
     /// resolves with the query's top-k after its window's sweep.
+    /// Optional per-query predicates (null = the scheduler's base
+    /// config predicates; empty vector = unfiltered query).
     /// Thread-safe.
-    std::future<std::vector<Candidate>> submit(const float* query,
-                                               uint32_t k);
+    std::future<std::vector<Candidate>> submit(
+            const float* query, uint32_t k,
+            const std::vector<Predicate>* predicates = nullptr);
 
     /// Drain the queue, stop the sweeper, resolve pending futures.
     void stop();
@@ -100,6 +103,7 @@ private:
     struct Entry {
         std::vector<float> query;
         uint32_t k;
+        std::vector<Predicate> predicates;  // empty = base config's
         std::promise<std::vector<Candidate>> promise;
         std::chrono::steady_clock::time_point submitted;
     };
@@ -123,6 +127,7 @@ private:
     struct CacheEntry {
         std::vector<float> query;
         uint32_t k;
+        std::vector<Predicate> predicates;
         std::vector<Candidate> results;
     };
     std::deque<CacheEntry> cache_;  // front = most recent

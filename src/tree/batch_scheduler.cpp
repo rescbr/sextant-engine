@@ -5,6 +5,25 @@
 
 namespace sextant::tree {
 
+/// Field-wise predicate equality (Predicate has no operator==; the
+/// result-cache key is query bytes + k + the full predicate list).
+inline bool predicates_equal(const std::vector<Predicate>& a,
+                             const std::vector<Predicate>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const auto& x = a[i];
+        const auto& y = b[i];
+        if (x.column != y.column || x.op != y.op ||
+            x.geo_lng_column != y.geo_lng_column ||
+            x.value != y.value || x.value2 != y.value2 ||
+            x.value3 != y.value3 || x.value4 != y.value4 ||
+            x.radius_km != y.radius_km || x.values != y.values) {
+            return false;
+        }
+    }
+    return true;
+}
+
 BatchScheduler::BatchScheduler(const IVFTreeIndex* index,
                                SearchConfig search_config, Config config)
     : index_(index),
@@ -22,19 +41,24 @@ BatchScheduler::BatchScheduler(const IVFTreeIndex* index,
 BatchScheduler::~BatchScheduler() { stop(); }
 
 std::future<std::vector<Candidate>> BatchScheduler::submit(
-        const float* query, uint32_t k) {
+        const float* query, uint32_t k,
+        const std::vector<Predicate>* predicates) {
     Entry e;
     e.query.assign(query, query + index_->dim());
     e.k = k;
+    if (predicates) e.predicates = *predicates;
     e.submitted = std::chrono::steady_clock::now();
     auto fut = e.promise.get_future();
 
     // Exact-repeat fast path: resolve from the result cache without
-    // routing (saves the scan compute too, not just the I/O).
+    // routing (saves the scan compute too, not just the I/O). The key
+    // includes the predicate set — same query bytes under a different
+    // filter is a different result.
     if (config_.result_cache_entries > 0) {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto it = cache_.begin(); it != cache_.end(); ++it) {
-            if (it->k == k && it->query.size() == e.query.size() &&
+            if (it->k == k && predicates_equal(it->predicates, e.predicates) &&
+                it->query.size() == e.query.size() &&
                 std::equal(it->query.begin(), it->query.end(),
                            e.query.begin())) {
                 auto results = it->results;  // copy for this caller
@@ -128,14 +152,25 @@ void BatchScheduler::dispatch_(std::deque<Entry> window) {
 
     // search_batch takes one k per call: run with the window's max and
     // prefix-cut each query's (distance-sorted) results to its own k.
+    // Per-query predicates ride along (empty = base config's).
     uint32_t k_eff = 0;
     for (const auto& e : window) k_eff = std::max(k_eff, e.k);
+    std::vector<std::vector<Predicate>> win_preds;
+    bool any_preds = false;
+    for (const auto& e : window)
+        any_preds = any_preds || !e.predicates.empty();
+    if (any_preds) {
+        win_preds.reserve(window.size());
+        for (const auto& e : window) win_preds.push_back(e.predicates);
+    }
 
     std::vector<std::vector<Candidate>> results;
     SearchConfig sc = search_config_;
     sc.search_threads = config_.search_threads;
     const auto t0 = std::chrono::steady_clock::now();
-    index_->search_batch(queries.data(), nq, k_eff, sc, results);
+    index_->search_batch(
+        queries.data(), nq, k_eff, sc, results,
+        any_preds ? &win_preds : nullptr);
     const auto t1 = std::chrono::steady_clock::now();
 
     std::lock_guard<std::mutex> lk(mu_);
@@ -160,6 +195,7 @@ void BatchScheduler::dispatch_(std::deque<Entry> window) {
             CacheEntry ce;
             ce.query = e.query;
             ce.k = e.k;
+            ce.predicates = e.predicates;
             ce.results = results[i];
             if (ce.results.size() > e.k) ce.results.resize(e.k);
             cache_.push_front(std::move(ce));

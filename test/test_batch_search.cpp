@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -435,5 +436,166 @@ TEST(BatchSearch, ExactRerankBaseParity) {
         const auto single = idx->search(
             queries.data() + static_cast<size_t>(i) * fx.dim, 10, sc);
         expect_same_results(single, out[i], /*exact_order=*/true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Predicates: shared-per-batch and per-query overrides.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Filtered fixture: clustered base + (year int32, category string)
+/// columns, row_id i → year = 2000 + i%50, category = cat_<i%10>.
+struct FilteredFixture {
+    std::filesystem::path dir;
+    std::string tree_path;
+    uint32_t dim = 32;
+
+    FilteredFixture() {
+        dir = std::filesystem::temp_directory_path() / "batch_filter_int";
+        std::filesystem::create_directories(dir);
+        const uint32_t n = 20000, n_clusters = 30;
+        const std::string base =
+            write_test_fbin((dir / "base.fbin").string(), n, dim, n_clusters);
+        tree_path = (dir / "tree").string();
+
+        sextant::Schema schema;
+        schema.columns.push_back({"year", sextant::ColumnType::Int32});
+        schema.columns.push_back(
+            {"category", sextant::ColumnType::String});
+        std::vector<sextant::ColumnData> cols(2);
+        cols[0].type = sextant::ColumnType::Int32;
+        cols[1].type = sextant::ColumnType::String;
+        cols[0].fixed_data.resize(static_cast<size_t>(n) * 4);
+        for (uint32_t i = 0; i < n; ++i) {
+            const int32_t year = 2000 + static_cast<int32_t>(i % 50);
+            std::memcpy(&cols[0].fixed_data[static_cast<size_t>(i) * 4],
+                        &year, 4);
+            const std::string val =
+                "cat_" + std::to_string(i % 10);
+            cols[1].str_offsets.push_back(
+                static_cast<uint32_t>(cols[1].str_data.size()));
+            cols[1].str_lengths.push_back(
+                static_cast<uint16_t>(val.size()));
+            cols[1].str_data.insert(cols[1].str_data.end(), val.data(),
+                                    val.data() + val.size());
+        }
+
+        sextant::FbinSource s(base);
+        sextant::tree::IVFTreeIndex::BuildConfig cfg;
+        cfg.k_root = 8;
+        cfg.leaf_capacity = 1000;
+        cfg.pca_dims = 0;
+        cfg.num_threads = 4;
+        cfg.closure_multiplier = 0.0f;
+        cfg.filter_schema = schema;
+        cfg.filter_column_data = std::move(cols);
+        sextant::tree::IVFTreeIndex::build_streaming_pca(s, tree_path, cfg);
+    }
+    ~FilteredFixture() { std::filesystem::remove_all(dir); }
+
+    const BatchFixture& queries() const { return fixture(); }
+};
+
+const FilteredFixture& filtered_fixture() {
+    static FilteredFixture f;
+    return f;
+}
+
+sextant::Predicate year_eq(int32_t year) {
+    sextant::Predicate p;
+    p.column = "year";
+    p.op = sextant::PredicateOp::Eq;
+    p.value = static_cast<double>(year);
+    return p;
+}
+
+}  // namespace
+
+TEST(BatchSearchPredicates, SharedFilterParity) {
+    const auto& fx = filtered_fixture();
+    const auto& qfx = fx.queries();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    auto sc = base_config();
+    sc.search_threads = 1;
+    sc.rerank = 0;
+    sc.predicates.push_back(year_eq(2020));
+    const uint32_t nq = 8;
+    const auto queries = qfx.make_queries(nq);
+    std::vector<std::vector<sextant::Candidate>> out;
+    idx->search_batch(queries.data(), nq, 10, sc, out);
+    for (uint32_t i = 0; i < nq; ++i) {
+        // Every result must satisfy the predicate.
+        for (const auto& c : out[i])
+            ASSERT_EQ(c.row_id % 50, 20) << "filter violated";
+        const auto single =
+            idx->search(queries.data() +
+                            static_cast<size_t>(i) * qfx.dim,
+                        10, sc);
+        expect_same_results(single, out[i], /*exact_order=*/true);
+    }
+}
+
+TEST(BatchSearchPredicates, PerQueryOverridesParity) {
+    const auto& fx = filtered_fixture();
+    const auto& qfx = fx.queries();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    // Base config: UNFILTERED. Per-query overrides vary the year; one
+    // query has an empty override list (unfiltered).
+    auto base = base_config();
+    base.search_threads = 1;
+    base.rerank = 0;
+    base.predicates.clear();
+    const uint32_t nq = 6;
+    const auto queries = qfx.make_queries(nq);
+    std::vector<std::vector<sextant::Predicate>> overrides;
+    for (uint32_t i = 0; i < nq; ++i) {
+        overrides.emplace_back();
+        if (i % 2 == 0) overrides.back().push_back(year_eq(2000 + i));
+    }
+    std::vector<std::vector<sextant::Candidate>> out;
+    idx->search_batch(queries.data(), nq, 10, base, out, &overrides);
+    for (uint32_t i = 0; i < nq; ++i) {
+        sextant::SearchConfig qcfg = base;
+        qcfg.predicates = overrides[i];
+        const auto single =
+            idx->search(queries.data() +
+                            static_cast<size_t>(i) * qfx.dim,
+                        10, qcfg);
+        expect_same_results(single, out[i], /*exact_order=*/true);
+        if (i % 2 == 0) {
+            for (const auto& c : out[i])
+                ASSERT_EQ(c.row_id % 50, i) << "filter violated";
+        }
+    }
+}
+
+TEST(BatchSearchPredicates, PerQueryOverrideWithCacheHotSet) {
+    const auto& fx = filtered_fixture();
+    const auto& qfx = fx.queries();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path, 8ull << 20);
+    auto base = base_config();
+    base.search_threads = 2;
+    base.rerank = 0;
+    const uint32_t nq = 6;
+    const auto queries = qfx.make_queries(nq);
+    std::vector<std::vector<sextant::Predicate>> overrides;
+    for (uint32_t i = 0; i < nq; ++i) {
+        overrides.emplace_back();
+        if (i < 4) overrides.back().push_back(year_eq(2010 + i));
+    }
+    std::vector<std::vector<sextant::Candidate>> out;
+    idx->search_batch(queries.data(), nq, 10, base, out, &overrides);
+    idx->search_batch(queries.data(), nq, 10, base, out, &overrides);
+    for (uint32_t i = 0; i < nq; ++i) {
+        sextant::SearchConfig qcfg = base;
+        qcfg.search_threads = 1;
+        qcfg.predicates = overrides[i];
+        const auto single =
+            idx->search(queries.data() +
+                            static_cast<size_t>(i) * qfx.dim,
+                        10, qcfg);
+        expect_same_results(single, out[i], /*exact_order=*/false);
     }
 }
