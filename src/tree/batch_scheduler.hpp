@@ -62,6 +62,16 @@ public:
         uint32_t result_cache_entries = 0;
         /// search_threads forwarded to search_batch.
         uint32_t search_threads = 1;
+        /// Max concurrently-sweeping windows (piggybacking via
+        /// pipelining). 1 = serialized windows (classic close rules
+        /// only); >=2 = a query arriving while sweeps are in flight AND
+        /// a slot is free dispatches IMMEDIATELY — it overlaps the
+        /// in-flight sweeps instead of waiting for the next window
+        /// (shared-leaf reads dedup in the ARC/page cache). At capacity,
+        /// arrivals accumulate into windows as before, so the
+        /// latency-mode/throughput-mode blend emerges from the cap.
+        /// 0 is treated as 1. Default 2.
+        uint32_t max_inflight_windows = 2;
     };
 
     struct Stats {
@@ -69,6 +79,7 @@ public:
         uint64_t queries = 0;
         uint64_t cache_hits = 0;
         uint64_t sweep_ns = 0;  // total search_batch wall inside dispatch
+        uint32_t peak_inflight = 0;  // max concurrent sweeps observed
         /// Per-query submit→dispatch-delay samples (ns), capped at
         /// max_delay_samples; sorted on snapshot for percentiles.
         std::vector<uint64_t> delay_ns;
@@ -117,11 +128,17 @@ private:
     const uint64_t window_max_ns_;
     const uint32_t max_window_queries_;
 
-    mutable std::mutex mu_;
+    mutable     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<Entry> queue_;
     bool stopped_ = false;
     std::thread sweeper_;
+    // Pipelined dispatch: in-flight search_batch calls + their futures
+    // (async futures block in their destructor — kept until reaped).
+    uint32_t inflight_ = 0;
+    const uint32_t max_inflight_;
+    std::mutex fut_mu_;
+    std::deque<std::future<void>> futs_;
 
     // Result cache: LRU over (query bytes, k) → results.
     struct CacheEntry {

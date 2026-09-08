@@ -104,6 +104,8 @@ int main(int argc, char* argv[]) {
         std::getenv("SCHED_MAX_US") ? std::atoll(std::getenv("SCHED_MAX_US")) : 100000;
     const uint32_t threads =
         std::getenv("SCHED_THREADS") ? std::atoi(std::getenv("SCHED_THREADS")) : 8;
+    const uint32_t inflight =
+        std::getenv("SCHED_INFLIGHT") ? std::atoi(std::getenv("SCHED_INFLIGHT")) : 2;
     const double dur_s =
         std::getenv("SCHED_DUR_US")
             ? std::atoll(std::getenv("SCHED_DUR_US")) / 1e6 : 6.0;
@@ -127,7 +129,7 @@ int main(int argc, char* argv[]) {
         wsc.search_threads = threads;
         sextant::tree::BatchScheduler warm(
             idx.get(), wsc,
-            {max_us, idle_us, 4096, 0, threads});
+            {max_us, idle_us, 4096, 0, threads, inflight});
         const auto t0 = Clock::now();
         for (uint32_t i = 0;
              std::chrono::duration<double>(Clock::now() - t0).count() < 3.0;

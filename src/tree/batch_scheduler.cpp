@@ -34,7 +34,9 @@ BatchScheduler::BatchScheduler(const IVFTreeIndex* index,
                          : 100'000'000ull),
       max_window_queries_(config.max_window_queries > 0
                               ? config.max_window_queries
-                              : 4096) {
+                              : 4096),
+      max_inflight_(std::max(
+          1u, config.max_inflight_windows)) {
     sweeper_ = std::thread([this] { sweeper_loop_(); });
 }
 
@@ -85,6 +87,12 @@ void BatchScheduler::stop() {
     }
     cv_.notify_all();
     if (sweeper_.joinable()) sweeper_.join();
+    // Drain in-flight dispatches so pending futures resolve before the
+    // scheduler dies (async futures block in their dtors anyway).
+    std::lock_guard<std::mutex> flk(fut_mu_);
+    for (auto& f : futs_)
+        if (f.valid()) f.get();
+    futs_.clear();
 }
 
 BatchScheduler::Stats BatchScheduler::stats() {
@@ -105,12 +113,27 @@ void BatchScheduler::sweeper_loop_() {
             cv_.wait(lk, [this] { return !queue_.empty() || stopped_; });
             continue;
         }
-        // Close decision for a nonempty queue, in priority order:
-        //   stop / size cap / oldest-entry deadline → close now;
-        //   otherwise wait until the EARLIER of (idle gap, deadline).
-        // Every submit notifies, so an arrival during the wait wakes us
-        // to re-evaluate (an active stream keeps extending the idle
-        // point); a quiet period times out and the window closes.
+        // CAPACITY GATE — never dispatch beyond max_inflight_ concurrent
+        // sweeps. While saturated, arrivals accumulate into the next
+        // window; a completion (notified) frees a slot and the whole
+        // accumulated window dispatches. Without this gate the idle
+        // close below would dispatch every arrival as its own sweep —
+        // unbounded concurrency, measured collapse at rate>=50 QPS.
+        if (!stopped_ && inflight_ >= max_inflight_) {
+            cv_.wait(lk, [this] {
+                return inflight_ < max_inflight_ || stopped_;
+            });
+            continue;  // re-evaluate with the accumulated queue
+        }
+        // Close decision, classic rules: stop / size cap / oldest-entry
+        // deadline / idle gap, whichever first. Every submit and every
+        // dispatch completion notifies, so waits re-evaluate. With
+        // max_inflight_ >= 2 this yields pipelined dispatch: a query
+        // arriving while a sweep is in flight AND a slot is free closes
+        // after the (short) idle gap and sweeps CONCURRENTLY — it
+        // overlaps the in-flight sweep instead of waiting out the next
+        // window (piggybacking via pipelining; shared-leaf reads dedup
+        // in the ARC/page cache).
         bool close = stopped_ || queue_.size() >= max_window_queries_;
         if (!close) {
             const auto now = std::chrono::steady_clock::now();
@@ -120,11 +143,10 @@ void BatchScheduler::sweeper_loop_() {
             if (now >= deadline) {
                 close = true;
             } else if (config_.idle_close_us > 0) {
-                const auto wait_to = std::min(deadline, now + idle);
-                if (cv_.wait_until(lk, wait_to) ==
+                if (cv_.wait_until(lk, std::min(deadline, now + idle)) ==
                     std::cv_status::no_timeout)
-                    continue;  // re-evaluate (arrival / stop)
-                close = true;  // idle gap (or deadline) elapsed
+                    continue;  // re-evaluate (arrival / completion)
+                close = true;
             } else {
                 if (cv_.wait_until(lk, deadline) ==
                     std::cv_status::no_timeout)
@@ -135,10 +157,36 @@ void BatchScheduler::sweeper_loop_() {
         (void)close;  // reaching here means close
         std::deque<Entry> window;
         window.swap(queue_);
+        ++inflight_;
+        stats_.peak_inflight =
+            std::max(stats_.peak_inflight, inflight_);
         lk.unlock();
-        dispatch_(std::move(window));
+        {
+            std::lock_guard<std::mutex> flk(fut_mu_);
+            futs_.push_back(std::async(
+                std::launch::async,
+                [this, w = std::move(window)]() mutable {
+                    dispatch_(std::move(w));
+                    {
+                        std::lock_guard<std::mutex> ilk(mu_);
+                        --inflight_;
+                    }
+                    cv_.notify_all();
+                }));
+            // Reap finished dispatches (keeping every async future
+            // alive — their dtors block until the task completes).
+            for (auto it = futs_.begin(); it != futs_.end();) {
+                if (it->wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready) {
+                    it->get();
+                    it = futs_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         lk.lock();
-        // Loop: on stop, the now-empty queue exits on the next iteration.
+        // Loop: on stop, the now-empty queue exits on the next pass.
     }
 }
 

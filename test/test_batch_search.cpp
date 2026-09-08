@@ -338,6 +338,7 @@ TEST(BatchScheduler, BurstCoalescesIntoFewWindows) {
     cfg.idle_close_us = 50'000;       // 50 ms: the burst fits one window
     cfg.window_max_us = 500'000;      // deadline far away
     cfg.search_threads = 1;
+    cfg.max_inflight_windows = 1;     // serialized: classic close rules
     sextant::SearchConfig sc = base_config();
     sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
 
@@ -392,6 +393,43 @@ TEST(BatchScheduler, ResultCacheServesExactRepeats) {
         EXPECT_EQ(r1[i].row_id, r2[i].row_id);
     const auto st = sched.stats();
     EXPECT_GE(st.cache_hits, 1u);
+}
+
+TEST(BatchScheduler, PipelinedDispatchOverlapsSweeps) {
+    // Pipelining (max_inflight_windows >= 2): a query arriving while a
+    // sweep is in flight and a slot free closes after the idle gap and
+    // sweeps CONCURRENTLY (piggybacking via pipelining). The capacity
+    // gate is the deterministic invariant: concurrent sweeps never
+    // exceed max_inflight_windows, and every future resolves. (Whether
+    // two sweeps actually overlap depends on timing — measured by
+    // scripts/sched_transition.cpp, not asserted here.)
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.idle_close_us = 500;       // short gap: paced arrivals pipeline
+    cfg.window_max_us = 500'000;
+    cfg.search_threads = 1;
+    cfg.max_inflight_windows = 2;
+    sextant::SearchConfig sc = base_config();
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+
+    const uint32_t nq = 12;
+    const auto queries = fx.make_queries(nq);
+    std::vector<std::future<std::vector<sextant::Candidate>>> futs;
+    for (uint32_t i = 0; i < nq; ++i) {
+        futs.push_back(sched.submit(
+            queries.data() + static_cast<size_t>(i) * fx.dim, 10));
+        // Pace arrivals at 2x the idle gap: windows form, sweeps overlap
+        // where service allows, the gate caps concurrency.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    for (auto& f : futs) EXPECT_EQ(f.get().size(), 10u);
+
+    const auto st = sched.stats();
+    EXPECT_EQ(st.queries, nq);
+    EXPECT_GE(st.windows, 1u);
+    EXPECT_LE(st.windows, nq);
+    EXPECT_LE(st.peak_inflight, 2u);  // capacity gate holds
 }
 
 TEST(BatchScheduler, PerQueryKTruncation) {
