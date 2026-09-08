@@ -96,37 +96,37 @@ endif
 spike_lm_recall = executable('spike_lm_recall',
     'spike_lm_recall.cpp',
     include_directories: [engine_inc, src_inc],
-    link_with: sextant_lib,
+    dependencies: sextant_dep,
 )
 
 spike_ip_bias = executable('spike_ip_bias',
     'spike_ip_bias.cpp',
     include_directories: [engine_inc, src_inc],
-    link_with: sextant_lib,
+    dependencies: sextant_dep,
 )
 
 spike_pq2_tier = executable('spike_pq2_tier',
     'spike_pq2_tier.cpp',
     include_directories: [engine_inc, src_inc],
-    link_with: sextant_lib,
+    dependencies: sextant_dep,
 )
 
 spike_local_shape = executable('spike_local_shape',
     'spike_local_shape.cpp',
     include_directories: [engine_inc, src_inc],
-    link_with: sextant_lib,
+    dependencies: sextant_dep,
 )
 
 spike_routing = executable('spike_routing',
     'spike_routing.cpp',
     include_directories: [engine_inc, src_inc, third_party_inc],
-    link_with: sextant_lib,
+    dependencies: sextant_dep,
 )
 
 spike_routing_ceiling = executable('spike_routing_ceiling',
     'spike_routing_ceiling.cpp',
     include_directories: [engine_inc, src_inc, third_party_inc],
-    link_with: sextant_lib,
+    dependencies: sextant_dep,
     c_args: ['-fopenmp'],
     link_args: ['-fopenmp'],
 )
@@ -134,13 +134,13 @@ spike_routing_ceiling = executable('spike_routing_ceiling',
 spike_slm_roundtrip = executable('spike_slm_roundtrip',
     'spike_slm_roundtrip.cpp',
     include_directories: [engine_inc, src_inc],
-    link_with: sextant_lib,
+    dependencies: sextant_dep,
 )
 
 spike_slm_storage = executable('spike_slm_storage',
     'spike_slm_storage.cpp',
     include_directories: [engine_inc, src_inc],
-    link_with: sextant_lib,
+    dependencies: sextant_dep,
 )
 
 capi_smoke = executable('capi_smoke',
@@ -152,7 +152,7 @@ capi_smoke = executable('capi_smoke',
 spike_uniform_check = executable('spike_uniform_check',
     'spike_uniform_check.cpp',
     include_directories: [engine_inc, src_inc],
-    link_with: sextant_lib,
+    dependencies: sextant_dep,
 )
 
 capi_qps = executable('capi_qps',
@@ -165,4 +165,10 @@ spike_bits_elbow = executable('spike_bits_elbow',
     'spike_bits_elbow.cpp',
     dependencies: sextant_dep,
     install: false,
+)
+
+sched_transition = executable('sched_transition',
+    'sched_transition.cpp',
+    include_directories: [engine_inc, src_inc, third_party_inc],
+    dependencies: sextant_dep,
 )
