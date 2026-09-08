@@ -769,6 +769,12 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
     p.add<uint32_t>("search-threads", 0,
         "Within-query leaf-parallel scan threads (0=serial; orthorgonal to --threads)", false, 0);
+    p.add<uint32_t>("batch-window", 0,
+        "Subtree-major batch mode: queries per search_batch window. Routes "
+        "the window, inverts probe sets, and sweeps each UNIQUE probed leaf "
+        "once in page order (coalesced I/O at zero engine DRAM; results "
+        "identical to per-query search). 0 = per-query search. Incompatible "
+        "with payload output", false, 0);
     p.add<uint32_t>("cache-mb", 0,
         "Engine-owned leaf cache in MiB (0=off: mmap path). Warm results "
         "with a cache must be labeled with this size (BENCHMARK_RULES)", false, 0);
@@ -899,6 +905,17 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.adaptive_w_gap = p.get<float>("adaptive-w-gap");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
     scfg.search_threads = p.get<uint32_t>("search-threads");
+    const uint32_t batch_window = p.get<uint32_t>("batch-window");
+    if (batch_window > 0) {
+        if (with_payload) {
+            std::cerr << "tree-search: --batch-window is incompatible with "
+                         "payload output (per-query mmap locations)\n";
+            return 1;
+        }
+        // Batch mode has no cross-query thread pool: search_batch
+        // parallelizes internally (route + sweep chunks).
+        if (scfg.search_threads == 0) scfg.search_threads = num_threads;
+    }
 
     // Exact-rerank base: mmap the original corpus read-only and hand the
     // engine a pointer (caller-owned, per the SearchConfig contract). The
@@ -1118,6 +1135,23 @@ int cmd_tree_search(int argc, char* argv[]) {
 
     const uint32_t passes = std::max(1u, p.get<uint32_t>("passes"));
     auto run_pass = [&]() {
+        if (batch_window > 0) {
+            // Subtree-major: one search_batch call per window; unique
+            // leaves swept once, page-ordered. Results land in the same
+            // all_results slots as the per-query path (recall + output
+            // code shared).
+            std::vector<std::vector<Candidate>> win_results;
+            for (uint32_t w = 0; w < qcount; w += batch_window) {
+                const uint32_t n =
+                    std::min(batch_window, qcount - w);
+                idx->search_batch(
+                    &queries[static_cast<size_t>(w) * qdim], n, k, scfg,
+                    win_results);
+                for (uint32_t i = 0; i < n; ++i)
+                    all_results[w + i] = std::move(win_results[i]);
+            }
+            return;
+        }
         if (num_threads <= 1) {
             for (uint32_t qi = 0; qi < qcount; ++qi) {
                 if (with_payload) {
@@ -1224,6 +1258,7 @@ int cmd_tree_search(int argc, char* argv[]) {
                         static_cast<double>(ru1.ru_stime.tv_sec) +
                         1e-6 * static_cast<double>(ru1.ru_stime.tv_usec);
     SearchStats::Snapshot st = idx->search_stats().snapshot_and_reset();
+    BatchStats::Snapshot bst = idx->batch_stats().snapshot_and_reset();
     const double cpu_win = cpu1 - cpu0;
     const double util = secs > 0 ? cpu_win / secs : 0.0;
     std::cerr << "metrics: queries=" << st.queries
@@ -1253,13 +1288,29 @@ int cmd_tree_search(int argc, char* argv[]) {
                                  : 0.0);
     }
     std::cerr << "\n";
+    if (bst.batches > 0) {
+        const double fanout = bst.leaves_unique > 0
+            ? static_cast<double>(bst.leaf_scans) / bst.leaves_unique
+            : 0.0;
+        std::cerr << "batch: windows=" << bst.batches
+                  << " leaves_unique=" << bst.leaves_unique
+                  << " fanout=" << fanout
+                  << " unique_bytes/query="
+                  << (st.queries
+                          ? double(bst.bytes_unique) / st.queries : 0.0)
+                  << " coalescing="
+                  << (bst.bytes_unique > 0
+                          ? double(st.bytes_touched) / bst.bytes_unique
+                          : 0.0)
+                  << "x\n";
+    }
     {
         const std::string mf = p.get<std::string>("metrics-file");
         if (!mf.empty()) {
             metrics::JsonlMetricsSink sink(mf);
             metrics::PhaseMetrics w;
             w.phase = "window";
-            w.source = "tree-search";
+            w.source = batch_window > 0 ? "tree-search-batch" : "tree-search";
             w.wall_seconds = st.wall_seconds;
             w.cpu_seconds = cpu_win;
             // bytes_touched is the window's leaf traffic; wait counters n/a.
@@ -1271,6 +1322,10 @@ int cmd_tree_search(int argc, char* argv[]) {
             w.routing_seconds =
                 static_cast<double>(st.routing_ns) / 1e9;
             w.node_bytes_read = st.node_bytes_read;
+            w.batches = bst.batches;
+            w.leaves_unique = bst.leaves_unique;
+            w.leaf_scans = bst.leaf_scans;
+            w.bytes_unique = bst.bytes_unique;
             w.timestamp = std::chrono::duration<double>(
                 t0.time_since_epoch()).count();
             sink.emit(w);

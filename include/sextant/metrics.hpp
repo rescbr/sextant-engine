@@ -58,6 +58,13 @@ struct PhaseMetrics {
     uint64_t cache_bytes_filled = 0;  ///< search.window.cache_bytes_filled
     double routing_seconds = 0;      ///< search.window.routing_seconds
     uint64_t node_bytes_read = 0;     ///< search.window.node_bytes_read
+    /// Subtree-major batch counters (additive wire fields; zero on
+    /// build records and query-major search windows). Emitted by the
+    /// tree-search-batch source.
+    uint64_t batches = 0;             ///< search.window.batches
+    uint64_t leaves_unique = 0;       ///< search.window.leaves_unique
+    uint64_t leaf_scans = 0;          ///< search.window.leaf_scans
+    uint64_t bytes_unique = 0;        ///< search.window.bytes_unique
     /// Monotonic seconds at emit time (steady_clock-based epoch), for
     /// time-series alignment when records from multiple processes are merged.
     double timestamp = 0;
@@ -218,6 +225,8 @@ inline std::string to_json(const PhaseMetrics& m) {
                   "\"cache_hits\":%llu,\"cache_misses\":%llu,"
                   "\"cache_bytes_filled\":%llu,"
                   "\"routing_seconds\":%.17g,\"node_bytes_read\":%llu,"
+                  "\"batches\":%llu,\"leaves_unique\":%llu,"
+                  "\"leaf_scans\":%llu,\"bytes_unique\":%llu,"
                   "\"timestamp\":%.17g}",
                   m.wall_seconds, m.cpu_seconds, m.source_wait_seconds,
                   static_cast<unsigned long long>(m.wait_count),
@@ -228,6 +237,10 @@ inline std::string to_json(const PhaseMetrics& m) {
                   static_cast<unsigned long long>(m.cache_bytes_filled),
                   m.routing_seconds,
                   static_cast<unsigned long long>(m.node_bytes_read),
+                  static_cast<unsigned long long>(m.batches),
+                  static_cast<unsigned long long>(m.leaves_unique),
+                  static_cast<unsigned long long>(m.leaf_scans),
+                  static_cast<unsigned long long>(m.bytes_unique),
                   m.timestamp);
     out += buf;
     return out;

@@ -10,14 +10,17 @@
 #include <gtest/gtest.h>
 
 #include "tree/ivf_tree_index.hpp"
+#include "tree/batch_scheduler.hpp"
 
 #include <sextant/error.hpp>
 #include <sextant/vector_source.hpp>
 #include "fbin_source.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <random>
 #include <set>
 #include <vector>
@@ -295,4 +298,113 @@ TEST(BatchSearch, FeedbackConfigRejected) {
     std::vector<std::vector<sextant::Candidate>> out;
     EXPECT_THROW(idx->search_batch(queries.data(), 2, 10, sc, out),
                  sextant::Error);
+}
+
+// ---------------------------------------------------------------------------
+// BatchScheduler: adaptive window close, futures, result cache.
+// ---------------------------------------------------------------------------
+
+TEST(BatchScheduler, LonelyQueryDispatchesImmediately) {
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.idle_close_us = 1000;  // 1 ms idle close
+    cfg.search_threads = 1;
+    sextant::SearchConfig sc = base_config();
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+
+    const auto queries = fx.make_queries(1);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto out = sched.submit(queries.data(), 10).get();
+    const auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+    ASSERT_EQ(out.size(), 10u);
+    // Idle-close fires at ~1ms: no window_max wait. Generous bound to
+    // stay robust on loaded CI machines.
+    EXPECT_LT(dt.count(), 500);
+
+    auto sc1 = base_config();
+    sc1.search_threads = 1;
+    const auto single = idx->search(queries.data(), 10, sc1);
+    for (size_t i = 0; i < single.size(); ++i)
+        EXPECT_EQ(single[i].row_id, out[i].row_id);
+}
+
+TEST(BatchScheduler, BurstCoalescesIntoFewWindows) {
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.idle_close_us = 50'000;       // 50 ms: the burst fits one window
+    cfg.window_max_us = 500'000;      // deadline far away
+    cfg.search_threads = 1;
+    sextant::SearchConfig sc = base_config();
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+
+    const uint32_t nq = 24;
+    const auto queries = fx.make_queries(nq);
+    std::vector<std::future<std::vector<sextant::Candidate>>> futs;
+    for (uint32_t i = 0; i < nq; ++i)
+        futs.push_back(sched.submit(
+            queries.data() + static_cast<size_t>(i) * fx.dim, 10));
+    for (auto& f : futs) EXPECT_EQ(f.get().size(), 10u);
+
+    const auto st = sched.stats();
+    EXPECT_EQ(st.queries, nq);
+    EXPECT_LE(st.windows, 2u);  // the burst coalesced
+    EXPECT_GE(st.windows, 1u);
+}
+
+TEST(BatchScheduler, DeadlineBoundRespected) {
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.idle_close_us = 0;          // idle close disabled
+    cfg.window_max_us = 20'000;     // 20 ms deadline
+    cfg.search_threads = 1;
+    sextant::SearchConfig sc = base_config();
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+
+    const auto queries = fx.make_queries(1);
+    const auto t0 = std::chrono::steady_clock::now();
+    (void)sched.submit(queries.data(), 10).get();
+    const auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+    // Dispatch must happen by the deadline (+ generous slack).
+    EXPECT_LT(dt.count(), 500);
+}
+
+TEST(BatchScheduler, ResultCacheServesExactRepeats) {
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.idle_close_us = 500;
+    cfg.result_cache_entries = 8;
+    cfg.search_threads = 1;
+    sextant::SearchConfig sc = base_config();
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+
+    const auto queries = fx.make_queries(2);
+    auto r1 = sched.submit(queries.data(), 10).get();
+    auto r2 = sched.submit(queries.data(), 10).get();  // exact repeat
+    ASSERT_EQ(r1.size(), r2.size());
+    for (size_t i = 0; i < r1.size(); ++i)
+        EXPECT_EQ(r1[i].row_id, r2[i].row_id);
+    const auto st = sched.stats();
+    EXPECT_GE(st.cache_hits, 1u);
+}
+
+TEST(BatchScheduler, PerQueryKTruncation) {
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.idle_close_us = 50'000;
+    cfg.search_threads = 1;
+    sextant::SearchConfig sc = base_config();
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+
+    const auto queries = fx.make_queries(2);
+    auto f5 = sched.submit(queries.data(), 5);
+    auto f10 = sched.submit(queries.data() + fx.dim, 10);
+    EXPECT_EQ(f5.get().size(), 5u);
+    EXPECT_EQ(f10.get().size(), 10u);
 }

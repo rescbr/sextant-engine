@@ -4087,10 +4087,16 @@ void IVFTreeIndex::search_batch(
                 for (uint32_t li = start; li < end; ++li) {
                     const auto& ul = uleaves[li];
                     // No-cache readahead: keep the kernel prefetching
-                    // page-ordered, ~8 leaves ahead of the scan.
+                    // page-ordered, well ahead of the scan. Depth matters:
+                    // scanning a leaf costs ~fanout x 150us of compute, so
+                    // a shallow window (8 leaves) lets the disk idle
+                    // between chunks — measured 0.46 GB/s effective cold
+                    // on cohere-10m. 64 leaves (~100 MiB) keeps the
+                    // sequential stream saturated (page cache is
+                    // reclaimable and cgroup-charged).
 #ifdef __linux__
-                    if (!leaf_cache_ && li + 8 < n_unique) {
-                        const auto& ahead = uleaves[li + 8];
+                    if (!leaf_cache_ && li + 64 < n_unique) {
+                        const auto& ahead = uleaves[li + 64];
                         ::posix_fadvise(
                             fd_,
                             static_cast<off_t>(ahead.page) * kPageSize,
