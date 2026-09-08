@@ -86,6 +86,7 @@ IVFTreeIndex::~IVFTreeIndex() {
 }
 
 void IVFTreeIndex::close() {
+    fd_ = -1;
     if (mmap_base_) {
         ::munmap(const_cast<uint8_t*>(mmap_base_), mmap_size_);
         mmap_base_ = nullptr;
@@ -102,6 +103,12 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
     auto idx = std::unique_ptr<IVFTreeIndex>(new IVFTreeIndex());
     idx->path_ = path;
     idx->file_ = PageFile(path);
+    // fd for the search path's posix_fadvise prefetch calls (open-issued
+    // read-ahead). Historically this was never wired — every fadvise64
+    // silently returned EBADF, so all pre-2026-09 cold-search numbers ran
+    // with NO kernel prefetch (pure 4KB demand paging). Found via strace
+    // while investigating the cache-path I/O granularity.
+    idx->fd_ = idx->file_.fd();
 
     // Load superblock.
     idx->superblock_.load(idx->file_);
@@ -315,12 +322,13 @@ void IVFTreeIndex::load_root_from_mmap() {
 const uint8_t* IVFTreeIndex::pin_leaf_(PageId page, uint32_t pages,
                                        LeafExtentCache::Handle& handle) const {
     handle.entry = nullptr;
-    if (!leaf_cache_) {
-        return mmap_base_ + static_cast<uint64_t>(page) * kPageSize;
-    }
+    const uint8_t* mmap_ptr =
+        mmap_base_ + static_cast<uint64_t>(page) * kPageSize;
+    if (!leaf_cache_) return mmap_ptr;
     bool hit = false;
     uint64_t filled = 0;
-    const uint8_t* p = leaf_cache_->pin(page, pages, handle, &hit, &filled);
+    const uint8_t* p = leaf_cache_->pin(page, pages, handle, mmap_ptr,
+                                        &hit, &filled);
     search_stats_.on_cache_op(hit, filled);
     return p;
 }
@@ -2915,17 +2923,20 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // --- Prefetch leaf extents ---
     // On Linux, posix_fadvise triggers async NVMe prefetch. On macOS it's
     // a no-op (the unified buffer cache handles read-ahead for sequential
-    // mmap access). With the leaf cache on, only UNcached extents are worth
-    // prefetching — hits never touch the disk.
-    for (const auto& c : candidates) {
-        if (leaf_cache_ && leaf_cache_->contains(c.page)) continue;
+    // mmap access). With the leaf cache on we pread each missing extent as
+    // one large sequential read anyway — prefetching the whole candidate
+    // set upfront would just fill the page cache (charged to our cgroup /
+    // polluting a budgeted host) ahead of the copies we are about to make.
+    if (!leaf_cache_) {
+        for (const auto& c : candidates) {
 #ifdef __linux__
-        ::posix_fadvise(fd_, static_cast<off_t>(c.page) * kPageSize,
-                        static_cast<off_t>(c.pages) * kPageSize,
-                        POSIX_FADV_WILLNEED);
+            ::posix_fadvise(fd_, static_cast<off_t>(c.page) * kPageSize,
+                            static_cast<off_t>(c.pages) * kPageSize,
+                            POSIX_FADV_WILLNEED);
 #else
-        (void)c;  // macOS: no-op
+            (void)c;  // macOS: no-op
 #endif
+        }
     }
 
     // --- Scan leaves ---

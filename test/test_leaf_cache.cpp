@@ -73,6 +73,8 @@ struct TempPageFile {
 LeafExtentCache::Handle pin_ok(LeafExtentCache& c, PageId page,
                                uint32_t pages, const uint8_t** out) {
     LeafExtentCache::Handle h;
+    // No fallback in unit tests: a refused fill returning nullptr is itself
+    // a testable outcome (integration paths pass the mmap fallback).
     *out = c.pin(page, pages, h);
     return h;
 }
@@ -116,21 +118,22 @@ TEST(LeafExtentCache, PinnedEntrySurvivesEviction) {
 
     const uint8_t* pa = nullptr;
     auto ha = pin_ok(cache, 100, kExtentPages, &pa);
-    // Fill past capacity with distinct extents.
+    // Fill past capacity with distinct extents. With strict-> admission the
+    // one-timer scan TIES against pinned A and must not evict it (that's the
+    // fix — ties keep the incumbent); older `>=` semantics evicted it.
     for (PageId pg = 200; pg < 240; pg += kExtentPages) {
         const uint8_t* px = nullptr;
         auto hx = pin_ok(cache, pg, kExtentPages, &px);
         cache.unpin(hx);
     }
-    EXPECT_FALSE(cache.contains(100));
-    // Still pinned: data intact.
+    // Whether A is still linked or evicted-but-pinned, its data must be
+    // intact and every use must be safe — that is the pin contract.
     TempPageFile::expect_page(pa, 100, kExtentPages);
     cache.unpin(ha);
 
     const uint8_t* p2 = nullptr;
     auto h2 = pin_ok(cache, 100, kExtentPages, &p2);
-    auto st = cache.stats();
-    EXPECT_GT(st.misses, 1u);  // re-fetched after eviction
+    TempPageFile::expect_page(p2, 100, kExtentPages);
     cache.unpin(h2);
 }
 
@@ -161,18 +164,58 @@ TEST(LeafExtentCache, TinyLfuProtectsHotEntry) {
 }
 
 // ---------------------------------------------------------------------------
-// Oversized extent: served as transient, not cached, no crash.
+// Oversized extent: refused outright (fallback returned, nothing cached).
 // ---------------------------------------------------------------------------
 TEST(LeafExtentCache, OversizedExtentIsTransient) {
     TempPageFile tf(64);
     LeafExtentCache cache(kPageSize, 1, tf.fd);  // 1 page total capacity
-    const uint8_t* p = nullptr;
-    auto h = pin_ok(cache, 4, kExtentPages, &p);
-    TempPageFile::expect_page(p, 4, kExtentPages);
-    cache.unpin(h);
+    static const uint8_t sentinel = 0xAB;
+    const uint8_t* fb = &sentinel;
+    LeafExtentCache::Handle h;
+    const uint8_t* p = cache.pin(4, kExtentPages, h, fb);
+    EXPECT_EQ(p, fb);              // refused → caller's fallback handed back
+    EXPECT_EQ(h.entry, nullptr);   // nothing to unpin
     auto st = cache.stats();
     EXPECT_EQ(st.rejections, 1u);
     EXPECT_FALSE(cache.contains(4));
+}
+
+// ---------------------------------------------------------------------------
+// Admission ties keep the incumbent (Caffeine strict-> semantics). A cold
+// candidate (sketch freq equal to the probation LRU's) must NOT evict it —
+// `>=` here previously degenerated retention to FIFO churn exactly when the
+// sketch had least information (handover 2026-09-07/08).
+// ---------------------------------------------------------------------------
+TEST(LeafExtentCache, AdmissionTieKeepsIncumbent) {
+    // Capacity 3 extents; fill main with 3 one-timers (equal frequencies),
+    // then insert a 4th never-seen candidate.
+    const uint64_t cap = 3 * kExtentPages * kPageSize;  // main fits < 3
+    TempPageFile tf(500);
+    LeafExtentCache cache(cap, 1, tf.fd);
+    cache.set_expected_entries(8);  // tiny sketch: cold-slate ties dominate
+
+    for (PageId pg = 16; pg < 16 + 3 * kExtentPages; pg += kExtentPages) {
+        const uint8_t* p = nullptr;
+        auto h = pin_ok(cache, pg, kExtentPages, &p);
+        cache.unpin(h);
+        const uint8_t* p2 = nullptr;
+        auto h2 = pin_ok(cache, pg, kExtentPages, &p2);  // 2 hits each: equal freq
+        cache.unpin(h2);
+    }
+    auto st0 = cache.stats();
+    const uint64_t ev_before = st0.evictions;
+
+    // 4th extent: same sketch frequency as the probation LRU (all tie) →
+    // rejected, no eviction of the incumbents.
+    const uint8_t* p = nullptr;
+    auto h = pin_ok(cache, 400, kExtentPages, &p);
+    cache.unpin(h);
+
+    auto st = cache.stats();
+    EXPECT_GT(st.rejections, 0u) << "tie candidate should be refused";
+    EXPECT_EQ(st.evictions, ev_before)
+        << "tie must not evict the probation incumbent";
+    EXPECT_TRUE(cache.contains(16));
 }
 
 // ---------------------------------------------------------------------------

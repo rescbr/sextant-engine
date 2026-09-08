@@ -104,6 +104,11 @@ void LeafExtentCache::maybe_delete(Entry* e) {
     delete e;
 }
 
+void LeafExtentCache::drop_filled(Entry* e) {
+    e->retired.store(true, std::memory_order_release);
+    maybe_delete_locked(e);
+}
+
 void LeafExtentCache::drop_entry(Entry* e) {
     e->retired.store(true, std::memory_order_release);
     maybe_delete_locked(e);  // all drop_entry call sites hold the shard lock
@@ -127,9 +132,13 @@ uint8_t* LeafExtentCache::Shard::acquire_buf(uint64_t size) {
 }
 
 void LeafExtentCache::Shard::release_buf(uint8_t* buf, uint64_t cap) {
-    // Bound the pool by the shard's cache capacity: pooled-but-idle memory is
-    // overhead on top of the advertised DRAM budget.
-    if (buf_pool_bytes + cap <= capacity_bytes) {
+    // The pool shares the shard's capacity budget with LIVE entry data —
+    // pooling up to `capacity_bytes` ON TOP of live data doubles the real
+    // footprint (measured: anon-rss 4.18 GB with cache-mb=2048 → cgroup
+    // OOM; kernel log CONSTRAINT_MEMCG, 2026-09-08). Only pool what fits
+    // next to the live bytes.
+    const uint64_t live = bytes_window + bytes_probation + bytes_protected;
+    if (buf_pool_bytes + cap + live <= capacity_bytes) {
         buf_pool.emplace_back(buf, cap);
         buf_pool_bytes += cap;
     } else {
@@ -263,7 +272,8 @@ bool LeafExtentCache::contains(PageId page) {
 }
 
 const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
-                                    bool* was_hit, uint64_t* filled_bytes) {
+                                    const uint8_t* fallback, bool* was_hit,
+                                    uint64_t* filled_bytes) {
     h.entry = nullptr;
     if (was_hit) *was_hit = false;
     if (filled_bytes) *filled_bytes = 0;
@@ -298,10 +308,18 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
                     s.probation.push_mru(d);
                     s.bytes_probation += d->size;
                 }
-                // Probation overflow (from the demotion) evicts its LRU.
-                while (s.bytes_probation > s.max_probation_bytes &&
-                       !s.probation.empty()) {
+                // Probation overflow (from the demotion) evicts its LRU —
+                // never a PINNED entry: evicting pinned data frees nothing,
+                // creates an un-freeable transient, and the pileup OOMs
+                // budgeted (partial-residency) runs. Skip to the next LRU;
+                // if none is unpinned, leave the list oversized.
+                while (s.bytes_probation > s.max_probation_bytes) {
                     Entry* v = s.probation.tail;
+                    while (v != nullptr &&
+                           v->refs.load(std::memory_order_relaxed) > 0) {
+                        v = v->prev;
+                    }
+                    if (v == nullptr) break;
                     List::unlink(v, s.probation);
                     s.bytes_probation -= v->size;
                     s.map.erase(v->page);
@@ -319,51 +337,59 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
     }
 
     // Miss: fill OUTSIDE the lock (pread latency must not serialize a shard).
+    // NOTE: a fill that is later refused is NOT wasted I/O — it warmed the
+    // page cache that the fallback (mmap) read will hit.
     misses_.fetch_add(1, std::memory_order_relaxed);
     Entry* e = new_entry(s, page, pages);
     bytes_filled_.fetch_add(e->size, std::memory_order_relaxed);
     if (filled_bytes) *filled_bytes = e->size;
-    h.entry = e;  // even if refused admission, the caller gets the data
 
     {
         ScopedWriteLock lock(s.mu);
         // Duplicate-insert race: another thread filled the same page first —
-        // keep the incumbent, hand out ours as a transient duplicate.
+        // keep the incumbent, serve ourselves from the fallback (no private
+        // transient).
         auto it = s.map.find(page);
         if (it != s.map.end()) {
             Entry* winner = it->second;
             winner->refs.fetch_add(1, std::memory_order_acq_rel);
             s.sketch->increment(page);
-            e->retired.store(true, std::memory_order_release);
-            maybe_delete_locked(e);  // h hands the caller the incumbent
             h.entry = winner;
+            drop_filled(e);  // our buffer never becomes visible
             return winner->data;
         }
         s.sketch->increment(page);
 
-        // Too big to ever cache → transient (freed on unpin).
+        // Too big to ever cache → serve from the fallback.
         if (e->size > s.max_window_bytes + s.max_main_bytes) {
             rejections_.fetch_add(1, std::memory_order_relaxed);
-            e->refs.store(1, std::memory_order_relaxed);
-            e->retired.store(true, std::memory_order_release);
-            return e->data;
+            h.entry = nullptr;
+            drop_filled(e);
+            return fallback;
         }
 
         // The caller holds a pin from here on: refs must be 1 BEFORE the
         // entry becomes reachable (map/lists), or a concurrent insert could
         // evict (and free) it between insertion and return.
         e->refs.store(1, std::memory_order_relaxed);
-
+        h.entry = e;  // null handle = caller never unpins = permanent leak
         // Enter at window MRU, then run W-TinyLFU admission until the window
-        // is back under budget (the loop never evicts the just-inserted
-        // entry itself: `s.window.tail != e`).
+        // is back under budget. Candidate = window LRU, SKIPPING pinned
+        // entries (rejecting an in-use entry would strand its buffer as a
+        // transient until that query ends — the OOM mechanism). The loop
+        // also never picks the just-inserted entry itself (`cand != e`).
         e->status = LeafExtentCacheStatus::WINDOW;
         s.window.push_mru(e);
         s.bytes_window += e->size;
         s.map.emplace(page, e);
 
-        while (s.bytes_window > s.max_window_bytes && s.window.tail != e) {
+        while (s.bytes_window > s.max_window_bytes) {
             Entry* cand = s.window.tail;
+            while (cand != nullptr && cand != e &&
+                   cand->refs.load(std::memory_order_relaxed) > 0) {
+                cand = cand->prev;
+            }
+            if (cand == nullptr || cand == e) break;  // nothing movable
             List::unlink(cand, s.window);
             s.bytes_window -= cand->size;
 
@@ -377,9 +403,17 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
                 continue;
             }
             // Main full: TinyLFU — candidate vs probation LRU on frequency.
+            // STRICTLY greater (Caffeine semantics): on a tie the incumbent
+            // stays (4-bit counters make ties dominate on a cold/aged
+            // sketch; `>=` degenerated to FIFO churn). Victim = probation
+            // LRU, SKIPPING pinned entries; none unpinned → reject candidate.
             Entry* victim = s.probation.tail;
+            while (victim != nullptr &&
+                   victim->refs.load(std::memory_order_relaxed) > 0) {
+                victim = victim->prev;
+            }
             if (victim != nullptr &&
-                s.sketch->frequency(cand->page) >=
+                s.sketch->frequency(cand->page) >
                     s.sketch->frequency(victim->page)) {
                 List::unlink(victim, s.probation);
                 s.bytes_probation -= victim->size;
@@ -390,8 +424,9 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
                 s.probation.push_mru(cand);
                 s.bytes_probation += cand->size;
             } else {
-                // Rejected: cand leaves the cache (its data survives until
-                // unpin — the current caller holds a ref).
+                // Rejected (unpinned, and never this caller's `e` — the
+                // cand selection guarantees both): remove from the cache.
+                // It frees immediately on drop (refs==0); no transient.
                 s.map.erase(cand->page);
                 rejections_.fetch_add(1, std::memory_order_relaxed);
                 drop_entry(cand);

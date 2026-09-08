@@ -91,11 +91,20 @@ public:
 
     /// Pin the extent at `page` (`pages` consecutive 4KB pages). Returns a
     /// pointer to the extent copy and fills `h`. On miss the extent is pread
-    /// from fd_ (bytes = pages * kPageSize, plus the TreeLeafHeader etc. —
-    /// the copy is byte-identical to the on-disk extent). Optional
-    /// out-params report the outcome for per-window search accounting
-    /// (SearchStats::on_cache_op).
+    /// from fd_. Optional out-params report the outcome for per-window
+    /// search accounting (SearchStats::on_cache_op).
+    ///
+    /// `fallback`: pointer handed back INSTEAD of a private copy when the
+    /// cache refuses the extent (oversized, admission-rejected, or lost an
+    /// insert race) — the caller serves that access from its own mapping
+    /// and `h` stays null. Without this, every refused fill becomes a
+    /// private transient buffer alive until unpin, and at partial residency
+    /// under concurrency the transients sum to the batch working set ON TOP
+    /// of the cache budget (measured OOM: anon-rss 4.18GB with cache=2GB,
+    /// 8 x 230MB/query, 2026-09-08). Refused extents stream through the
+    /// kernel page cache — reclaimable file pages, not anon.
     const uint8_t* pin(PageId page, uint32_t pages, Handle& h,
+                       const uint8_t* fallback = nullptr,
                        bool* was_hit = nullptr,
                        uint64_t* filled_bytes = nullptr);
 
@@ -122,6 +131,10 @@ private:
     Entry* new_entry(Shard& s, PageId page, uint32_t pages);  // buf + pread
     static void maybe_delete(Entry* e);
     static void maybe_delete_locked(Entry* e);  // caller holds owner mu
+    /// Retire + free a fill that was never exposed to a caller (lost an
+    /// insert race / refused for size). Caller holds the shard lock; the
+    /// entry has refs==0.
+    static void drop_filled(Entry* e);
     static void drop_entry(Entry* e);           // retire + maybe deferred free
 
     uint64_t capacity_bytes_;
