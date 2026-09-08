@@ -4267,11 +4267,20 @@ void IVFTreeIndex::search_batch(
                     if (pread_sweep) {
                         // Direct pread: page-ordered sequential streams,
                         // no mmap faults, no page-cache pollution.
+                        // Read wall is accumulated for the effective-
+                        // bandwidth / uncoalesced-capacity metrics.
                         const size_t bytes =
                             static_cast<size_t>(ul.pages) * kPageSize;
-                        if (!pread_full(fd_, pread_buf.data(), bytes,
-                                        static_cast<uint64_t>(ul.page) *
-                                            kPageSize)) {
+                        const auto tr0 = std::chrono::steady_clock::now();
+                        const bool ok =
+                            pread_full(fd_, pread_buf.data(), bytes,
+                                       static_cast<uint64_t>(ul.page) *
+                                           kPageSize);
+                        batch_stats_.on_read(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - tr0)
+                                .count());
+                        if (!ok) {
                             continue;  // I/O error: leaf contributes
                                        // nothing (mmap would SIGBUS)
                         }

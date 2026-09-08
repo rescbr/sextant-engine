@@ -104,6 +104,37 @@ public:
             const float* query, uint32_t k,
             const std::vector<Predicate>* predicates = nullptr);
 
+    /// Submit with a per-request latency tolerance (deadline class).
+    /// `max_delay_us` is the QUEUEING delay the request accepts: the
+    /// scheduler must DISPATCH it within that long of submission.
+    /// Semantics:
+    ///   - It bounds queueing only — the sweep itself has a physics
+    ///     floor (~60 ms fanout-1 on NAND-backed indexes) no deadline
+    ///     can compress; end-to-end ≈ max_delay_us + sweep when the
+    ///     deadline is met. Values below the sweep floor are all
+    ///     effectively "Immediate".
+    ///   - Large values = "Batchable": the request coalesces into
+    ///     windows (~50x fewer bytes/query). Small values = "Immediate":
+    ///     it jumps the queue (deadline-sorted), dispatches on the next
+    ///     free slot, and carries its own uncoalesced reads. The knob is
+    ///     literally a per-request bytes price.
+    ///   - Deadline-driven dispatches split off only the DUE prefix —
+    ///     patient entries behind an urgent one keep coalescing.
+    ///   - 0 = the scheduler's window_max_us (default class).
+    ///   - Beyond the uncoalesced service capacity (urgent offered rate
+    ///     above the immediate-class request-rate ceiling — ~21 QPS
+    ///     aggregate on the reference box: ~214 MB/query, ~65 ms
+    ///     singleton sweeps, measured directly as
+    ///     `tree-search --batch-window 1` → uncoalesced_capacity_qps)
+    ///     deadlines become arbitration, not guarantees — enforce with
+    ///     admission control at the edge. Exposed as metrics:
+    ///     read_stream_gbps (per-stream bandwidth ingredient) and
+    ///     uncoalesced_capacity_qps (singleton-window measurement).
+    std::future<std::vector<Candidate>> submit(
+            const float* query, uint32_t k,
+            const std::vector<Predicate>* predicates,
+            uint64_t max_delay_us);
+
     /// Drain the queue, stop the sweeper, resolve pending futures.
     void stop();
 
@@ -115,8 +146,11 @@ private:
         std::vector<float> query;
         uint32_t k;
         std::vector<Predicate> predicates;  // empty = base config's
-        std::promise<std::vector<Candidate>> promise;
         std::chrono::steady_clock::time_point submitted;
+        std::chrono::steady_clock::time_point deadline;  // submitted +
+        // max_delay_us (default: window_max_us). The queue is kept
+        // deadline-sorted; the close rule takes the front's deadline.
+        std::promise<std::vector<Candidate>> promise;
     };
 
     void sweeper_loop_();

@@ -637,3 +637,58 @@ TEST(BatchSearchPredicates, PerQueryOverrideWithCacheHotSet) {
         expect_same_results(single, out[i], /*exact_order=*/false);
     }
 }
+
+TEST(BatchScheduler, PerRequestDeadlineUrgentJumpsAhead) {
+    // A patient request (large max_delay) waits to coalesce; an urgent
+    // one (small max_delay) dispatches on the next free slot WITHOUT
+    // dragging the patient entry out of the queue (due-prefix split).
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.idle_close_us = 50'000;        // patient window: idle 50 ms
+    cfg.window_max_us = 2'000'000;     // patient deadline: 2 s
+    cfg.search_threads = 1;
+    sextant::SearchConfig sc = base_config();
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+
+    const auto queries = fx.make_queries(2);
+    // Patient first (would hold the window open for 50 ms idle).
+    auto patient = sched.submit(queries.data(), 10, nullptr,
+                                2'000'000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto t0 = std::chrono::steady_clock::now();
+    auto urgent = sched.submit(queries.data() + fx.dim, 10, nullptr,
+                               1'000);  // 1 ms tolerance
+    auto r = urgent.get();
+    const auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+    EXPECT_EQ(r.size(), 10u);
+    // Urgent dispatched without waiting out the patient's 50 ms idle
+    // gap or 2 s deadline (sweep itself is fast on this fixture).
+    EXPECT_LT(dt.count(), 300);
+    // Patient still pending at urgent completion — it kept coalescing.
+    EXPECT_EQ(patient.wait_for(std::chrono::seconds(0)),
+              std::future_status::timeout);
+    EXPECT_EQ(patient.get().size(), 10u);
+}
+
+TEST(BatchScheduler, BatchClassDefaultMatchesWindow) {
+    // max_delay_us = 0 (default) uses window_max_us — behavior identical
+    // to the classic scheduler (existing tests cover it; this pins the
+    // default-class deadline against regression).
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.idle_close_us = 500;
+    cfg.window_max_us = 50'000;
+    cfg.search_threads = 1;
+    sextant::SearchConfig sc = base_config();
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+    const auto queries = fx.make_queries(1);
+    auto f = sched.submit(queries.data(), 10);
+    const auto t0 = std::chrono::steady_clock::now();
+    (void)f.get();
+    const auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+    EXPECT_LT(dt.count(), 500);  // window_max bound honored loosely
+}

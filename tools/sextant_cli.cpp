@@ -1288,10 +1288,25 @@ int cmd_tree_search(int argc, char* argv[]) {
                                  : 0.0);
     }
     std::cerr << "\n";
+    double read_stream_gbps = 0, uncoalesced_capacity_qps = 0;
     if (bst.batches > 0) {
         const double fanout = bst.leaves_unique > 0
             ? static_cast<double>(bst.leaf_scans) / bst.leaves_unique
             : 0.0;
+        // read_stream_gbps = bytes / summed per-leaf pread wall = mean
+        // PER-STREAM sequential bandwidth. uncoalesced_capacity_qps (the
+        // immediate-class request-rate ceiling) is only derivable from
+        // singleton windows: 1/mean-lonely-sweep-wall; multi-query
+        // windows report 0 (measure via scripts/sched_transition rate-1).
+        read_stream_gbps =
+            bst.read_ns > 0
+                ? static_cast<double>(bst.bytes_unique) /
+                      static_cast<double>(bst.read_ns)
+                : 0.0;
+        uncoalesced_capacity_qps =
+            (bst.batches > 0 && bst.queries == bst.batches && secs > 0
+                 ? static_cast<double>(st.queries) / secs
+                 : 0.0);
         std::cerr << "batch: windows=" << bst.batches
                   << " leaves_unique=" << bst.leaves_unique
                   << " fanout=" << fanout
@@ -1302,7 +1317,10 @@ int cmd_tree_search(int argc, char* argv[]) {
                   << (bst.bytes_unique > 0
                           ? double(st.bytes_touched) / bst.bytes_unique
                           : 0.0)
-                  << "x\n";
+                  << "x"
+                  << " read_stream=" << read_stream_gbps << "GB/s"
+                  << " uncoalesced_capacity=" << uncoalesced_capacity_qps
+                  << "QPS\n";
     }
     {
         const std::string mf = p.get<std::string>("metrics-file");
@@ -1326,6 +1344,8 @@ int cmd_tree_search(int argc, char* argv[]) {
             w.leaves_unique = bst.leaves_unique;
             w.leaf_scans = bst.leaf_scans;
             w.bytes_unique = bst.bytes_unique;
+            w.read_stream_gbps = read_stream_gbps;
+            w.uncoalesced_capacity_qps = uncoalesced_capacity_qps;
             w.timestamp = std::chrono::duration<double>(
                 t0.time_since_epoch()).count();
             sink.emit(w);

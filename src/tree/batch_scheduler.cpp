@@ -44,12 +44,15 @@ BatchScheduler::~BatchScheduler() { stop(); }
 
 std::future<std::vector<Candidate>> BatchScheduler::submit(
         const float* query, uint32_t k,
-        const std::vector<Predicate>* predicates) {
+        const std::vector<Predicate>* predicates, uint64_t max_delay_us) {
     Entry e;
     e.query.assign(query, query + index_->dim());
     e.k = k;
     if (predicates) e.predicates = *predicates;
     e.submitted = std::chrono::steady_clock::now();
+    const uint64_t delay_ns =
+        (max_delay_us > 0 ? max_delay_us * 1000ull : window_max_ns_);
+    e.deadline = e.submitted + std::chrono::nanoseconds(delay_ns);
     auto fut = e.promise.get_future();
 
     // Exact-repeat fast path: resolve from the result cache without
@@ -74,10 +77,20 @@ std::future<std::vector<Candidate>> BatchScheduler::submit(
 
     {
         std::lock_guard<std::mutex> lk(mu_);
-        queue_.push_back(std::move(e));
+        // Deadline-sorted insert (stable: equal deadlines keep arrival
+        // order) — urgent requests jump ahead of patient ones.
+        auto it = queue_.begin();
+        while (it != queue_.end() && it->deadline <= e.deadline) ++it;
+        queue_.insert(it, std::move(e));
     }
     cv_.notify_one();
     return fut;
+}
+
+std::future<std::vector<Candidate>> BatchScheduler::submit(
+        const float* query, uint32_t k,
+        const std::vector<Predicate>* predicates) {
+    return submit(query, k, predicates, 0);
 }
 
 void BatchScheduler::stop() {
@@ -125,30 +138,25 @@ void BatchScheduler::sweeper_loop_() {
             });
             continue;  // re-evaluate with the accumulated queue
         }
-        // Close decision, classic rules: stop / size cap / oldest-entry
-        // deadline / idle gap, whichever first. Every submit and every
-        // dispatch completion notifies, so waits re-evaluate. With
-        // max_inflight_ >= 2 this yields pipelined dispatch: a query
-        // arriving while a sweep is in flight AND a slot is free closes
-        // after the (short) idle gap and sweeps CONCURRENTLY — it
-        // overlaps the in-flight sweep instead of waiting out the next
-        // window (piggybacking via pipelining; shared-leaf reads dedup
-        // in the ARC/page cache).
+        // Close decision, classic rules with a per-request deadline:
+        // the queue is deadline-sorted, so the FRONT's deadline is the
+        // binding one — close when it is due (urgent requests dispatch
+        // on the next free slot), or on stop / size cap / idle gap.
+        // Every submit and every dispatch completion notifies.
         bool close = stopped_ || queue_.size() >= max_window_queries_;
         if (!close) {
             const auto now = std::chrono::steady_clock::now();
-            const auto deadline =
-                queue_.front().submitted +
-                std::chrono::nanoseconds(window_max_ns_);
-            if (now >= deadline) {
+            if (now >= queue_.front().deadline) {
                 close = true;
             } else if (config_.idle_close_us > 0) {
-                if (cv_.wait_until(lk, std::min(deadline, now + idle)) ==
+                if (cv_.wait_until(lk,
+                                   std::min(queue_.front().deadline,
+                                            now + idle)) ==
                     std::cv_status::no_timeout)
                     continue;  // re-evaluate (arrival / completion)
-                close = true;
+                close = true;  // idle gap (or deadline) elapsed
             } else {
-                if (cv_.wait_until(lk, deadline) ==
+                if (cv_.wait_until(lk, queue_.front().deadline) ==
                     std::cv_status::no_timeout)
                     continue;
                 close = true;
@@ -156,7 +164,20 @@ void BatchScheduler::sweeper_loop_() {
         }
         (void)close;  // reaching here means close
         std::deque<Entry> window;
-        window.swap(queue_);
+        if (std::chrono::steady_clock::now() >= queue_.front().deadline) {
+            // Deadline-driven close: split off ONLY the due prefix —
+            // patient entries behind the urgent one keep coalescing
+            // (their bytes stay cheap). Stop/size/idle closes take the
+            // whole queue (classic windowing).
+            while (!queue_.empty() &&
+                   std::chrono::steady_clock::now() >=
+                       queue_.front().deadline) {
+                window.push_back(std::move(queue_.front()));
+                queue_.pop_front();
+            }
+        } else {
+            window.swap(queue_);
+        }
         ++inflight_;
         stats_.peak_inflight =
             std::max(stats_.peak_inflight, inflight_);

@@ -65,6 +65,16 @@ struct PhaseMetrics {
     uint64_t leaves_unique = 0;       ///< search.window.leaves_unique
     uint64_t leaf_scans = 0;          ///< search.window.leaf_scans
     uint64_t bytes_unique = 0;        ///< search.window.bytes_unique
+    /// DERIVED (documented, emitted for convenience — not raw):
+    /// read_stream_gbps = bytes_unique / summed per-leaf pread wall =
+    /// mean PER-STREAM sequential bandwidth (hardware character; the
+    /// box aggregate is ~streams x this — 8 streams measured ~10 GB/s).
+    /// uncoalesced_capacity_qps is the immediate-class request-rate
+    /// ceiling: only meaningful from singleton-window measurements
+    /// (1/lonely-sweep-wall — scripts/sched_transition rate-1 rows);
+    /// 0 when not derivable from the current window.
+    double read_stream_gbps = 0;            ///< search.window.read_stream_gbps
+    double uncoalesced_capacity_qps = 0;    ///< search.window.uncoalesced_capacity_qps
     /// Monotonic seconds at emit time (steady_clock-based epoch), for
     /// time-series alignment when records from multiple processes are merged.
     double timestamp = 0;
@@ -227,6 +237,8 @@ inline std::string to_json(const PhaseMetrics& m) {
                   "\"routing_seconds\":%.17g,\"node_bytes_read\":%llu,"
                   "\"batches\":%llu,\"leaves_unique\":%llu,"
                   "\"leaf_scans\":%llu,\"bytes_unique\":%llu,"
+                  "\"read_stream_gbps\":%.17g,"
+                  "\"uncoalesced_capacity_qps\":%.17g,"
                   "\"timestamp\":%.17g}",
                   m.wall_seconds, m.cpu_seconds, m.source_wait_seconds,
                   static_cast<unsigned long long>(m.wait_count),
@@ -241,6 +253,8 @@ inline std::string to_json(const PhaseMetrics& m) {
                   static_cast<unsigned long long>(m.leaves_unique),
                   static_cast<unsigned long long>(m.leaf_scans),
                   static_cast<unsigned long long>(m.bytes_unique),
+                  m.read_stream_gbps,
+                  m.uncoalesced_capacity_qps,
                   m.timestamp);
     out += buf;
     return out;

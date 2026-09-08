@@ -375,6 +375,7 @@ struct BatchStats {
         uint64_t leaves_unique = 0;    ///< unique leaves swept (page-deduped)
         uint64_t leaf_scans = 0;       ///< (leaf, query) scans executed
         uint64_t bytes_unique = 0;     ///< unique-leaf bytes read (the floor)
+        uint64_t read_ns = 0;          ///< wall spent inside leaf preads
         uint64_t fallback_queries = 0; ///< queries served by per-query paths
         double wall_seconds = 0;
     };
@@ -392,6 +393,13 @@ struct BatchStats {
                            std::memory_order_relaxed);
     }
 
+    /// Accumulate actual leaf-read wall (sweep workers, pread backend).
+    /// bytes_unique/read_ns is the true effective read bandwidth —
+    /// batch wall would underestimate it under compute-bound windows.
+    void on_read(uint64_t read_ns) const {
+        read_ns_.fetch_add(read_ns, std::memory_order_relaxed);
+    }
+
     Snapshot snapshot_and_reset() const {
         Snapshot s;
         s.batches = batches_.exchange(0, std::memory_order_relaxed);
@@ -399,6 +407,7 @@ struct BatchStats {
         s.leaves_unique = leaves_unique_.exchange(0, std::memory_order_relaxed);
         s.leaf_scans = leaf_scans_.exchange(0, std::memory_order_relaxed);
         s.bytes_unique = bytes_unique_.exchange(0, std::memory_order_relaxed);
+        s.read_ns = read_ns_.exchange(0, std::memory_order_relaxed);
         s.fallback_queries =
             fallback_queries_.exchange(0, std::memory_order_relaxed);
         s.wall_seconds = static_cast<double>(
@@ -412,6 +421,7 @@ private:
     mutable std::atomic<uint64_t> leaves_unique_{0};
     mutable std::atomic<uint64_t> leaf_scans_{0};
     mutable std::atomic<uint64_t> bytes_unique_{0};
+    mutable std::atomic<uint64_t> read_ns_{0};
     mutable std::atomic<uint64_t> fallback_queries_{0};
     mutable std::atomic<uint64_t> wall_ns_{0};
 };
