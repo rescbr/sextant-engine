@@ -56,6 +56,8 @@ struct PhaseMetrics {
     uint64_t cache_hits = 0;          ///< search.window.cache_hits
     uint64_t cache_misses = 0;        ///< search.window.cache_misses
     uint64_t cache_bytes_filled = 0;  ///< search.window.cache_bytes_filled
+    double routing_seconds = 0;      ///< search.window.routing_seconds
+    uint64_t node_bytes_read = 0;     ///< search.window.node_bytes_read
     /// Monotonic seconds at emit time (steady_clock-based epoch), for
     /// time-series alignment when records from multiple processes are merged.
     double timestamp = 0;
@@ -215,6 +217,7 @@ inline std::string to_json(const PhaseMetrics& m) {
                   "\"bytes_read\":%llu,\"rss_bytes\":%llu,"
                   "\"cache_hits\":%llu,\"cache_misses\":%llu,"
                   "\"cache_bytes_filled\":%llu,"
+                  "\"routing_seconds\":%.17g,\"node_bytes_read\":%llu,"
                   "\"timestamp\":%.17g}",
                   m.wall_seconds, m.cpu_seconds, m.source_wait_seconds,
                   static_cast<unsigned long long>(m.wait_count),
@@ -223,6 +226,8 @@ inline std::string to_json(const PhaseMetrics& m) {
                   static_cast<unsigned long long>(m.cache_hits),
                   static_cast<unsigned long long>(m.cache_misses),
                   static_cast<unsigned long long>(m.cache_bytes_filled),
+                  m.routing_seconds,
+                  static_cast<unsigned long long>(m.node_bytes_read),
                   m.timestamp);
     out += buf;
     return out;

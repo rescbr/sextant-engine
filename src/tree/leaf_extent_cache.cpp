@@ -184,9 +184,11 @@ void LeafExtentCache::List::move_to_mru(Entry* e, List& l) {
 // --- Construction ------------------------------------------------------------
 
 LeafExtentCache::LeafExtentCache(uint64_t capacity_bytes, uint32_t num_shards,
-                                 int fd)
+                                 int fd, uint32_t window_pct)
     : capacity_bytes_(capacity_bytes), fd_(fd) {
     if (num_shards == 0) num_shards = 1;
+    if (window_pct == 0) window_pct = 1;
+    if (window_pct > 90) window_pct = 90;
     shards_.reserve(num_shards);
     sketches_ = std::make_unique<FrequencySketch[]>(num_shards);
     for (uint32_t i = 0; i < num_shards; ++i) {
@@ -195,7 +197,7 @@ LeafExtentCache::LeafExtentCache(uint64_t capacity_bytes, uint32_t num_shards,
         // protected/probation, per shard.
         const uint64_t cap = capacity_bytes / num_shards;
         s->capacity_bytes = cap;
-        s->max_window_bytes = cap / 100;
+        s->max_window_bytes = cap * window_pct / 100;
         s->max_main_bytes = cap - s->max_window_bytes;
         s->max_protected_bytes = s->max_main_bytes * 80 / 100;
         s->max_probation_bytes = s->max_main_bytes - s->max_protected_bytes;

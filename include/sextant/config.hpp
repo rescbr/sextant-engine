@@ -303,17 +303,24 @@ struct SearchStats {
         uint64_t cache_hits = 0;      ///< LeafExtentCache hits (0 when off)
         uint64_t cache_misses = 0;    ///< LeafExtentCache misses
         uint64_t cache_bytes_filled = 0;  ///< disk bytes pread into the cache
+        uint64_t routing_ns = 0;         ///< per-query descent wall, summed
+        uint64_t node_bytes_read = 0;     ///< internal-node extents touched
         double wall_seconds = 0;
     };
 
     void on_query(double wall_s, uint64_t leaves, uint64_t bytes,
-                  uint64_t reranked) const {
+                  uint64_t reranked, uint64_t routing_ns = 0,
+                  uint64_t node_bytes = 0) const {
         queries_.fetch_add(1, std::memory_order_relaxed);
         wall_ns_.fetch_add(static_cast<uint64_t>(wall_s * 1e9),
                            std::memory_order_relaxed);
         leaves_probed_.fetch_add(leaves, std::memory_order_relaxed);
         bytes_touched_.fetch_add(bytes, std::memory_order_relaxed);
         rerank_count_.fetch_add(reranked, std::memory_order_relaxed);
+        if (routing_ns)
+            routing_ns_.fetch_add(routing_ns, std::memory_order_relaxed);
+        if (node_bytes)
+            node_bytes_.fetch_add(node_bytes, std::memory_order_relaxed);
     }
 
     /// Record one LeafExtentCache pin outcome (search path). Zero-cost when
@@ -337,6 +344,9 @@ struct SearchStats {
             cache_bytes_filled_.exchange(0, std::memory_order_relaxed);
         s.wall_seconds = static_cast<double>(
             wall_ns_.exchange(0, std::memory_order_relaxed)) / 1e9;
+        s.routing_ns = routing_ns_.exchange(0, std::memory_order_relaxed);
+        s.node_bytes_read =
+            node_bytes_.exchange(0, std::memory_order_relaxed);
         return s;
     }
 
@@ -349,6 +359,8 @@ private:
     mutable std::atomic<uint64_t> cache_hits_{0};
     mutable std::atomic<uint64_t> cache_misses_{0};
     mutable std::atomic<uint64_t> cache_bytes_filled_{0};
+    mutable std::atomic<uint64_t> routing_ns_{0};
+    mutable std::atomic<uint64_t> node_bytes_{0};
 };
 
 /// Search configuration.

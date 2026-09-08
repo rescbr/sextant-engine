@@ -74,7 +74,11 @@ public:
 
     /// `capacity_bytes` is the total DRAM budget for extent copies across all
     /// shards. `fd` is the (open) index file to pread misses from.
-    LeafExtentCache(uint64_t capacity_bytes, uint32_t num_shards, int fd);
+    /// `window_pct` = W-TinyLFU window as a percentage of shard capacity
+    /// (Caffeine default 1). Larger windows favor recency over frequency —
+    /// the sweep knob for scan-heavy vs skewed query streams.
+    LeafExtentCache(uint64_t capacity_bytes, uint32_t num_shards, int fd,
+                    uint32_t window_pct = 1);
     ~LeafExtentCache();
 
     LeafExtentCache(const LeafExtentCache&) = delete;

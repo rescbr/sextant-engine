@@ -99,7 +99,8 @@ void IVFTreeIndex::close() {
 // ===========================================================================
 
 std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
-                                              uint64_t leaf_cache_bytes) {
+                                              uint64_t leaf_cache_bytes,
+                                              uint32_t cache_window_pct) {
     auto idx = std::unique_ptr<IVFTreeIndex>(new IVFTreeIndex());
     idx->path_ = path;
     idx->file_ = PageFile(path);
@@ -245,7 +246,8 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
     if (leaf_cache_bytes > 0) {
         constexpr uint32_t kLeafCacheShards = 16;
         idx->leaf_cache_ = std::make_unique<LeafExtentCache>(
-            leaf_cache_bytes, kLeafCacheShards, idx->file_.fd());
+            leaf_cache_bytes, kLeafCacheShards, idx->file_.fd(),
+            cache_window_pct);
         idx->leaf_cache_->set_expected_entries(idx->manifest_.n_leaves);
         spdlog::info("[sextant] IVFTreeIndex: leaf cache {} bytes ({} shards)",
                      leaf_cache_bytes, kLeafCacheShards);
@@ -2462,14 +2464,26 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         IVFTreeIndex const* idx;
         std::chrono::steady_clock::time_point t0;
         uint64_t leaves = 0, bytes = 0, reranked = 0;
+        // Routing observability: descent wall (query start → candidate set
+        // final) and internal-node bytes touched during the descent.
+        uint64_t routing_ns = 0, node_bytes = 0;
+        std::chrono::steady_clock::time_point t_route_end{};
+        bool route_done = false;
         // Set once the search scratch is acquired; released on every exit.
         std::vector<LeafExtentCache::Handle>* pins = nullptr;
         ~QueryGuard() {
             if (pins) idx->release_leaf_pins_(*pins);
+            const uint64_t r_ns =
+                route_done
+                    ? static_cast<uint64_t>(
+                          std::chrono::duration<double>(t_route_end - t0)
+                              .count() *
+                          1e9)
+                    : 0;
             idx->search_stats_.on_query(
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t0).count(),
-                leaves, bytes, reranked);
+                leaves, bytes, reranked, r_ns, node_bytes);
         }
     } qguard{this, std::chrono::steady_clock::now()};
 
@@ -2602,6 +2616,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const uint8_t* node_ptr = mmap_base_ +
             static_cast<uint64_t>(e.page) * kPageSize;
         const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
+        qguard.node_bytes += static_cast<uint64_t>(e.pages) * kPageSize;
         const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
 
         auto& child_dists = scratch.child_dists;
@@ -2911,6 +2926,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         }
     }
 
+    // Routing observability: descent is done (candidates final, pre-scan).
+    qguard.t_route_end = std::chrono::steady_clock::now();
+    qguard.route_done = true;
+
     // Routing diagnostics: report the physical first-page of every leaf that
     // will be scanned (post predicate pruning). The harness maps these back
     // to leaf contents via debug_leaf_info()/debug_leaf_row_ids().
@@ -3016,6 +3035,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             }
             const uint32_t slot1 =
                 static_cast<uint32_t>(fb_candidates.size());
+            if (!qguard.route_done) {
+                qguard.t_route_end = std::chrono::steady_clock::now();
+                qguard.route_done = true;
+            }
             // Prefetch this block's extents before scanning it (cold-
             // storage semantics: one fadvise per subtree, like the batch
             // path does for its whole selection).

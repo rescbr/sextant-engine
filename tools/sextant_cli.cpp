@@ -772,6 +772,8 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("cache-mb", 0,
         "Engine-owned leaf cache in MiB (0=off: mmap path). Warm results "
         "with a cache must be labeled with this size (BENCHMARK_RULES)", false, 0);
+    p.add<uint32_t>("cache-window-pct", 0,
+        "LeafCache W-TinyLFU window as % of capacity (default 1, Caffeine)", false, 1);
     p.add<uint32_t>("passes", 0,
         "Run the query set N times. N>=2 discards the first pass as warmup "
         "and times the rest (BENCHMARK_RULES warm measurement; combine with "
@@ -821,7 +823,8 @@ int cmd_tree_search(int argc, char* argv[]) {
     const bool with_payload = p.exist("with-payload");
 
     auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"),
-        static_cast<uint64_t>(p.get<uint32_t>("cache-mb")) * 1024 * 1024);
+        static_cast<uint64_t>(p.get<uint32_t>("cache-mb")) * 1024 * 1024,
+        p.get<uint32_t>("cache-window-pct"));
 
     // Read query file (.fbin or .parquet).
     const std::string query_path = p.get<std::string>("query");
@@ -1240,7 +1243,16 @@ int cmd_tree_search(int argc, char* argv[]) {
                       << (st.queries ? double(st.cache_bytes_filled) / st.queries : 0.0);
         }
     }
-    std::cerr << " cpu=" << cpu_win << "s util=" << (100.0 * util) << "%\n";
+    std::cerr << " cpu=" << cpu_win << "s util=" << (100.0 * util) << "%";
+    if (st.wall_seconds > 0) {
+        const double rshare = static_cast<double>(st.routing_ns) / 1e9 /
+                              st.wall_seconds;
+        std::cerr << " routing=" << (100.0 * rshare) << "%"
+                  << " node_bytes/query="
+                  << (st.queries ? double(st.node_bytes_read) / st.queries
+                                 : 0.0);
+    }
+    std::cerr << "\n";
     {
         const std::string mf = p.get<std::string>("metrics-file");
         if (!mf.empty()) {
@@ -1256,6 +1268,9 @@ int cmd_tree_search(int argc, char* argv[]) {
             w.cache_hits = st.cache_hits;
             w.cache_misses = st.cache_misses;
             w.cache_bytes_filled = st.cache_bytes_filled;
+            w.routing_seconds =
+                static_cast<double>(st.routing_ns) / 1e9;
+            w.node_bytes_read = st.node_bytes_read;
             w.timestamp = std::chrono::duration<double>(
                 t0.time_since_epoch()).count();
             sink.emit(w);
