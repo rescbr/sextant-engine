@@ -181,13 +181,17 @@ No application-level cache — same as today's scan path.
 beam_search hops). The scan path doesn't use it and doesn't need it —
 sequential streaming and OS page cache are the right tools.
 
-**Phase 2 (if query skew is high): leaf-level W-TinyLFU cache — separate
-phase for isolated testing.** In production, popular queries hit the same
-leaves repeatedly. An application-level leaf cache with admission control
-(reuse the existing `BlockCache` infrastructure, keyed by leaf extent)
-prevents cold one-off scans from evicting hot leaves from the page cache.
-The existing `CacheController` (adaptive hill-climber) extends to manage a
-third segment: graph blocks + code blocks + tree leaves.
+**Phase 2: leaf-level W-TinyLFU cache — SHIPPED 2026-09-07
+(`src/tree/leaf_extent_cache.{hpp,cpp}`, `tree-search --cache-mb`,
+`IVFTreeIndex::open(path, cache_bytes)`).** Keyed by leaf start page,
+variable-size whole-extent entries, per-shard FrequencySketch admission
+(reused from the graph path's BlockCache), byte-budget capacity, per-entry
+refcount + deferred free (no locks held during scans), recycled buffer pool
+(glibc mmap-churn fix), wholesale invalidation on remap_(). Evidence and
+sizing contract: `results/leaf_cache/cohere10m_20260907.md` — full-residency
+cache: 8.5× cold QPS (255 vs 30) and warm parity vs mmap; undersized caches
+are strictly harmful (size ≥ hot working set or leave off). CacheController
+was NOT extended — a single tree cache segment, no rebalancing.
 
 Deliberately a separate phase so the tree's routing and I/O can be
 validated independently before adding a caching layer.

@@ -769,6 +769,13 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
     p.add<uint32_t>("search-threads", 0,
         "Within-query leaf-parallel scan threads (0=serial; orthorgonal to --threads)", false, 0);
+    p.add<uint32_t>("cache-mb", 0,
+        "Engine-owned leaf cache in MiB (0=off: mmap path). Warm results "
+        "with a cache must be labeled with this size (BENCHMARK_RULES)", false, 0);
+    p.add<uint32_t>("passes", 0,
+        "Run the query set N times. N>=2 discards the first pass as warmup "
+        "and times the rest (BENCHMARK_RULES warm measurement; combine with "
+        "--cache-mb and report the cache size with the result)", false, 1);
     p.add<std::string>("metrics-file", 0,
         "Append search window metrics as one JSON line (search.* field names)", false, "");
     p.add<std::string>("output", 0, "Output file (default stdout)", false, "");
@@ -813,7 +820,8 @@ int cmd_tree_search(int argc, char* argv[]) {
 
     const bool with_payload = p.exist("with-payload");
 
-    auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"));
+    auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"),
+        static_cast<uint64_t>(p.get<uint32_t>("cache-mb")) * 1024 * 1024);
 
     // Read query file (.fbin or .parquet).
     const std::string query_path = p.get<std::string>("query");
@@ -1105,6 +1113,51 @@ int cmd_tree_search(int argc, char* argv[]) {
     std::vector<std::vector<PayloadLoc>> all_payload_locs;
     if (with_payload) all_payload_locs.resize(qcount);
 
+    const uint32_t passes = std::max(1u, p.get<uint32_t>("passes"));
+    auto run_pass = [&]() {
+        if (num_threads <= 1) {
+            for (uint32_t qi = 0; qi < qcount; ++qi) {
+                if (with_payload) {
+                    all_results[qi] = idx->search(
+                        &queries[static_cast<size_t>(qi) * qdim], k, scfg,
+                        &all_payload_locs[qi]);
+                } else {
+                    all_results[qi] = idx->search(
+                        &queries[static_cast<size_t>(qi) * qdim], k, scfg);
+                }
+            }
+        } else {
+            // Query-level parallelism: each query is independent.
+            std::vector<std::future<void>> futs;
+            std::atomic<uint32_t> next_qi{0};
+            for (uint32_t t = 0; t < num_threads; ++t) {
+                futs.push_back(std::async(std::launch::async, [&]() {
+                    while (true) {
+                        const uint32_t qi = next_qi.fetch_add(1);
+                        if (qi >= qcount) break;
+                        if (with_payload) {
+                            all_results[qi] = idx->search(
+                                &queries[static_cast<size_t>(qi) * qdim], k,
+                                scfg, &all_payload_locs[qi]);
+                        } else {
+                            all_results[qi] = idx->search(
+                                &queries[static_cast<size_t>(qi) * qdim], k,
+                                scfg);
+                        }
+                    }
+                }));
+            }
+            for (auto& f : futs) f.get();
+        }
+    };
+
+    // Discarded warmup pass (BENCHMARK_RULES): with --passes>=2 the first
+    // pass fills the engine caches and is not timed.
+    if (passes > 1) {
+        run_pass();
+        (void)idx->search_stats().snapshot_and_reset();
+    }
+
     const auto t0 = std::chrono::steady_clock::now();
     struct rusage ru0{};
     getrusage(RUSAGE_SELF, &ru0);
@@ -1113,39 +1166,8 @@ int cmd_tree_search(int argc, char* argv[]) {
                       static_cast<double>(ru0.ru_stime.tv_sec) +
                       1e-6 * static_cast<double>(ru0.ru_stime.tv_usec);
 
-    if (num_threads <= 1) {
-        for (uint32_t qi = 0; qi < qcount; ++qi) {
-            if (with_payload) {
-                all_results[qi] = idx->search(
-                    &queries[static_cast<size_t>(qi) * qdim], k, scfg,
-                    &all_payload_locs[qi]);
-            } else {
-                all_results[qi] = idx->search(
-                    &queries[static_cast<size_t>(qi) * qdim], k, scfg);
-            }
-        }
-    } else {
-        // Query-level parallelism: each query is independent.
-        std::vector<std::future<void>> futs;
-        std::atomic<uint32_t> next_qi{0};
-        for (uint32_t t = 0; t < num_threads; ++t) {
-            futs.push_back(std::async(std::launch::async, [&]() {
-                while (true) {
-                    const uint32_t qi = next_qi.fetch_add(1);
-                    if (qi >= qcount) break;
-                    if (with_payload) {
-                        all_results[qi] = idx->search(
-                            &queries[static_cast<size_t>(qi) * qdim], k, scfg,
-                            &all_payload_locs[qi]);
-                    } else {
-                        all_results[qi] = idx->search(
-                            &queries[static_cast<size_t>(qi) * qdim], k, scfg);
-                    }
-                }
-            }));
-        }
-        for (auto& f : futs) f.get();
-    }
+    for (uint32_t pass = 0; pass < (passes > 1 ? passes - 1 : passes); ++pass)
+        run_pass();
 
     // Tally recall + emit results (serial — I/O bound).
     // Recall metric: fraction of search top-k results that appear in the
@@ -1204,8 +1226,21 @@ int cmd_tree_search(int argc, char* argv[]) {
     std::cerr << "metrics: queries=" << st.queries
               << " leaves/query=" << (st.queries ? double(st.leaves_probed) / st.queries : 0.0)
               << " bytes/query=" << (st.queries ? double(st.bytes_touched) / st.queries : 0.0)
-              << " shortlist/query=" << (st.queries ? double(st.rerank_count) / st.queries : 0.0)
-              << " cpu=" << cpu_win << "s util=" << (100.0 * util) << "%\n";
+              << " shortlist/query=" << (st.queries ? double(st.rerank_count) / st.queries : 0.0);
+    {
+        const uint64_t cache_ops = st.cache_hits + st.cache_misses;
+        if (cache_ops > 0) {
+            const uint64_t cache_mb = p.get<uint32_t>("cache-mb");
+            const double hit_rate =
+                static_cast<double>(st.cache_hits) /
+                static_cast<double>(cache_ops);
+            std::cerr << " LeafCache=" << cache_mb << "MB"
+                      << " hit=" << (100.0 * hit_rate) << "%"
+                      << " disk_bytes/query="
+                      << (st.queries ? double(st.cache_bytes_filled) / st.queries : 0.0);
+        }
+    }
+    std::cerr << " cpu=" << cpu_win << "s util=" << (100.0 * util) << "%\n";
     {
         const std::string mf = p.get<std::string>("metrics-file");
         if (!mf.empty()) {
@@ -1218,6 +1253,9 @@ int cmd_tree_search(int argc, char* argv[]) {
             // bytes_touched is the window's leaf traffic; wait counters n/a.
             w.bytes_read = st.bytes_touched;
             w.wait_count = st.queries;
+            w.cache_hits = st.cache_hits;
+            w.cache_misses = st.cache_misses;
+            w.cache_bytes_filled = st.cache_bytes_filled;
             w.timestamp = std::chrono::duration<double>(
                 t0.time_since_epoch()).count();
             sink.emit(w);

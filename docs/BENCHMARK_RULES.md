@@ -25,14 +25,28 @@ the blog: we bench the hard problem, not the cache.)
   `atime=off`).
 - `primarycache=metadata` — the ARC may cache metadata but **not data**.
   This is deliberate: it makes cold reads structural, not a matter of
-  discipline. It also means `mmap` faults do not persist (no page cache to
-  lean on), so cold behavior cannot sneak back in.
+  discipline.
+- **CAVEAT (measured 2026-09-07, see results/leaf_cache/):** on this box
+  `primarycache=metadata` does NOT keep data out of RAM — it pushes it out
+  of the 2 GB ARC into the *unbounded* Linux page cache. Repeated mmap
+  passes retain the whole index (`Cached` grows by the file size; a 4.6 GB
+  index warmed to 162 QPS "for free"). The old "mmap faults do not persist"
+  claim was wrong in this direction and has been removed. Consequences:
+  - **Cold numbers require an explicit `echo 3 > /proc/sys/vm/drop_caches`**
+    (+ `zpool sync pastry`) before the measured pass, every time.
+  - Cold mmap *scan* passes still pay per-fault disk reads (230 GB of 4 KB
+    faults on a 1000-query f=0.05 pass = 33 s); the page cache only warms
+    via the readahead/fadvise path. Both behaviors are reproducible.
+  - The tree-path engine cache (`--cache-mb`, LeafExtentCache) keeps the
+    page cache out of the measurement entirely (composability), which is
+    part of why it is the reportable warm layer.
 - ARC cap 2 GB (metadata-sized on purpose). Do not raise it to fit data.
 - No `vmtouch`, no `cat file > /dev/null` pre-warm, no "run it twice and
   take the second number" for anything reported as cold-search/build.
 - Repeated-query *search* runs are fine (a server legitimately serves many
-  queries); the engine's own `BlockCache` (userspace, explicitly DRAM-
-  budgeted) is the only data cache in play — that is the real-world layer
+  queries); the engine's own caches (userspace, explicitly DRAM-budgeted:
+  graph `BlockCache`, tree `LeafExtentCache` via `tree-search --cache-mb`)
+  are the only data caches in play — that is the real-world layer
   and it is part of the measured system.
 
 ## Categories we report

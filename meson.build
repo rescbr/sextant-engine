@@ -269,6 +269,7 @@ engine_sources = [
     'src/tree/superblock.cpp',
     'src/tree/tree_manifest.cpp',
     'src/tree/ivf_tree_index.cpp',
+    'src/tree/leaf_extent_cache.cpp',
     'src/tree/coders/coder_factory.cpp',
     'src/tree/coders/global_pq_coder.cpp',
     'src/tree/coders/local_pq_coder.cpp',

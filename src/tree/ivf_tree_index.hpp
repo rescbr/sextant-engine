@@ -22,6 +22,7 @@
 #include "tree/tree_manifest.hpp"
 #include "tree/tree_nodes.hpp"
 #include "tree/leaf_coder.hpp"
+#include "tree/leaf_extent_cache.hpp"
 #include "tree/cardinality.hpp"  // CardinalityTable (Phase D selectivity estimation)
 #include <sextant/column_data.hpp>
 #include "sextant/config.hpp"
@@ -113,8 +114,9 @@ public:
     // --- Search observability ---
 
     /// Aggregated search counters (queries, leaves probed, bytes touched,
-    /// rerank count, BlockCache stubs). Window semantics: accumulate across
-    /// searches, take deltas via search_stats().snapshot_and_reset().
+    /// rerank count, LeafExtentCache hits/misses). Window semantics:
+    /// accumulate across searches, take deltas via search_stats().
+    /// snapshot_and_reset().
     const SearchStats& search_stats() const { return search_stats_; }
 
     /// PCA-preconditioned streaming build: project vectors onto top-k PCs
@@ -128,7 +130,16 @@ public:
                                              const BuildConfig& cfg);
 
     /// Open an existing tree index for searching. Mmaps the file.
-    static std::unique_ptr<IVFTreeIndex> open(const std::string& path);
+    ///
+    /// `leaf_cache_bytes` (0 = off, the default and today's behavior) sizes
+    /// an engine-owned LeafExtentCache for the search path: leaf extents are
+    /// served from a DRAM-budgeted W-TinyLFU cache (pread on miss) instead of
+    /// the mmap. This is the only BENCHMARK_RULES-reportable warm layer;
+    /// internal/routing nodes always use the mmap (they are part of the
+    /// routing DRAM budget). Mutations (insert/delete/split/vacuum/defrag)
+    /// invalidate the cache wholesale via remap_().
+    static std::unique_ptr<IVFTreeIndex> open(const std::string& path,
+                                              uint64_t leaf_cache_bytes = 0);
 
     // --- Search ---
 
@@ -304,6 +315,9 @@ private:
     int fd_ = -1;
     const uint8_t* mmap_base_ = nullptr;  // mmap'd file base (read-only)
     uint64_t mmap_size_ = 0;
+    // Engine-owned leaf-extent cache (null = off: search reads leaves via
+    // mmap_base_, exactly the pre-cache behavior). See open().
+    std::unique_ptr<class LeafExtentCache> leaf_cache_;
 
     PageFile file_;
     Superblock superblock_;
@@ -344,6 +358,16 @@ private:
 
     /// Parse the root node from the mmap.
     void load_root_from_mmap();
+
+    /// Resolve a leaf extent pointer for the search path. With the cache
+    /// off: plain mmap pointer, `handle` left null. With it on: pin the
+    /// extent (hit/miss counted into search_stats_), caller must unpin via
+    /// release_leaf_pins once the scan (and any leaf_ptr uses) are done.
+    const uint8_t* pin_leaf_(PageId page, uint32_t pages,
+                             LeafExtentCache::Handle& handle) const;
+
+    /// Release every pin taken by one search() call (QueryGuard exit path).
+    void release_leaf_pins_(std::vector<LeafExtentCache::Handle>& pins) const;
 
     /// Close mmap + fd.
     void close();

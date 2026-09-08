@@ -51,6 +51,11 @@ struct PhaseMetrics {
     uint64_t wait_count = 0;          ///< build.phase.wait_count
     uint64_t bytes_read = 0;          ///< build.phase.bytes_read
     uint64_t rss_bytes = 0;           ///< build.phase.rss_bytes (phase peak)
+    /// Search-window LeafExtentCache counters (additive wire fields; zero
+    /// on build records and cache-off search windows).
+    uint64_t cache_hits = 0;          ///< search.window.cache_hits
+    uint64_t cache_misses = 0;        ///< search.window.cache_misses
+    uint64_t cache_bytes_filled = 0;  ///< search.window.cache_bytes_filled
     /// Monotonic seconds at emit time (steady_clock-based epoch), for
     /// time-series alignment when records from multiple processes are merged.
     double timestamp = 0;
@@ -208,11 +213,16 @@ inline std::string to_json(const PhaseMetrics& m) {
                   "\",\"wall_seconds\":%.17g,\"cpu_seconds\":%.17g,"
                   "\"source_wait_seconds\":%.17g,\"wait_count\":%llu,"
                   "\"bytes_read\":%llu,\"rss_bytes\":%llu,"
+                  "\"cache_hits\":%llu,\"cache_misses\":%llu,"
+                  "\"cache_bytes_filled\":%llu,"
                   "\"timestamp\":%.17g}",
                   m.wall_seconds, m.cpu_seconds, m.source_wait_seconds,
                   static_cast<unsigned long long>(m.wait_count),
                   static_cast<unsigned long long>(m.bytes_read),
                   static_cast<unsigned long long>(m.rss_bytes),
+                  static_cast<unsigned long long>(m.cache_hits),
+                  static_cast<unsigned long long>(m.cache_misses),
+                  static_cast<unsigned long long>(m.cache_bytes_filled),
                   m.timestamp);
     out += buf;
     return out;

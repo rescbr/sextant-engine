@@ -97,7 +97,8 @@ void IVFTreeIndex::close() {
 // Open
 // ===========================================================================
 
-std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
+std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
+                                              uint64_t leaf_cache_bytes) {
     auto idx = std::unique_ptr<IVFTreeIndex>(new IVFTreeIndex());
     idx->path_ = path;
     idx->file_ = PageFile(path);
@@ -232,8 +233,18 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path) {
     // Parse the root node from the mmap.
     idx->load_root_from_mmap();
 
+    // Optional engine-owned leaf cache (see open() doc). Sized at open so
+    // the DRAM budget is an explicit, reportable number.
+    if (leaf_cache_bytes > 0) {
+        constexpr uint32_t kLeafCacheShards = 16;
+        idx->leaf_cache_ = std::make_unique<LeafExtentCache>(
+            leaf_cache_bytes, kLeafCacheShards, idx->file_.fd());
+        idx->leaf_cache_->set_expected_entries(idx->manifest_.n_leaves);
+        spdlog::info("[sextant] IVFTreeIndex: leaf cache {} bytes ({} shards)",
+                     leaf_cache_bytes, kLeafCacheShards);
+    }
+
     // If PCA routing: build leaf_id mapping for depth=2 trees.
-    // The pca_leaf_centroids_ array is indexed by global leaf ID (the order
     // leaves were written during build). At search time, we need to map from
     // (root_child, local_child) → global_leaf_id.
     if (idx->pca_dims_ > 0 && idx->manifest_.depth == 2) {
@@ -301,6 +312,27 @@ void IVFTreeIndex::load_root_from_mmap() {
     }
 }
 
+const uint8_t* IVFTreeIndex::pin_leaf_(PageId page, uint32_t pages,
+                                       LeafExtentCache::Handle& handle) const {
+    handle.entry = nullptr;
+    if (!leaf_cache_) {
+        return mmap_base_ + static_cast<uint64_t>(page) * kPageSize;
+    }
+    bool hit = false;
+    uint64_t filled = 0;
+    const uint8_t* p = leaf_cache_->pin(page, pages, handle, &hit, &filled);
+    search_stats_.on_cache_op(hit, filled);
+    return p;
+}
+
+void IVFTreeIndex::release_leaf_pins_(
+    std::vector<LeafExtentCache::Handle>& pins) const {
+    if (leaf_cache_) {
+        for (auto& h : pins) leaf_cache_->unpin(h);
+    }
+    pins.clear();
+}
+
 // ===========================================================================
 // Search
 // ===========================================================================
@@ -322,7 +354,10 @@ namespace {
 struct HeapEntryFull {
     uint32_t pq_dist;
     int64_t  row_id;
-    const uint8_t* leaf_ptr;   // mmap base of the leaf extent
+    const uint8_t* leaf_ptr;   // scan/rerank pointer (mmap or cache buffer)
+    const uint8_t* mmap_ptr;   // always the mmap base of the extent — for
+                               // pointers that outlive the search (payload
+                               // locs): cache pins are released at exit
     uint32_t local_idx;        // vector index within the leaf
 };
 
@@ -2395,6 +2430,13 @@ struct SearchScratch {
     std::vector<uint32_t> sweep_order;
     std::vector<Candidate> sweep_work;
     std::vector<std::pair<uint32_t, uint32_t>> sweep_plan;  // (W, out index)
+    // LeafExtentCache pins: every pin taken during the query lives here
+    // until QueryGuard exit (scan + materialization + rerank share the
+    // buffers; unpinning mid-query would force refills).
+    std::vector<LeafExtentCache::Handle> pins;
+    std::vector<std::vector<LeafExtentCache::Handle>> worker_pins;
+    // Materialization scratch: one resolved pointer per candidate leaf.
+    std::vector<const uint8_t*> leaf_ptrs;
 };
 
 }  // namespace
@@ -2412,7 +2454,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         IVFTreeIndex const* idx;
         std::chrono::steady_clock::time_point t0;
         uint64_t leaves = 0, bytes = 0, reranked = 0;
+        // Set once the search scratch is acquired; released on every exit.
+        std::vector<LeafExtentCache::Handle>* pins = nullptr;
         ~QueryGuard() {
+            if (pins) idx->release_leaf_pins_(*pins);
             idx->search_stats_.on_query(
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t0).count(),
@@ -2424,6 +2469,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // thread (see SearchScratch above). CLI std::async workers and test
     // threads each get their own instance.
     static thread_local SearchScratch scratch;
+    qguard.pins = &scratch.pins;
     const bool sweep = sweep_Ws != nullptr && sweep_out != nullptr
         && payload_locs == nullptr && !sweep_Ws->empty();
     if (sweep) {
@@ -2840,12 +2886,14 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         pruned.reserve(candidates.size());
         for (const auto& cand : candidates) {
             if (cand.page == kInvalidPage) continue;
-            const uint8_t* leaf_ptr = mmap_base_ +
-                static_cast<uint64_t>(cand.page) * kPageSize;
+            LeafExtentCache::Handle h;
+            const uint8_t* leaf_ptr =
+                pin_leaf_(cand.page, static_cast<uint32_t>(cand.pages), h);
+            if (h.entry) scratch.pins.push_back(h);
             const uint8_t* summary = leaf_ptr + leaf_filter_offset();
-            if (summary_may_match(summary, manifest_.summary_size,
-                                  manifest_.schema, config.predicates,
-                                  pred_col_indices, geo_lng_col_indices)) {
+            if (summary_may_match(
+                    summary, manifest_.summary_size, manifest_.schema,
+                    config.predicates, pred_col_indices, geo_lng_col_indices)) {
                 pruned.push_back(cand);
             }
         }
@@ -2867,8 +2915,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // --- Prefetch leaf extents ---
     // On Linux, posix_fadvise triggers async NVMe prefetch. On macOS it's
     // a no-op (the unified buffer cache handles read-ahead for sequential
-    // mmap access).
+    // mmap access). With the leaf cache on, only UNcached extents are worth
+    // prefetching — hits never touch the disk.
     for (const auto& c : candidates) {
+        if (leaf_cache_ && leaf_cache_->contains(c.page)) continue;
 #ifdef __linux__
         ::posix_fadvise(fd_, static_cast<off_t>(c.page) * kPageSize,
                         static_cast<off_t>(c.pages) * kPageSize,
@@ -2969,8 +3019,11 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 #endif
             }
             for (uint32_t j = slot0; j < slot1; ++j) {
-                const uint8_t* leaf_ptr = mmap_base_ +
-                    static_cast<uint64_t>(fb_candidates[j].page) * kPageSize;
+                LeafExtentCache::Handle h;
+                const uint8_t* leaf_ptr =
+                    pin_leaf_(fb_candidates[j].page,
+                              static_cast<uint32_t>(fb_candidates[j].pages), h);
+                if (h.entry) scratch.pins.push_back(h);
                 if (per_leaf) coder_->bind_leaf(*scan_setup, leaf_ptr);
                 RawScanHeap heap{&sheap, W, j};
                 coder_->scan_leaf(*scan_setup, leaf_ptr, heap);
@@ -2997,6 +3050,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 for (uint32_t j = 0; j < k_eff && j < fb_ord.size(); ++j) {
                     const auto& e = fb_ord[j];
                     const LeafCandidate& lc = fb_candidates[e.leaf_slot];
+                    // The scan pins above are still held — a fresh pin would
+                    // hit, but a plain mmap read is cheaper and equivalent
+                    // for this diagnostic-only path.
                     const uint8_t* leaf_ptr = mmap_base_ +
                         static_cast<uint64_t>(lc.page) * kPageSize;
                     const auto* lh =
@@ -3063,8 +3119,11 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         if (!parallel_scan) {
             for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
                 if (candidates[ci].page == kInvalidPage) continue;
-                const uint8_t* leaf_ptr = mmap_base_ +
-                    static_cast<uint64_t>(candidates[ci].page) * kPageSize;
+                LeafExtentCache::Handle h;
+                const uint8_t* leaf_ptr =
+                    pin_leaf_(candidates[ci].page,
+                              static_cast<uint32_t>(candidates[ci].pages), h);
+                if (h.entry) scratch.pins.push_back(h);
                 if (per_leaf) coder_->bind_leaf(*scan_setup, leaf_ptr);
                 RawScanHeap heap{&sheap, W, ci};
                 coder_->scan_leaf(*scan_setup, leaf_ptr, heap);
@@ -3081,6 +3140,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             // families share one read-only setup.
             std::vector<std::future<void>> futs;
             futs.reserve(T);
+            auto& wpins = scratch.worker_pins;
+            if (wpins.size() < T) wpins.resize(T);
+            for (auto& v : wpins) v.clear();
             const uint32_t per = (static_cast<uint32_t>(candidates.size()) + T - 1) / T;
             for (uint32_t t = 0; t < T; ++t) {
                 const uint32_t start = t * per;
@@ -3099,9 +3161,13 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                         }
                         for (uint32_t c = s; c < e; ++c) {
                             if (candidates[c].page == kInvalidPage) continue;
-                            const uint8_t* leaf_ptr = mmap_base_ +
-                                static_cast<uint64_t>(candidates[c].page) *
-                                    kPageSize;
+                            LeafExtentCache::Handle h;
+                            const uint8_t* leaf_ptr =
+                                pin_leaf_(candidates[c].page,
+                                          static_cast<uint32_t>(
+                                              candidates[c].pages),
+                                          h);
+                            if (h.entry) wpins[ti].push_back(h);
                             if (per_leaf) coder_->bind_leaf(*use, leaf_ptr);
                             RawScanHeap heap{&my, W, c};
                             coder_->scan_leaf(*use, leaf_ptr, heap);
@@ -3109,6 +3175,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                     }, start, end, t));
             }
             for (auto& f : futs) f.get();
+            // Adopt worker pins (refcounts held) so they live until guard exit.
+            for (auto& v : wpins)
+                scratch.pins.insert(scratch.pins.end(), v.begin(), v.end());
 
             // Deterministic merge: collect every entry from all per-thread
             // heaps, then keep the top-W by (pq_dist asc, tie: leaf_slot,
@@ -3155,14 +3224,29 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         auto& hf = scratch.heap_full;
         hf.clear();
         hf.reserve(sheap.size());
+        // Pin each candidate leaf ONCE (heap entries reference the same
+        // <=n_leaves extents — per-entry pinning would double-count cache
+        // accesses and thrash the LRU).
+        auto& ptrs = scratch.leaf_ptrs;
+        ptrs.clear();
+        ptrs.resize(candidates.size(), nullptr);
+        for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
+            if (candidates[ci].page == kInvalidPage) continue;
+            LeafExtentCache::Handle h;
+            ptrs[ci] = pin_leaf_(candidates[ci].page,
+                                 static_cast<uint32_t>(candidates[ci].pages),
+                                 h);
+            if (h.entry) scratch.pins.push_back(h);
+        }
         for (const auto& e : sheap) {
-            const LeafCandidate& c = candidates[e.leaf_slot];
-            const uint8_t* leaf_ptr = mmap_base_ +
-                static_cast<uint64_t>(c.page) * kPageSize;
+            const uint32_t ci = e.leaf_slot;
+            const LeafCandidate& c = candidates[ci];
+            const uint8_t* leaf_ptr = ptrs[ci];
             const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
             const RowId* rids = reinterpret_cast<const RowId*>(
                 leaf_ptr + coder_->geometry(lh).rowids_offset);
             hf.push_back({e.pq_dist, rids[e.local_idx], leaf_ptr,
+                          mmap_base_ + static_cast<uint64_t>(c.page) * kPageSize,
                           e.local_idx});
         }
     }
@@ -3177,7 +3261,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
     // Phase E: when payload locations are requested, carry (leaf_ptr, local_idx)
     // alongside each result through dedup/sort/truncate. The heap entries'
-    // payload locations are valid mmap pointers (stable for the index's life).
+    // payload locations are always MMAP pointers (stable for the index's
+    // life — cache pins would dangle after search() returns).
     const bool want_locs = (payload_locs != nullptr);
     auto& results_loc = scratch.results_loc;
     results_loc.clear();
@@ -3250,7 +3335,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             }
             if (want_locs) {
                 results_loc.push_back({{entry.row_id, exact_dist},
-                                        entry.leaf_ptr, entry.local_idx});
+                                        entry.mmap_ptr, entry.local_idx});
             } else {
                 results.push_back({entry.row_id, exact_dist});
             }
@@ -3266,7 +3351,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             if (want_locs) {
                 results_loc.push_back({{entry.row_id,
                                          static_cast<float>(entry.pq_dist)},
-                                        entry.leaf_ptr, entry.local_idx});
+                                        entry.mmap_ptr, entry.local_idx});
             } else {
                 results.push_back({entry.row_id,
                                    static_cast<float>(entry.pq_dist)});
@@ -3926,6 +4011,9 @@ void IVFTreeIndex::write_leaf_(uint32_t leaf_id, std::vector<uint8_t>& buf,
 // --- Remap the read-only mmap after mutations ---
 
 void IVFTreeIndex::remap_() {
+    // Cached leaf extents are wholesale stale after any mutation commit —
+    // pages may have been rewritten or relocated.
+    if (leaf_cache_) leaf_cache_->invalidate_all();
     if (mmap_base_) {
         ::munmap(const_cast<uint8_t*>(mmap_base_), mmap_size_);
         mmap_base_ = nullptr;

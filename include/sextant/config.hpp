@@ -300,8 +300,9 @@ struct SearchStats {
         uint64_t leaves_probed = 0;
         uint64_t bytes_touched = 0;   ///< leaf pages × page size (the currency)
         uint64_t rerank_count = 0;    ///< candidates decoded+reranked
-        uint64_t cache_hits = 0;      ///< BlockCache stub (zero until wired)
-        uint64_t cache_misses = 0;    ///< BlockCache stub
+        uint64_t cache_hits = 0;      ///< LeafExtentCache hits (0 when off)
+        uint64_t cache_misses = 0;    ///< LeafExtentCache misses
+        uint64_t cache_bytes_filled = 0;  ///< disk bytes pread into the cache
         double wall_seconds = 0;
     };
 
@@ -315,6 +316,15 @@ struct SearchStats {
         rerank_count_.fetch_add(reranked, std::memory_order_relaxed);
     }
 
+    /// Record one LeafExtentCache pin outcome (search path). Zero-cost when
+    /// the cache is off (never called).
+    void on_cache_op(bool hit, uint64_t bytes_filled) const {
+        if (hit) cache_hits_.fetch_add(1, std::memory_order_relaxed);
+        else cache_misses_.fetch_add(1, std::memory_order_relaxed);
+        if (bytes_filled) cache_bytes_filled_.fetch_add(bytes_filled,
+                                                        std::memory_order_relaxed);
+    }
+
     Snapshot snapshot_and_reset() const {
         Snapshot s;
         s.queries = queries_.exchange(0, std::memory_order_relaxed);
@@ -323,6 +333,8 @@ struct SearchStats {
         s.rerank_count = rerank_count_.exchange(0, std::memory_order_relaxed);
         s.cache_hits = cache_hits_.exchange(0, std::memory_order_relaxed);
         s.cache_misses = cache_misses_.exchange(0, std::memory_order_relaxed);
+        s.cache_bytes_filled =
+            cache_bytes_filled_.exchange(0, std::memory_order_relaxed);
         s.wall_seconds = static_cast<double>(
             wall_ns_.exchange(0, std::memory_order_relaxed)) / 1e9;
         return s;
@@ -336,6 +348,7 @@ private:
     mutable std::atomic<uint64_t> rerank_count_{0};
     mutable std::atomic<uint64_t> cache_hits_{0};
     mutable std::atomic<uint64_t> cache_misses_{0};
+    mutable std::atomic<uint64_t> cache_bytes_filled_{0};
 };
 
 /// Search configuration.

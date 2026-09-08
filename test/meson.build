@@ -33,6 +33,7 @@ test_sources = [
     'test_vacuum_defrag.cpp',
     'test_quantizer_families.cpp',
     'test_simd_x86.cpp',
+    'test_leaf_cache.cpp',
     
 ]
 
