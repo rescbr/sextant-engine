@@ -3732,6 +3732,136 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     return search(query, k, config, payload_locs, nullptr, nullptr);
 }
 
+namespace {
+
+/// Full pread (loops on short reads). Returns false on I/O error.
+bool pread_full(int fd, void* buf, size_t n, uint64_t off) {
+    auto* p = static_cast<uint8_t*>(buf);
+    while (n > 0) {
+        const ssize_t r = ::pread(fd, p, n, static_cast<off_t>(off));
+        if (r <= 0) return false;
+        p += r;
+        off += static_cast<uint64_t>(r);
+        n -= static_cast<size_t>(r);
+    }
+    return true;
+}
+
+/// Row-id (+ eagerly reranked distance) pool entry for the pread sweep
+/// path: leaf buffers die at the next leaf, so everything finalize needs
+/// from the leaf is resolved at harvest time, right after the (query,
+/// leaf) scan.
+struct PoolEntry {
+    uint32_t pq_dist;
+    uint32_t leaf_slot;
+    uint32_t local_idx;
+    int64_t row_id;
+    float dist;        // exact distance when reranked, else unused
+    bool reranked;     // coder rerank computed at harvest time
+};
+
+/// Dedup by row_id (closure may replicate vectors across leaves → same
+/// row_id appears with different distances → keep the min), adaptive
+/// shortlist cut, top-k, distance sort. Shared tail of every per-query
+/// finalize variant.
+void cut_topk_results_(std::vector<Candidate>& results, uint32_t k,
+                       const SearchConfig& config) {
+    std::sort(results.begin(), results.end(),
+              [](const Candidate& a, const Candidate& b) {
+                  if (a.row_id != b.row_id) return a.row_id < b.row_id;
+                  return a.dist < b.dist;
+              });
+    auto last = std::unique(results.begin(), results.end(),
+                            [](const Candidate& a, const Candidate& b) {
+                                return a.row_id == b.row_id;
+                            });
+    results.erase(last, results.end());
+    // Adaptive shortlist cut: keep up to W (not just k) and truncate at
+    // the first distance gap past k. Clustered queries cut at ~k, noisy
+    // queries keep the deep list. Off (0) or without rerank: plain top-k.
+    // Signal: the gap d[w]-d[k-1] against the top-k region's own typical
+    // gap (dimensionless, metric-transferable; see search()).
+    size_t keep = k;
+    if (config.adaptive_w_gap > 0 && config.rerank &&
+        results.size() > k) {
+        std::sort(results.begin(), results.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.dist < b.dist;
+                  });
+        const float dk = results[k - 1].dist;
+        const float g = (dk - results[0].dist) / static_cast<float>(k - 1);
+        const float scale = std::max(g, 1e-12f);
+        keep = results.size();
+        for (size_t w = k; w < results.size(); ++w) {
+            if (results[w].dist - dk > config.adaptive_w_gap * scale) {
+                keep = w;
+                break;
+            }
+        }
+    }
+    if (results.size() > keep) {
+        std::nth_element(results.begin(), results.begin() + keep,
+                         results.end(),
+                         [](const Candidate& a, const Candidate& b) {
+                             return a.dist < b.dist;
+                         });
+        results.resize(keep);
+    }
+    std::sort(results.begin(), results.end(),
+              [](const Candidate& a, const Candidate& b) {
+                  return a.dist < b.dist;
+              });
+}
+
+/// Pool-based finalize for the pread sweep path: look up each merged-
+/// heap survivor's row_id (and, when the coder rerank ran eagerly at
+/// harvest, its exact distance) in the query's pool. exact_rerank_base
+/// reranks lazily here through the row_id — no leaf pointer needed.
+void finalize_pool_query_(const float* query, uint32_t k,
+                          MetricKind metric, uint32_t dim,
+                          const SearchConfig& config,
+                          std::vector<PoolEntry>& pool,
+                          const std::vector<HeapEntry>& heap,
+                          std::vector<Candidate>& results) {
+    std::sort(pool.begin(), pool.end(),
+              [](const PoolEntry& a, const PoolEntry& b) {
+                  if (a.leaf_slot != b.leaf_slot)
+                      return a.leaf_slot < b.leaf_slot;
+                  return a.local_idx < b.local_idx;
+              });
+    results.clear();
+    results.reserve(heap.size());
+    for (const auto& e : heap) {
+        const auto it = std::lower_bound(
+            pool.begin(), pool.end(), e,
+            [](const PoolEntry& p, const HeapEntry& h) {
+                if (p.leaf_slot != h.leaf_slot)
+                    return p.leaf_slot < h.leaf_slot;
+                return p.local_idx < h.local_idx;
+            });
+        if (it == pool.end() || it->leaf_slot != e.leaf_slot ||
+            it->local_idx != e.local_idx) {
+            continue;  // defensive: cannot happen without pool overflow
+        }
+        float dist;
+        if (it->reranked) {
+            dist = it->dist;
+        } else if (config.rerank && config.exact_rerank_base) {
+            const float* v = config.exact_rerank_base +
+                             static_cast<size_t>(it->row_id) * dim;
+            dist = (metric == MetricKind::InnerProduct)
+                       ? -simd::dot_f32(query, v, dim)
+                       : simd::l2sq_f32(query, v, dim);
+        } else {
+            dist = static_cast<float>(e.pq_dist);
+        }
+        results.push_back({it->row_id, dist});
+    }
+    cut_topk_results_(results, k, config);
+}
+
+}  // namespace
+
 void IVFTreeIndex::finalize_query_(const float* query, uint32_t k,
                                    const SearchConfig& config,
                                    SearchScratch& scratch,
@@ -3739,8 +3869,7 @@ void IVFTreeIndex::finalize_query_(const float* query, uint32_t k,
                                    std::vector<const uint8_t*>& ptrs,
                                    std::vector<HeapEntry>& sheap,
                                    ScanSetup& scan_setup,
-                                   std::vector<Candidate>& results) const {
-    const bool has_predicates = !config.predicates.empty();
+                                   std::vector<Candidate>& results) const {    const bool has_predicates = !config.predicates.empty();
     auto& pred_col_indices = scratch.pred_col_indices;
     auto& geo_lng_col_indices = scratch.geo_lng_col_indices;
     const MetricKind metric = coder_->metric();
@@ -3858,61 +3987,10 @@ void IVFTreeIndex::finalize_query_(const float* query, uint32_t k,
         }
     }
 
-    // Dedup by row_id (closure may replicate vectors across leaves → same
-    // row_id appears with different distances → keep the min). Sort by
-    // row_id first so duplicates are adjacent, with min-dist tiebreak.
-    std::sort(results.begin(), results.end(),
-              [](const Candidate& a, const Candidate& b) {
-                  if (a.row_id != b.row_id) return a.row_id < b.row_id;
-                  return a.dist < b.dist;
-              });
-    auto last = std::unique(results.begin(), results.end(),
-                            [](const Candidate& a, const Candidate& b) {
-                                return a.row_id == b.row_id;
-                            });
-    results.erase(last, results.end());
-    // Adaptive shortlist cut: keep up to W (not just k) and truncate at
-    // the first distance gap past k. Clustered queries cut at ~k, noisy
-    // queries keep the deep list — the caller's rerank bandwidth follows
-    // the returned length. Off (0) or without rerank: plain top-k.
-    //
-    // Signal: the gap d[w]-d[k-1] against the top-k region's OWN typical
-    // gap, g = (d[k-1]-d[0])/(k-1). τ is therefore a dimensionless
-    // multiplier of the local score scale and one calibration transfers
-    // across metrics (IP distances are negated dots ≈ -1, so scaling by
-    // |d[k-1]| as in v1 compressed the signal and forced per-metric τ).
-    size_t keep = k;
-    if (config.adaptive_w_gap > 0 && config.rerank &&
-        results.size() > k) {
-        std::sort(results.begin(), results.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return a.dist < b.dist;
-                  });
-        const float dk = results[k - 1].dist;
-        const float g = (dk - results[0].dist) / static_cast<float>(k - 1);
-        const float scale = std::max(g, 1e-12f);
-        keep = results.size();
-        for (size_t w = k; w < results.size(); ++w) {
-            if (results[w].dist - dk >
-                config.adaptive_w_gap * scale) {
-                keep = w;
-                break;
-            }
-        }
-    }
-    if (results.size() > keep) {
-        std::nth_element(results.begin(), results.begin() + keep,
-                         results.end(),
-                         [](const Candidate& a, const Candidate& b) {
-                             return a.dist < b.dist;
-                         });
-        results.resize(keep);
-    }
-    std::sort(results.begin(), results.end(),
-              [](const Candidate& a, const Candidate& b) {
-                  return a.dist < b.dist;
-              });
+    // Shared dedup / adaptive cut / top-k tail (see cut_topk_results_).
+    cut_topk_results_(results, k, config);
 }
+
 
 void IVFTreeIndex::search_batch(
         const float* queries, uint32_t nq, uint32_t k,
@@ -3946,6 +4024,8 @@ void IVFTreeIndex::search_batch(
         std::vector<const uint8_t*> ptrs;   // per candidate slot
         std::unique_ptr<ScanSetup> setup;   // adopted from a sweep partial
         std::vector<HeapEntry> heap;        // merged, bounded W
+        std::vector<PoolEntry> pool;        // pread path: harvested row-ids
+        bool pool_overflow = false;         // pool capped → mmap finalize
         uint32_t W = 0;
         bool fallback = false;              // brute-force filtered path
         uint64_t routing_ns = 0;
@@ -4058,6 +4138,25 @@ void IVFTreeIndex::search_batch(
     const uint32_t n_unique =
         static_cast<uint32_t>(uleaves.size());
 
+    // Read-layer selection. The zero-DRAM sweep reads leaves with direct
+    // preads into a per-thread buffer (measured 4x cold vs the ZFS mmap
+    // fault path; page-ordered preads stream at ~10 GB/s). The buffer
+    // dies at the next leaf, so everything finalize needs from the leaf
+    // (row_id; coder-rerank distances) is resolved eagerly into per-query
+    // pools right after each (query, leaf) scan. exact_rerank_base reranks
+    // lazily through the row_id. Pool overflow (adversarial distance
+    // orders) falls back to the mmap finalize path — correctness never
+    // depends on the cap. Predicate configs keep the pin/mmap path
+    // (pools don't carry filter columns); hot-set mode keeps its pins.
+    const bool pread_sweep = !leaf_cache_ && !has_predicates;
+    uint32_t max_extent_pages = 0;
+    if (pread_sweep) {
+        for (const auto& ul : uleaves)
+            max_extent_pages = std::max(max_extent_pages, ul.pages);
+    }
+    const bool eager_rerank =
+        pread_sweep && config.rerank && !config.exact_rerank_base;
+
     // --- Phase 3: sweep unique leaves in page order (parallel chunks) ---
     // Threads claim contiguous chunks of the page-ordered unique-leaf
     // list. A query's probe set is subtree-contiguous, so it intersects
@@ -4068,6 +4167,8 @@ void IVFTreeIndex::search_batch(
         uint32_t qidx;
         std::unique_ptr<ScanSetup> setup;
         std::vector<HeapEntry> heap;
+        std::vector<PoolEntry> pool;   // pread path harvest
+        bool pool_overflow = false;
     };
     std::vector<Partial> partials;
     std::vector<LeafExtentCache::Handle> batch_pins;
@@ -4079,6 +4180,49 @@ void IVFTreeIndex::search_batch(
             std::vector<LeafExtentCache::Handle> my_pins;
             std::vector<Partial> my_partials;
             std::unordered_map<uint32_t, size_t> pmap;  // qidx → partial idx
+            // Pread-mode scratch: one buffer per thread (the scan + harvest
+            // of leaf L complete before the next leaf's pread reuses it).
+            std::vector<uint8_t> pread_buf(
+                pread_sweep
+                    ? static_cast<size_t>(max_extent_pages) * kPageSize
+                    : 0);
+            // Harvest: resolve everything finalize needs from THIS leaf
+            // for one query, while the buffer is still valid.
+            auto harvest = [&](Partial& p, QueryState& s,
+                               const uint8_t* leaf_ptr,
+                               const ProbeRef& fr) {
+                if (p.pool_overflow) return;
+                // Cap = 8x W: real churn (measured cohere-10m f=0.05)
+                // harvests ~5x W per query — the first leaf fills W
+                // entries, later leaves contribute their survivors into
+                // the top-W. Overflow (adversarial orders) falls back to
+                // the mmap finalize path.
+                if (p.pool.size() > 8u * s.W) {
+                    p.pool_overflow = true;
+                    return;
+                }
+                const auto* lh =
+                    reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+                const RowId* rids = reinterpret_cast<const RowId*>(
+                    leaf_ptr + coder_->geometry(lh).rowids_offset);
+                for (const auto& e : p.heap) {
+                    if (e.leaf_slot != fr.slot) continue;
+                    PoolEntry pe;
+                    pe.pq_dist = e.pq_dist;
+                    pe.leaf_slot = e.leaf_slot;
+                    pe.local_idx = e.local_idx;
+                    pe.row_id = rids[e.local_idx];
+                    pe.reranked = false;
+                    pe.dist = 0.0f;
+                    if (eager_rerank) {
+                        pe.dist = coder_->rerank(
+                            s.query, *p.setup, leaf_ptr, e.local_idx,
+                            nullptr);
+                        pe.reranked = true;
+                    }
+                    p.pool.push_back(pe);
+                }
+            };
             for (;;) {
                 const uint32_t start =
                     next_chunk.fetch_add(kChunk, std::memory_order_relaxed);
@@ -4086,27 +4230,24 @@ void IVFTreeIndex::search_batch(
                 const uint32_t end = std::min(start + kChunk, n_unique);
                 for (uint32_t li = start; li < end; ++li) {
                     const auto& ul = uleaves[li];
-                    // No-cache readahead: keep the kernel prefetching
-                    // page-ordered, well ahead of the scan. Depth matters:
-                    // scanning a leaf costs ~fanout x 150us of compute, so
-                    // a shallow window (8 leaves) lets the disk idle
-                    // between chunks — measured 0.46 GB/s effective cold
-                    // on cohere-10m. 64 leaves (~100 MiB) keeps the
-                    // sequential stream saturated (page cache is
-                    // reclaimable and cgroup-charged).
-#ifdef __linux__
-                    if (!leaf_cache_ && li + 64 < n_unique) {
-                        const auto& ahead = uleaves[li + 64];
-                        ::posix_fadvise(
-                            fd_,
-                            static_cast<off_t>(ahead.page) * kPageSize,
-                            static_cast<off_t>(ahead.pages) * kPageSize,
-                            POSIX_FADV_WILLNEED);
-                    }
-#endif
                     LeafExtentCache::Handle h;
-                    const uint8_t* leaf_ptr = pin_leaf_(ul.page, ul.pages, h);
-                    if (h.entry) my_pins.push_back(h);
+                    const uint8_t* leaf_ptr;
+                    if (pread_sweep) {
+                        // Direct pread: page-ordered sequential streams,
+                        // no mmap faults, no page-cache pollution.
+                        const size_t bytes =
+                            static_cast<size_t>(ul.pages) * kPageSize;
+                        if (!pread_full(fd_, pread_buf.data(), bytes,
+                                        static_cast<uint64_t>(ul.page) *
+                                            kPageSize)) {
+                            continue;  // I/O error: leaf contributes
+                                       // nothing (mmap path would SIGBUS)
+                        }
+                        leaf_ptr = pread_buf.data();
+                    } else {
+                        leaf_ptr = pin_leaf_(ul.page, ul.pages, h);
+                        if (h.entry) my_pins.push_back(h);
+                    }
                     const uint32_t ref_end =
                         li + 1 < n_unique ? uleaves[li + 1].ref_begin
                                           : static_cast<uint32_t>(refs.size());
@@ -4129,7 +4270,17 @@ void IVFTreeIndex::search_batch(
                         if (per_leaf) coder_->bind_leaf(*p->setup, leaf_ptr);
                         RawScanHeap rh{&p->heap, s.W, fr.slot};
                         coder_->scan_leaf(*p->setup, leaf_ptr, rh);
-                        s.ptrs[fr.slot] = leaf_ptr;  // distinct slots — safe
+                        // Pread mode: hand finalize the stable mmap pointer
+                        // (used only if the pool overflows); pool mode
+                        // never dereferences it. Pin/mmap mode: the live
+                        // scan pointer (pins held until batch end).
+                        s.ptrs[fr.slot] =
+                            pread_sweep
+                                ? mmap_base_ +
+                                      static_cast<uint64_t>(ul.page) *
+                                          kPageSize
+                                : leaf_ptr;
+                        if (pread_sweep) harvest(*p, s, leaf_ptr, fr);
                     }
                 }
             }
@@ -4166,15 +4317,24 @@ void IVFTreeIndex::search_batch(
             while (j < by_q.size() && by_q[j].first == by_q[i].first) ++j;
             QueryState& s = qs[by_q[i].first];
             if (!s.setup) s.setup = std::move(partials[by_q[i].second].setup);
-            size_t total = 0;
-            for (size_t l = i; l < j; ++l)
+            size_t total = 0, pool_total = 0;
+            for (size_t l = i; l < j; ++l) {
                 total += partials[by_q[l].second].heap.size();
+                pool_total += partials[by_q[l].second].pool.size();
+                s.pool_overflow = s.pool_overflow ||
+                                  partials[by_q[l].second].pool_overflow;
+            }
             s.heap.reserve(total);
+            s.pool.reserve(pool_total);
             for (size_t l = i; l < j; ++l) {
                 auto& ph = partials[by_q[l].second].heap;
                 s.heap.insert(s.heap.end(),
                               std::make_move_iterator(ph.begin()),
                               std::make_move_iterator(ph.end()));
+                auto& pp = partials[by_q[l].second].pool;
+                s.pool.insert(s.pool.end(),
+                              std::make_move_iterator(pp.begin()),
+                              std::make_move_iterator(pp.end()));
             }
             s.heap.erase(std::remove_if(s.heap.begin(), s.heap.end(),
                                         heap_entry_is_sentinel),
@@ -4216,8 +4376,18 @@ void IVFTreeIndex::search_batch(
                     continue;  // empty results
                 }
                 const auto tf0 = std::chrono::steady_clock::now();
-                finalize_query_(s.query, k, config, fscratch, s.candidates,
-                                s.ptrs, s.heap, *s.setup, results[i]);
+                if (pread_sweep && !s.pool_overflow && !s.pool.empty()) {
+                    // Pool path: row-ids (and coder-rerank distances)
+                    // resolved eagerly during the sweep; exact_rerank_base
+                    // reranks lazily through the row_id.
+                    finalize_pool_query_(s.query, k, coder_->metric(), dim,
+                                         config, s.pool, s.heap,
+                                         results[i]);
+                } else {
+                    finalize_query_(s.query, k, config, fscratch,
+                                    s.candidates, s.ptrs, s.heap, *s.setup,
+                                    results[i]);
+                }
                 const double fw = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - tf0).count();
                 uint64_t bytes = 0;

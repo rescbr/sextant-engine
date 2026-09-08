@@ -408,3 +408,32 @@ TEST(BatchScheduler, PerQueryKTruncation) {
     EXPECT_EQ(f5.get().size(), 5u);
     EXPECT_EQ(f10.get().size(), 10u);
 }
+
+TEST(BatchSearch, ExactRerankBaseParity) {
+    const auto& fx = fixture();
+    // Load the fixture corpus for exact rerank (row order = build order:
+    // the fbin was streamed in order).
+    std::vector<float> base;
+    {
+        std::ifstream f(fx.dir / "base.fbin", std::ios::binary);
+        uint32_t hdr[2];
+        f.read(reinterpret_cast<char*>(hdr), 8);
+        base.resize(static_cast<size_t>(hdr[0]) * hdr[1]);
+        f.read(reinterpret_cast<char*>(base.data()),
+               base.size() * sizeof(float));
+    }
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    auto sc = base_config();
+    sc.search_threads = 1;
+    sc.rerank = 1;
+    sc.exact_rerank_base = base.data();
+    const uint32_t nq = 6;
+    const auto queries = fx.make_queries(nq);
+    std::vector<std::vector<sextant::Candidate>> out;
+    idx->search_batch(queries.data(), nq, 10, sc, out);
+    for (uint32_t i = 0; i < nq; ++i) {
+        const auto single = idx->search(
+            queries.data() + static_cast<size_t>(i) * fx.dim, 10, sc);
+        expect_same_results(single, out[i], /*exact_order=*/true);
+    }
+}
