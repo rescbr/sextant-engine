@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <unordered_map>
 #include <utility>
 
@@ -20,6 +21,11 @@ enum class LeafExtentCacheStatus : uint8_t { WINDOW, PROBATION, PROTECTED };
 
 struct LeafExtentCache::Entry {
     PageId page = 0;
+    /// All map keys pointing at this entry: the fill page plus any aliases
+    /// (leaf starts inside a contiguous multi-leaf run fill). Eviction
+    /// removes them together; a later pin(key) computes its pointer as
+    /// data + (key - page) * kPageSize.
+    std::vector<PageId> keys;
     uint32_t size = 0;          // bytes (= pages * kPageSize)
     LeafExtentCacheStatus status = LeafExtentCacheStatus::WINDOW;
     Entry* prev = nullptr;      // LRU list pointers (valid while linked)
@@ -148,9 +154,12 @@ void LeafExtentCache::Shard::release_buf(uint8_t* buf, uint64_t cap) {
 
 LeafExtentCache::Shard::~Shard() {
     // Engine shutdown: live entries (refs ignored — no searchers remain) and
-    // pooled buffers all go back to the heap.
+    // pooled buffers all go back to the heap. Multi-key (run) entries appear
+    // once per alias in the map — the `deleted` claim flag dedups.
     for (auto& [page, e] : map) {
         (void)page;
+        bool expected = false;
+        if (!e->deleted.compare_exchange_strong(expected, true)) continue;
         delete[] e->data;
         delete e;
     }
@@ -189,6 +198,7 @@ LeafExtentCache::LeafExtentCache(uint64_t capacity_bytes, uint32_t num_shards,
     if (num_shards == 0) num_shards = 1;
     if (window_pct == 0) window_pct = 1;
     if (window_pct > 90) window_pct = 90;
+    fill_stripes_ = std::make_unique<Mutex[]>(kFillStripes);
     shards_.reserve(num_shards);
     sketches_ = std::make_unique<FrequencySketch[]>(num_shards);
     for (uint32_t i = 0; i < num_shards; ++i) {
@@ -227,6 +237,7 @@ LeafExtentCache::Entry* LeafExtentCache::new_entry(Shard& s, PageId page,
     const uint64_t size = entry_size(pages);
     auto* e = new Entry();
     e->page = page;
+    e->keys.assign(1, page);
     e->size = static_cast<uint32_t>(size);
     e->owner = &s;
     {
@@ -273,13 +284,77 @@ bool LeafExtentCache::contains(PageId page) {
     return s.map.find(page) != s.map.end();
 }
 
+uint8_t* LeafExtentCache::entry_ptr(Entry* e, PageId page) {
+    return e->data + (page - e->page) * kPageSize;
+}
+
+void LeafExtentCache::erase_keys(Shard& s, Entry* e) {
+    // Claim-safe: a key may belong to an older entry if a merged run fill
+    // raced a single-leaf fill — only remove keys that still point at `e`.
+    for (PageId k : e->keys) {
+        auto it = s.map.find(k);
+        if (it != s.map.end() && it->second == e) s.map.erase(it);
+    }
+}
+
+void LeafExtentCache::hit_locked(Shard& s, Entry* e, PageId page) {
+    e->refs.fetch_add(1, std::memory_order_acq_rel);
+    s.sketch->increment(page);
+    hits_.fetch_add(1, std::memory_order_relaxed);
+    switch (e->status) {
+    case LeafExtentCacheStatus::WINDOW:
+        List::move_to_mru(e, s.window); break;
+    case LeafExtentCacheStatus::PROBATION: {
+        List::unlink(e, s.probation);
+        s.bytes_probation -= e->size;
+        e->status = LeafExtentCacheStatus::PROTECTED;
+        s.protected_.push_mru(e);
+        s.bytes_protected += e->size;
+        // Protected overflow demotes to probation MRU.
+        while (s.bytes_protected > s.max_protected_bytes &&
+               !s.protected_.empty()) {
+            Entry* d = s.protected_.tail;
+            List::unlink(d, s.protected_);
+            s.bytes_protected -= d->size;
+            d->status = LeafExtentCacheStatus::PROBATION;
+            s.probation.push_mru(d);
+            s.bytes_probation += d->size;
+        }
+        // Probation overflow (from the demotion) evicts its LRU —
+        // never a PINNED entry: evicting pinned data frees nothing,
+        // creates an un-freeable transient, and the pileup OOMs
+        // budgeted (partial-residency) runs. Skip to the next LRU;
+        // if none is unpinned, leave the list oversized.
+        while (s.bytes_probation > s.max_probation_bytes) {
+            Entry* v = s.probation.tail;
+            while (v != nullptr &&
+                   v->refs.load(std::memory_order_relaxed) > 0) {
+                v = v->prev;
+            }
+            if (v == nullptr) break;
+            List::unlink(v, s.probation);
+            s.bytes_probation -= v->size;
+            erase_keys(s, v);
+            evictions_.fetch_add(1, std::memory_order_relaxed);
+            drop_entry(v);
+        }
+        break;
+    }
+    case LeafExtentCacheStatus::PROTECTED:
+        List::move_to_mru(e, s.protected_);
+        break;
+    }
+}
+
 const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
                                     const uint8_t* fallback, bool* was_hit,
-                                    uint64_t* filled_bytes) {
+                                    uint64_t* filled_bytes,
+                                    const PageId* aliases, uint32_t n_aliases) {
     h.entry = nullptr;
     if (was_hit) *was_hit = false;
     if (filled_bytes) *filled_bytes = 0;
     Shard& s = shard_for(page);
+    Mutex& stripe = fill_stripes_[fill_stripe(page)];
 
     // Fast path: hit (write lock — hits mutate LRU order + SLRU promotion).
     {
@@ -287,78 +362,63 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
         auto it = s.map.find(page);
         if (it != s.map.end()) {
             Entry* e = it->second;
-            e->refs.fetch_add(1, std::memory_order_acq_rel);
-            s.sketch->increment(page);
-            hits_.fetch_add(1, std::memory_order_relaxed);
+            hit_locked(s, e, page);
             if (was_hit) *was_hit = true;
-            switch (e->status) {
-            case LeafExtentCacheStatus::WINDOW:
-                List::move_to_mru(e, s.window); break;
-            case LeafExtentCacheStatus::PROBATION:
-                List::unlink(e, s.probation);
-                s.bytes_probation -= e->size;
-                e->status = LeafExtentCacheStatus::PROTECTED;
-                s.protected_.push_mru(e);
-                s.bytes_protected += e->size;
-                // Protected overflow demotes to probation MRU.
-                while (s.bytes_protected > s.max_protected_bytes &&
-                       !s.protected_.empty()) {
-                    Entry* d = s.protected_.tail;
-                    List::unlink(d, s.protected_);
-                    s.bytes_protected -= d->size;
-                    d->status = LeafExtentCacheStatus::PROBATION;
-                    s.probation.push_mru(d);
-                    s.bytes_probation += d->size;
-                }
-                // Probation overflow (from the demotion) evicts its LRU —
-                // never a PINNED entry: evicting pinned data frees nothing,
-                // creates an un-freeable transient, and the pileup OOMs
-                // budgeted (partial-residency) runs. Skip to the next LRU;
-                // if none is unpinned, leave the list oversized.
-                while (s.bytes_probation > s.max_probation_bytes) {
-                    Entry* v = s.probation.tail;
-                    while (v != nullptr &&
-                           v->refs.load(std::memory_order_relaxed) > 0) {
-                        v = v->prev;
-                    }
-                    if (v == nullptr) break;
-                    List::unlink(v, s.probation);
-                    s.bytes_probation -= v->size;
-                    s.map.erase(v->page);
-                    evictions_.fetch_add(1, std::memory_order_relaxed);
-                    drop_entry(v);
-                }
-                break;
-            case LeafExtentCacheStatus::PROTECTED:
-                List::move_to_mru(e, s.protected_);
-                break;
-            }
             h.entry = e;
-            return e->data;
+            return entry_ptr(e, page);
         }
     }
 
-    // Miss: fill OUTSIDE the lock (pread latency must not serialize a shard).
-    // NOTE: a fill that is later refused is NOT wasted I/O — it warmed the
-    // page cache that the fallback (mmap) read will hit.
+    // Miss: single-flight through the fill stripe — TRY-LOCK variant.
+    // Dedup when uncontended (one fill, the losers take the hit path on
+    // their double-check). When CONTENDED, do NOT block: a waiting filler
+    // turns parallel redundancy into serialization — measured on zipf at
+    // f=0.01, blocking single-flight cut disk traffic 2.4x and QPS 16%
+    // (latency-bound regime: redundant parallel reads beat serialized
+    // dedup). The contended loser pays its own read and the post-fill
+    // duplicate-insert race resolves ownership. Lock order: stripe BEFORE
+    // shard, never the reverse.
+    const bool gated = stripe.try_lock();
+
+    // Double-check (only meaningful when we hold the gate): filled while we
+    // were acquiring it?
+    if (gated) {
+        ScopedWriteLock lock(s.mu);
+        auto it = s.map.find(page);
+        if (it != s.map.end()) {
+            Entry* e = it->second;
+            hit_locked(s, e, page);
+            if (was_hit) *was_hit = true;
+            h.entry = e;
+            stripe.unlock();
+            return entry_ptr(e, page);
+        }
+    }
+
+    // Fill holding ONLY the stripe (pread latency must not serialize a
+    // shard). A fill that is later refused is NOT wasted I/O — it warmed
+    // the page cache that the fallback (mmap) read will hit.
     misses_.fetch_add(1, std::memory_order_relaxed);
     Entry* e = new_entry(s, page, pages);
     bytes_filled_.fetch_add(e->size, std::memory_order_relaxed);
     if (filled_bytes) *filled_bytes = e->size;
+    if (aliases != nullptr && n_aliases > 0) {
+        e->keys.reserve(n_aliases + 1);
+        e->keys.insert(e->keys.end(), aliases, aliases + n_aliases);
+    }
 
     {
         ScopedWriteLock lock(s.mu);
-        // Duplicate-insert race: another thread filled the same page first —
-        // keep the incumbent, serve ourselves from the fallback (no private
-        // transient).
+        // Duplicate-insert race (lost the stripe gate, or a wider run fill
+        // covered this page): keep the incumbent.
         auto it = s.map.find(page);
         if (it != s.map.end()) {
             Entry* winner = it->second;
-            winner->refs.fetch_add(1, std::memory_order_acq_rel);
-            s.sketch->increment(page);
+            hit_locked(s, winner, page);
             h.entry = winner;
-            drop_filled(e);  // our buffer never becomes visible
-            return winner->data;
+            drop_filled(e);  // our buffer never became visible
+            if (gated) stripe.unlock();
+            return entry_ptr(winner, page);
         }
         s.sketch->increment(page);
 
@@ -367,14 +427,19 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
             rejections_.fetch_add(1, std::memory_order_relaxed);
             h.entry = nullptr;
             drop_filled(e);
+            if (gated) stripe.unlock();
             return fallback;
         }
 
         // The caller holds a pin from here on: refs must be 1 BEFORE the
         // entry becomes reachable (map/lists), or a concurrent insert could
-        // evict (and free) it between insertion and return.
+        // evict (and free) it between insertion and return. h.entry MUST be
+        // set too — a null handle means the caller never unpins and the
+        // refcount (and therefore the entry) leaks permanently, which pins
+        // every entry "in use" and disables all eviction (the 2x-budget
+        // OOM, 2026-09-08).
         e->refs.store(1, std::memory_order_relaxed);
-        h.entry = e;  // null handle = caller never unpins = permanent leak
+        h.entry = e;
         // Enter at window MRU, then run W-TinyLFU admission until the window
         // is back under budget. Candidate = window LRU, SKIPPING pinned
         // entries (rejecting an in-use entry would strand its buffer as a
@@ -384,6 +449,11 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
         s.window.push_mru(e);
         s.bytes_window += e->size;
         s.map.emplace(page, e);
+        for (PageId a : e->keys) {
+            // Claim-safe aliasing: never displace an existing entry's key
+            // (a single-leaf fill may have raced this wider run fill).
+            if (a != page) s.map.try_emplace(a, e);
+        }
 
         while (s.bytes_window > s.max_window_bytes) {
             Entry* cand = s.window.tail;
@@ -419,7 +489,7 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
                     s.sketch->frequency(victim->page)) {
                 List::unlink(victim, s.probation);
                 s.bytes_probation -= victim->size;
-                s.map.erase(victim->page);
+                erase_keys(s, victim);
                 evictions_.fetch_add(1, std::memory_order_relaxed);
                 drop_entry(victim);
                 cand->status = LeafExtentCacheStatus::PROBATION;
@@ -429,13 +499,14 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
                 // Rejected (unpinned, and never this caller's `e` — the
                 // cand selection guarantees both): remove from the cache.
                 // It frees immediately on drop (refs==0); no transient.
-                s.map.erase(cand->page);
+                erase_keys(s, cand);
                 rejections_.fetch_add(1, std::memory_order_relaxed);
                 drop_entry(cand);
             }
         }
     }
-    return e->data;
+    if (gated) stripe.unlock();
+    return entry_ptr(e, page);
 }
 
 void LeafExtentCache::unpin(Handle& h) {
@@ -454,6 +525,8 @@ void LeafExtentCache::invalidate_all() {
         ScopedWriteLock lock(s.mu);
         for (auto& [page, e] : s.map) {
             (void)page;
+            // Multi-key (run) entries appear once per key — retire only once.
+            if (e->retired.load(std::memory_order_relaxed)) continue;
             switch (e->status) {
             case LeafExtentCacheStatus::WINDOW:
                 List::unlink(e, s.window); break;

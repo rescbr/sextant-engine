@@ -219,6 +219,81 @@ TEST(LeafExtentCache, AdmissionTieKeepsIncumbent) {
 }
 
 // ---------------------------------------------------------------------------
+// Single-flight (try-lock): concurrent pins of the same missing page are
+// deduped ONLY when uncontended — the gate is deliberately non-blocking
+// (blocking single-flight serialized parallel redundancy and cost 16% QPS
+// on latency-bound zipf runs). Contract: every racer gets valid data, and
+// the total fill count stays bounded by the racer count.
+// ---------------------------------------------------------------------------
+TEST(LeafExtentCache, SingleFlightTryLockContract) {
+    TempPageFile tf(400);
+    LeafExtentCache cache(64ull << 20, 4, tf.fd);
+    cache.set_expected_entries(32);
+
+    std::atomic<int> go{0};
+    std::vector<std::thread> ths;
+    for (int t = 0; t < 8; ++t) {
+        ths.emplace_back([&] {
+            ++go;
+            while (go.load() < 8) std::this_thread::yield();
+            const uint8_t* p = nullptr;
+            auto h = pin_ok(cache, 200, kExtentPages, &p);
+            TempPageFile::expect_page(p, 200, kExtentPages);
+            cache.unpin(h);
+        });
+    }
+    for (auto& th : ths) th.join();
+
+    auto st = cache.stats();
+    EXPECT_GE(st.misses, 1u);
+    EXPECT_LE(st.misses, 8u) << "one fill per racer at most";
+    EXPECT_LE(st.bytes_filled, 8u * kExtentPages * kPageSize);
+    // Uncontended sequential access dedups trivially: second pin hits.
+    const uint8_t* p = nullptr;
+    auto h = pin_ok(cache, 300, kExtentPages, &p);
+    cache.unpin(h);
+    h = pin_ok(cache, 300, kExtentPages, &p);
+    cache.unpin(h);
+    auto st2 = cache.stats();
+    EXPECT_EQ(st2.misses, st.misses + 1u);
+    EXPECT_EQ(st2.hits, st.hits + 1u);
+}
+
+// ---------------------------------------------------------------------------
+// Run aliases: one merged fill covers multiple adjacent leaves; member
+// pins hit the alias keys and get offset-correct pointers.
+// ---------------------------------------------------------------------------
+TEST(LeafExtentCache, RunAliasMergedFill) {
+    TempPageFile tf(400);
+    LeafExtentCache cache(64ull << 20, 1, tf.fd);
+    cache.set_expected_entries(32);
+
+    const PageId p1 = 32, p2 = 32 + kExtentPages;
+    const PageId aliases[] = {p2};
+    LeafExtentCache::Handle h1;
+    const uint8_t* run = cache.pin(p1, 2 * kExtentPages, h1, nullptr,
+                                   nullptr, nullptr, aliases, 1);
+    TempPageFile::expect_page(run, p1, kExtentPages);
+
+    const uint8_t* p2ptr = nullptr;
+    auto h2 = pin_ok(cache, p2, kExtentPages, &p2ptr);
+    TempPageFile::expect_page(p2ptr, p2, kExtentPages);  // offset correct
+    EXPECT_NE(p2ptr, run);
+    EXPECT_EQ(p2ptr, run + kExtentPages * kPageSize);
+    cache.unpin(h2);
+    cache.unpin(h1);
+
+    auto st = cache.stats();
+    EXPECT_EQ(st.misses, 1u) << "alias pin must hit the run entry";
+    EXPECT_EQ(st.hits, 1u);
+
+    // Eviction removes every key of the run together.
+    cache.invalidate_all();
+    EXPECT_FALSE(cache.contains(p1));
+    EXPECT_FALSE(cache.contains(p2));
+}
+
+// ---------------------------------------------------------------------------
 // invalidate_all: cached entries dropped; pinned ones usable until unpin.
 // ---------------------------------------------------------------------------
 TEST(LeafExtentCache, InvalidateAll) {

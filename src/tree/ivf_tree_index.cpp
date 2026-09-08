@@ -2445,7 +2445,9 @@ struct SearchScratch {
     // buffers; unpinning mid-query would force refills).
     std::vector<LeafExtentCache::Handle> pins;
     std::vector<std::vector<LeafExtentCache::Handle>> worker_pins;
-    // Materialization scratch: one resolved pointer per candidate leaf.
+    // Cache-mode fill stage: candidate indices in page-sorted order + one
+    // resolved pointer per candidate (shared by scan + materialization).
+    std::vector<uint32_t> leaf_order;
     std::vector<const uint8_t*> leaf_ptrs;
 };
 
@@ -2958,6 +2960,75 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         }
     }
 
+    // --- Leaf cache fill planning (page-sorted + contiguous runs) ---
+    // Leaf extents emitted by the build are physically contiguous (measured
+    // cohere-10m: all 2864 leaves form ONE contiguous 4.3GiB run), and probe
+    // semantics are subtree-whole — so candidates from one subtree are
+    // page-adjacent. Filling in page order lets us (a) merge adjacent
+    // extents into single preads (fewer syscalls, near-streaming I/O) via
+    // alias-keyed run entries, and (b) issue reads in offset order for the
+    // NVMe queue. Fills are NOT done upfront: an all-at-once fill stage
+    // phase-separates I/O from compute and, when query threads run similar
+    // candidate sets (zipf), phase-locks them into lockstep — measured
+    // −14% QPS at f=0.01. Instead the scan loop fills one run AHEAD of the
+    // run it scans, keeping cross-thread overlap. Results are order-
+    // independent (heap entries carry leaf_slot; ties break on it).
+    if (leaf_cache_) {
+        auto& ord = scratch.leaf_order;
+        ord.clear();
+        ord.reserve(candidates.size());
+        for (uint32_t ci = 0; ci < candidates.size(); ++ci)
+            if (candidates[ci].page != kInvalidPage) ord.push_back(ci);
+        std::sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) {
+            return candidates[a].page < candidates[b].page;
+        });
+        auto& ptrs = scratch.leaf_ptrs;
+        ptrs.clear();
+        ptrs.resize(candidates.size(), nullptr);
+    }
+    // Run-fill helper shared by the scan loop (serial path) and the
+    // upfront stage (parallel path). Merges ONLY when every member is
+    // currently uncached — a merged fill over partially-resident members
+    // would duplicate their bytes and double-claim their keys.
+    auto fill_run = [&](size_t i, size_t j,
+                        std::vector<PageId>& alias_buf) {
+        if (i == j) return;
+        const auto& ord = scratch.leaf_order;
+        for (size_t k = i; k <= j; ++k) {
+            if (leaf_cache_->contains(candidates[ord[k]].page)) return;
+        }
+        alias_buf.clear();
+        for (size_t k = i + 1; k <= j; ++k)
+            alias_buf.push_back(candidates[ord[k]].page);
+        const PageId start = candidates[ord[i]].page;
+        const uint32_t run_pages = static_cast<uint32_t>(
+            (candidates[ord[j]].page + candidates[ord[j]].pages) - start);
+        LeafExtentCache::Handle h;
+        (void)leaf_cache_->pin(
+            start, run_pages, h,
+            mmap_base_ + static_cast<uint64_t>(start) * kPageSize,
+            nullptr, nullptr, alias_buf.data(),
+            static_cast<uint32_t>(alias_buf.size()));
+        if (h.entry) scratch.pins.push_back(h);
+    };
+    auto run_end = [&](size_t i) {
+        // End position (inclusive) of the contiguous run starting at i,
+        // capped at kMaxRunBytes.
+        constexpr uint64_t kMaxRunBytes = 2ull << 20;
+        const auto& ord = scratch.leaf_order;
+        size_t j = i;
+        uint64_t run_bytes = candidates[ord[i]].pages * kPageSize;
+        while (j + 1 < ord.size() &&
+               candidates[ord[j]].page + candidates[ord[j]].pages ==
+                   candidates[ord[j + 1]].page &&
+               run_bytes + candidates[ord[j + 1]].pages * kPageSize <=
+                   kMaxRunBytes) {
+            ++j;
+            run_bytes += candidates[ord[j]].pages * kPageSize;
+        }
+        return j;
+    };
+
     // --- Scan leaves ---
     // Adaptive W driven by predicate selectivity (computed above, before routing).
     uint32_t W = std::max(config.fastscan_W > 0 ? config.fastscan_W : 1000u, k);
@@ -3150,17 +3221,75 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const bool per_leaf = coder_->per_leaf_setup();
         const bool parallel_scan = config.search_threads > 1
             && candidates.size() >= 2;
+        // With the leaf cache, the fill stage pre-resolved every pointer
+        // (page-sorted, run-merged) into scratch.leaf_ptrs and scans follow
+        // the same sorted order (I/O already done; order only affects heap
+        // slot addressing, which is fixed per candidate either way).
+        const auto& ord = scratch.leaf_order;
+        const bool use_ord = leaf_cache_ != nullptr;
+        const uint32_t n_scan = use_ord ? static_cast<uint32_t>(ord.size())
+                                        : static_cast<uint32_t>(candidates.size());
         if (!parallel_scan) {
-            for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
-                if (candidates[ci].page == kInvalidPage) continue;
-                LeafExtentCache::Handle h;
-                const uint8_t* leaf_ptr =
-                    pin_leaf_(candidates[ci].page,
-                              static_cast<uint32_t>(candidates[ci].pages), h);
-                if (h.entry) scratch.pins.push_back(h);
-                if (per_leaf) coder_->bind_leaf(*scan_setup, leaf_ptr);
-                RawScanHeap heap{&sheap, W, ci};
-                coder_->scan_leaf(*scan_setup, leaf_ptr, heap);
+            if (use_ord) {
+                // Run-pipelined cache path: fill the NEXT contiguous run
+                // (merged pread) while scanning the current one; per-leaf
+                // pins inside the loop hit the already-filled entries.
+                // Restores cross-thread I/O/compute overlap (no upfront
+                // fill stage — see fill planning comment above).
+                std::vector<PageId> alias_buf;
+                size_t next = 0;
+                size_t filled = SIZE_MAX;  // run [0, run_end] already filled
+                size_t pos = 0;
+                fill_run(0, run_end(0), alias_buf);
+                filled = 0;
+                while (pos < n_scan) {
+                    const size_t rend = run_end(pos);
+                    if (rend != filled) {
+                        // pos starts a new run (previous finished): fill
+                        // THIS run's successors ahead is handled below; we
+                        // fill the run we are about to scan only if it was
+                        // not already prefilled as a predecessor's "next".
+                        fill_run(pos, rend, alias_buf);
+                        filled = rend;
+                    }
+                    for (size_t q = pos; q <= rend; ++q) {
+                        const uint32_t ci = ord[q];
+                        LeafExtentCache::Handle h;
+                        const uint8_t* leaf_ptr =
+                            pin_leaf_(candidates[ci].page,
+                                      static_cast<uint32_t>(
+                                          candidates[ci].pages),
+                                      h);
+                        if (h.entry) scratch.pins.push_back(h);
+                        scratch.leaf_ptrs[ci] = leaf_ptr;
+                        if (per_leaf)
+                            coder_->bind_leaf(*scan_setup, leaf_ptr);
+                        RawScanHeap heap{&sheap, W, ci};
+                        coder_->scan_leaf(*scan_setup, leaf_ptr, heap);
+                    }
+                    // Prefill the next run so its read overlaps this loop's
+                    // remaining compute and other threads' scans.
+                    if (rend + 1 < n_scan) {
+                        const size_t nrend = run_end(rend + 1);
+                        fill_run(rend + 1, nrend, alias_buf);
+                        filled = nrend;
+                    }
+                    pos = rend + 1;
+                    (void)next;
+                }
+            } else {
+                for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
+                    if (candidates[ci].page == kInvalidPage) continue;
+                    LeafExtentCache::Handle h;
+                    const uint8_t* leaf_ptr =
+                        pin_leaf_(candidates[ci].page,
+                                  static_cast<uint32_t>(candidates[ci].pages),
+                                  h);
+                    if (h.entry) scratch.pins.push_back(h);
+                    if (per_leaf) coder_->bind_leaf(*scan_setup, leaf_ptr);
+                    RawScanHeap heap{&sheap, W, ci};
+                    coder_->scan_leaf(*scan_setup, leaf_ptr, heap);
+                }
             }
         } else {
             const uint32_t T = std::min(config.search_threads,
@@ -3177,11 +3306,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             auto& wpins = scratch.worker_pins;
             if (wpins.size() < T) wpins.resize(T);
             for (auto& v : wpins) v.clear();
-            const uint32_t per = (static_cast<uint32_t>(candidates.size()) + T - 1) / T;
+            const uint32_t per = (n_scan + T - 1) / T;
             for (uint32_t t = 0; t < T; ++t) {
                 const uint32_t start = t * per;
-                const uint32_t end = std::min(start + per,
-                    static_cast<uint32_t>(candidates.size()));
+                const uint32_t end = std::min(start + per, n_scan);
                 if (start >= end) break;
                 futs.push_back(std::async(std::launch::async,
                     [&](uint32_t s, uint32_t e, uint32_t ti) {
@@ -3193,8 +3321,12 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                             own_setup = coder_->scan_setup(query);
                             use = own_setup.get();
                         }
-                        for (uint32_t c = s; c < e; ++c) {
+                        for (uint32_t pos = s; pos < e; ++pos) {
+                            const uint32_t c = use_ord ? ord[pos] : pos;
                             if (candidates[c].page == kInvalidPage) continue;
+                            // Workers pin per leaf (in page-sorted order for
+                            // the cache path — no prefill stage; see fill
+                            // planning comment).
                             LeafExtentCache::Handle h;
                             const uint8_t* leaf_ptr =
                                 pin_leaf_(candidates[c].page,
@@ -3202,6 +3334,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                               candidates[c].pages),
                                           h);
                             if (h.entry) wpins[ti].push_back(h);
+                            scratch.leaf_ptrs[c] = leaf_ptr;
                             if (per_leaf) coder_->bind_leaf(*use, leaf_ptr);
                             RawScanHeap heap{&my, W, c};
                             coder_->scan_leaf(*use, leaf_ptr, heap);
@@ -3260,17 +3393,20 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         hf.reserve(sheap.size());
         // Pin each candidate leaf ONCE (heap entries reference the same
         // <=n_leaves extents — per-entry pinning would double-count cache
-        // accesses and thrash the LRU).
+        // accesses and thrash the LRU). With the cache on, the fill stage
+        // already resolved every pointer (and holds the pins) — reuse.
         auto& ptrs = scratch.leaf_ptrs;
-        ptrs.clear();
-        ptrs.resize(candidates.size(), nullptr);
-        for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
-            if (candidates[ci].page == kInvalidPage) continue;
-            LeafExtentCache::Handle h;
-            ptrs[ci] = pin_leaf_(candidates[ci].page,
-                                 static_cast<uint32_t>(candidates[ci].pages),
-                                 h);
-            if (h.entry) scratch.pins.push_back(h);
+        if (!leaf_cache_) {
+            ptrs.clear();
+            ptrs.resize(candidates.size(), nullptr);
+            for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
+                if (candidates[ci].page == kInvalidPage) continue;
+                LeafExtentCache::Handle h;
+                ptrs[ci] = pin_leaf_(candidates[ci].page,
+                                     static_cast<uint32_t>(candidates[ci].pages),
+                                     h);
+                if (h.entry) scratch.pins.push_back(h);
+            }
         }
         for (const auto& e : sheap) {
             const uint32_t ci = e.leaf_slot;

@@ -110,7 +110,9 @@ public:
     const uint8_t* pin(PageId page, uint32_t pages, Handle& h,
                        const uint8_t* fallback = nullptr,
                        bool* was_hit = nullptr,
-                       uint64_t* filled_bytes = nullptr);
+                       uint64_t* filled_bytes = nullptr,
+                       const PageId* aliases = nullptr,
+                       uint32_t n_aliases = 0);
 
     /// Release a pin. Last unpin of an evicted/transient entry frees it.
     void unpin(Handle& h);
@@ -132,6 +134,13 @@ private:
         return static_cast<uint64_t>(pages) * kPageSize;
     }
     Shard& shard_for(PageId page);
+    /// Offset-aware entry pointer (pins may target ALIAS keys — leaf starts
+    /// inside a multi-leaf run fill — whose data begins mid-buffer).
+    static uint8_t* entry_ptr(Entry* e, PageId page);
+    /// Hit-path bookkeeping + SLRU promotion; caller holds the shard lock.
+    void hit_locked(Shard& s, Entry* e, PageId page);
+    /// Erase every key of `e` from the shard map; caller holds the lock.
+    static void erase_keys(Shard& s, Entry* e);
     Entry* new_entry(Shard& s, PageId page, uint32_t pages);  // buf + pread
     static void maybe_delete(Entry* e);
     static void maybe_delete_locked(Entry* e);  // caller holds owner mu
@@ -145,6 +154,15 @@ private:
     int fd_;
     std::unique_ptr<FrequencySketch[]> sketches_;  // one per shard
     std::vector<std::unique_ptr<Shard>> shards_;
+
+    /// Single-flight fill gate: stripe mutexes indexed by a hash of the
+    /// page. Lock order: stripe BEFORE shard lock, never the reverse.
+    static constexpr uint32_t kFillStripes = 1024;
+    std::unique_ptr<Mutex[]> fill_stripes_;
+    uint32_t fill_stripe(PageId page) const {
+        return static_cast<uint32_t>((page * 0x9E3779B97F4A7C15ull) >> 58)
+               % kFillStripes;
+    }
 
     // Cache-wide counters (relaxed; aggregated from pin/unpin/invalidate).
     mutable std::atomic<uint64_t> hits_{0};

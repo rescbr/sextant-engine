@@ -36,6 +36,8 @@ public:
     /// Exclusive (write) lock.
     void lock() { nsync::nsync_mu_lock(&mu_); }
     void unlock() { nsync::nsync_mu_unlock(&mu_); }
+    /// Non-blocking try-acquire of the exclusive lock.
+    bool try_lock() { return nsync::nsync_mu_trylock(&mu_) != 0; }
 
     /// Shared (read) lock.
     void lock_shared() { nsync::nsync_mu_rlock(&mu_); }
