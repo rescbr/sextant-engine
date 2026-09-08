@@ -44,11 +44,13 @@ BatchScheduler::~BatchScheduler() { stop(); }
 
 std::future<std::vector<Candidate>> BatchScheduler::submit(
         const float* query, uint32_t k,
-        const std::vector<Predicate>* predicates, uint64_t max_delay_us) {
+        const std::vector<Predicate>* predicates, uint64_t max_delay_us,
+        float probe_fraction) {
     Entry e;
     e.query.assign(query, query + index_->dim());
     e.k = k;
     if (predicates) e.predicates = *predicates;
+    e.probe_fraction = probe_fraction;
     e.submitted = std::chrono::steady_clock::now();
     const uint64_t delay_ns =
         (max_delay_us > 0 ? max_delay_us * 1000ull : window_max_ns_);
@@ -63,6 +65,7 @@ std::future<std::vector<Candidate>> BatchScheduler::submit(
         std::lock_guard<std::mutex> lk(mu_);
         for (auto it = cache_.begin(); it != cache_.end(); ++it) {
             if (it->k == k && predicates_equal(it->predicates, e.predicates) &&
+                it->probe_fraction == e.probe_fraction &&
                 it->query.size() == e.query.size() &&
                 std::equal(it->query.begin(), it->query.end(),
                            e.query.begin())) {
@@ -85,12 +88,6 @@ std::future<std::vector<Candidate>> BatchScheduler::submit(
     }
     cv_.notify_one();
     return fut;
-}
-
-std::future<std::vector<Candidate>> BatchScheduler::submit(
-        const float* query, uint32_t k,
-        const std::vector<Predicate>* predicates) {
-    return submit(query, k, predicates, 0);
 }
 
 void BatchScheduler::stop() {
@@ -232,6 +229,14 @@ void BatchScheduler::dispatch_(std::deque<Entry> window) {
         win_preds.reserve(window.size());
         for (const auto& e : window) win_preds.push_back(e.predicates);
     }
+    std::vector<float> win_frac;
+    bool any_frac = false;
+    for (const auto& e : window)
+        any_frac = any_frac || e.probe_fraction > 0.0f;
+    if (any_frac) {
+        win_frac.reserve(window.size());
+        for (const auto& e : window) win_frac.push_back(e.probe_fraction);
+    }
 
     std::vector<std::vector<Candidate>> results;
     SearchConfig sc = search_config_;
@@ -239,7 +244,8 @@ void BatchScheduler::dispatch_(std::deque<Entry> window) {
     const auto t0 = std::chrono::steady_clock::now();
     index_->search_batch(
         queries.data(), nq, k_eff, sc, results,
-        any_preds ? &win_preds : nullptr);
+        any_preds ? &win_preds : nullptr,
+        any_frac ? &win_frac : nullptr);
     const auto t1 = std::chrono::steady_clock::now();
 
     std::lock_guard<std::mutex> lk(mu_);
@@ -265,6 +271,7 @@ void BatchScheduler::dispatch_(std::deque<Entry> window) {
             ce.query = e.query;
             ce.k = e.k;
             ce.predicates = e.predicates;
+            ce.probe_fraction = e.probe_fraction;
             ce.results = results[i];
             if (ce.results.size() > e.k) ce.results.resize(e.k);
             cache_.push_front(std::move(ce));

@@ -692,3 +692,51 @@ TEST(BatchScheduler, BatchClassDefaultMatchesWindow) {
         std::chrono::steady_clock::now() - t0);
     EXPECT_LT(dt.count(), 500);  // window_max bound honored loosely
 }
+
+TEST(BatchSearch, PerQueryProbeFractionParity) {
+    // Recall-depth overrides: per-query fraction must match a per-query
+    // search with the same config, and a deeper query must return a
+    // superset-quality result (its own parity is the check).
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    auto base = base_config();
+    base.search_threads = 1;
+    base.n_probe = 0;            // fraction routing (per-query fraction
+    base.probe_fraction = 0.05f; // overrides don't mix with n_probe)
+    const uint32_t nq = 6;
+    const auto queries = fx.make_queries(nq);
+    std::vector<float> fracs(nq);
+    for (uint32_t i = 0; i < nq; ++i) fracs[i] = (i % 2 == 0) ? 0.4f : 0.0f;
+    std::vector<std::vector<sextant::Candidate>> out;
+    idx->search_batch(queries.data(), nq, 10, base, out, nullptr, &fracs);
+    for (uint32_t i = 0; i < nq; ++i) {
+        sextant::SearchConfig qcfg = base;
+        if (fracs[i] > 0) qcfg.probe_fraction = fracs[i];
+        const auto single = idx->search(
+            queries.data() + static_cast<size_t>(i) * fx.dim, 10, qcfg);
+        expect_same_results(single, out[i], /*exact_order=*/true);
+    }
+}
+
+TEST(BatchSearch, MixedDepthsShareLeafReads) {
+    // A window mixing f=0.05 and f=0.4 queries sweeps the UNION of
+    // probe sets; unique-leaf bytes stay far below the sum of the
+    // per-query (uncoalesced) bytes.
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    auto base = base_config();
+    base.search_threads = 2;
+    base.n_probe = 0;
+    base.probe_fraction = 0.05f;
+    const uint32_t nq = 24;
+    const auto queries = fx.make_queries(nq);
+    std::vector<float> fracs(nq);
+    for (uint32_t i = 0; i < nq; ++i) fracs[i] = (i % 2) ? 0.4f : 0.0f;
+    std::vector<std::vector<sextant::Candidate>> out;
+    idx->search_batch(queries.data(), nq, 10, base, out, nullptr, &fracs);
+    const auto bs = idx->batch_stats().snapshot_and_reset();
+    const auto s = idx->search_stats().snapshot_and_reset();
+    ASSERT_GT(bs.leaves_unique, 0u);
+    EXPECT_GT(s.bytes_touched, bs.bytes_unique);      // union dedups
+    EXPECT_LT(bs.bytes_unique, s.bytes_touched / 2);  // substantially
+}

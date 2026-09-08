@@ -97,14 +97,14 @@ public:
 
     /// Submit one query (dim() floats, copied). The returned future
     /// resolves with the query's top-k after its window's sweep.
-    /// Optional per-query predicates (null = the scheduler's base
-    /// config predicates; empty vector = unfiltered query).
-    /// Thread-safe.
-    std::future<std::vector<Candidate>> submit(
-            const float* query, uint32_t k,
-            const std::vector<Predicate>* predicates = nullptr);
+    /// Optional per-request settings (all default to the scheduler's
+    /// base config): predicates (empty vector = unfiltered query),
+    /// max_delay_us (latency tolerance — see the deadline-class docs
+    /// at the full overload), probe_fraction (recall depth — a
+    /// bytes-priced quality knob). Thread-safe.
 
-    /// Submit with a per-request latency tolerance (deadline class).
+    /// Full overload with per-request latency tolerance (deadline
+    /// class).
     /// `max_delay_us` is the QUEUEING delay the request accepts: the
     /// scheduler must DISPATCH it within that long of submission.
     /// Semantics:
@@ -132,8 +132,8 @@ public:
     ///     uncoalesced_capacity_qps (singleton-window measurement).
     std::future<std::vector<Candidate>> submit(
             const float* query, uint32_t k,
-            const std::vector<Predicate>* predicates,
-            uint64_t max_delay_us);
+            const std::vector<Predicate>* predicates = nullptr,
+            uint64_t max_delay_us = 0, float probe_fraction = 0.0f);
 
     /// Drain the queue, stop the sweeper, resolve pending futures.
     void stop();
@@ -146,6 +146,9 @@ private:
         std::vector<float> query;
         uint32_t k;
         std::vector<Predicate> predicates;  // empty = base config's
+        float probe_fraction = 0.0f;        // 0 = base config's (RECALL
+        // knob: deeper queries probe more leaves, priced in bytes; the
+        // unique-leaf sweep still reads shared leaves once)
         std::chrono::steady_clock::time_point submitted;
         std::chrono::steady_clock::time_point deadline;  // submitted +
         // max_delay_us (default: window_max_us). The queue is kept
@@ -179,6 +182,7 @@ private:
         std::vector<float> query;
         uint32_t k;
         std::vector<Predicate> predicates;
+        float probe_fraction = 0.0f;
         std::vector<Candidate> results;
     };
     std::deque<CacheEntry> cache_;  // front = most recent

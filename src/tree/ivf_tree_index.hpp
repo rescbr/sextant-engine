@@ -228,7 +228,9 @@ public:
                                               const SearchConfig& config,
                                               std::vector<std::vector<Candidate>>& results,
                                               const std::vector<std::vector<Predicate>>*
-                                                  per_query_predicates = nullptr) const;
+                                                  per_query_predicates = nullptr,
+                                              const std::vector<float>* per_query_probe_fraction =
+                                                  nullptr) const;
 
 
     // --- Routing diagnostics (loss-decomposition harness) ---

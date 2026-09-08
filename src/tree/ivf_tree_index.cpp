@@ -4051,7 +4051,8 @@ void IVFTreeIndex::search_batch(
         const float* queries, uint32_t nq, uint32_t k,
         const SearchConfig& config,
         std::vector<std::vector<Candidate>>& results,
-        const std::vector<std::vector<Predicate>>* per_query_predicates)
+        const std::vector<std::vector<Predicate>>* per_query_predicates,
+        const std::vector<float>* per_query_probe_fraction)
         const {
     const auto t0 = std::chrono::steady_clock::now();
     results.clear();
@@ -4068,9 +4069,13 @@ void IVFTreeIndex::search_batch(
 
     // --- Per-query state (route output + sweep accumulation) ---
     // Predicates: per-query overrides when provided (empty vector = no
-    // predicates for that query), else the base config's. Everything
+    // predicates for that query), else the base config's. Probe
+    // fraction: per-query override (>0; overrides n_probe too) — a
+    // RECALL knob, priced in bytes: deeper queries probe more leaves,
+    // which merge into the same unique-leaf sweep (shared leaves read
+    // once regardless of which query depth requested them). Everything
     // downstream (routing selectivity/summary pruning, harvest-time
-    // evaluation, pool finalize) uses the query's own predicate set.
+    // evaluation, pool finalize) uses the query's own settings.
     struct QueryState {
         const float* query = nullptr;
         std::vector<LeafCandidate> candidates;
@@ -4079,6 +4084,7 @@ void IVFTreeIndex::search_batch(
         std::vector<PoolEntry> pool;        // harvested row-ids (bounded W)
         const std::vector<Predicate>* predicates = nullptr;
         std::vector<uint32_t> pred_col_indices, geo_lng_col_indices;
+        float probe_fraction = 0.0f;       // 0 = base config's
         uint32_t W = 0;
         bool fallback = false;              // brute-force filtered path
         uint64_t routing_ns = 0;
@@ -4090,6 +4096,8 @@ void IVFTreeIndex::search_batch(
             (per_query_predicates && !(*per_query_predicates)[i].empty())
                 ? &(*per_query_predicates)[i]
                 : &config.predicates;
+        if (per_query_probe_fraction)
+            qs[i].probe_fraction = (*per_query_probe_fraction)[i];
     }
     const bool batch_has_predicates = [&qs, nq]() {
         for (uint32_t i = 0; i < nq; ++i)
@@ -4111,6 +4119,10 @@ void IVFTreeIndex::search_batch(
                 // predicates. (Stack copy; predicates are small.)
                 SearchConfig qcfg = config;
                 qcfg.predicates = *s.predicates;
+                if (s.probe_fraction > 0.0f) {
+                    qcfg.probe_fraction = s.probe_fraction;
+                    qcfg.n_probe = 0;  // fraction routing requires it
+                }
                 const auto tr0 = std::chrono::steady_clock::now();
                 const RouteStatus st =
                     route_query_(s.query, qcfg, rscratch, s.candidates);
