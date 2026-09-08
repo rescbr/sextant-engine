@@ -363,6 +363,59 @@ private:
     mutable std::atomic<uint64_t> node_bytes_{0};
 };
 
+/// Subtree-major batch observability (IVFTreeIndex::search_batch).
+/// Counters accumulate across batch calls; snapshot per metrics window.
+/// The per-query SearchStats keep their query-major meaning (each query's
+/// own probe set size and bytes), so query-major and batch runs remain
+/// comparable; these counters describe the COALESCING.
+struct BatchStats {
+    struct Snapshot {
+        uint64_t batches = 0;          ///< search_batch calls
+        uint64_t queries = 0;          ///< queries across batches
+        uint64_t leaves_unique = 0;    ///< unique leaves swept (page-deduped)
+        uint64_t leaf_scans = 0;       ///< (leaf, query) scans executed
+        uint64_t bytes_unique = 0;     ///< unique-leaf bytes read (the floor)
+        uint64_t fallback_queries = 0; ///< queries served by per-query paths
+        double wall_seconds = 0;
+    };
+
+    void on_batch(uint64_t queries, uint64_t leaves_unique,
+                  uint64_t leaf_scans, uint64_t bytes_unique,
+                  uint64_t fallback, double wall_s) const {
+        batches_.fetch_add(1, std::memory_order_relaxed);
+        queries_.fetch_add(queries, std::memory_order_relaxed);
+        leaves_unique_.fetch_add(leaves_unique, std::memory_order_relaxed);
+        leaf_scans_.fetch_add(leaf_scans, std::memory_order_relaxed);
+        bytes_unique_.fetch_add(bytes_unique, std::memory_order_relaxed);
+        fallback_queries_.fetch_add(fallback, std::memory_order_relaxed);
+        wall_ns_.fetch_add(static_cast<uint64_t>(wall_s * 1e9),
+                           std::memory_order_relaxed);
+    }
+
+    Snapshot snapshot_and_reset() const {
+        Snapshot s;
+        s.batches = batches_.exchange(0, std::memory_order_relaxed);
+        s.queries = queries_.exchange(0, std::memory_order_relaxed);
+        s.leaves_unique = leaves_unique_.exchange(0, std::memory_order_relaxed);
+        s.leaf_scans = leaf_scans_.exchange(0, std::memory_order_relaxed);
+        s.bytes_unique = bytes_unique_.exchange(0, std::memory_order_relaxed);
+        s.fallback_queries =
+            fallback_queries_.exchange(0, std::memory_order_relaxed);
+        s.wall_seconds = static_cast<double>(
+            wall_ns_.exchange(0, std::memory_order_relaxed)) / 1e9;
+        return s;
+    }
+
+private:
+    mutable std::atomic<uint64_t> batches_{0};
+    mutable std::atomic<uint64_t> queries_{0};
+    mutable std::atomic<uint64_t> leaves_unique_{0};
+    mutable std::atomic<uint64_t> leaf_scans_{0};
+    mutable std::atomic<uint64_t> bytes_unique_{0};
+    mutable std::atomic<uint64_t> fallback_queries_{0};
+    mutable std::atomic<uint64_t> wall_ns_{0};
+};
+
 /// Search configuration.
 struct SearchConfig {
     uint32_t k = 10;

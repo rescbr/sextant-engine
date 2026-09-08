@@ -77,11 +77,18 @@ struct HeapEntry {
     uint32_t local_idx;
 };
 
+/// Total order on scan-heap entries: (pq_dist, leaf_slot, local_idx).
+/// The tiebreak makes the bounded top-W set DETERMINISTIC regardless of
+/// scan order — required for bit-exact equivalence between query-major
+/// search() and leaf-major search_batch() (both scan the same per-query
+/// candidate list, so leaf_slot/local_idx agree across paths).
 inline bool heap_entry_less(const HeapEntry& a, const HeapEntry& b) {
-    return a.pq_dist < b.pq_dist;
+    if (a.pq_dist != b.pq_dist) return a.pq_dist < b.pq_dist;
+    if (a.leaf_slot != b.leaf_slot) return a.leaf_slot < b.leaf_slot;
+    return a.local_idx < b.local_idx;
 }
 
-/// Sift-down replacement of the heap root (max-pq_dist).
+/// Sift-down replacement of the heap root (worst entry by heap_entry_less).
 inline void heap_replace(std::vector<HeapEntry>& h, uint32_t new_d,
                          uint32_t leaf_slot, uint32_t local_idx) {
     h[0] = {new_d, leaf_slot, local_idx};
@@ -91,9 +98,9 @@ inline void heap_replace(std::vector<HeapEntry>& h, uint32_t new_d,
         const uint32_t left = 2 * pos + 1;
         const uint32_t right = 2 * pos + 2;
         uint32_t largest = pos;
-        if (left < n && h[left].pq_dist > h[largest].pq_dist)
+        if (left < n && heap_entry_less(h[largest], h[left]))
             largest = left;
-        if (right < n && h[right].pq_dist > h[largest].pq_dist)
+        if (right < n && heap_entry_less(h[largest], h[right]))
             largest = right;
         if (largest == pos) break;
         std::swap(h[pos], h[largest]);
@@ -123,6 +130,41 @@ inline void heap_push(RawScanHeap& s, uint32_t dist_key, uint32_t local_idx) {
 }
 inline uint32_t heap_front(const RawScanHeap& s) {
     return s.h->front().pq_dist;
+}
+/// Sentinel entry marking "not yet filled": sorts worst in heap_entry_less
+/// (max pq_dist) so real entries always displace it.
+inline bool heap_entry_is_sentinel(const HeapEntry& e) {
+    return e.pq_dist == 0xFFFFFFFFu;
+}
+/// Pre-fill a bounded top-W heap with sentinel entries. Every real entry
+/// then takes the guarded replace path, so the final bounded set is
+/// EXACTLY the W smallest by heap_entry_less — independent of arrival
+/// order. Required for bit-exact equivalence between query-major
+/// search() (candidate-order scans) and leaf-major search_batch()
+/// (page-order sweeps); without it, the first W encountered entries are
+/// kept un-evicted and the survivor set depends on scan order.
+inline void heap_init(std::vector<HeapEntry>& h, uint32_t w) {
+    h.clear();
+    h.assign(w, {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu});
+}
+/// Drop sentinel entries and restore the heap invariant (feedback loop
+/// reads heap_front between scans).
+inline void heap_compact(std::vector<HeapEntry>& h) {
+    h.erase(std::remove_if(h.begin(), h.end(), heap_entry_is_sentinel),
+            h.end());
+    std::make_heap(h.begin(), h.end(), heap_entry_less);
+}
+/// Should an entry (dist_key, local_idx) from THIS leaf displace the heap
+/// front? Yes when strictly closer, or when tying pq_dist AND beating the
+/// front on the total order's tiebreak. Kernels use this instead of a
+/// bare `dist_key < heap_front()` so the bounded set is exactly the W
+/// smallest by heap_entry_less (order-independent under ties).
+inline bool heap_should_replace(const RawScanHeap& s, uint32_t dist_key,
+                                uint32_t local_idx) {
+    const HeapEntry& f = s.h->front();
+    if (dist_key != f.pq_dist) return dist_key < f.pq_dist;
+    if (s.leaf_slot != f.leaf_slot) return s.leaf_slot < f.leaf_slot;
+    return local_idx < f.local_idx;
 }
 inline void heap_replace_top(RawScanHeap& s, uint32_t dist_key,
                              uint32_t local_idx) {

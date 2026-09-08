@@ -255,9 +255,10 @@ void LocalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
                 if (!heap_full(heap)) continue;
             }
             const uint32_t block_min = u32_min16(out);
-            if (block_min >= heap_front(heap)) continue;
+            if (block_min > heap_front(heap)) continue;
             for (uint32_t j = 0; j < 16; ++j) {
-                if (out[j] == 0xFFFFFFFFu || out[j] >= heap_front(heap)) continue;
+                if (out[j] == 0xFFFFFFFFu) continue;
+                if (!heap_should_replace(heap, out[j], base + j)) continue;
                 heap_replace_top(heap, out[j], base + j);
             }
         } else {
@@ -275,9 +276,9 @@ void LocalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
                 }
                 if (!heap_full(heap)) continue;
             }
-            if (u32_min32(out) >= heap_front(heap)) continue;
+            if (u32_min32(out) > heap_front(heap)) continue;
             for (uint32_t j = 0; j < 32; ++j) {
-                if (out[j] >= heap_front(heap)) continue;
+                if (!heap_should_replace(heap, out[j], base + j)) continue;
                 heap_replace_top(heap, out[j], base + j);
             }
         }

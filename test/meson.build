@@ -34,7 +34,8 @@ test_sources = [
     'test_quantizer_families.cpp',
     'test_simd_x86.cpp',
     'test_leaf_cache.cpp',
-    
+    'test_batch_search.cpp',
+
 ]
 
 foreach src : test_sources

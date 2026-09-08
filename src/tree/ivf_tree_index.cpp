@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <numeric>
 #include <sys/mman.h>
 #include <thread>
@@ -2386,15 +2387,6 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
 // ===========================================================================
 namespace {
 
-/// Frontier entry during routing (was local to search()).
-struct ProbeEntry {
-    float    dist;
-    PageId   page;
-    uint64_t pages;
-    uint16_t is_leaf;
-    const float16_t* centroid;  // inline FP16 centroid (points into mmap)
-};
-
 /// Result candidate carrying its payload location (was local to search()).
 struct ResultWithLoc {
     Candidate cand;
@@ -2411,8 +2403,6 @@ namespace {
 
 }  // namespace
 
-namespace {
-
 struct SearchScratch {
     // query prep
     std::vector<float16_t> query_fp16;
@@ -2425,6 +2415,14 @@ struct SearchScratch {
     std::vector<ProbeEntry> frontier, next_frontier;
     std::vector<uint32_t> root_idx, next_root_idx;
     std::vector<LeafCandidate> candidates, pruned_candidates;
+    // routing side channels (filled by route_query_, read by the caller):
+    // predicate selectivity, accumulated internal-node bytes, resolved gap
+    // pruning threshold, and whether feedback probing is active for this
+    // config (the feedback loop in search() reuses root_dists + gap).
+    float selectivity = 1.0f;
+    uint64_t route_node_bytes = 0;
+    float route_gap = 0.0f;
+    bool route_feedback = false;
     // scan + predicate filtering of the heap
     std::vector<HeapEntry> heap;              // scan-time (12B entries)
     std::vector<HeapEntryFull> heap_full;      // materialized post-scan
@@ -2451,7 +2449,432 @@ struct SearchScratch {
     std::vector<const uint8_t*> leaf_ptrs;
 };
 
-}  // namespace
+bool IVFTreeIndex::resolve_pred_columns_(
+        const SearchConfig& config,
+        std::vector<uint32_t>& pred_col_indices,
+        std::vector<uint32_t>& geo_lng_col_indices) const {
+    pred_col_indices.clear();
+    geo_lng_col_indices.clear();
+    if (config.predicates.empty()) return true;
+    pred_col_indices.reserve(config.predicates.size());
+    geo_lng_col_indices.resize(config.predicates.size(), UINT32_MAX);
+    for (uint32_t pi = 0; pi < config.predicates.size(); ++pi) {
+        const auto& pred = config.predicates[pi];
+        const auto* col = manifest_.schema.find(pred.column);
+        if (!col) return false;  // Predicate references unknown column.
+        pred_col_indices.push_back(
+            static_cast<uint32_t>(col - manifest_.schema.columns.data()));
+        // Geo predicates need a second column (longitude).
+        if (pred.op == PredicateOp::GeoRadius ||
+            pred.op == PredicateOp::GeoBox) {
+            if (pred.geo_lng_column.empty()) return false;
+            const auto* lng_col = manifest_.schema.find(pred.geo_lng_column);
+            if (!lng_col) return false;
+            geo_lng_col_indices[pi] = static_cast<uint32_t>(
+                lng_col - manifest_.schema.columns.data());
+        }
+    }
+    return true;
+}
+
+void IVFTreeIndex::expand_probe_(const ProbeEntry& e, bool use_pca_leaves,
+                                 uint32_t root_child_for_pca, float gap,
+                                 uint32_t n_probe_ln,
+                                 const SearchConfig& config,
+                                 const std::vector<uint32_t>& pred_col_indices,
+                                 const std::vector<uint32_t>& geo_lng_col_indices,
+                                 SearchScratch& scratch,
+                                 std::vector<ProbeEntry>& out,
+                                 uint64_t& node_bytes) const {
+    const bool has_predicates = !config.predicates.empty();
+    const uint32_t cesize =
+        child_entry_size(manifest_.dim, manifest_.summary_size);
+    const uint8_t* node_ptr = mmap_base_ +
+        static_cast<uint64_t>(e.page) * kPageSize;
+    const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
+    node_bytes += static_cast<uint64_t>(e.pages) * kPageSize;
+    const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
+
+    auto& child_dists = scratch.child_dists;
+    child_dists.clear();
+    child_dists.reserve(nh->n_children);
+    // Summary offset within each child entry (after the inline FP16
+    // centroid). Used for subtree-level pruning during routing.
+    const uint32_t child_summary_off =
+        sizeof(ChildEntry) + manifest_.dim * sizeof(float16_t);
+    for (uint32_t j = 0; j < nh->n_children; ++j) {
+        // Summary-aware routing: skip children whose filter summary rules
+        // out all matches for the predicates (prunes whole subtrees during
+        // descent, not just leaves after descent). Conservative — never
+        // produces false negatives.
+        if (has_predicates && manifest_.summary_size > 0) {
+            const uint8_t* child_summary = p + child_summary_off;
+            if (!summary_may_match(child_summary, manifest_.summary_size,
+                                   manifest_.schema, config.predicates,
+                                   pred_col_indices, geo_lng_col_indices)) {
+                p += cesize;
+                continue;  // PRUNED: subtree can't contain matches
+            }
+        }
+        float d;
+        if (use_pca_leaves && root_child_for_pca < pca_leaf_base_.size() &&
+            pca_leaf_base_[root_child_for_pca] != UINT64_MAX) {
+            const uint32_t gid = static_cast<uint32_t>(
+                pca_leaf_base_[root_child_for_pca]) + j;
+            const float* lc = &pca_leaf_centroids_[gid * pca_dims_];
+            d = 0.0f;
+            for (uint32_t kk = 0; kk < pca_dims_; ++kk) {
+                const float diff = scratch.query_pca[kk] - lc[kk];
+                d += diff * diff;
+            }
+        } else {
+            const float16_t* cent = reinterpret_cast<const float16_t*>(
+                p + sizeof(ChildEntry));
+            d = simd::dist_f16(coder_->metric(), scratch.query_fp16.data(),
+                               cent, manifest_.dim);
+        }
+        child_dists.emplace_back(d, j);
+        p += cesize;
+    }
+    std::sort(child_dists.begin(), child_dists.end());
+
+    // n_probe_ln is bounded by child_dists.size(), not nh->n_children:
+    // summary-aware pruning above may have removed children that can't
+    // match the predicates, so child_dists can be smaller than
+    // n_children. Using n_children here causes an out-of-bounds access
+    // under heavy filtering.
+    const uint32_t n_probe_ln_eff = std::min(
+        static_cast<uint64_t>(n_probe_ln),
+        static_cast<uint64_t>(child_dists.size()));
+    const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);
+    for (uint32_t j = 0; j < n_probe_ln_eff; ++j) {
+        if (gap > 0 && j > 0 &&
+            child_dists[j].first > child_dists[j - 1].first * gap) break;
+        const uint32_t idx = child_dists[j].second;
+        const auto* ce = reinterpret_cast<const ChildEntry*>(
+            p2 + idx * cesize);
+        if (ce->child_page == kInvalidPage) continue;  // empty child
+        // Leaf children store a leaf_id (index into leaf_table_);
+        // internal children store a physical page directly.
+        PageId rpage = ce->child_page;
+        uint64_t rpages = ce->child_pages;
+        if (ce->is_leaf) {
+            rpage = leaf_table_[ce->child_page].page;
+            rpages = leaf_table_[ce->child_page].pages;
+        }
+        const float16_t* cent = reinterpret_cast<const float16_t*>(
+            reinterpret_cast<const uint8_t*>(ce) + sizeof(ChildEntry));
+        out.push_back({child_dists[j].first, rpage,
+                       rpages, ce->is_leaf, cent});
+    }
+}
+
+IVFTreeIndex::RouteStatus IVFTreeIndex::route_query_(
+        const float* query, const SearchConfig& config,
+        SearchScratch& scratch,
+        std::vector<LeafCandidate>& candidates) const {
+    candidates.clear();
+
+    // Cast query to FP16 for routing (non-PCA path + leaf centroid reads).
+    auto& query_fp16 = scratch.query_fp16;
+    query_fp16.resize(manifest_.dim);
+    cast_fp32_to_fp16(query, query_fp16.data(), manifest_.dim);
+
+    // --- Project query to PCA space if PCA routing is enabled ---
+    auto& query_pca = scratch.query_pca;
+    query_pca.clear();
+    if (pca_dims_ > 0) {
+        query_pca.resize(pca_dims_);
+        for (uint32_t k = 0; k < pca_dims_; ++k) {
+            query_pca[k] = simd::dot_f32(&pca_proj_[k * manifest_.dim],
+                                          query, manifest_.dim)
+                           - pca_mean_proj_[k];
+        }
+    }
+
+    // --- Resolve predicate column indices (once per query) ---
+    if (!resolve_pred_columns_(config, scratch.pred_col_indices,
+                               scratch.geo_lng_col_indices)) {
+        return RouteStatus::Empty;  // unknown predicate column
+    }
+    const bool has_predicates = !config.predicates.empty();
+
+    // --- Descent configuration ---
+    // Adaptive gap resolution (SearchConfig::adaptive_probe_gap):
+    //   <0 = off (disable early-exit entirely)
+    //    0 = auto (use the value baked into the manifest at build time)
+    //   >0 = explicit override
+    // NOTE: gap pruning is a QPS/recall trade knob. On noise-dominated
+    // embeddings (e.g. Cohere), centroid distances are nearly uniform, so
+    // even a modest gap (1.5) prunes probing to a few leaves and silently
+    // destroys recall. Disabled by default; see ResolvedParams.
+    float gap = manifest_.adaptive_probe_gap;
+    if (config.adaptive_probe_gap < 0) gap = 0.0f;
+    else if (config.adaptive_probe_gap > 0) gap = config.adaptive_probe_gap;
+    scratch.route_gap = gap;
+
+    // Probe-fraction routing (leaf-coverage contract). Precedence:
+    // explicit n_probe (absolute, expert) > probe_fraction (call or
+    // manifest) > legacy manifest counts.
+    float probe_frac = config.probe_fraction;
+    if (probe_frac <= 0.0f && config.n_probe == 0) {
+        probe_frac = manifest_.probe_fraction;
+    }
+    const bool fraction_routing = probe_frac > 0.0f && config.n_probe == 0;
+
+    // Scan-feedback probing (FeedbackProbe): root children probed in
+    // routing order one subtree block at a time, stopping on scan feedback
+    // instead of a fixed fraction. Not coalescible — search_batch rejects
+    // it; search() runs the feedback loop itself (reusing root_dists).
+    const bool feedback_active =
+        config.feedback.mode != FeedbackProbe::Mode::Off
+        && config.n_probe == 0 && !has_predicates
+        && manifest_.depth <= 2;
+    scratch.route_feedback = feedback_active;
+
+    const uint32_t n_probe_ln_cfg = (fraction_routing || feedback_active)
+        ? UINT32_MAX  // probe ALL leaves of each selected root child
+        : (config.n_probe_ln > 0
+               ? config.n_probe_ln
+               : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4));
+
+    // --- Phase D: compute selectivity BEFORE routing ---
+    float selectivity = 1.0f;
+    if (has_predicates) {
+        if (!card_table_.empty()) {
+            selectivity = card_table_.selectivity_combined(
+                manifest_.schema, config.predicates, scratch.pred_col_indices,
+                scratch.geo_lng_col_indices);
+        } else {
+            // Fallback: root-summary-based subtree overlap estimation.
+            selectivity = 1.0f;
+            auto& root_summaries = scratch.root_summaries;
+            root_summaries.clear();
+            root_summaries.resize(root_children_.size());
+            const uint32_t dim16 = manifest_.dim;
+            for (uint32_t c = 0; c < root_children_.size(); ++c) {
+                root_summaries[c] = reinterpret_cast<const uint8_t*>(
+                    root_children_[c].centroid) + dim16 * sizeof(float16_t);
+            }
+            for (uint32_t p = 0; p < config.predicates.size(); ++p) {
+                const auto& pred = config.predicates[p];
+                const uint32_t col_idx = scratch.pred_col_indices[p];
+                const auto& col = manifest_.schema.columns[col_idx];
+                float s = 1.0f;
+                if (col.type == ColumnType::Int32 || col.type == ColumnType::Int64 ||
+                    col.type == ColumnType::Float) {
+                    s = estimate_numeric_selectivity(
+                        root_summaries.data(),
+                        static_cast<uint32_t>(root_children_.size()),
+                        manifest_.summary_size, manifest_.schema,
+                        pred, col_idx);
+                }
+                selectivity *= std::max(s, 0.0001f);
+            }
+            selectivity = std::min(selectivity, 1.0f);
+        }
+    }
+    scratch.selectivity = selectivity;
+
+    // Brute-force PQ-decode fallback for extreme low selectivity (<1%).
+    // Triggered before routing — no point routing when we'll scan all
+    // matching leaves anyway.
+    if (has_predicates && selectivity > 0.0f && selectivity < 0.01f) {
+        return RouteStatus::FallbackFiltered;
+    }
+
+    // --- Level 0: root children ---
+    const uint32_t k_root = root_header_->n_children;
+    uint32_t n_probe_l0 = config.n_probe > 0
+        ? config.n_probe
+        : manifest_.n_probe_l0;
+    n_probe_l0 = std::min(n_probe_l0, k_root);
+
+    // MUST_ENTER filter-directed routing (§3.8): at low selectivity (≤20%),
+    // the matching vectors concentrate in a few subtrees that may be FAR from
+    // the query centroid. Normal centroid-distance ranking would skip them.
+    // Instead, probe ALL root children whose summary indicates they CAN contain
+    // matches. The summary pruning in the scoring loop below already removes
+    // children that can't match; here we widen n_probe_l0 to include every
+    // surviving child when selectivity is low.
+    const bool filter_directed = has_predicates && selectivity <= 0.20f;
+
+    // Score root children, sort, select top-n_probe_l0 with gap pruning.
+    auto& root_dists = scratch.root_dists;
+    root_dists.clear();
+    root_dists.reserve(k_root);
+    // Summary offset within each root child entry (after the inline FP16
+    // centroid). root_children_[c].centroid points at the centroid, which
+    // sits at child-entry offset sizeof(ChildEntry); the summary follows.
+    const uint32_t root_child_summary_bytes =
+        manifest_.dim * sizeof(float16_t);
+    for (uint32_t c = 0; c < k_root; ++c) {
+        // Summary-aware routing at the root: prune whole root subtrees whose
+        // filter summary rules out all predicate matches.
+        if (has_predicates && manifest_.summary_size > 0) {
+            const uint8_t* child_summary =
+                reinterpret_cast<const uint8_t*>(root_children_[c].centroid)
+                + root_child_summary_bytes;
+            if (!summary_may_match(child_summary, manifest_.summary_size,
+                                   manifest_.schema, config.predicates,
+                                   scratch.pred_col_indices,
+                                   scratch.geo_lng_col_indices)) {
+                continue;  // PRUNED: root subtree can't contain matches
+            }
+        }
+        float d;
+        if (pca_dims_ > 0) {
+            // PCA-space L2sq to root centroid.
+            const float* rcc = &pca_root_centroids_[c * pca_dims_];
+            d = 0.0f;
+            for (uint32_t kk = 0; kk < pca_dims_; ++kk) {
+                const float diff = query_pca[kk] - rcc[kk];
+                d += diff * diff;
+            }
+        } else {
+            d = simd::dist_f16(coder_->metric(), query_fp16.data(),
+                               root_children_[c].centroid, manifest_.dim);
+        }
+        root_dists.emplace_back(d, c);
+    }
+    std::sort(root_dists.begin(), root_dists.end());
+
+    auto& frontier = scratch.frontier;
+    auto& root_idx = scratch.root_idx;  // root-child index per frontier entry
+    frontier.clear();
+    root_idx.clear();
+    // When filter-directed, probe ALL summary-matching children (no
+    // n_probe_l0 cap, no gap pruning). Otherwise: fraction routing cuts by
+    // cumulative subtree extent; legacy path takes top-n_probe_l0 with gap
+    // pruning.
+    const uint32_t effective_probe = filter_directed
+        ? static_cast<uint32_t>(root_dists.size())
+        : n_probe_l0;
+    frontier.reserve(effective_probe);
+    if (fraction_routing && !filter_directed) {
+        // Leaf-coverage cut: walk children nearest-first, keep selecting
+        // until their cumulative subtree extent (pages) reaches
+        // probe_frac of the scored total. Pages ≈ vectors at fixed
+        // bytes/vector, so the fraction measures actual scan budget
+        // regardless of how unbalanced the children are — and no gap
+        // pruning: an early gap break would void the coverage contract.
+        uint64_t total_pages = 0;
+        for (const auto& rd : root_dists)
+            total_pages += root_children_[rd.second].pages;
+        const uint64_t budget = static_cast<uint64_t>(
+            probe_frac * static_cast<double>(total_pages));
+        uint64_t cum = 0;
+        for (size_t i = 0; i < root_dists.size(); ++i) {
+            const uint32_t c = root_dists[i].second;
+            const auto& rc = root_children_[c];
+            frontier.push_back({root_dists[i].first, rc.page, rc.pages,
+                                rc.is_leaf, rc.centroid});
+            root_idx.push_back(c);
+            cum += rc.pages;
+            if (cum >= budget) break;  // >=1 child always selected
+        }
+    } else {
+        for (uint32_t i = 0; i < effective_probe && i < root_dists.size(); ++i) {
+            if (!filter_directed && gap > 0 && i > 0 &&
+                root_dists[i].first > root_dists[i - 1].first * gap) break;
+            const uint32_t c = root_dists[i].second;
+            const auto& rc = root_children_[c];
+            frontier.push_back({root_dists[i].first, rc.page, rc.pages,
+                                rc.is_leaf, rc.centroid});
+            root_idx.push_back(c);
+        }
+    }
+
+    // --- Descend through internal levels ---
+    // depth=1 → no descent (frontier is already leaves).
+    // depth=2 → one expansion (root children → leaves).
+    // depth=3 → two expansions (root → L1 → L2, then L2 → leaves).
+    const bool pca_depth2 = (pca_dims_ > 0 && manifest_.depth == 2);
+    for (uint16_t level = 1; level < manifest_.depth; ++level) {
+        auto& next_frontier = scratch.next_frontier;
+        auto& next_root_idx = scratch.next_root_idx;  // only depth=2
+        next_frontier.clear();
+        next_root_idx.clear();
+        // Capacity hint only — clamp the multiply: probe-all callers pass
+        // n_probe_ln = UINT32_MAX, and frontier.size() × UINT32_MAX
+        // overflows into a multi-TB reserve (bad_alloc). The real per-node
+        // clamp lives at the expansion loop (min against each node's child
+        // count).
+        next_frontier.reserve(std::min<uint64_t>(
+            frontier.size() * std::max(1u, n_probe_ln_cfg), 1u << 20));
+
+        for (uint32_t fi = 0; fi < frontier.size(); ++fi) {
+            const auto& e = frontier[fi];
+            if (e.is_leaf) {
+                // Already a leaf — carry through.
+                next_frontier.push_back(e);
+                if (pca_depth2) next_root_idx.push_back(root_idx[fi]);
+                continue;
+            }
+            if (e.page == kInvalidPage) continue;  // empty internal node
+            // At the root→L1 step of a depth=2 PCA tree, use PCA leaf
+            // centroids; elsewhere route by FP16 inline centroids.
+            const bool use_pca_leaves = pca_depth2 && (level == 1);
+            const uint32_t rc_for_pca = use_pca_leaves ? root_idx[fi] : 0;
+            const size_t before = next_frontier.size();
+            expand_probe_(e, use_pca_leaves, rc_for_pca, gap, n_probe_ln_cfg,
+                          config, scratch.pred_col_indices,
+                          scratch.geo_lng_col_indices, scratch,
+                          next_frontier, scratch.route_node_bytes);
+            // Propagate root-child index to children (only needed for the
+            // depth=2 PCA path, which terminates at this level).
+            if (pca_depth2 && level == 1) {
+                for (size_t j = before; j < next_frontier.size(); ++j)
+                    next_root_idx.push_back(root_idx[fi]);
+            }
+        }
+        if (next_frontier.empty()) break;
+        frontier = std::move(next_frontier);
+        root_idx = std::move(next_root_idx);
+    }
+
+    // --- Collect leaf candidates from the final frontier ---
+    for (const auto& e : frontier) {
+        if (e.is_leaf && e.page != kInvalidPage) {
+            candidates.push_back({e.page, e.pages, e.dist, e.centroid});
+        }
+    }
+    if (candidates.empty()) {
+        return RouteStatus::Empty;
+    }
+
+    // --- Phase D: summary-based leaf pruning ---
+    // Before scanning, drop any candidate leaf whose summary rules out all
+    // matches for the predicates (numeric range miss or bloom negative).
+    // This skips entire leaves, saving the FastScan cost at low
+    // selectivity. Pins are taken through scratch.pins (released by the
+    // caller's guard).
+    if (has_predicates) {
+        auto& pruned = scratch.pruned_candidates;
+        pruned.clear();
+        pruned.reserve(candidates.size());
+        for (const auto& cand : candidates) {
+            if (cand.page == kInvalidPage) continue;
+            LeafExtentCache::Handle h;
+            const uint8_t* leaf_ptr =
+                pin_leaf_(cand.page, static_cast<uint32_t>(cand.pages), h);
+            if (h.entry) scratch.pins.push_back(h);
+            const uint8_t* summary = leaf_ptr + leaf_filter_offset();
+            if (summary_may_match(
+                    summary, manifest_.summary_size, manifest_.schema,
+                    config.predicates, scratch.pred_col_indices,
+                    scratch.geo_lng_col_indices)) {
+                pruned.push_back(cand);
+            }
+        }
+        candidates = std::move(pruned);
+        if (candidates.empty()) {
+            return RouteStatus::Empty;
+        }
+    }
+
+    return RouteStatus::Ok;
+}
 
 std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                              const SearchConfig& config,
@@ -2504,433 +2927,32 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // Local families re-bind it per leaf inside the scan loop.
     auto scan_setup = coder_->scan_setup(query);
 
-    // Cast query to FP16 for routing (used for non-PCA path + leaf centroid reads).
-    auto& query_fp16 = scratch.query_fp16;
-    query_fp16.resize(manifest_.dim);
-    cast_fp32_to_fp16(query, query_fp16.data(), manifest_.dim);
+    // --- Route: shared descent (route_query_, also used by search_batch) ---
     const MetricKind metric = coder_->metric();
-
-    // --- Project query to PCA space if PCA routing is enabled ---
-    auto& query_pca = scratch.query_pca;
-    query_pca.clear();
-    if (pca_dims_ > 0) {
-        query_pca.resize(pca_dims_);
-        for (uint32_t k = 0; k < pca_dims_; ++k) {
-            query_pca[k] = simd::dot_f32(&pca_proj_[k * manifest_.dim],
-                                          query, manifest_.dim)
-                           - pca_mean_proj_[k];
+    {
+        const RouteStatus rstatus =
+            route_query_(query, config, scratch, scratch.candidates);
+        qguard.t_route_end = std::chrono::steady_clock::now();
+        qguard.route_done = true;
+        qguard.node_bytes += scratch.route_node_bytes;
+        scratch.route_node_bytes = 0;
+        if (rstatus == RouteStatus::Empty) return {};
+        if (rstatus == RouteStatus::FallbackFiltered) {
+            // Brute-force PQ-decode fallback for extreme low selectivity
+            // (<1%) — per-query, not coalescible.
+            return search_brute_force_filtered(
+                query, k, config, scratch.pred_col_indices,
+                scratch.geo_lng_col_indices, payload_locs);
         }
     }
-
-    // --- Resolve predicate column indices (once per query) ---
-    // Phase D: if predicates are present, map each predicate's column name to
-    // its schema column index up-front. A predicate referencing an unknown
-    // column yields no results. For geo predicates, also resolve the longitude
-    // column name.
-    auto& pred_col_indices = scratch.pred_col_indices;
-    auto& geo_lng_col_indices = scratch.geo_lng_col_indices;  // geo only
-    pred_col_indices.clear();
-    geo_lng_col_indices.clear();
-    if (!config.predicates.empty()) {
-        pred_col_indices.reserve(config.predicates.size());
-        geo_lng_col_indices.resize(config.predicates.size(), UINT32_MAX);
-        for (uint32_t pi = 0; pi < config.predicates.size(); ++pi) {
-            const auto& pred = config.predicates[pi];
-            const auto* col = manifest_.schema.find(pred.column);
-            if (!col) {
-                return {};  // Predicate references unknown column.
-            }
-            pred_col_indices.push_back(
-                static_cast<uint32_t>(col - manifest_.schema.columns.data()));
-            // Geo predicates need a second column (longitude).
-            if (pred.op == PredicateOp::GeoRadius ||
-                pred.op == PredicateOp::GeoBox) {
-                if (pred.geo_lng_column.empty()) {
-                    return {};  // Misconfigured geo predicate.
-                }
-                const auto* lng_col = manifest_.schema.find(pred.geo_lng_column);
-                if (!lng_col) {
-                    return {};  // Longitude column not found.
-                }
-                geo_lng_col_indices[pi] = static_cast<uint32_t>(
-                    lng_col - manifest_.schema.columns.data());
-            }
-        }
-    }
-    const bool has_predicates = !config.predicates.empty();
-
-    // --- Route: iterative descent from root to leaves ---
-    //
-    // At each level we hold a frontier of (distance, child descriptor). The
-    // frontier is expanded one level at a time: each internal node is read
-    // from the mmap, its children are scored, and the top-n_probe_ln are kept.
-    // Leaf frontier entries are carried through unchanged. After the final
-    // descent, all surviving leaf entries become scan candidates.
-    // Level 0 (root) uses PCA-space distances when pca_dims_ > 0. For depth=2
-    // with PCA enabled, the L1→leaf step also uses PCA leaf centroids. For
-    // depth>=3, deeper levels (L1→L2, L2→leaves) route by FP16 distance to the
-    // inline child centroids (the data is already well-partitioned there).
-    const uint32_t cesize = child_entry_size(manifest_.dim, manifest_.summary_size);
-    // Adaptive gap resolution (SearchConfig::adaptive_probe_gap):
-    //   <0 = off (disable early-exit entirely)
-    //    0 = auto (use the value baked into the manifest at build time)
-    //   >0 = explicit override
-    // NOTE: gap pruning is a QPS/recall trade knob. On noise-dominated
-    // embeddings (e.g. Cohere), centroid distances are nearly uniform, so
-    // even a modest gap (1.5) prunes probing to a few leaves and silently
-    // destroys recall. Disabled by default; see ResolvedParams.
-    float gap = manifest_.adaptive_probe_gap;
-    if (config.adaptive_probe_gap < 0) gap = 0.0f;
-    else if (config.adaptive_probe_gap > 0) gap = config.adaptive_probe_gap;
-
-    // Probe-fraction routing (leaf-coverage contract). Precedence:
-    // explicit n_probe (absolute, expert) > probe_fraction (call or
-    // manifest) > legacy manifest counts. Resolved before level-0 so both
-    // the root cut and the deeper expansion see it.
-    float probe_frac = config.probe_fraction;
-    if (probe_frac <= 0.0f && config.n_probe == 0) {
-        probe_frac = manifest_.probe_fraction;
-    }
-    const bool fraction_routing = probe_frac > 0.0f && config.n_probe == 0;
-
-    // Scan-feedback probing (FeedbackProbe): root children probed in
-    // routing order one subtree block at a time, stopping on scan feedback
-    // instead of a fixed fraction. Same unit as fraction routing (whole
-    // root-child subtrees) and same probe-all semantics under each —
-    // requires n_probe == 0 and no predicates; depth > 2 falls back to the
-    // normal path (the per-child descent is only wired for depth <= 2).
-    const bool feedback_active =
-        config.feedback.mode != FeedbackProbe::Mode::Off
-        && config.n_probe == 0 && !has_predicates
-        && manifest_.depth <= 2;
-
-    const uint32_t n_probe_ln_cfg = (fraction_routing || feedback_active)
-        ? UINT32_MAX  // probe ALL leaves of each selected root child
-        : (config.n_probe_ln > 0
-               ? config.n_probe_ln
-               : (manifest_.n_probe_ln > 0 ? manifest_.n_probe_ln : 4));
-
-    // Lambda: read an internal node from mmap, score children, push top-n onto
-    // `out`. `use_pca_leaves` selects PCA leaf-centroid lookup (depth=2 path).
-    auto expand_internal = [&](const ProbeEntry& e, bool use_pca_leaves,
-                               uint32_t root_child_for_pca,
-                               std::vector<ProbeEntry>& out) {
-        const uint8_t* node_ptr = mmap_base_ +
-            static_cast<uint64_t>(e.page) * kPageSize;
-        const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
-        qguard.node_bytes += static_cast<uint64_t>(e.pages) * kPageSize;
-        const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
-
-        auto& child_dists = scratch.child_dists;
-        child_dists.clear();
-        child_dists.reserve(nh->n_children);
-        // Summary offset within each child entry (after the inline FP16
-        // centroid). Used for subtree-level pruning during routing.
-        const uint32_t child_summary_off =
-            sizeof(ChildEntry) + manifest_.dim * sizeof(float16_t);
-        for (uint32_t j = 0; j < nh->n_children; ++j) {
-            // Summary-aware routing: skip children whose filter summary rules
-            // out all matches for the predicates (prunes whole subtrees during
-            // descent, not just leaves after descent). Conservative — never
-            // produces false negatives.
-            if (has_predicates && manifest_.summary_size > 0) {
-                const uint8_t* child_summary = p + child_summary_off;
-                if (!summary_may_match(child_summary, manifest_.summary_size,
-                                       manifest_.schema, config.predicates,
-                                       pred_col_indices, geo_lng_col_indices)) {
-                    p += cesize;
-                    continue;  // PRUNED: subtree can't contain matches
-                }
-            }
-            float d;
-            if (use_pca_leaves && root_child_for_pca < pca_leaf_base_.size() &&
-                pca_leaf_base_[root_child_for_pca] != UINT64_MAX) {
-                const uint32_t gid = static_cast<uint32_t>(
-                    pca_leaf_base_[root_child_for_pca]) + j;
-                const float* lc = &pca_leaf_centroids_[gid * pca_dims_];
-                d = 0.0f;
-                for (uint32_t kk = 0; kk < pca_dims_; ++kk) {
-                    const float diff = query_pca[kk] - lc[kk];
-                    d += diff * diff;
-                }
-            } else {
-                const float16_t* cent = reinterpret_cast<const float16_t*>(
-                    p + sizeof(ChildEntry));
-                d = simd::dist_f16(metric, query_fp16.data(),
-                                    cent, manifest_.dim);
-            }
-            child_dists.emplace_back(d, j);
-            p += cesize;
-        }
-        std::sort(child_dists.begin(), child_dists.end());
-
-        // n_probe_ln is bounded by child_dists.size(), not nh->n_children:
-        // summary-aware pruning above may have removed children that can't
-        // match the predicates, so child_dists can be smaller than
-        // n_children. Using n_children here causes an out-of-bounds access
-        // under heavy filtering.
-        const uint32_t n_probe_ln = std::min(
-            static_cast<uint64_t>(n_probe_ln_cfg),
-            static_cast<uint64_t>(child_dists.size()));
-        const uint8_t* p2 = node_ptr + sizeof(TreeNodeHeader);
-        for (uint32_t j = 0; j < n_probe_ln; ++j) {
-            if (gap > 0 && j > 0 &&
-                child_dists[j].first > child_dists[j - 1].first * gap) break;
-            const uint32_t idx = child_dists[j].second;
-            const auto* ce = reinterpret_cast<const ChildEntry*>(
-                p2 + idx * cesize);
-            if (ce->child_page == kInvalidPage) continue;  // empty child
-            // Leaf children store a leaf_id (index into leaf_table_);
-            // internal children store a physical page directly.
-            PageId rpage = ce->child_page;
-            uint64_t rpages = ce->child_pages;
-            if (ce->is_leaf) {
-                rpage = leaf_table_[ce->child_page].page;
-                rpages = leaf_table_[ce->child_page].pages;
-            }
-            const float16_t* cent = reinterpret_cast<const float16_t*>(
-                reinterpret_cast<const uint8_t*>(ce) + sizeof(ChildEntry));
-            out.push_back({child_dists[j].first, rpage,
-                           rpages, ce->is_leaf, cent});
-        }
-    };
-
-    // --- Phase D: compute selectivity BEFORE routing ---
-    // selectivity = estimated fraction of rows passing all predicates.
-    // Used for: (1) MUST_ENTER filter-directed routing at low selectivity,
-    // (2) adaptive W, (3) brute-force fallback trigger at <1%.
-    float selectivity = 1.0f;
-    if (has_predicates) {
-        if (!card_table_.empty()) {
-            selectivity = card_table_.selectivity_combined(
-                manifest_.schema, config.predicates, pred_col_indices, geo_lng_col_indices);
-        } else {
-            // Fallback: root-summary-based subtree overlap estimation.
-            selectivity = 1.0f;
-            auto& root_summaries = scratch.root_summaries;
-            root_summaries.clear();
-            root_summaries.resize(root_children_.size());
-            const uint32_t dim16 = manifest_.dim;
-            for (uint32_t c = 0; c < root_children_.size(); ++c) {
-                root_summaries[c] = reinterpret_cast<const uint8_t*>(
-                    root_children_[c].centroid) + dim16 * sizeof(float16_t);
-            }
-            for (uint32_t p = 0; p < config.predicates.size(); ++p) {
-                const auto& pred = config.predicates[p];
-                const uint32_t col_idx = pred_col_indices[p];
-                const auto& col = manifest_.schema.columns[col_idx];
-                float s = 1.0f;
-                if (col.type == ColumnType::Int32 || col.type == ColumnType::Int64 ||
-                    col.type == ColumnType::Float) {
-                    s = estimate_numeric_selectivity(
-                        root_summaries.data(),
-                        static_cast<uint32_t>(root_children_.size()),
-                        manifest_.summary_size, manifest_.schema,
-                        pred, col_idx);
-                }
-                selectivity *= std::max(s, 0.0001f);
-            }
-            selectivity = std::min(selectivity, 1.0f);
-        }
-    }
-
-    // Brute-force PQ-decode fallback for extreme low selectivity (<1%).
-    // Triggered before routing — no point routing when we'll scan all
-    // matching leaves anyway.
-    if (has_predicates && selectivity > 0.0f && selectivity < 0.01f) {
-        return search_brute_force_filtered(query, k, config, pred_col_indices,
-                                           geo_lng_col_indices, payload_locs);
-    }
-
-    // --- Level 0: root children ---
-    const uint32_t k_root = root_header_->n_children;
-    uint32_t n_probe_l0 = config.n_probe > 0
-        ? config.n_probe
-        : manifest_.n_probe_l0;
-    n_probe_l0 = std::min(n_probe_l0, k_root);
-
-    // MUST_ENTER filter-directed routing (§3.8): at low selectivity (≤20%),
-    // the matching vectors concentrate in a few subtrees that may be FAR from
-    // the query centroid. Normal centroid-distance ranking would skip them.
-    // Instead, probe ALL root children whose summary indicates they CAN contain
-    // matches. The summary pruning in the scoring loop below already removes
-    // children that can't match; here we widen n_probe_l0 to include every
-    // surviving child when selectivity is low.
-    const bool filter_directed = has_predicates && selectivity <= 0.20f;
-
-    // Score root children, sort, select top-n_probe_l0 with gap pruning. We
-    // track each entry's root-child index (needed later for the depth=2 PCA
-    // leaf-centroid lookup).
-    auto& root_dists = scratch.root_dists;
-    root_dists.clear();
-    root_dists.reserve(k_root);
-    // Summary offset within each root child entry (after the inline FP16
-    // centroid). root_children_[c].centroid points at the centroid, which sits
-    // at child-entry offset sizeof(ChildEntry); the summary follows it.
-    const uint32_t root_child_summary_bytes =
-        manifest_.dim * sizeof(float16_t);
-    for (uint32_t c = 0; c < k_root; ++c) {
-        // Summary-aware routing at the root: prune whole root subtrees whose
-        // filter summary rules out all predicate matches.
-        if (has_predicates && manifest_.summary_size > 0) {
-            const uint8_t* child_summary =
-                reinterpret_cast<const uint8_t*>(root_children_[c].centroid)
-                + root_child_summary_bytes;
-            if (!summary_may_match(child_summary, manifest_.summary_size,
-                                   manifest_.schema, config.predicates,
-                                   pred_col_indices, geo_lng_col_indices)) {
-                continue;  // PRUNED: root subtree can't contain matches
-            }
-        }
-        float d;
-        if (pca_dims_ > 0) {
-            // PCA-space L2sq to root centroid.
-            const float* rcc = &pca_root_centroids_[c * pca_dims_];
-            d = 0.0f;
-            for (uint32_t kk = 0; kk < pca_dims_; ++kk) {
-                const float diff = query_pca[kk] - rcc[kk];
-                d += diff * diff;
-            }
-        } else {
-            d = simd::dist_f16(metric, query_fp16.data(),
-                               root_children_[c].centroid, manifest_.dim);
-        }
-        root_dists.emplace_back(d, c);
-    }
-    std::sort(root_dists.begin(), root_dists.end());
-
-    auto& frontier = scratch.frontier;
-    auto& root_idx = scratch.root_idx;  // root-child index per frontier entry
-    frontier.clear();
-    root_idx.clear();
-    // When filter-directed, probe ALL summary-matching children (no n_probe_l0
-    // cap, no gap pruning). Otherwise: fraction routing cuts by cumulative
-    // subtree extent; legacy path takes top-n_probe_l0 with gap pruning.
-    const uint32_t effective_probe = filter_directed
-        ? static_cast<uint32_t>(root_dists.size())
-        : n_probe_l0;
-    frontier.reserve(effective_probe);
-    if (fraction_routing && !filter_directed) {
-        // Leaf-coverage cut: walk children nearest-first, keep selecting
-        // until their cumulative subtree extent (pages) reaches
-        // probe_frac of the scored total. Pages ≈ vectors at fixed
-        // bytes/vector, so the fraction measures actual scan budget
-        // regardless of how unbalanced the children are — and no gap
-        // pruning: an early gap break would void the coverage contract.
-        uint64_t total_pages = 0;
-        for (const auto& rd : root_dists)
-            total_pages += root_children_[rd.second].pages;
-        const uint64_t budget = static_cast<uint64_t>(
-            probe_frac * static_cast<double>(total_pages));
-        uint64_t cum = 0;
-        for (size_t i = 0; i < root_dists.size(); ++i) {
-            const uint32_t c = root_dists[i].second;
-            const auto& rc = root_children_[c];
-            frontier.push_back({root_dists[i].first, rc.page, rc.pages,
-                                rc.is_leaf, rc.centroid});
-            root_idx.push_back(c);
-            cum += rc.pages;
-            if (cum >= budget) break;  // >=1 child always selected
-        }
-    } else {
-        for (uint32_t i = 0; i < effective_probe && i < root_dists.size(); ++i) {
-            if (!filter_directed && gap > 0 && i > 0 &&
-                root_dists[i].first > root_dists[i - 1].first * gap) break;
-            const uint32_t c = root_dists[i].second;
-            const auto& rc = root_children_[c];
-            frontier.push_back({root_dists[i].first, rc.page, rc.pages,
-                                rc.is_leaf, rc.centroid});
-            root_idx.push_back(c);
-        }
-    }
-
-    // --- Descend through internal levels ---
-    // depth=1 → no descent (frontier is already leaves).
-    // depth=2 → one expansion (root children → leaves).
-    // depth=3 → two expansions (root → L1 → L2, then L2 → leaves).
-    const bool pca_depth2 = (pca_dims_ > 0 && manifest_.depth == 2);
-    for (uint16_t level = 1; level < manifest_.depth; ++level) {
-        auto& next_frontier = scratch.next_frontier;
-        auto& next_root_idx = scratch.next_root_idx;  // only depth=2
-        next_frontier.clear();
-        next_root_idx.clear();
-        // Capacity hint only — clamp the multiply: probe-all callers pass
-        // n_probe_ln = UINT32_MAX, and frontier.size() × UINT32_MAX overflows
-        // into a multi-TB reserve (bad_alloc). The real per-node clamp lives
-        // at the expansion loop (min against each node's child count).
-        next_frontier.reserve(std::min<uint64_t>(
-            frontier.size() * std::max(1u, n_probe_ln_cfg), 1u << 20));
-
-        for (uint32_t fi = 0; fi < frontier.size(); ++fi) {
-            const auto& e = frontier[fi];
-            if (e.is_leaf) {
-                // Already a leaf — carry through.
-                next_frontier.push_back(e);
-                if (pca_depth2) next_root_idx.push_back(root_idx[fi]);
-                continue;
-            }
-            if (e.page == kInvalidPage) continue;  // empty internal node
-            // At the root→L1 step of a depth=2 PCA tree, use PCA leaf
-            // centroids; elsewhere route by FP16 inline centroids.
-            const bool use_pca_leaves = pca_depth2 && (level == 1);
-            const uint32_t rc_for_pca = use_pca_leaves ? root_idx[fi] : 0;
-            const size_t before = next_frontier.size();
-            expand_internal(e, use_pca_leaves, rc_for_pca, next_frontier);
-            // Propagate root-child index to children (only needed for the
-            // depth=2 PCA path, which terminates at this level).
-            if (pca_depth2 && level == 1) {
-                for (size_t j = before; j < next_frontier.size(); ++j)
-                    next_root_idx.push_back(root_idx[fi]);
-            }
-        }
-        if (next_frontier.empty()) break;
-        frontier = std::move(next_frontier);
-        root_idx = std::move(next_root_idx);
-    }
-
-    // --- Collect leaf candidates from the final frontier ---
     auto& candidates = scratch.candidates;
-    candidates.clear();
-    for (const auto& e : frontier) {
-        if (e.is_leaf && e.page != kInvalidPage) {
-            candidates.push_back({e.page, e.pages, e.dist, e.centroid});
-        }
-    }
-
-    if (candidates.empty()) {
-        return {};
-    }
-
-    // --- Phase D: summary-based leaf pruning ---
-    // Before scanning, drop any candidate leaf whose summary rules out all
-    // matches for the predicates (numeric range miss or bloom negative). This
-    // skips entire leaves, saving the FastScan cost at low selectivity.
-    if (has_predicates) {
-        auto& pruned = scratch.pruned_candidates;
-        pruned.clear();
-        pruned.reserve(candidates.size());
-        for (const auto& cand : candidates) {
-            if (cand.page == kInvalidPage) continue;
-            LeafExtentCache::Handle h;
-            const uint8_t* leaf_ptr =
-                pin_leaf_(cand.page, static_cast<uint32_t>(cand.pages), h);
-            if (h.entry) scratch.pins.push_back(h);
-            const uint8_t* summary = leaf_ptr + leaf_filter_offset();
-            if (summary_may_match(
-                    summary, manifest_.summary_size, manifest_.schema,
-                    config.predicates, pred_col_indices, geo_lng_col_indices)) {
-                pruned.push_back(cand);
-            }
-        }
-        candidates = std::move(pruned);
-        if (candidates.empty()) {
-            return {};
-        }
-    }
-
-    // Routing observability: descent is done (candidates final, pre-scan).
-    qguard.t_route_end = std::chrono::steady_clock::now();
-    qguard.route_done = true;
+    const bool has_predicates = !config.predicates.empty();
+    const bool feedback_active = scratch.route_feedback;
+    const float selectivity = scratch.selectivity;
+    const float gap = scratch.route_gap;
+    auto& pred_col_indices = scratch.pred_col_indices;
+    auto& geo_lng_col_indices = scratch.geo_lng_col_indices;
+    auto& root_dists = scratch.root_dists;
 
     // Routing diagnostics: report the physical first-page of every leaf that
     // will be scanned (post predicate pruning). The harness maps these back
@@ -3058,8 +3080,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // local_idx are carried so the rerank step can decode each candidate's
     // PQ code back to FP32 without a row_id -> code lookup.
     auto& sheap = scratch.heap;
-    sheap.clear();
-    sheap.reserve(W + 32);
+    // Sentinel prefill: the bounded set must be the W smallest by
+    // heap_entry_less regardless of scan order (see heap_init).
+    heap_init(sheap, W);
 
     if (feedback_active) {
         // --- Feedback probing: incremental subtree-block scan loop ---
@@ -3093,9 +3116,12 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 fb_blk.push_back({rd.first, rc.page, rc.pages, rc.is_leaf,
                                   rc.centroid});
             } else {
-                expand_internal({rd.first, rc.page, rc.pages, rc.is_leaf,
-                                rc.centroid},
-                                pca_leaves_fb, c, fb_blk);
+                expand_probe_({rd.first, rc.page, rc.pages, rc.is_leaf,
+                               rc.centroid},
+                              pca_leaves_fb, c, gap, UINT32_MAX, config,
+                              scratch.pred_col_indices,
+                              scratch.geo_lng_col_indices, scratch,
+                              fb_blk, qguard.node_bytes);
             }
             const uint32_t slot0 =
                 static_cast<uint32_t>(fb_candidates.size());
@@ -3138,6 +3164,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
 
             // Feedback statistics over the bounded heap: kth-best scan key
             // and how many current top-k entries came from this block.
+            // (Strip sentinel slots first — they'd pollute kth/gained.)
+            heap_compact(sheap);
             uint32_t kth = UINT32_MAX, gained = 0;
             if (sheap.size() >= k_eff) {
                 fb_ord.assign(sheap.begin(), sheap.end());
@@ -3314,7 +3342,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 futs.push_back(std::async(std::launch::async,
                     [&](uint32_t s, uint32_t e, uint32_t ti) {
                         auto& my = th[ti];
-                        my.reserve(W + 32);
+                        heap_init(my, W);
                         std::unique_ptr<ScanSetup> own_setup;
                         ScanSetup* use = scan_setup.get();
                         if (per_leaf) {
@@ -3375,6 +3403,11 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     }
     }  // end feedback_active else-branch
 
+    // Drop unfilled sentinel slots before materialization/rerank.
+    sheap.erase(std::remove_if(sheap.begin(), sheap.end(),
+                               heap_entry_is_sentinel),
+                sheap.end());
+
     // Final I/O accounting for this query (both probe paths converge here;
     // `candidates` is final). bytes_touched = leaf pages × page size —
     // the bytes-touched currency. `reranked` = decoded shortlist size.
@@ -3383,6 +3416,15 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     for (const auto& c : candidates)
         qguard.bytes += static_cast<uint64_t>(c.pages) * kPageSize;
     qguard.reranked = sheap.size();
+
+    // Plain path (no payload locs, no W sweep): the shared per-query
+    // finalize pipeline — also used verbatim by search_batch().
+    if (payload_locs == nullptr && !sweep) {
+        finalize_query_(query, k, config, scratch, candidates,
+                        scratch.leaf_ptrs, sheap, *scan_setup,
+                        scratch.results);
+        return scratch.results;
+    }
 
     // --- Materialize full entries for the extraction/rerank paths ---
     // Resolve row_id + leaf_ptr from (leaf_slot, local_idx) for the <=W
@@ -3688,6 +3730,521 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
         const SearchConfig& config,
         std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs) const {
     return search(query, k, config, payload_locs, nullptr, nullptr);
+}
+
+void IVFTreeIndex::finalize_query_(const float* query, uint32_t k,
+                                   const SearchConfig& config,
+                                   SearchScratch& scratch,
+                                   std::vector<LeafCandidate>& candidates,
+                                   std::vector<const uint8_t*>& ptrs,
+                                   std::vector<HeapEntry>& sheap,
+                                   ScanSetup& scan_setup,
+                                   std::vector<Candidate>& results) const {
+    const bool has_predicates = !config.predicates.empty();
+    auto& pred_col_indices = scratch.pred_col_indices;
+    auto& geo_lng_col_indices = scratch.geo_lng_col_indices;
+    const MetricKind metric = coder_->metric();
+
+    // --- Materialize full entries for the extraction/rerank paths ---
+    // Resolve row_id + leaf_ptr from (leaf_slot, local_idx) for the <=W
+    // survivors. Layout mirrors the scan-side row_ids placement.
+    {
+        auto& hf = scratch.heap_full;
+        hf.clear();
+        hf.reserve(sheap.size());
+        // Pin each candidate leaf ONCE (heap entries reference the same
+        // <=n_leaves extents — per-entry pinning would double-count cache
+        // accesses and thrash the LRU). With the cache on, the fill stage
+        // (query-major) or the sweep (batch) already resolved every
+        // pointer (and holds the pins) — reuse.
+        if (!leaf_cache_) {
+            ptrs.clear();
+            ptrs.resize(candidates.size(), nullptr);
+            for (uint32_t ci = 0; ci < candidates.size(); ++ci) {
+                if (candidates[ci].page == kInvalidPage) continue;
+                LeafExtentCache::Handle h;
+                ptrs[ci] = pin_leaf_(candidates[ci].page,
+                                     static_cast<uint32_t>(candidates[ci].pages),
+                                     h);
+                if (h.entry) scratch.pins.push_back(h);
+            }
+        }
+        for (const auto& e : sheap) {
+            const uint32_t ci = e.leaf_slot;
+            const LeafCandidate& c = candidates[ci];
+            const uint8_t* leaf_ptr = ptrs[ci];
+            const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+            const RowId* rids = reinterpret_cast<const RowId*>(
+                leaf_ptr + coder_->geometry(lh).rowids_offset);
+            hf.push_back({e.pq_dist, rids[e.local_idx], leaf_ptr,
+                          mmap_base_ + static_cast<uint64_t>(c.page) * kPageSize,
+                          e.local_idx});
+        }
+    }
+    auto& heap = scratch.heap_full;
+
+    // --- Extract top-k from the heap ---
+    results.clear();
+    results.reserve(heap.size());
+
+    // --- Phase D: filter the heap survivors by predicate ---
+    // Predicates are evaluated AFTER heap selection, not during the scan.
+    // This is the "fastest code is code that doesn't run" principle: we only
+    // evaluate predicates on the W heap survivors (not on every scanned candidate).
+    // The heap is large enough (W = k/selectivity * overscan) to contain enough
+    // matching candidates even at low selectivity.
+    //
+    // Optimization: group heap entries by leaf_ptr so we parse each leaf's
+    // filter columns only once (not once per entry). Multiple heap entries
+    // from the same leaf share the same column layout.
+    if (has_predicates && !heap.empty()) {
+        // Sort by leaf_ptr so entries from the same leaf are contiguous.
+        std::sort(heap.begin(), heap.end(),
+                  [](const HeapEntryFull& a, const HeapEntryFull& b) {
+                      return a.leaf_ptr < b.leaf_ptr;
+                  });
+        auto& filtered = scratch.filtered_heap;
+        filtered.clear();
+        filtered.reserve(heap.size());
+        const uint8_t* cur_leaf = nullptr;
+        auto& cols = scratch.filter_cols;
+        cols.clear();
+        for (const auto& entry : heap) {
+            if (entry.leaf_ptr != cur_leaf) {
+                cur_leaf = entry.leaf_ptr;
+                const auto* lh = reinterpret_cast<const TreeLeafHeader*>(cur_leaf);
+                auto layout = LeafFilterLayout::from_geometry(
+                    cur_leaf, coder_->geometry(lh));
+                cols = parse_filter_columns(layout.filter_base, lh->count,
+                                             manifest_.schema);
+            }
+            if (eval_all_predicates(cols, manifest_.schema, entry.local_idx,
+                                     config.predicates, pred_col_indices, geo_lng_col_indices))
+                filtered.push_back(entry);
+        }
+        heap = std::move(filtered);
+    }
+
+    if (config.rerank && !heap.empty()) {
+        // Rerank: refine each of the W candidates' distances through the
+        // family coder (decode / LUT). Caller-provided exact rerank against
+        // the original f32 corpus takes PRECEDENCE over the coder's own
+        // rerank. Per-query serial (W is small; batch parallelizes across
+        // queries).
+        for (const auto& entry : heap) {
+            float exact_dist;
+            if (config.exact_rerank_base) {
+                // Exact rerank against the caller's original vectors: no
+                // decode, no extract, no quantization ranking error, no IP
+                // bias (the true vector has no reconstruction shrinkage).
+                const float* v = config.exact_rerank_base +
+                    static_cast<size_t>(entry.row_id) * manifest_.dim;
+                exact_dist =
+                    (metric == MetricKind::InnerProduct)
+                        ? -simd::dot_f32(query, v, manifest_.dim)
+                        : simd::l2sq_f32(query, v, manifest_.dim);
+            } else {
+                exact_dist = coder_->rerank(query, scan_setup,
+                                            entry.leaf_ptr, entry.local_idx,
+                                            nullptr);
+            }
+            results.push_back({entry.row_id, exact_dist});
+        }
+    } else {
+        // No rerank: use the raw PQ-approximate uint32 distances.
+        for (const auto& entry : heap) {
+            results.push_back({entry.row_id,
+                               static_cast<float>(entry.pq_dist)});
+        }
+    }
+
+    // Dedup by row_id (closure may replicate vectors across leaves → same
+    // row_id appears with different distances → keep the min). Sort by
+    // row_id first so duplicates are adjacent, with min-dist tiebreak.
+    std::sort(results.begin(), results.end(),
+              [](const Candidate& a, const Candidate& b) {
+                  if (a.row_id != b.row_id) return a.row_id < b.row_id;
+                  return a.dist < b.dist;
+              });
+    auto last = std::unique(results.begin(), results.end(),
+                            [](const Candidate& a, const Candidate& b) {
+                                return a.row_id == b.row_id;
+                            });
+    results.erase(last, results.end());
+    // Adaptive shortlist cut: keep up to W (not just k) and truncate at
+    // the first distance gap past k. Clustered queries cut at ~k, noisy
+    // queries keep the deep list — the caller's rerank bandwidth follows
+    // the returned length. Off (0) or without rerank: plain top-k.
+    //
+    // Signal: the gap d[w]-d[k-1] against the top-k region's OWN typical
+    // gap, g = (d[k-1]-d[0])/(k-1). τ is therefore a dimensionless
+    // multiplier of the local score scale and one calibration transfers
+    // across metrics (IP distances are negated dots ≈ -1, so scaling by
+    // |d[k-1]| as in v1 compressed the signal and forced per-metric τ).
+    size_t keep = k;
+    if (config.adaptive_w_gap > 0 && config.rerank &&
+        results.size() > k) {
+        std::sort(results.begin(), results.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.dist < b.dist;
+                  });
+        const float dk = results[k - 1].dist;
+        const float g = (dk - results[0].dist) / static_cast<float>(k - 1);
+        const float scale = std::max(g, 1e-12f);
+        keep = results.size();
+        for (size_t w = k; w < results.size(); ++w) {
+            if (results[w].dist - dk >
+                config.adaptive_w_gap * scale) {
+                keep = w;
+                break;
+            }
+        }
+    }
+    if (results.size() > keep) {
+        std::nth_element(results.begin(), results.begin() + keep,
+                         results.end(),
+                         [](const Candidate& a, const Candidate& b) {
+                             return a.dist < b.dist;
+                         });
+        results.resize(keep);
+    }
+    std::sort(results.begin(), results.end(),
+              [](const Candidate& a, const Candidate& b) {
+                  return a.dist < b.dist;
+              });
+}
+
+void IVFTreeIndex::search_batch(
+        const float* queries, uint32_t nq, uint32_t k,
+        const SearchConfig& config,
+        std::vector<std::vector<Candidate>>& results) const {
+    const auto t0 = std::chrono::steady_clock::now();
+    results.clear();
+    results.resize(nq);
+    if (nq == 0) return;
+    if (config.feedback.mode != FeedbackProbe::Mode::Off) {
+        throw Error(ErrorCode::InvalidParam,
+                    "search_batch: feedback probing adapts the probe set "
+                    "per query and cannot be coalesced");
+    }
+    const uint32_t T = std::max(1u, config.search_threads);
+    const bool per_leaf = coder_->per_leaf_setup();
+    const bool has_predicates = !config.predicates.empty();
+    const uint32_t dim = manifest_.dim;
+
+    // Unknown predicate column → no results for every query (per-query
+    // search() semantics).
+    if (has_predicates) {
+        std::vector<uint32_t> pred_cols, geo_cols;
+        if (!resolve_pred_columns_(config, pred_cols, geo_cols)) return;
+    }
+
+    // --- Per-query state (route output + sweep accumulation) ---
+    struct QueryState {
+        const float* query = nullptr;
+        std::vector<LeafCandidate> candidates;
+        std::vector<const uint8_t*> ptrs;   // per candidate slot
+        std::unique_ptr<ScanSetup> setup;   // adopted from a sweep partial
+        std::vector<HeapEntry> heap;        // merged, bounded W
+        uint32_t W = 0;
+        bool fallback = false;              // brute-force filtered path
+        uint64_t routing_ns = 0;
+    };
+    auto qs = std::make_unique<QueryState[]>(nq);
+    for (uint32_t i = 0; i < nq; ++i)
+        qs[i].query = queries + static_cast<size_t>(i) * dim;
+
+    // --- Phase 1: route every query (parallel over queries) ---
+    {
+        std::atomic<uint32_t> next{0};
+        auto route_worker = [&]() {
+            static thread_local SearchScratch rscratch;
+            for (;;) {
+                const uint32_t i =
+                    next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= nq) break;
+                auto& s = qs[i];
+                const auto tr0 = std::chrono::steady_clock::now();
+                const RouteStatus st =
+                    route_query_(s.query, config, rscratch, s.candidates);
+                s.routing_ns = static_cast<uint64_t>(
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - tr0).count() * 1e9);
+                if (st == RouteStatus::FallbackFiltered) {
+                    s.fallback = true;
+                } else if (st == RouteStatus::Ok) {
+                    // W: verbatim from search() (no sweep_Ws in batch).
+                    uint32_t W = std::max(
+                        config.fastscan_W > 0 ? config.fastscan_W : 1000u, k);
+                    if (has_predicates) {
+                        // Adaptive W: see search() — the heap collects
+                        // top-W by PQ distance without predicate filtering;
+                        // 2x overscan over k/selectivity suffices.
+                        constexpr float kOverscan = 2.0f;
+                        const uint32_t adaptive_w =
+                            rscratch.selectivity > 0.001f
+                                ? static_cast<uint32_t>(
+                                      static_cast<float>(k) /
+                                      rscratch.selectivity * kOverscan)
+                                : k * 200u;
+                        W = std::max(W, adaptive_w);
+                        W = std::max(W, k * 10u);  // floor
+                    }
+                    s.W = W;
+                    s.ptrs.assign(s.candidates.size(), nullptr);
+                }
+                // Route-phase pins (predicate summary pruning) covered
+                // only summary reads — release per query; the sweep takes
+                // its own batch-scoped pins.
+                release_leaf_pins_(rscratch.pins);
+            }
+        };
+        if (T == 1) {
+            route_worker();
+        } else {
+            std::vector<std::future<void>> futs;
+            for (uint32_t t = 0; t < T; ++t)
+                futs.push_back(
+                    std::async(std::launch::async, route_worker));
+            for (auto& f : futs) f.get();
+        }
+    }
+
+    // --- Phase 2: invert probe sets into leaf-major refs ---
+    // One (page, qidx, slot) triple per probed leaf occurrence, sorted by
+    // page: the unique-leaf sweep list and each leaf's fanout (the queries
+    // that probed it, with their candidate slots) are contiguous slices.
+    struct ProbeRef {
+        PageId page;
+        uint32_t qidx;
+        uint32_t slot;
+    };
+    std::vector<ProbeRef> refs;
+    {
+        size_t total = 0;
+        for (uint32_t i = 0; i < nq; ++i)
+            total += qs[i].candidates.size();
+        refs.reserve(total);
+        for (uint32_t i = 0; i < nq; ++i) {
+            const auto& cands = qs[i].candidates;
+            for (uint32_t slot = 0; slot < cands.size(); ++slot) {
+                if (cands[slot].page == kInvalidPage) continue;
+                refs.push_back({cands[slot].page, i, slot});
+            }
+        }
+        std::sort(refs.begin(), refs.end(),
+                  [](const ProbeRef& a, const ProbeRef& b) {
+                      if (a.page != b.page) return a.page < b.page;
+                      if (a.qidx != b.qidx) return a.qidx < b.qidx;
+                      return a.slot < b.slot;
+                  });
+    }
+    struct UniqueLeaf {
+        PageId page;
+        uint32_t pages;
+        uint32_t ref_begin;  // slice [ref_begin, next.ref_begin) of refs
+    };
+    std::vector<UniqueLeaf> uleaves;
+    uleaves.reserve(refs.size());
+    for (size_t i = 0; i < refs.size(); ++i) {
+        if (uleaves.empty() || refs[i].page != uleaves.back().page) {
+            const auto& c =
+                qs[refs[i].qidx].candidates[refs[i].slot];
+            uleaves.push_back({refs[i].page,
+                               static_cast<uint32_t>(c.pages),
+                               static_cast<uint32_t>(i)});
+        }
+    }
+    const uint32_t n_unique =
+        static_cast<uint32_t>(uleaves.size());
+
+    // --- Phase 3: sweep unique leaves in page order (parallel chunks) ---
+    // Threads claim contiguous chunks of the page-ordered unique-leaf
+    // list. A query's probe set is subtree-contiguous, so it intersects
+    // few chunks; each thread keeps its OWN per-query partial (setup +
+    // bounded heap) — a query's setup/heap are never touched by two
+    // threads at once. Partials merge deterministically below.
+    struct Partial {
+        uint32_t qidx;
+        std::unique_ptr<ScanSetup> setup;
+        std::vector<HeapEntry> heap;
+    };
+    std::vector<Partial> partials;
+    std::vector<LeafExtentCache::Handle> batch_pins;
+    {
+        std::mutex adopt_mu;
+        std::atomic<uint32_t> next_chunk{0};
+        constexpr uint32_t kChunk = 32;  // page-adjacent leaves per claim
+        auto sweep_worker = [&]() {
+            std::vector<LeafExtentCache::Handle> my_pins;
+            std::vector<Partial> my_partials;
+            std::unordered_map<uint32_t, size_t> pmap;  // qidx → partial idx
+            for (;;) {
+                const uint32_t start =
+                    next_chunk.fetch_add(kChunk, std::memory_order_relaxed);
+                if (start >= n_unique) break;
+                const uint32_t end = std::min(start + kChunk, n_unique);
+                for (uint32_t li = start; li < end; ++li) {
+                    const auto& ul = uleaves[li];
+                    // No-cache readahead: keep the kernel prefetching
+                    // page-ordered, ~8 leaves ahead of the scan.
+#ifdef __linux__
+                    if (!leaf_cache_ && li + 8 < n_unique) {
+                        const auto& ahead = uleaves[li + 8];
+                        ::posix_fadvise(
+                            fd_,
+                            static_cast<off_t>(ahead.page) * kPageSize,
+                            static_cast<off_t>(ahead.pages) * kPageSize,
+                            POSIX_FADV_WILLNEED);
+                    }
+#endif
+                    LeafExtentCache::Handle h;
+                    const uint8_t* leaf_ptr = pin_leaf_(ul.page, ul.pages, h);
+                    if (h.entry) my_pins.push_back(h);
+                    const uint32_t ref_end =
+                        li + 1 < n_unique ? uleaves[li + 1].ref_begin
+                                          : static_cast<uint32_t>(refs.size());
+                    for (uint32_t ri = ul.ref_begin; ri < ref_end; ++ri) {
+                        const auto& fr = refs[ri];
+                        QueryState& s = qs[fr.qidx];
+                        Partial* p;
+                        auto it = pmap.find(fr.qidx);
+                        if (it == pmap.end()) {
+                            Partial np;
+                            np.qidx = fr.qidx;
+                            np.setup = coder_->scan_setup(s.query);
+                            heap_init(np.heap, s.W);
+                            my_partials.push_back(std::move(np));
+                            p = &my_partials.back();
+                            pmap.emplace(fr.qidx, my_partials.size() - 1);
+                        } else {
+                            p = &my_partials[it->second];
+                        }
+                        if (per_leaf) coder_->bind_leaf(*p->setup, leaf_ptr);
+                        RawScanHeap rh{&p->heap, s.W, fr.slot};
+                        coder_->scan_leaf(*p->setup, leaf_ptr, rh);
+                        s.ptrs[fr.slot] = leaf_ptr;  // distinct slots — safe
+                    }
+                }
+            }
+            std::lock_guard<std::mutex> lk(adopt_mu);
+            batch_pins.insert(batch_pins.end(), my_pins.begin(), my_pins.end());
+            partials.insert(partials.end(),
+                            std::make_move_iterator(my_partials.begin()),
+                            std::make_move_iterator(my_partials.end()));
+        };
+        if (T == 1) {
+            sweep_worker();
+        } else {
+            std::vector<std::future<void>> futs;
+            for (uint32_t t = 0; t < T; ++t)
+                futs.push_back(
+                    std::async(std::launch::async, sweep_worker));
+            for (auto& f : futs) f.get();
+        }
+    }
+
+    // --- Merge per-query partial heaps (deterministic) ---
+    // Same contract as search()'s parallel scan path: concat every
+    // partial's entries, keep the top-W by (pq_dist asc, tie: leaf_slot,
+    // local_idx) — bit-stable regardless of how leaves were sharded.
+    {
+        std::vector<std::pair<uint32_t, size_t>> by_q;  // (qidx, partial)
+        by_q.reserve(partials.size());
+        for (size_t pi = 0; pi < partials.size(); ++pi)
+            by_q.push_back({partials[pi].qidx, pi});
+        std::sort(by_q.begin(), by_q.end());
+        size_t i = 0;
+        while (i < by_q.size()) {
+            size_t j = i;
+            while (j < by_q.size() && by_q[j].first == by_q[i].first) ++j;
+            QueryState& s = qs[by_q[i].first];
+            if (!s.setup) s.setup = std::move(partials[by_q[i].second].setup);
+            size_t total = 0;
+            for (size_t l = i; l < j; ++l)
+                total += partials[by_q[l].second].heap.size();
+            s.heap.reserve(total);
+            for (size_t l = i; l < j; ++l) {
+                auto& ph = partials[by_q[l].second].heap;
+                s.heap.insert(s.heap.end(),
+                              std::make_move_iterator(ph.begin()),
+                              std::make_move_iterator(ph.end()));
+            }
+            s.heap.erase(std::remove_if(s.heap.begin(), s.heap.end(),
+                                        heap_entry_is_sentinel),
+                         s.heap.end());
+            if (s.heap.size() > s.W) {
+                std::sort(s.heap.begin(), s.heap.end(),
+                          [](const HeapEntry& a, const HeapEntry& b) {
+                              if (a.pq_dist != b.pq_dist)
+                                  return a.pq_dist < b.pq_dist;
+                              if (a.leaf_slot != b.leaf_slot)
+                                  return a.leaf_slot < b.leaf_slot;
+                              return a.local_idx < b.local_idx;
+                          });
+                s.heap.resize(s.W);
+            }
+            i = j;
+        }
+    }
+
+    // --- Phase 4: per-query finalize (parallel over queries) ---
+    {
+        std::atomic<uint32_t> next{0};
+        std::atomic<uint64_t> fallback_count{0};
+        auto finalize_worker = [&]() {
+            static thread_local SearchScratch fscratch;
+            for (;;) {
+                const uint32_t i =
+                    next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= nq) break;
+                auto& s = qs[i];
+                if (s.fallback) {
+                    // Extreme predicate selectivity: per-query brute-force
+                    // path (not coalescible).
+                    results[i] = search(s.query, k, config);
+                    fallback_count.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                if (s.candidates.empty() || s.heap.empty() || !s.setup) {
+                    continue;  // empty results
+                }
+                const auto tf0 = std::chrono::steady_clock::now();
+                finalize_query_(s.query, k, config, fscratch, s.candidates,
+                                s.ptrs, s.heap, *s.setup, results[i]);
+                const double fw = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - tf0).count();
+                uint64_t bytes = 0;
+                for (const auto& c : s.candidates)
+                    bytes += static_cast<uint64_t>(c.pages) * kPageSize;
+                search_stats_.on_query(
+                    fw + static_cast<double>(s.routing_ns) / 1e9,
+                    s.candidates.size(), bytes, s.heap.size(),
+                    s.routing_ns);
+            }
+        };
+        if (T == 1) {
+            finalize_worker();
+        } else {
+            std::vector<std::future<void>> futs;
+            for (uint32_t t = 0; t < T; ++t)
+                futs.push_back(
+                    std::async(std::launch::async, finalize_worker));
+            for (auto& f : futs) f.get();
+        }
+    }
+
+    // Batch pins cover every swept leaf (cache pointers are referenced by
+    // per-query ptrs through finalize) — release now.
+    release_leaf_pins_(batch_pins);
+
+    uint64_t unique_bytes = 0;
+    for (const auto& ul : uleaves)
+        unique_bytes += static_cast<uint64_t>(ul.pages) * kPageSize;
+    batch_stats_.on_batch(
+        nq, n_unique, refs.size(), unique_bytes, 0,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count());
 }
 
 // ===========================================================================

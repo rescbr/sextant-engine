@@ -255,7 +255,7 @@ inline void scalar_heap_push4(RawScanHeap& heap, const ScalarScanCtx& c,
         const uint32_t pq_dist = f32_to_dist_key(dist);
         if (!heap_full(heap)) {
             heap_push(heap, pq_dist, i + v);
-        } else if (pq_dist < heap_front(heap)) {
+        } else if (heap_should_replace(heap, pq_dist, i + v)) {
             heap_replace_top(heap, pq_dist, i + v);
         }
     }

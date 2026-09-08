@@ -41,6 +41,17 @@ namespace sextant { class ScalarLloydMaxQuantizer; }
 
 namespace sextant::tree {
 
+struct SearchScratch;  // internal per-thread search buffers (ivf_tree_index.cpp)
+
+/// Frontier entry during routing (shared by search / search_batch / the
+/// feedback probe loop).
+struct ProbeEntry {
+    float    dist;
+    PageId   page;
+    uint64_t pages;
+    uint16_t is_leaf;
+    const float16_t* centroid;  // inline FP16 centroid (points into mmap)
+};
 /// A routed leaf candidate: the extent to scan + routing context.
 struct LeafCandidate {
     PageId   page;           // leaf extent start page
@@ -119,6 +130,10 @@ public:
     /// snapshot_and_reset().
     const SearchStats& search_stats() const { return search_stats_; }
 
+    /// Batch-path observability (search_batch only). Same delta contract
+    /// as search_stats(): snapshot_and_reset() per window.
+    const BatchStats& batch_stats() const { return batch_stats_; }
+
     /// PCA-preconditioned streaming build: project vectors onto top-k PCs
     /// before routing. On high-LID data (d_eff≈2), this exposes the manifold
     /// structure so k-means converges. Scan codes stay in original space.
@@ -159,19 +174,50 @@ public:
 
     /// Sweep mode: evaluate multiple rerank shortlist widths W from ONE scan.
     /// When sweep_Ws is non-null, the search runs with W = max(*sweep_Ws) and
-    /// fills sweep_out[i] with the result set (top-k, deduped) for sweep_Ws[i].
-    /// Bit-exact equivalent to running search() separately with each W (each
+    /// bit-exact equivalent to running search() separately with each W (each
     /// W result is a prefix cut of the W_max scan order, followed by the same
     /// dedup/top-k selection as the normal path).
     /// Ignored when payload_locs is non-null (payload locations require the
     /// single-W path); also ignored when either sweep argument is null or
     /// sweep_Ws is empty.
     std::vector<Candidate> search(const float* query, uint32_t k,
-                                  const SearchConfig& config,
-        std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs,
-        const std::vector<uint32_t>* sweep_Ws,
-        std::vector<std::vector<Candidate>>* sweep_out,
-        std::vector<PageId>* visited_leaf_pages = nullptr) const;
+    const SearchConfig& config,
+                                  std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs,
+                                  const std::vector<uint32_t>* sweep_Ws,
+                                  std::vector<std::vector<Candidate>>* sweep_out,
+                                  std::vector<PageId>* visited_leaf_pages = nullptr) const;
+
+    /// Subtree-major batch search (the 1B-scale path). Routes every query,
+    /// inverts the probe sets into a leaf→queries fanout table, then sweeps
+    /// each UNIQUE probed leaf exactly once in page order — every query that
+    /// probed it is scanned against that single read. I/O is shared across
+    /// the batch (measured 50x read amplification eliminated vs query-major
+    /// at zero engine-owned DRAM); compute is not (each (leaf, query) pair
+    /// still runs its own scan).
+    ///
+    /// `queries` holds nq row-major vectors of dim() floats. results[i]
+    /// receives query i's top-k, produced by the SAME per-query
+    /// materialize/filter/rerank/dedup pipeline as search() — identical
+    /// inputs yield the same candidates modulo pq_dist tie order under
+    /// parallelism (the same contract as search()'s parallel scan path).
+    ///
+    /// Read layer: with a leaf cache configured (open cache_bytes > 0) the
+    /// sweep pins each unique leaf once (cross-window hot set); without one,
+    /// leaves are streamed through mmap with page-ordered readahead (the
+    /// batch controls access order, so faults are sequential). Feedback
+    /// probing is not supported (per-query adaptive probe sets cannot be
+    /// coalesced) — such configs are rejected with an error. Queries whose
+    /// predicate selectivity triggers the brute-force filtered fallback are
+    /// served by the per-query search() path individually.
+    ///
+    /// Concurrency: config.search_threads > 1 parallelizes both the route
+    /// phase and the sweep (threads claim contiguous page-ordered chunks of
+    /// the unique-leaf list; per-query heaps/setups are sharded per thread
+    /// and merged deterministically).
+    void search_batch(const float* queries, uint32_t nq, uint32_t k,
+                                              const SearchConfig& config,
+                                              std::vector<std::vector<Candidate>>& results) const;
+
 
     // --- Routing diagnostics (loss-decomposition harness) ---
 
@@ -313,6 +359,7 @@ private:
     // --- Open state ---
     std::string path_;
     mutable SearchStats search_stats_;  // relaxed atomics; search() is const
+    mutable BatchStats batch_stats_;     // relaxed atomics; search_batch() is const
     int fd_ = -1;
     const uint8_t* mmap_base_ = nullptr;  // mmap'd file base (read-only)
     uint64_t mmap_size_ = 0;
@@ -369,6 +416,63 @@ private:
 
     /// Release every pin taken by one search() call (QueryGuard exit path).
     void release_leaf_pins_(std::vector<LeafExtentCache::Handle>& pins) const;
+
+    // --- Shared route/scan/finalize decomposition (search + search_batch) ---
+
+    /// Resolve predicate column names to schema indices once per query.
+    /// Returns false when a predicate (or geo longitude) references an
+    /// unknown column → the query yields no results.
+    bool resolve_pred_columns_(const SearchConfig& config,
+                               std::vector<uint32_t>& pred_col_indices,
+                               std::vector<uint32_t>& geo_lng_col_indices) const;
+
+    /// Outcome of routing one query.
+    enum class RouteStatus : uint8_t {
+        Ok,                ///< candidates populated
+        Empty,             ///< no leaf candidates (or unknown predicate column)
+        FallbackFiltered,  ///< selectivity < 1%: caller must use the
+                           ///< per-query brute-force filtered path
+    };
+
+    /// Route one query from the root to its leaf candidate set: query prep
+    /// (FP16/PCA projection), predicate column resolution + selectivity,
+    /// root scoring (fraction / gap / filter-directed variants), level-by-
+    /// level descent, summary-based leaf pruning. Fills
+    /// scratch.{pred_col_indices, geo_lng_col_indices, selectivity,
+    /// route_node_bytes, root_dists} as side effects (feedback probing
+    /// reuses root_dists). This is the exact routing block of search(),
+    /// extracted so search_batch() shares it verbatim.
+    RouteStatus route_query_(const float* query, const SearchConfig& config,
+                             SearchScratch& scratch,
+                             std::vector<LeafCandidate>& candidates) const;
+
+    /// Expand one internal frontier entry: read the node, score children
+    /// (PCA leaf centroids when use_pca_leaves, else inline FP16), keep the
+    /// top-n_probe_ln with gap pruning, resolve leaf ids to physical pages.
+    /// Summary-aware: children whose filter summary can't match the
+    /// predicates are pruned. node_bytes accumulates internal-node I/O.
+    void expand_probe_(const ProbeEntry& e, bool use_pca_leaves,
+                       uint32_t root_child_for_pca, float gap,
+                       uint32_t n_probe_ln, const SearchConfig& config,
+                       const std::vector<uint32_t>& pred_col_indices,
+                       const std::vector<uint32_t>& geo_lng_col_indices,
+                       SearchScratch& scratch,
+                       std::vector<ProbeEntry>& out,
+                       uint64_t& node_bytes) const;
+
+    /// Per-query post-scan pipeline shared by search() and search_batch():
+    /// materialize heap survivors (row_id + leaf pointers), predicate-filter
+    /// the heap, rerank (coder or exact_rerank_base), dedup by row_id,
+    /// adaptive shortlist cut, top-k, distance sort. Plain path only —
+    /// payload_locs / sweep_Ws variants remain inline in search().
+    void finalize_query_(const float* query, uint32_t k,
+                         const SearchConfig& config,
+                         SearchScratch& scratch,
+                         std::vector<LeafCandidate>& candidates,
+                         std::vector<const uint8_t*>& leaf_ptrs,
+                         std::vector<HeapEntry>& sheap,
+                         ScanSetup& scan_setup,
+                         std::vector<Candidate>& results) const;
 
     /// Close mmap + fd.
     void close();
