@@ -4140,22 +4140,28 @@ void IVFTreeIndex::search_batch(
 
     // Read-layer selection. The zero-DRAM sweep reads leaves with direct
     // preads into a per-thread buffer (measured 4x cold vs the ZFS mmap
-    // fault path; page-ordered preads stream at ~10 GB/s). The buffer
-    // dies at the next leaf, so everything finalize needs from the leaf
-    // (row_id; coder-rerank distances) is resolved eagerly into per-query
-    // pools right after each (query, leaf) scan. exact_rerank_base reranks
-    // lazily through the row_id. Pool overflow (adversarial distance
-    // orders) falls back to the mmap finalize path — correctness never
-    // depends on the cap. Predicate configs keep the pin/mmap path
-    // (pools don't carry filter columns); hot-set mode keeps its pins.
+    // fault path; page-ordered preads stream at ~10 GB/s). Both the pread
+    // path AND the hot-set path resolve everything finalize needs from
+    // the leaf (row_id; coder-rerank distances) eagerly into per-query
+    // pools right after each (query, leaf) scan: the pread buffer dies at
+    // the next leaf, and — equally important — the hot-set path can then
+    // UNPIN each leaf after its fanout scans (pins held to batch end
+    // would disable eviction entirely: the "bounded" cache silently
+    // grows to the full working set — measured 100% hit at 12% nominal
+    // residency). exact_rerank_base reranks lazily through the row_id.
+    // Pool overflow (adversarial distance orders) falls back to the mmap
+    // finalize path — correctness never depends on the cap. Predicate
+    // configs keep the long-lived pin/mmap path (pools don't carry
+    // filter columns).
     const bool pread_sweep = !leaf_cache_ && !has_predicates;
+    const bool harvest_mode = !has_predicates;  // pread + hot-set paths
     uint32_t max_extent_pages = 0;
     if (pread_sweep) {
         for (const auto& ul : uleaves)
             max_extent_pages = std::max(max_extent_pages, ul.pages);
     }
     const bool eager_rerank =
-        pread_sweep && config.rerank && !config.exact_rerank_base;
+        harvest_mode && config.rerank && !config.exact_rerank_base;
 
     // --- Phase 3: sweep unique leaves in page order (parallel chunks) ---
     // Threads claim contiguous chunks of the page-ordered unique-leaf
@@ -4232,6 +4238,7 @@ void IVFTreeIndex::search_batch(
                     const auto& ul = uleaves[li];
                     LeafExtentCache::Handle h;
                     const uint8_t* leaf_ptr;
+                    bool leaf_pinned = false;  // hot-set: unpin after fanout
                     if (pread_sweep) {
                         // Direct pread: page-ordered sequential streams,
                         // no mmap faults, no page-cache pollution.
@@ -4246,7 +4253,13 @@ void IVFTreeIndex::search_batch(
                         leaf_ptr = pread_buf.data();
                     } else {
                         leaf_ptr = pin_leaf_(ul.page, ul.pages, h);
-                        if (h.entry) my_pins.push_back(h);
+                        if (h.entry) {
+                            if (harvest_mode) {
+                                leaf_pinned = true;  // unpinned below
+                            } else {
+                                my_pins.push_back(h);
+                            }
+                        }
                     }
                     const uint32_t ref_end =
                         li + 1 < n_unique ? uleaves[li + 1].ref_begin
@@ -4270,18 +4283,25 @@ void IVFTreeIndex::search_batch(
                         if (per_leaf) coder_->bind_leaf(*p->setup, leaf_ptr);
                         RawScanHeap rh{&p->heap, s.W, fr.slot};
                         coder_->scan_leaf(*p->setup, leaf_ptr, rh);
-                        // Pread mode: hand finalize the stable mmap pointer
-                        // (used only if the pool overflows); pool mode
-                        // never dereferences it. Pin/mmap mode: the live
-                        // scan pointer (pins held until batch end).
+                        // Pool mode (pread + hot-set): hand finalize the
+                        // stable mmap pointer (used only if the pool
+                        // overflows); the pool path never dereferences
+                        // it. Predicate mode: the live pin/mmap scan
+                        // pointer (pins held until batch end).
                         s.ptrs[fr.slot] =
-                            pread_sweep
+                            harvest_mode
                                 ? mmap_base_ +
                                       static_cast<uint64_t>(ul.page) *
                                           kPageSize
                                 : leaf_ptr;
-                        if (pread_sweep) harvest(*p, s, leaf_ptr, fr);
+                        if (harvest_mode) harvest(*p, s, leaf_ptr, fr);
                     }
+                    // Hot-set mode: the leaf's row-ids (and rerank
+                    // distances) are harvested — nothing references the
+                    // buffer anymore. Unpin so the entry can EVICT (pins
+                    // held to batch end disable eviction: the cache would
+                    // grow to the full working set regardless of budget).
+                    if (leaf_pinned) leaf_cache_->unpin(h);
                 }
             }
             std::lock_guard<std::mutex> lk(adopt_mu);
@@ -4376,7 +4396,7 @@ void IVFTreeIndex::search_batch(
                     continue;  // empty results
                 }
                 const auto tf0 = std::chrono::steady_clock::now();
-                if (pread_sweep && !s.pool_overflow && !s.pool.empty()) {
+                if (harvest_mode && !s.pool_overflow && !s.pool.empty()) {
                     // Pool path: row-ids (and coder-rerank distances)
                     // resolved eagerly during the sweep; exact_rerank_base
                     // reranks lazily through the row_id.
