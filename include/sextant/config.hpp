@@ -521,13 +521,6 @@ struct SearchConfig {
     ///  >1 = explicit gap value
     float adaptive_probe_gap = 0.0f;
 
-    /// Scan code budget (D): maximum total codes (vectors) to scan across all
-    /// probed shards. 0 = unlimited (scan all n_probe shards). When set, shards
-    /// are scanned in centroid-distance order until the budget is exhausted.
-    /// This adapts to skew: small shards are cheap (scanned fully), large shards
-    /// may be skipped if the budget runs out. Recommended: ~np × mean_shard_size.
-    uint32_t scan_code_budget = 0;
-
     /// Rerank top-W candidates by decoding PQ codes to FP32 and computing the
     /// exact distance to the query. The PQ-approximate distances used during
     /// the FastScan heap have non-trivial error (especially on high-LID data);

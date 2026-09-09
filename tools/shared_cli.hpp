@@ -99,11 +99,6 @@ inline void add_common_flags(cmdline::parser& p) {
         "homogeneous and stable; use a local quantizer when data drifts or "
         "appends are expected. See docs/quantizer-selection.md.",
         false, "local_scalar");
-    p.add<float>("anisotropy-threshold", 0,
-        "ScaNN anisotropic threshold T for anisotropic-pq training (default "
-        "0.2 → η ≈ 4.125). Higher T weights parallel quantization error more. "
-        "Only meaningful with --quantizer anisotropic-pq. See ScaNN paper §3.",
-        false, 0.2f);
     p.add<uint32_t>("prq-nsplits", 0,
         "PRQ nsplits (sub-space count) for --quantizer prq. 0 = auto (dim/8, "
         "i.e. sub_dim=8 per sub-space). Must divide both dim and m4. Only "

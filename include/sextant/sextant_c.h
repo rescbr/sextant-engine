@@ -59,7 +59,6 @@ typedef struct sextant_search_opts {
     uint32_t n_probe_ln;       ///< per-root-child probe count (same semantics)
     uint32_t fastscan_W;       ///< shortlist width (0 = index default)
     float adaptive_probe_gap;  ///< <0 = off, 0 = index default, >1 = explicit
-    uint32_t scan_code_budget; ///< 0 = unlimited
     int rerank;                ///< 0/1 (rerank top-W by decoded distance)
     float adaptive_w_gap;      ///< tau: post-rerank shortlist cut (0 = off).
                                ///< With it, search returns up to W>k ids whose

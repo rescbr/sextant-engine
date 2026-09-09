@@ -455,6 +455,22 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<uint16_t>("pq4-m", 0, "PQ subquantizers (0=dim/4)", false, 0);
     p.add<uint32_t>("pq-bits", 0, "PQ bits (4 or 8)", false, 4);
     p.add<std::string>("quantizer", 0, "pq / prq / local_pq / scalar_lloydmax / scalar_uniform / scalar_shape / anisotropic_pq", false, "pq");
+    p.add<uint32_t>("prq-nsplits", 0,
+        "PRQ nsplits (sub-space count) for --quantizer prq. 0 = auto. "
+        "Must divide both dim and m4.", false, 0);
+    p.add<uint32_t>("prq-beam-size", 0,
+        "PRQ beam size for encoding (1=greedy, >1=beam search).", false, 1);
+    p.add<std::string>("prq-encode-mode", 0,
+        "PRQ encoding strategy: greedy (default), beam, or icm "
+        "(ICM+ILS coordinate descent, best quality).", false, "greedy");
+    p.add<uint32_t>("prq-icm-iters", 0,
+        "PRQ ICM sweeps per ILS cycle (icm mode only).", false, 4);
+    p.add<uint32_t>("prq-ils-iters", 0,
+        "PRQ ILS cycles: perturb + ICM + accept (icm mode only).", false, 4);
+    p.add<uint32_t>("prq-ils-perturb", 0,
+        "PRQ codes randomized per ILS cycle (icm mode only).", false, 4);
+    p.add<uint32_t>("prq-lsq-train-iters", 0,
+        "LSQ training iterations (0 = progressive k-means only).", false, 0);
     p.add<std::string>("metric", 0, "l2sq / ip", false, "l2sq");
     p.add<uint32_t>("threads", 0, "Build threads (0=auto)", false, 0);
     p.add<uint32_t>("pca-dims", 0, "PCA dimensions (default 32)", false, 32);
@@ -485,6 +501,21 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     cfg.params.pq4_m = p.get<uint16_t>("pq4-m");
     cfg.params.scan_pq_bits = static_cast<uint8_t>(p.get<uint32_t>("pq-bits"));
     cfg.params.quantizer_type = p.get<std::string>("quantizer");
+    if (p.exist("prq-nsplits"))
+        cfg.params.prq_nsplits = p.get<uint32_t>("prq-nsplits");
+    if (p.exist("prq-beam-size"))
+        cfg.params.prq_beam_size = p.get<uint32_t>("prq-beam-size");
+    if (p.exist("prq-encode-mode"))
+        cfg.params.prq_encode_mode = p.get<std::string>("prq-encode-mode");
+    if (p.exist("prq-icm-iters"))
+        cfg.params.prq_icm_iters = p.get<uint32_t>("prq-icm-iters");
+    if (p.exist("prq-ils-iters"))
+        cfg.params.prq_ils_iters = p.get<uint32_t>("prq-ils-iters");
+    if (p.exist("prq-ils-perturb"))
+        cfg.params.prq_ils_perturb = p.get<uint32_t>("prq-ils-perturb");
+    if (p.exist("prq-lsq-train-iters"))
+        cfg.params.prq_lsq_train_iters =
+            p.get<uint32_t>("prq-lsq-train-iters");
     const std::string metric = p.get<std::string>("metric");
     cfg.params.metric = (metric == "ip") ? MetricKind::InnerProduct
                                           : MetricKind::L2Sq;

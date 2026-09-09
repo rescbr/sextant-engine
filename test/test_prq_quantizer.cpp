@@ -3,6 +3,7 @@
 #include "quant/pq_quantizer.hpp"
 #include "simd_kernels.hpp"
 #include "sextant/error.hpp"
+#include "tree/coders/global_pq_coder.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -517,4 +518,58 @@ TEST(ProductResidualQuantizer, LsqTrainingReducesError) {
 }
 
 }  // namespace
+}  // namespace sextant
+
+namespace sextant {
+
+// Coder-level wiring (audit F6): GlobalPqCoder must thread the encode-mode
+// and ICM/ILS/LSQ knobs from CoderParams into the ProductResidualQuantizer
+// ctor — they were parsed then dropped, leaving the research branches
+// unreachable. Observable: ICM-mode coder's encode error <= greedy's.
+TEST(GlobalPqCoderPrqWiring, EncodeModeReachesQuantizer) {
+    const uint32_t dim = 64;
+    const uint16_t m = 16;
+    const uint64_t n = 2000;
+    auto data = make_clustered_data(n, dim, 50, 42);
+
+    auto make_coder = [&](const std::string& mode) {
+        sextant::tree::CoderParams cp;
+        cp.dim = static_cast<uint16_t>(dim);
+        cp.m4 = m;
+        cp.pq_bits = 4;
+        cp.metric = MetricKind::L2Sq;
+        cp.prq_nsplits = 8;
+        cp.prq_beam_size = 1;
+        cp.prq_encode_mode = mode;
+        cp.prq_icm_iters = 4;
+        cp.prq_ils_iters = 8;
+        cp.prq_ils_perturb = 4;
+        cp.prq_lsq_train_iters = 2;
+        return sextant::tree::GlobalPqCoder(
+            sextant::tree::GlobalPqCoder::Kind::Prq, cp);
+    };
+    auto coder_g = make_coder("greedy");
+    auto coder_i = make_coder("icm");
+    coder_g.train(data.data(), n);
+    coder_i.train(data.data(), n);
+
+    double err_g = 0, err_i = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const float* vec = data.data() + i * dim;
+        std::vector<uint8_t> cg(coder_g.code_size(), 0),
+            ci(coder_i.code_size(), 0);
+        coder_g.encode(vec, cg.data(), nullptr);
+        coder_i.encode(vec, ci.data(), nullptr);
+        std::vector<float> rg(dim), ri(dim);
+        const auto* qg = coder_g.pq_quantizer();
+        const auto* qi = coder_i.pq_quantizer();
+        qg->decode_code(cg.data(), rg.data());
+        qi->decode_code(ci.data(), ri.data());
+        for (uint32_t d = 0; d < dim; d++) {
+            err_g += std::pow(double(vec[d]) - double(rg[d]), 2);
+            err_i += std::pow(double(vec[d]) - double(ri[d]), 2);
+        }
+    }
+    EXPECT_LE(err_i, err_g * 1.001);
+}
 }  // namespace sextant

@@ -577,6 +577,11 @@ void resolve_build_params(TreeBuildContext& ctx) {
     cp.metric = params.metric;
     cp.prq_nsplits = params.prq_nsplits;
     cp.prq_beam_size = params.prq_beam_size;
+    cp.prq_encode_mode = params.prq_encode_mode;
+    cp.prq_icm_iters = params.prq_icm_iters;
+    cp.prq_ils_iters = params.prq_ils_iters;
+    cp.prq_ils_perturb = params.prq_ils_perturb;
+    cp.prq_lsq_train_iters = params.prq_lsq_train_iters;
     ctx.coder = make_leaf_coder(params.quantizer_type, cp,
                                 /*for_open=*/false);
     ctx.m4 = cp.m4;  // factory may normalize (scalar families)

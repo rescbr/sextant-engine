@@ -148,7 +148,6 @@ sextant_search_opts sextant_default_search_opts(void) {
     o.n_probe_ln = 0;
     o.fastscan_W = 0;
     o.adaptive_probe_gap = 0.0f;
-    o.scan_code_budget = 0;
     o.rerank = 0;
     o.search_threads = 0;
     o.int8_scan = -1;  // -1 = auto (int8 on AVX512/VNNI); 0 here previously
@@ -179,13 +178,11 @@ int32_t sextant_search(void* index, const float* query,
             cfg.n_probe = UINT32_MAX;
             cfg.n_probe_ln = UINT32_MAX;
             cfg.adaptive_probe_gap = -1.0f;  // <0 = off
-            cfg.scan_code_budget = 0;
         } else {
             cfg.n_probe = opts->n_probe;
             cfg.n_probe_ln = opts->n_probe_ln;
             cfg.probe_fraction = opts->probe_fraction;
             cfg.adaptive_probe_gap = opts->adaptive_probe_gap;
-            cfg.scan_code_budget = opts->scan_code_budget;
         }
         cfg.fastscan_W = opts->fastscan_W;
         cfg.rerank = opts->rerank != 0;

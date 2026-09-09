@@ -36,7 +36,9 @@ GlobalPqCoder::GlobalPqCoder(Kind kind, const CoderParams& params)
     if (kind == Kind::Prq) {
         quantizer_ = std::make_unique<ProductResidualQuantizer>(
             params.metric, dim, m4, bits, params.prq_nsplits,
-            params.prq_beam_size, 42);
+            params.prq_beam_size, 42, params.prq_encode_mode,
+            params.prq_icm_iters, params.prq_ils_iters,
+            params.prq_ils_perturb, params.prq_lsq_train_iters);
     } else if (kind == Kind::Anisotropic) {
         quantizer_ = std::make_unique<AnisotropicPqQuantizer>(
             params.metric, dim, m4, bits);

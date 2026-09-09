@@ -204,6 +204,13 @@ struct CoderParams {
     uint32_t prq_nsplits = 0;    // prq only
     uint8_t scan_i8_mode = 0;    // scalar scan kernel selection (0/1/2)
     uint32_t prq_beam_size = 1;  // prq only (build)
+    // PRQ encode strategy (build): greedy / beam / icm + ICM/ILS/LSQ
+    // counts. Threaded from ResolvedParams (CLI --prq-* flags).
+    std::string prq_encode_mode = "greedy";
+    uint32_t prq_icm_iters = 4;
+    uint32_t prq_ils_iters = 4;
+    uint32_t prq_ils_perturb = 4;
+    uint32_t prq_lsq_train_iters = 0;
     /// summary_size is not needed by coders (it rides on the leaf header).
 };
 
