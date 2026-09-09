@@ -227,10 +227,21 @@ void PageAllocator::grow(PageFile& file, uint64_t extra_pages) {
 
 void PageAllocator::flush_bitmap(PageFile& file) const {
     if (bitmap_pages_ == 0) return;
-    // Write the bitmap pages. The in-memory bitmap may be larger than
-    // bitmap_pages_ * kPageSize if the file grew; in that case the caller
-    // should have grown bitmap_pages_ first (future: auto-grow bitmap).
+    // Write the bitmap pages. The in-memory bitmap must fit the reserved
+    // on-disk region — if it doesn't, the file outgrew the region sized at
+    // format time and bits past the region would be silently dropped
+    // (every such page would look FREE on disk). Fail loudly instead.
     const uint32_t bytes_to_write = bitmap_pages_ * kPageSize;
+    if (bitmap_.size() > bytes_to_write) {
+        const size_t uncovered_pages =
+            (bitmap_.size() * 8 - static_cast<size_t>(bytes_to_write) * 8);
+        throw Error(ErrorCode::CorruptIndex,
+            "PageAllocator::flush_bitmap: file grew past the allocation "
+            "bitmap region (" + std::to_string(bitmap_.size()) +
+            " bytes in memory vs " + std::to_string(bytes_to_write) +
+            " reserved; " + std::to_string(uncovered_pages) +
+            " pages uncovered) — bitmap under-provisioned at format time");
+    }
     if (bitmap_.size() < bytes_to_write) {
         // Pad with zeros.
         std::vector<uint8_t> padded(bytes_to_write, 0);

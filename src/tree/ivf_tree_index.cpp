@@ -2348,17 +2348,15 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     { std::vector<uint8_t> b(cfg_npg*kPageSize, 0); std::memcpy(b.data(),cfg_toml.data(),cfg_toml.size());
       file.write_pages(cfg_page, cfg_npg, b.data()); }
 
-    const PageId bitmap_page = 2;
-    const uint32_t bitmap_pages = 1;
     alloc.flush_bitmap(file);
     Superblock sb;
-    sb.init_fresh(bitmap_page, bitmap_pages);
+    sb.init_fresh(alloc.bitmap_page(), alloc.bitmap_pages());
     sb.set_root(root_page, root_npg);
     sb.set_depth(depth);
     sb.set_n_leaves(n_leaves_total);
     sb.set_n_pages(file.num_pages());
     sb.set_free_list(alloc.free_list_head(), alloc.n_free_pages());
-    sb.set_bitmap(bitmap_page, bitmap_pages);
+    sb.set_bitmap(alloc.bitmap_page(), alloc.bitmap_pages());
     sb.set_codebook(cb_page, cb_npg);
     sb.set_config(cfg_page, cfg_npg);
     sb.set_pca(pca_page, pca_npg);
@@ -4713,8 +4711,28 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
     // The PageFile + PageAllocator are initialized before the emission pass so
     // leaves can be allocated + written at flush time. The file starts with
     // just the bitmap (page 2); leaves are allocated sequentially.
+    //
+    // The bitmap region is FIXED at format time (it cannot grow in place —
+    // everything after it shifts). One bitmap page addresses 32768 file
+    // pages (128 MiB); the old hard-coded bitmap_pages=1 silently marked
+    // every page past 128 MiB FREE on disk (audit F3/F4: fsck orphan
+    // storms on large pristine trees, insert/delete handing out live
+    // leaf pages). Size it from a generous upper bound on the final page
+    // count: worst-case fp16-per-vec payload + per-leaf centroid/codebook
+    // overhead at the smallest legal leaf (leaf_cap/2 after a split).
     const PageId bitmap_page = 2;
-    const uint32_t bitmap_pages = 1;
+    const uint64_t kPagesPerBitmapPage =
+        static_cast<uint64_t>(kPageSize) * 8;
+    const uint64_t vec_bytes =
+        ctx.n * (2ull * ctx.dim + 24);  // fp16 vec + rowid/ip-bias/slack
+    const uint64_t n_leaves_est =
+        ctx.n / std::max<uint64_t>(1, ctx.leaf_cap / 2) + 2;
+    const uint64_t leaf_overhead =
+        n_leaves_est * (4ull * ctx.dim * 17 + 2 * kPageSize);
+    const uint64_t upper_pages =
+        (vec_bytes + leaf_overhead) / kPageSize + 64;
+    const uint32_t bitmap_pages = static_cast<uint32_t>(
+        upper_pages / kPagesPerBitmapPage + 2);
     PageFile file(output_path);
     PageAllocator alloc;
     file.truncate(bitmap_page + bitmap_pages);

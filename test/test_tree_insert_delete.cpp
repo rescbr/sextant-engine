@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "fbin_source.hpp"
 #include "test_data.hpp"
+#include "tree/fsck.hpp"
 #include "tree/ivf_tree_index.hpp"
 #include "mem_source.hpp"  // MemSourceBuilder
 #include <sextant/column_data.hpp>
@@ -1438,4 +1439,75 @@ TEST(TreeInsertDelete, LocalScalarInsertAndSplit) {
 }
 
 }  // namespace
+}  // namespace sextant::tree
+
+namespace sextant::tree {
+// Regression guard for audit F3/F4: the allocation bitmap was hard-sized
+// to ONE page (32,768 addressable pages = 128 MiB file). Larger trees
+// silently dropped every bitmap bit past that point — pages looked FREE
+// on disk, fsck reported 77% orphan storms on pristine trees, and
+// open-for-write insert handed out LIVE leaf pages (bad_alloc cascade,
+// corrupted leaves). This test crosses the 128 MiB boundary and proves:
+// bitmap covers the whole file (fsck clean), and insert/delete round-trip
+// without corrupting the tree.
+TEST(TreeInsertDelete, LargeTreeBitmapCoversFileAndMutates) {
+    // pq with m=768, 8-bit codes keeps 768 B/vec + 8 B row id:
+    // 180k x 776 B ~ 135 MiB ~ 34k pages — past the one-bitmap-page limit
+    // (32,768 pages) where the old code silently dropped bits.
+    const uint64_t n = 180000;
+    const uint32_t dim = 768;
+    const std::string base_path = write_test_fbin(
+        "phasej_large.fbin", n, dim, /*n_clusters=*/64, /*seed=*/7);
+    const std::string tree_path = temp_path("_large.tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "pq";
+    cfg.params.pq4_m = 768;
+    cfg.params.scan_pq_bits = 8;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 64;
+    cfg.leaf_capacity = 5000;
+    cfg.num_threads = 4;
+    cfg.adaptive_probe_gap = 0.0f;
+
+    ([&]{ FbinSource s(base_path);
+          return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    {
+        auto idx = IVFTreeIndex::open(tree_path);
+        EXPECT_GT(idx->live_count(), n - 1);
+    }
+
+    // The whole file must be accounted: no orphans, no leaks — and the
+    // file must actually cross the old one-bitmap-page boundary, or this
+    // test would silently stop guarding the regression.
+    const auto res = fsck(tree_path);
+    EXPECT_GT(res.total_pages, 32768u) << "test fixture shrank below the "
+                                         "bitmap-page boundary; grow it";
+    EXPECT_TRUE(res.page_accounting_ok)
+        << "orphans=" << res.orphan_pages << " leaked=" << res.leaked_pages;
+
+    // Mutation at scale: insert, reopen, delete, reopen, fsck clean.
+    {
+        auto idx = IVFTreeIndex::open(tree_path);
+        std::vector<float> vec(dim, 0.5f);
+        std::vector<IVFTreeIndex::InsertPoint> points;
+        points.push_back({vec.data(), static_cast<RowId>(n + 1), {}, {}});
+        idx->insert_batch(points);
+        EXPECT_GE(idx->live_count(), n);
+    }
+    {
+        auto idx = IVFTreeIndex::open(tree_path);
+        idx->delete_batch({static_cast<RowId>(n + 1)});
+    }
+    const auto res2 = fsck(tree_path);
+    EXPECT_TRUE(res2.page_accounting_ok)
+        << "post-mutation orphans=" << res2.orphan_pages
+        << " leaked=" << res2.leaked_pages;
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
 }  // namespace sextant::tree
