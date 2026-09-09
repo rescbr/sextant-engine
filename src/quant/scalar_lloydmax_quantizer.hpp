@@ -15,6 +15,7 @@
 #include <sextant/types.hpp>
 #include <cstdint>
 #include <cstddef>
+#include <thread>
 #include <vector>
 
 namespace sextant {
@@ -29,6 +30,15 @@ public:
     /// uses spaced-random data-point inits for basin diversity.
     void train(const float* samples, uint64_t n,
                uint32_t n_restarts = 10, uint32_t lloyd_iters = 30);
+
+    /// Threads for the per-dim training loop above. Default:
+    /// hardware_concurrency — dims are independent (disjoint levels_
+    /// slices, per-dim RNG seeded 42+d), so the trained table is
+    /// bit-identical at any thread count, and the only caller (the
+    /// global scalar coder train, once at build start) is serial-context
+    /// — nothing to oversubscribe. Builders pin it to their configured
+    /// thread count for benchmark discipline.
+    void set_train_threads(uint32_t t) { train_threads_ = t; }
 
     /// Train per-dim EQUIDISTANT levels from the per-dim [min, max].
     /// At 8 bits this matches (slightly beats) Lloyd-Max recall — level
@@ -133,6 +143,8 @@ private:
     std::vector<float> f_;
     std::vector<float> steps_;
     std::vector<uint8_t> fu8_;  // f scaled to u8 for the TBL kernel
+
+    uint32_t train_threads_ = std::thread::hardware_concurrency();
 
     /// Recompute bounds_ from levels_.
     void compute_bounds_();

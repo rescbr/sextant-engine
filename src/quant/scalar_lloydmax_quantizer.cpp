@@ -7,6 +7,7 @@
 #include <cstring>
 #include <random>
 #include <numeric>
+#include <thread>
 
 namespace sextant {
 
@@ -132,56 +133,79 @@ void ScalarLloydMaxQuantizer::train(const float* samples, uint64_t n,
                         std::to_string(n) + " < K=" + std::to_string(K_));
     }
 
-    // Extract per-dimension data into a scratch buffer.
-    std::vector<float> col(n);
+    // Per-dim training: dims are fully independent (each writes only its
+    // own levels_ slice and seeds its own RNG with 42+d), so the loop is
+    // parallelized across train_threads_ with bit-identical output — the
+    // serial version spent 10.6s here on arxiv-1M (43% of total build
+    // wall, util 95%), the only serial-compute phase in a shape build.
+    const uint32_t n_threads =
+        std::min<uint32_t>(train_threads_ ? train_threads_ : 1, dim_);
+    const auto train_dim_range = [&](uint32_t d_begin, uint32_t d_end) {
+        std::vector<float> col(n);
+        for (uint32_t d = d_begin; d < d_end; ++d) {
+            for (uint64_t i = 0; i < n; ++i)
+                col[i] = samples[i * dim_ + d];
 
-    for (uint32_t d = 0; d < dim_; ++d) {
-        for (uint64_t i = 0; i < n; ++i)
-            col[i] = samples[i * dim_ + d];
+            // Sort col FIRST — quantile inits below require ordered data.
+            std::sort(col.begin(), col.end());
 
-        // Sort col FIRST — quantile inits below require ordered data.
-        std::sort(col.begin(), col.end());
-
-        // Init 1: uniform quantiles (best default).
-        std::vector<float> quantile_init(K_);
-        for (uint32_t k = 0; k < K_; ++k) {
-            double frac = static_cast<double>(k) / (K_ - 1);
-            uint64_t idx = static_cast<uint64_t>(frac * (n - 1));
-            quantile_init[k] = col[idx];
-        }
-
-        auto best = lloyd_max_1d(col.data(), n, K_, lloyd_iters, quantile_init);
-        double best_mse = quantizer_mse(col.data(), n, best);
-
-        // Restarts with DIVERSE inits: K uniformly-spaced random data points.
-        // (The old jittered-quantile init perturbed by ±0.1% of range — every
-        // restart converged to the same local minimum, wasting the restart.)
-        // Sampling actual data points gives genuinely different basins,
-        // matching the spirit of sklearn's n_init with random inits.
-        std::mt19937 rng(42 + d);
-        for (uint32_t r = 1; r < n_restarts; ++r) {
-            std::vector<float> init(K_);
-            // Spaced random positions: level k draws from the k-th slice of
-            // the sorted data. Spacing keeps the init sorted-ish (diverse but
-            // not degenerate) and covers the whole distribution.
+            // Init 1: uniform quantiles (best default).
+            std::vector<float> quantile_init(K_);
             for (uint32_t k = 0; k < K_; ++k) {
-                std::uniform_real_distribution<double> u(
-                    static_cast<double>(k) / K_,
-                    static_cast<double>(k + 1) / K_);
-                uint64_t idx = static_cast<uint64_t>(u(rng) * (n - 1));
-                init[k] = col[idx];
+                double frac = static_cast<double>(k) / (K_ - 1);
+                uint64_t idx = static_cast<uint64_t>(frac * (n - 1));
+                quantile_init[k] = col[idx];
             }
-            auto cand = lloyd_max_1d(col.data(), n, K_, lloyd_iters, init);
-            double mse = quantizer_mse(col.data(), n, cand);
-            if (mse < best_mse) {
-                best_mse = mse;
-                best = std::move(cand);
-            }
-        }
 
-        // Store levels for this dimension.
-        std::memcpy(&levels_[static_cast<size_t>(d) * K_], best.data(),
-                    K_ * sizeof(float));
+            auto best = lloyd_max_1d(col.data(), n, K_, lloyd_iters,
+                                     quantile_init);
+            double best_mse = quantizer_mse(col.data(), n, best);
+
+            // Restarts with DIVERSE inits: K uniformly-spaced random data
+            // points. (The old jittered-quantile init perturbed by ±0.1% of
+            // range — every restart converged to the same local minimum,
+            // wasting the restart.) Sampling actual data points gives
+            // genuinely different basins, matching the spirit of sklearn's
+            // n_init with random inits.
+            std::mt19937 rng(42 + d);
+            for (uint32_t r = 1; r < n_restarts; ++r) {
+                std::vector<float> init(K_);
+                // Spaced random positions: level k draws from the k-th
+                // slice of the sorted data. Spacing keeps the init
+                // sorted-ish (diverse but not degenerate) and covers the
+                // whole distribution.
+                for (uint32_t k = 0; k < K_; ++k) {
+                    std::uniform_real_distribution<double> u(
+                        static_cast<double>(k) / K_,
+                        static_cast<double>(k + 1) / K_);
+                    uint64_t idx = static_cast<uint64_t>(u(rng) * (n - 1));
+                    init[k] = col[idx];
+                }
+                auto cand = lloyd_max_1d(col.data(), n, K_, lloyd_iters, init);
+                double mse = quantizer_mse(col.data(), n, cand);
+                if (mse < best_mse) {
+                    best_mse = mse;
+                    best = std::move(cand);
+                }
+            }
+
+            // Store levels for this dimension.
+            std::memcpy(&levels_[static_cast<size_t>(d) * K_], best.data(),
+                        K_ * sizeof(float));
+        }
+    };
+    if (n_threads <= 1) {
+        train_dim_range(0, dim_);
+    } else {
+        std::vector<std::thread> ts;
+        ts.reserve(n_threads);
+        const uint32_t per = (dim_ + n_threads - 1) / n_threads;
+        for (uint32_t t = 0; t < n_threads; ++t) {
+            const uint32_t b = t * per;
+            if (b >= dim_) break;
+            ts.emplace_back(train_dim_range, b, std::min(dim_, b + per));
+        }
+        for (auto& t : ts) t.join();
     }
 
     compute_bounds_();

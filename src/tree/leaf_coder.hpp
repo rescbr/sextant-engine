@@ -239,6 +239,10 @@ public:
     /// Train global state (no-op for local families; local state is fitted
     /// per leaf at flush/split time).
     virtual void train(const float* sample, uint32_t n) = 0;
+    /// Thread budget for train() (no-op default: most families either
+    /// train internally parallel or are local/serial-by-context). Callers
+    /// pin it to the build's configured thread count.
+    virtual void set_train_threads(uint32_t) {}
     /// Serialize global state (codebook/ruler blob) for the superblock;
     /// returns false when the family stores no global blob (local families).
     virtual bool serialize_global(std::vector<uint8_t>& out) const = 0;

@@ -72,6 +72,10 @@ uint32_t ScalarLmCoder::code_size() const {
     return quantizer_->code_size();
 }
 
+void ScalarLmCoder::set_train_threads(uint32_t t) {
+    quantizer_->set_train_threads(t);
+}
+
 void ScalarLmCoder::train(const float* sample, uint32_t n) {
     switch (policy_) {
         case LevelPolicy::Uniform: quantizer_->train_uniform(sample, n); break;

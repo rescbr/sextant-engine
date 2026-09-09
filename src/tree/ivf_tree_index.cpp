@@ -636,6 +636,11 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     }
 
     const bool coder_has_global = ctx.coder->has_global_state();
+    // Pin global training to the build's thread budget (scalar families
+    // parallelize per-dim here; other families ignore it).
+    ctx.coder->set_train_threads(
+        ctx.cfg.num_threads ? ctx.cfg.num_threads
+                            : std::thread::hardware_concurrency());
     ctx.coder->train(sample.data(), train_n);
     if (coder_has_global) {
         spdlog::info("[sextant] build_streaming_pca: trained {} in {:.2f}s",

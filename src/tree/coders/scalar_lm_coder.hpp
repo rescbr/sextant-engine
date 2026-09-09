@@ -38,6 +38,7 @@ public:
     uint32_t code_size() const override;
 
     void train(const float* sample, uint32_t n) override;
+    void set_train_threads(uint32_t t) override;
     bool serialize_global(std::vector<uint8_t>& out) const override;
     bool deserialize_global(const uint8_t* data, uint64_t size) override;
     void encode(const float* vec, uint8_t* code_out,
