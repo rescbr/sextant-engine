@@ -365,7 +365,8 @@ public:
 /// quantizer_type string → LeafCoder. The ONLY translation point of the
 /// family strings (called from build resolve and open). Throws on unknown
 /// (same message style as the old open()). `params` is IN/OUT: scalar
-/// families normalize m4 to dim; the env SEXTANT_SCAN_I8 override is
+/// families normalize m4 to dim; the scan_i8 override (-1=auto, via
+/// set_scan_i8_override) is
 /// resolved into scan_i8_mode here once. `for_open` selects open-time
 /// construction (deserialization-friendly defaults) vs build-time
 /// (trainer selection from ResolvedParams).

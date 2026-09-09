@@ -67,8 +67,9 @@ struct LeafCandidate {
 /// internal nodes and leaf headers from the mmap; leaf code scanning reads
 /// from the mmap too.
 /// Per-thread override for the i8 SDOT scan kernel (C ABI harnesses
-/// serving mixed rows): >0 forces on, 0 forces off, -1 (default) lets
-/// SEXTANT_SCAN_I8 decide. See the kernel comment in search().
+/// serving mixed rows): >0 forces on, 0 forces off, -1 (default) = auto
+/// (int8 kernel on AVX512/VNNI, float FMA otherwise). See the kernel
+/// comment in search().
 void set_scan_i8_override(int v);
 
 class IVFTreeIndex {

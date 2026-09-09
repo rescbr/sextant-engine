@@ -151,7 +151,7 @@ sextant_search_opts sextant_default_search_opts(void) {
     o.scan_code_budget = 0;
     o.rerank = 0;
     o.search_threads = 0;
-    o.int8_scan = -1;  // env decides (SEXTANT_SCAN_I8); 0 here previously
+    o.int8_scan = -1;  // -1 = auto (int8 on AVX512/VNNI); 0 here previously
                         // force-disabled the i8 kernel for default callers
     o.exhaustive = 0;
     o.probe_fraction = 0.0f;
@@ -193,8 +193,8 @@ int32_t sextant_search(void* index, const float* query,
         cfg.adaptive_w_gap = opts->adaptive_w_gap;
         scan_i8_override = opts->int8_scan;
         cfg.search_threads = opts->search_threads;
-        // The engine gates its i8 kernel on SEXTANT_SCAN_I8 (process-global
-        // env). A per-call override uses a thread-local the scan reads.
+        // The scan kernel mode is a process-wide setting with a per-thread
+        // override the scan reads (set below).
         sextant::tree::set_scan_i8_override(scan_i8_override);
         auto results = idx->search(query, opts->k, cfg);
         // Under the adaptive-W contract (adaptive_w_gap > 0) the engine may

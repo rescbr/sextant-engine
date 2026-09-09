@@ -201,7 +201,7 @@ inline void add_mode_extras(cmdline::parser& p, Mode mode) {
             "higher k.",
             false, 100);
     }
-    if (mode == Mode::Build || mode == Mode::Autobuild) {
+    if (mode == Mode::Build || mode == Mode::Autobuild || mode == Mode::Analyze) {
         p.add<std::string>("graph-build-metric", 0,
             "Graph construction distance source: pq (default), fp16, or "
             "fp32 (K=1 path only; fp32 loads +N*dim*4B of raw vectors)",

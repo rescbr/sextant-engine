@@ -366,11 +366,11 @@ void Builder::pass1_sample_and_train(VectorSource& source,
     if (pq_m == 0 || pq_bits == 0) {
         throw Error(
             ErrorCode::InvalidParam,
-            "build requires explicit --pq-m and --pq-bits (got pq_m=" +
+            "build requires explicit --pq-segments and --pq-bits (got pq_m=" +
                 std::to_string(pq_m) + ", pq_bits=" +
                 std::to_string(pq_bits) +
                 "). Pass them on the command line, e.g. `sextant build ... "
-                "--pq-m 96 --pq-bits 8`, or run `sextant analyze` first to "
+                "--pq-segments 96 --pq-bits 8`, or run `sextant analyze` first to "
                 "get a dataset-specific recommendation.");
     }
 

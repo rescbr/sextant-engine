@@ -71,8 +71,9 @@ typedef struct sextant_search_opts {
                                ///< 3-4x faster, NOT score-bit-identical:
                                ///< raw-ranking recall drops (dbpedia 100K
                                ///< flat: -25pp; tau-rerank path: ~0). Use
-                               ///< for rerank-serving rows only. -1 = env
-                               ///< SEXTANT_SCAN_I8 decides. Default -1.
+                               ///< for rerank-serving rows only. -1 = auto
+                               ///< (int8 on AVX512/VNNI, float otherwise).
+                               ///< Default -1.
     int exhaustive;            ///< 1 overrides the above into probe-all:
                                ///< n_probe = n_probe_ln = UINT32_MAX,
                                ///< gap pruning off, budget unlimited.
