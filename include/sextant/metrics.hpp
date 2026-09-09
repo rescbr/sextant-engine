@@ -65,6 +65,14 @@ struct PhaseMetrics {
     uint64_t leaves_unique = 0;       ///< search.window.leaves_unique
     uint64_t leaf_scans = 0;          ///< search.window.leaf_scans
     uint64_t bytes_unique = 0;        ///< search.window.bytes_unique
+    /// Sweep decomposition (raw, additive): summed per-thread wall INSIDE
+    /// leaf preads (read_ns), summed per-thread wall in scan+harvest
+    /// EXCLUDING reads (scan_ns), and the sweep phase's wall-clock span
+    /// (sweep_wall_seconds; per-thread busy sums vs sweep_wall x
+    /// sweep_threads give the overlap efficiency).
+    uint64_t read_ns = 0;             ///< search.window.read_ns
+    uint64_t scan_ns = 0;             ///< search.window.scan_ns
+    double sweep_wall_seconds = 0;    ///< search.window.sweep_wall_seconds
     /// DERIVED (documented, emitted for convenience — not raw):
     /// read_stream_gbps = bytes_unique / summed per-leaf pread wall =
     /// mean PER-STREAM sequential bandwidth (hardware character; the
@@ -221,7 +229,7 @@ inline std::string json_escape(std::string_view s) {
 }
 
 inline std::string to_json(const PhaseMetrics& m) {
-    char buf[512];
+    char buf[1024];
     std::string out;
     out.reserve(384);
     out += "{\"phase\":\"";
@@ -237,6 +245,8 @@ inline std::string to_json(const PhaseMetrics& m) {
                   "\"routing_seconds\":%.17g,\"node_bytes_read\":%llu,"
                   "\"batches\":%llu,\"leaves_unique\":%llu,"
                   "\"leaf_scans\":%llu,\"bytes_unique\":%llu,"
+                  "\"read_ns\":%llu,\"scan_ns\":%llu,"
+                  "\"sweep_wall_seconds\":%.17g,"
                   "\"read_stream_gbps\":%.17g,"
                   "\"uncoalesced_capacity_qps\":%.17g,"
                   "\"timestamp\":%.17g}",
@@ -253,6 +263,9 @@ inline std::string to_json(const PhaseMetrics& m) {
                   static_cast<unsigned long long>(m.leaves_unique),
                   static_cast<unsigned long long>(m.leaf_scans),
                   static_cast<unsigned long long>(m.bytes_unique),
+                  static_cast<unsigned long long>(m.read_ns),
+                  static_cast<unsigned long long>(m.scan_ns),
+                  m.sweep_wall_seconds,
                   m.read_stream_gbps,
                   m.uncoalesced_capacity_qps,
                   m.timestamp);

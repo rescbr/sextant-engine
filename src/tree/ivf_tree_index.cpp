@@ -4268,6 +4268,9 @@ void IVFTreeIndex::search_batch(
                 pread_sweep
                     ? static_cast<size_t>(max_extent_pages) * kPageSize
                     : 0);
+            // Per-worker scan+harvest wall (excludes preads): feeds the
+            // batch.scan_ns overlap-decomposition metric.
+            uint64_t my_scan_ns = 0;
             // Filter columns of the CURRENT leaf, parsed once per leaf
             // and shared by every query in its fanout (column layout is
             // query-independent; predicates are per query).
@@ -4305,6 +4308,8 @@ void IVFTreeIndex::search_batch(
                     } else {
                         leaf_ptr = pin_leaf_(ul.page, ul.pages, h);
                     }
+                    // Scan+harvest wall for this leaf (read excluded).
+                    const auto ts0 = std::chrono::steady_clock::now();
                     // Parse the leaf's filter columns once (predicates
                     // evaluate per query against this shared view).
                     if (batch_has_predicates) {
@@ -4387,13 +4392,19 @@ void IVFTreeIndex::search_batch(
                     // references the buffer. Unpin so the entry can
                     // evict (pins held longer disable eviction).
                     if (h.entry) leaf_cache_->unpin(h);
+                    my_scan_ns +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - ts0)
+                            .count();
                 }
             }
             std::lock_guard<std::mutex> lk(adopt_mu);
+            batch_stats_.on_scan(my_scan_ns);
             partials.insert(partials.end(),
                             std::make_move_iterator(my_partials.begin()),
                             std::make_move_iterator(my_partials.end()));
         };
+        const auto t_sweep0 = std::chrono::steady_clock::now();
         if (T == 1) {
             sweep_worker();
         } else {
@@ -4403,6 +4414,11 @@ void IVFTreeIndex::search_batch(
                     std::async(std::launch::async, sweep_worker));
             for (auto& f : futs) f.get();
         }
+        batch_stats_.on_sweep(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_sweep0)
+                .count(),
+            T);
     }
 
     // --- Merge per-query partials (deterministic) ---

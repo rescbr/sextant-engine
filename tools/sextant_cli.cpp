@@ -1344,6 +1344,10 @@ int cmd_tree_search(int argc, char* argv[]) {
             w.leaves_unique = bst.leaves_unique;
             w.leaf_scans = bst.leaf_scans;
             w.bytes_unique = bst.bytes_unique;
+            w.read_ns = bst.read_ns;
+            w.scan_ns = bst.scan_ns;
+            w.sweep_wall_seconds =
+                static_cast<double>(bst.sweep_wall_ns) / 1e9;
             w.read_stream_gbps = read_stream_gbps;
             w.uncoalesced_capacity_qps = uncoalesced_capacity_qps;
             w.timestamp = std::chrono::duration<double>(

@@ -376,6 +376,9 @@ struct BatchStats {
         uint64_t leaf_scans = 0;       ///< (leaf, query) scans executed
         uint64_t bytes_unique = 0;     ///< unique-leaf bytes read (the floor)
         uint64_t read_ns = 0;          ///< wall spent inside leaf preads
+        uint64_t scan_ns = 0;  ///< per-thread scan+harvest wall (no reads)
+        uint64_t sweep_wall_ns = 0;    ///< sweep phase wall span (summed)
+        uint64_t sweep_threads = 0;    ///< sweep thread count (summed)
         uint64_t fallback_queries = 0; ///< queries served by per-query paths
         double wall_seconds = 0;
     };
@@ -400,6 +403,17 @@ struct BatchStats {
         read_ns_.fetch_add(read_ns, std::memory_order_relaxed);
     }
 
+    /// Accumulate per-thread scan+harvest wall inside the sweep (excludes
+    /// preads) and the sweep phase's wall-clock span (once per window).
+    /// read_ns+scan_ns vs sweep_wall x sweep_threads = overlap efficiency.
+    void on_scan(uint64_t scan_ns) const {
+        scan_ns_.fetch_add(scan_ns, std::memory_order_relaxed);
+    }
+    void on_sweep(uint64_t wall_ns, uint32_t threads) const {
+        sweep_wall_ns_.fetch_add(wall_ns, std::memory_order_relaxed);
+        sweep_threads_.fetch_add(threads, std::memory_order_relaxed);
+    }
+
     Snapshot snapshot_and_reset() const {
         Snapshot s;
         s.batches = batches_.exchange(0, std::memory_order_relaxed);
@@ -408,6 +422,11 @@ struct BatchStats {
         s.leaf_scans = leaf_scans_.exchange(0, std::memory_order_relaxed);
         s.bytes_unique = bytes_unique_.exchange(0, std::memory_order_relaxed);
         s.read_ns = read_ns_.exchange(0, std::memory_order_relaxed);
+        s.scan_ns = scan_ns_.exchange(0, std::memory_order_relaxed);
+        s.sweep_wall_ns =
+            sweep_wall_ns_.exchange(0, std::memory_order_relaxed);
+        s.sweep_threads =
+            sweep_threads_.exchange(0, std::memory_order_relaxed);
         s.fallback_queries =
             fallback_queries_.exchange(0, std::memory_order_relaxed);
         s.wall_seconds = static_cast<double>(
@@ -422,6 +441,9 @@ private:
     mutable std::atomic<uint64_t> leaf_scans_{0};
     mutable std::atomic<uint64_t> bytes_unique_{0};
     mutable std::atomic<uint64_t> read_ns_{0};
+    mutable std::atomic<uint64_t> scan_ns_{0};
+    mutable std::atomic<uint64_t> sweep_wall_ns_{0};
+    mutable std::atomic<uint64_t> sweep_threads_{0};
     mutable std::atomic<uint64_t> fallback_queries_{0};
     mutable std::atomic<uint64_t> wall_ns_{0};
 };
