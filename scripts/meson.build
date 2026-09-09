@@ -172,3 +172,10 @@ sched_transition = executable('sched_transition',
     include_directories: [engine_inc, src_inc, third_party_inc],
     dependencies: sextant_dep,
 )
+
+join_sim = executable('join_sim',
+    'join_sim.cpp',
+    include_directories: [engine_inc, src_inc, third_party_inc],
+    dependencies: sextant_dep,
+    install: false,
+)

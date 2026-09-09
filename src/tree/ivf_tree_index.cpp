@@ -3330,6 +3330,15 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             auto& th = scratch.worker_heaps;
             if (th.size() < T) th.resize(T);
             for (auto& my : th) my.clear();
+            // No-cache parallel scan: leaf_ptrs is only pre-sized on the
+            // cache path (fill stage above); size it here or the worker
+            // write below is out of bounds (crashed with search_threads>1
+            // and cache off — caught by scripts/join_sim's probe pass).
+            if (!use_ord) scratch.leaf_ptrs.assign(candidates.size(), nullptr);
+            // Workers must fill the CALLING thread's leaf_ptrs — `scratch`
+            // is thread_local, so referencing it inside the async worker
+            // resolves to the worker's own (empty) instance.
+            auto& out_ptrs = scratch.leaf_ptrs;
             // Per-worker setups: local families own mutable per-leaf state
             // (a_d transform, LUTs) in the setup, so each worker builds its
             // own from the same query (identical arithmetic). Global
@@ -3367,7 +3376,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                                               candidates[c].pages),
                                           h);
                             if (h.entry) wpins[ti].push_back(h);
-                            scratch.leaf_ptrs[c] = leaf_ptr;
+                            out_ptrs[c] = leaf_ptr;
                             if (per_leaf) coder_->bind_leaf(*use, leaf_ptr);
                             RawScanHeap heap{&my, W, c};
                             coder_->scan_leaf(*use, leaf_ptr, heap);
