@@ -4289,6 +4289,26 @@ void IVFTreeIndex::search_batch(
                     next_chunk.fetch_add(kChunk, std::memory_order_relaxed);
                 if (start >= n_unique) break;
                 const uint32_t end = std::min(start + kChunk, n_unique);
+                if (pread_sweep && end < n_unique) {
+                    // Read-ahead the NEXT chunk while scanning this one:
+                    // each thread's blocking preads serialize against its
+                    // scans (measured: read wall ~23% of per-thread time
+                    // while aggregate disk demand sits far below the
+                    // device). WILLNEED gives the kernel the whole chunk
+                    // scan (~hundreds of ms) to prefetch the next ~tens
+                    // of MB — the per-thread pread then hits warm pages.
+                    // No threads, no rings; the engine already relies on
+                    // fadvise prefetch on the cache fill path.
+                    const auto& nb = uleaves[end];
+                    const auto& ne = uleaves[std::min(
+                        end + kChunk, n_unique) - 1];
+                    ::posix_fadvise(
+                        fd_,
+                        static_cast<off_t>(nb.page) * kPageSize,
+                        static_cast<off_t>(ne.page + ne.pages - nb.page) *
+                            kPageSize,
+                        POSIX_FADV_WILLNEED);
+                }
                 for (uint32_t li = start; li < end; ++li) {
                     const auto& ul = uleaves[li];
                     LeafExtentCache::Handle h;
