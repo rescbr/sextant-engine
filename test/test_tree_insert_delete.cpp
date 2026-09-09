@@ -1511,3 +1511,63 @@ TEST(TreeInsertDelete, LargeTreeBitmapCoversFileAndMutates) {
     std::filesystem::remove(tree_path);
 }
 }  // namespace sextant::tree
+
+namespace sextant::tree {
+
+// Regression guard (found via ASan in the fragmentation-churn session):
+// PqQuantizer::code_distance_batch4 kept the anchor's per-segment ids in a
+// fixed uint32_t[256] stack array — any tree with m4 > 256 (pq8 m=384/768)
+// smashed 512+ bytes of worker stack inside split_leaf_'s K=2 k-means,
+// corrupting unrelated state and crashing later readers. The insert+split
+// below runs that exact path with m4 = dim.
+TEST(TreeInsertDelete, SplitWithWidePqMNoStackSmash) {
+    const uint64_t n = 6000;
+    const uint32_t dim = 384;  // == m4: > 256 segments
+    const std::string base_path = write_test_fbin(
+        "phasej_wide.fbin", n, dim, /*n_clusters=*/12, /*seed=*/5);
+    const std::string tree_path = temp_path("_wide.tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "pq";
+    cfg.params.pq4_m = static_cast<uint16_t>(dim);  // m4 = 384 > 256
+    cfg.params.scan_pq_bits = 8;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 4;
+    cfg.leaf_capacity = 1500;   // inserts push leaves past 2x cap → splits
+    cfg.num_threads = 4;
+    cfg.adaptive_probe_gap = 0.0f;
+
+    ([&]{ FbinSource s(base_path);
+          return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    {
+        auto idx = IVFTreeIndex::open(tree_path);
+        // Insert enough to force at least one split (kmeans_pq m=384 runs
+        // inside split_leaf_ — the exact path that smashed the stack).
+        const uint32_t n_insert = 4000;
+        std::vector<float> vec_storage(
+            static_cast<size_t>(n_insert) * dim);
+        std::mt19937 rng(31337);
+        for (auto& v : vec_storage)
+            v = std::uniform_real_distribution<float>(-5, 5)(rng);
+        std::vector<IVFTreeIndex::InsertPoint> points;
+        for (uint32_t i = 0; i < n_insert; ++i)
+            points.push_back({&vec_storage[static_cast<size_t>(i) * dim],
+                              static_cast<RowId>(n + i), {}, {}});
+        idx->insert_batch(points);
+        EXPECT_GE(idx->live_count(), n + n_insert - 1);
+        EXPECT_GT(idx->n_leaves(), 4u);  // splits happened
+    }
+    {
+        auto idx = IVFTreeIndex::open(tree_path);
+        EXPECT_GE(idx->live_count(), n + 4000 - 1);
+    }
+    const auto res = fsck(tree_path);
+    EXPECT_TRUE(res.tree_walk_ok && res.leaf_internals_ok);
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+}  // namespace sextant::tree

@@ -1268,7 +1268,11 @@ void PqQuantizer::code_distance_batch4(const uint8_t* anchor,
 
     // Pre-extract anchor's per-segment centroid ids.
     // For 8-bit codes this is just a direct byte read.
-    uint32_t ac[256];  // max m we support
+    // Heap-allocated: m_ is only bounded by dim (e.g. m4=384/768 trees) —
+    // a fixed 256-entry stack array was smashed by any m > 256, corrupting
+    // the worker stack in split_leaf_'s K=2 k-means (found via ASan; the
+    // build path survived only by stack-layout luck).
+    std::vector<uint32_t> ac(m_);
     for (uint32_t s = 0; s < m_; s++)
         ac[s] = read_code(anchor, bits_, s);
 
