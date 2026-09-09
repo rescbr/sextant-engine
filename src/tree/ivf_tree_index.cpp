@@ -323,16 +323,21 @@ void IVFTreeIndex::load_root_from_mmap() {
 }
 
 const uint8_t* IVFTreeIndex::pin_leaf_(PageId page, uint32_t pages,
-                                       LeafExtentCache::Handle& handle) const {
+                                       LeafExtentCache::Handle& handle,
+                                       bool* was_hit) const {
     handle.entry = nullptr;
     const uint8_t* mmap_ptr =
         mmap_base_ + static_cast<uint64_t>(page) * kPageSize;
-    if (!leaf_cache_) return mmap_ptr;
+    if (!leaf_cache_) {
+        if (was_hit) *was_hit = false;
+        return mmap_ptr;
+    }
     bool hit = false;
     uint64_t filled = 0;
     const uint8_t* p = leaf_cache_->pin(page, pages, handle, mmap_ptr,
                                         &hit, &filled);
     search_stats_.on_cache_op(hit, filled);
+    if (was_hit) *was_hit = hit;
     return p;
 }
 
@@ -4352,7 +4357,19 @@ void IVFTreeIndex::search_batch(
                         }
                         leaf_ptr = pread_buf.data();
                     } else {
-                        leaf_ptr = pin_leaf_(ul.page, ul.pages, h);
+                        // Cache backend: fill preads block the worker the
+                        // same way — feed batch read_ns on MISS only (the
+                        // hit path is lock+LRU, not a read).
+                        const auto tr0 = std::chrono::steady_clock::now();
+                        bool hit = true;
+                        leaf_ptr = pin_leaf_(ul.page, ul.pages, h, &hit);
+                        if (!hit) {
+                            batch_stats_.on_read(
+                                std::chrono::duration_cast<
+                                    std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - tr0)
+                                    .count());
+                        }
                     }
                     // Scan+harvest wall for this leaf (read excluded).
                     const auto ts0 = std::chrono::steady_clock::now();

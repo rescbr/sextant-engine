@@ -426,7 +426,8 @@ private:
     /// extent (hit/miss counted into search_stats_), caller must unpin via
     /// release_leaf_pins once the scan (and any leaf_ptr uses) are done.
     const uint8_t* pin_leaf_(PageId page, uint32_t pages,
-                             LeafExtentCache::Handle& handle) const;
+                             LeafExtentCache::Handle& handle,
+                             bool* was_hit = nullptr) const;
 
     /// Release every pin taken by one search() call (QueryGuard exit path).
     void release_leaf_pins_(std::vector<LeafExtentCache::Handle>& pins) const;
