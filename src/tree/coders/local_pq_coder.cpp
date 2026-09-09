@@ -30,6 +30,11 @@ struct LocalPqCoder::Setup : public ScanSetup {
     std::vector<uint8_t> lut4, lut8;
     std::vector<float> query_copy;  // query for the residual transform
     std::unique_ptr<PqQuantizer> leaf_q;  // LUT builder (params fixed)
+    // Leaf this setup is currently bound to (set by bind_leaf). The
+    // batch sweep reranks eagerly right after bind_leaf, reusing leaf_q's
+    // codebook; the pointer-identity check is what makes that reuse safe
+    // (the pread sweep reuses ONE buffer address for every leaf).
+    const uint8_t* bound_leaf = nullptr;
     // Per-leaf LUT quantization (set by bind_leaf): the fastscan raw sum is
     // in THIS leaf's quantized units. d_hat = raw / lut_scale + lut_offset
     // is the comparable-across-leaves distance estimate. Without it the
@@ -179,6 +184,7 @@ std::unique_ptr<ScanSetup> LocalPqCoder::scan_setup(const float* query) {
 
 void LocalPqCoder::bind_leaf(ScanSetup& setup, const uint8_t* leaf) const {
     auto& s = static_cast<Setup&>(setup);
+    s.bound_leaf = leaf;
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
     const float* centroid = reinterpret_cast<const float*>(
         leaf + lh->centroid_offset);
@@ -285,6 +291,22 @@ void LocalPqCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
     }
 }
 
+float LocalPqCoder::rerank(const float* query, const ScanSetup& setup,
+                           const uint8_t* leaf, uint32_t local_idx,
+                           float* scratch_decoded) {
+    const auto& s = static_cast<const Setup&>(setup);
+    if (s.bound_leaf == leaf && s.leaf_q) {
+        // Fast path (batch sweep): the setup is bound to THIS leaf —
+        // leaf_q already carries its codebook. The g_rerank_ctx address
+        // cache is unusable here: the pread sweep reads every leaf into
+        // the same per-thread buffer, so `last_leaf != leaf` can't detect
+        // a codebook change.
+        return rerank_with(query, leaf, local_idx, scratch_decoded,
+                           *s.leaf_q);
+    }
+    return rerank(query, leaf, local_idx, scratch_decoded);
+}
+
 float LocalPqCoder::rerank(const float* query, const uint8_t* leaf,
                            uint32_t local_idx, float* scratch_decoded) {
     auto& ctx = g_rerank_ctx;
@@ -297,6 +319,13 @@ float LocalPqCoder::rerank(const float* query, const uint8_t* leaf,
         ctx.quant->set_codebook_data(reinterpret_cast<const float*>(
             leaf + lh->codebook_offset));
     }
+    return rerank_with(query, leaf, local_idx, scratch_decoded, *ctx.quant);
+}
+
+float LocalPqCoder::rerank_with(const float* query, const uint8_t* leaf,
+                                uint32_t local_idx, float* scratch_decoded,
+                                PqQuantizer& quant) {
+    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
     const uint64_t codes_off = local_codes_offset(
         lh->summary_size, params_.dim, lh->m4, lh->pq_bits);
     const uint32_t cpb = (lh->pq_bits == 8) ? 16 : 32;
@@ -307,8 +336,9 @@ float LocalPqCoder::rerank(const float* query, const uint8_t* leaf,
     extract_code_from_leaf(leaf, local_idx, lh->summary_size, lh->m4,
                            lh->pq_bits, cpb, lh->m4 * 16, code.data(),
                            codes_off);
-    std::vector<float> dec(params_.dim);
-    ctx.quant->decode_code(code.data(), dec.data());
+    static thread_local std::vector<float> dec;
+    dec.resize(params_.dim);
+    quant.decode_code(code.data(), dec.data());
     const float* centroid = reinterpret_cast<const float*>(
         leaf + lh->centroid_offset);
     for (uint32_t d = 0; d < params_.dim; ++d) dec[d] += centroid[d];

@@ -23,6 +23,7 @@
 #include <fstream>
 #include <future>
 #include <random>
+#include <map>
 #include <set>
 #include <vector>
 
@@ -95,6 +96,37 @@ struct BatchFixture {
 
 const BatchFixture& fixture() {
     static BatchFixture f;
+    return f;
+}
+
+/// Same clustered fixture, but built with the local_pq family (per-leaf
+/// codebooks). Regression guard for the batch-rerank bug (audit F1): the
+/// pread sweep reads every leaf into ONE per-thread buffer, so
+/// LocalPqCoder's pointer-address-keyed rerank codebook cache decoded
+/// codes against the FIRST leaf's codebook — batch recall collapsed
+/// (0.4371 -> 0.0333 on cohere100k) whenever decoded rerank was on.
+const BatchFixture& lpq_fixture() {
+    struct LpqFixture : BatchFixture {
+        LpqFixture() {
+            dir = std::filesystem::temp_directory_path() /
+                "batch_search_lpq";
+            std::filesystem::create_directories(dir);
+            const std::string base =
+                write_test_fbin((dir / "base.fbin").string(), 20000, dim, 30);
+            tree_path = (dir / "tree").string();
+            sextant::FbinSource s(base);
+            sextant::tree::IVFTreeIndex::BuildConfig cfg;
+            cfg.k_root = 8;
+            cfg.leaf_capacity = 1000;
+            cfg.pca_dims = 0;
+            cfg.num_threads = 4;
+            cfg.closure_multiplier = 0.0f;
+            cfg.params.quantizer_type = "local_pq";
+            sextant::tree::IVFTreeIndex::build_streaming_pca(
+                s, tree_path, cfg);
+        }
+    };
+    static LpqFixture f;
     return f;
 }
 
@@ -739,4 +771,39 @@ TEST(BatchSearch, MixedDepthsShareLeafReads) {
     ASSERT_GT(bs.leaves_unique, 0u);
     EXPECT_GT(s.bytes_touched, bs.bytes_unique);      // union dedups
     EXPECT_LT(bs.bytes_unique, s.bytes_touched / 2);  // substantially
+}
+
+// ---------------------------------------------------------------------------
+// local_pq: decoded-rerank equivalence in batch (audit F1 regression).
+// The existing equivalence tests ran with rerank off; the bug only fired
+// with decoded rerank on, where the coder's pointer-keyed codebook cache
+// went stale inside the one-buffer pread sweep.
+// ---------------------------------------------------------------------------
+
+TEST(BatchSearch, LocalPqBatchRerankMatchesSearch) {
+    const auto& fx = lpq_fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    for (uint32_t nq : {1u, 8u, 64u}) {
+        auto sc = base_config();
+        sc.search_threads = 1;
+        sc.rerank = true;  // the path the F1 bug collapsed
+        const auto queries = fx.make_queries(nq, 23);
+        std::vector<std::vector<sextant::Candidate>> out;
+        idx->search_batch(queries.data(), nq, 10, sc, out);
+        ASSERT_EQ(out.size(), nq);
+        for (uint32_t i = 0; i < nq; ++i) {
+            const auto single = idx->search(
+                queries.data() + static_cast<size_t>(i) * fx.dim, 10, sc);
+            ASSERT_FALSE(single.empty());
+            // Row-id sets and their reranked distances must match; ties may
+            // reorder, so compare as (row_id -> dist) maps.
+            ASSERT_EQ(single.size(), out[i].size());
+            std::map<int64_t, float> ms, mb;
+            for (size_t j = 0; j < single.size(); ++j) {
+                ms[single[j].row_id] = single[j].dist;
+                mb[out[i][j].row_id] = out[i][j].dist;
+            }
+            EXPECT_EQ(ms, mb) << "nq=" << nq << " query " << i;
+        }
+    }
 }

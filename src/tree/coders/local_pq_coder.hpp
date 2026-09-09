@@ -47,6 +47,9 @@ public:
                    RawScanHeap& heap) override;
     float rerank(const float* query, const uint8_t* leaf, uint32_t local_idx,
                  float* scratch_decoded) override;
+    float rerank(const float* query, const ScanSetup& setup,
+                 const uint8_t* leaf, uint32_t local_idx,
+                 float* scratch_decoded) override;
 
     SplitPlan plan_split(const uint8_t* leaf, const uint8_t* codes,
                          const float* vecs, uint32_t count,
@@ -66,6 +69,11 @@ public:
 
 private:
     struct Setup;
+    /// Shared decode+distance core for both rerank entry points (ctx-cache
+    /// and setup-bound codebook).
+    float rerank_with(const float* query, const uint8_t* leaf,
+                      uint32_t local_idx, float* scratch_decoded,
+                      PqQuantizer& quant);
     CoderParams params_;
 };
 
