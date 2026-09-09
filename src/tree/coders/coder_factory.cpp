@@ -20,6 +20,14 @@ void set_override(int v) { g_scan_i8_override = v; }
 std::unique_ptr<LeafCoder> make_leaf_coder(const std::string& quantizer_type,
                                            CoderParams& params,
                                            bool for_open) {
+    // Resolve the thread-local kernel override ONCE, on the opening
+    // thread: scan setups are built on sweep worker threads where a
+    // thread-local reads -1 (the CLI flag must reach the workers).
+    // Per-search overrides (C API) set AFTER open keep the thread-local
+    // route on caller threads.
+    if (for_open && scan_detail::scan_i8_override() > 0)
+        params.scan_i8_mode =
+            static_cast<uint8_t>(scan_detail::scan_i8_override());
     if (quantizer_type == "pq") {
         return std::make_unique<GlobalPqCoder>(GlobalPqCoder::Kind::Plain,
                                                params);

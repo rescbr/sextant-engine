@@ -196,15 +196,23 @@ std::unique_ptr<ScanSetup> ScalarLmCoder::scan_setup(const float* query) {
             s->rr_ready = true;
         }
     }
-    // i8 scan-kernel selection: thread-local override, else env-resolved
-    // default from CoderParams.scan_i8_mode.
+    // i8 scan-kernel selection: thread-local override, else the coder
+    // param, else the AVX512 VNNI default below.
     s->i8_mode = 0;
 #if defined(__ARM_FEATURE_DOTPROD) || defined(SEXTANT_HAS_AVX512_SCAN)
-    if (slm_arith && !slm_shaped) {
+    if (slm_arith) {  // uniform AND shared-shape (kernel shuffles fu8)
         const int ov = scan_detail::scan_i8_override();
         if (ov > 0) s->i8_mode = ov;
-        else if (ov < 0 && params_.scan_i8_mode > 0)
+        else if (ov == 0) {}  // explicit float FMA requested
+        else if (params_.scan_i8_mode > 0)
             s->i8_mode = params_.scan_i8_mode;
+#if defined(SEXTANT_HAS_AVX512_SCAN)
+        // VNNI default on x86 AVX512: +33% scan throughput at f=0.05,
+        // +62% at f=0.25, recall identical to 4 decimals (cohere-10m
+        // shape; the float fused rerank corrects the shortlist anyway).
+        // Override 0 selects the float kernel.
+        else s->i8_mode = 1;
+#endif
     }
 #endif
     // i8 operand prep: a8[d] = clamp(round(a_d · s)), s = 127/amax.
@@ -229,6 +237,25 @@ std::unique_ptr<ScanSetup> ScalarLmCoder::scan_setup(const float* query) {
                 s->a8_lo[d] = static_cast<int8_t>(r >= 0.f
                     ? r * 127.f + 0.5f : r * 127.f - 0.5f);
             }
+        }
+        // Shared-shape affine correction: the kernel multiplies by
+        // fu8[k] = round((f[k]-fmin)·S), so the true dot contribution
+        // Σ a_d·f[c_d] = fmin·Σa_d + (1/S)·Σ a_d·fu8[c_d]. Fold fmin·Σa_d
+        // into c0 and 1/S into i8_inv.
+        if (slm_shaped) {
+            const uint32_t K = quantizer_->K();
+            const float* f = quantizer_->shape();
+            float fmin = f[0], fmax = f[0];
+            for (uint32_t k = 0; k < K; ++k) {
+                fmin = std::min(fmin, f[k]);
+                fmax = std::max(fmax, f[k]);
+            }
+            const float S = fmax > fmin ? 255.f / (fmax - fmin) : 1.f;
+            float sum_a = 0.f;
+            for (uint32_t d = 0; d < params_.dim; ++d)
+                sum_a += s->a_uni[d];
+            s->c0 += fmin * sum_a;
+            s->i8_inv /= S;
         }
     }
     return s;

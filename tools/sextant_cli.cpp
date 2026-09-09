@@ -767,6 +767,10 @@ int cmd_tree_search(int argc, char* argv[]) {
         "Adaptive shortlist cut: truncate results at the first reranked "
         "distance gap past k (0=off)", false, 0.0f);
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
+    p.add<int>("scan-i8", 0,
+        "Scalar scan kernel i8 SDOT/VNNI mode (0=float FMA, 1=int8, "
+        "2=int8+dual residual); uniform and shared-shape families",
+        false, 0);
     p.add<uint32_t>("search-threads", 0,
         "Within-query leaf-parallel scan threads (0=serial; orthorgonal to --threads)", false, 0);
     p.add<uint32_t>("batch-window", 0,
@@ -828,6 +832,9 @@ int cmd_tree_search(int argc, char* argv[]) {
 
     const bool with_payload = p.exist("with-payload");
 
+    // Scalar scan kernel selection: resolved into the coder's params at
+    // open (must precede open — the factory reads the override once).
+    sextant::tree::set_scan_i8_override(p.get<int>("scan-i8"));
     auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"),
         static_cast<uint64_t>(p.get<uint32_t>("cache-mb")) * 1024 * 1024,
         p.get<uint32_t>("cache-window-pct"));

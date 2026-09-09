@@ -293,8 +293,10 @@ inline void scalar_i8_dots4_ref(const ScalarScanCtx& c,
         for (uint32_t d = 0; d < dim; ++d) {
             const uint8_t byte = cp[v][d / 2];
             const uint32_t nib = (d % 2 == 0) ? (byte & 0xF) : (byte >> 4);
-            acc += static_cast<int64_t>(a8[d]) * nib;
-            if (a8_lo) acc_lo += static_cast<int64_t>(a8_lo[d]) * nib;
+            const int64_t g = c.slm_shaped ? c.shape_u8[nib]
+                                           : static_cast<int64_t>(nib);
+            acc += static_cast<int64_t>(a8[d]) * g;
+            if (a8_lo) acc_lo += static_cast<int64_t>(a8_lo[d]) * g;
         }
         dots[v] = (static_cast<float>(acc)
                    + (a8_lo ? static_cast<float>(acc_lo) / 127.0f : 0.0f))
@@ -366,33 +368,30 @@ inline void scalar_i8_dots4(const ScalarScanCtx& c,
     const uint32_t d16i = fully_padded ? padded : dim / 16 * 16;
     const int8_t* a8p = c.a8;
     const int8_t* a8lop = c.i8_mode >= 2 ? c.a8_lo : nullptr;
-    const __m512i ones = _mm512_set1_epi8(1);
-    const __m512i xor80 = _mm512_set1_epi8(-128);
+    // Shared-shape: nibbles map through the u8 f table (pshufb per
+    // 128-bit lane) before the dpbusd — the affine f correction
+    // (fmin·Σa_d, 1/S) is folded into c0/i8_inv at setup time.
+    // dpbusd operand roles: FIRST unsigned, SECOND signed. The g-mapped
+    // nibbles (0..255) take the unsigned slot; a8 (int8) broadcasts take
+    // the signed slot — the product is then EXACT, no bias correction.
+    const __m512i g_tbl = c.slm_shaped
+        ? _mm512_broadcast_i32x4(_mm_loadu_si128(
+              reinterpret_cast<const __m128i*>(c.shape_u8)))
+        : _mm512_setzero_si512();
     __m512i acc = _mm512_setzero_si512();   // quarter v: row v lane sums
     __m512i acclo = _mm512_setzero_si512();
     for (uint32_t d = 0; d < d16i; d += 16) {
-        const __m512i nibs = avx512_nibbles4(cp, d);
-        const __m512i corr = _mm512_slli_epi32(
-            _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, nibs), 7);
+        __m512i nibs = avx512_nibbles4(cp, d);
+        if (c.slm_shaped) nibs = _mm512_shuffle_epi8(g_tbl, nibs);
         const __m128i a128 = _mm_loadu_si128(
             reinterpret_cast<const __m128i*>(a8p + d));
-        const __m512i biased = _mm512_xor_si512(
-            _mm512_broadcast_i32x4(a128), xor80);
-        acc = _mm512_add_epi32(
-            acc, _mm512_sub_epi32(
-                     _mm512_dpbusd_epi32(_mm512_setzero_si512(),
-                                         biased, nibs),
-                     corr));
+        acc = _mm512_dpbusd_epi32(acc, nibs,
+                                  _mm512_broadcast_i32x4(a128));
         if (a8lop) {
             const __m128i alo128 = _mm_loadu_si128(
                 reinterpret_cast<const __m128i*>(a8lop + d));
-            const __m512i lbiased = _mm512_xor_si512(
-                _mm512_broadcast_i32x4(alo128), xor80);
-            acclo = _mm512_add_epi32(
-                acclo, _mm512_sub_epi32(
-                           _mm512_dpbusd_epi32(_mm512_setzero_si512(),
-                                               lbiased, nibs),
-                           corr));
+            acclo = _mm512_dpbusd_epi32(acclo, nibs,
+                                        _mm512_broadcast_i32x4(alo128));
         }
     }
     alignas(64) int32_t lanes[16];
@@ -419,7 +418,8 @@ inline void scalar_i8_dots4(const ScalarScanCtx& c,
                 const uint8_t byte = cp[v][d / 2];
                 const uint8_t nib = (d % 2 == 0) ? (byte & 0xF)
                                                  : ((byte >> 4) & 0xF);
-                dots[v] += a8d * nib * c.i8_inv;
+                const uint8_t g = c.slm_shaped ? c.shape_u8[nib] : nib;
+                dots[v] += a8d * g * c.i8_inv;
             }
         }
     }
