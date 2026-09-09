@@ -206,6 +206,12 @@ std::unique_ptr<ScanSetup> LocalScalarCoder::scan_setup(const float* query) {
         if (ov > 0) s->i8_mode = ov;
         else if (ov < 0 && params_.scan_i8_mode > 0)
             s->i8_mode = params_.scan_i8_mode;
+#if defined(SEXTANT_HAS_AVX512_SCAN)
+        // VNNI default on x86 AVX512, mirroring scalar_lm_coder (audit
+        // F9: the asymmetry left local_scalar on the float kernel by
+        // default). Override 0 still selects float FMA.
+        else s->i8_mode = 1;
+#endif
     }
 #endif
     return s;

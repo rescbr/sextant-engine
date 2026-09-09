@@ -13,7 +13,10 @@
 #include "simd_kernels.hpp"
 #include "tree/coders/coder_util.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <unordered_map>
+#include <utility>
 #include <cstdint>
 #include <random>
 #include <vector>
@@ -191,6 +194,114 @@ TEST(SimdX86, U4DecodeDotMatchesRef) {
         }
         EXPECT_NEAR(got, want, std::abs(want) * 1e-5f + 1e-5f)
             << "dim=" << dim;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// scalar_arith_dist1: fused rerank (A + B.g + C.g^2) vs manual reference
+// (audit F9: recall parity was the only indirect evidence — this is the
+// direct one).
+// ---------------------------------------------------------------------------
+TEST(SimdX86, ScalarArithDist1MatchesRef) {
+    Rng r;
+    for (uint32_t dim : {16u, 48u, 768u}) {
+        for (bool shaped : {false, true}) {
+            const uint32_t padded = (dim + 15) / 16 * 16;
+            const uint32_t cs = dim / 2;
+            std::vector<float> b(padded, 0.f), c(padded, 0.f);
+            for (uint32_t d = 0; d < dim; d++) {
+                b[d] = r.uf(r.g);
+                c[d] = r.uf(r.g);
+            }
+            std::vector<uint8_t> gu8(16);
+            std::vector<float> g(16);
+            for (int i = 0; i < 16; i++) {
+                gu8[i] = uint8_t(r.ui8(r.g));
+                g[i] = float(gu8[i]);
+            }
+            if (!shaped) {
+                // uniform: g = identity over 16 levels
+                for (int i = 0; i < 16; i++) { gu8[i] = uint8_t(i); g[i] = float(i); }
+            }
+            const float a = r.uf(r.g);
+            std::vector<uint8_t> row(cs, 0);
+            for (auto& by : row) by = uint8_t(r.ui8(r.g));
+            const float got = tree::coders::scalar_arith_dist1(
+                row.data(), dim, cs, a, b.data(), c.data(),
+                gu8.data(), g.data());
+            float want = a;
+            for (uint32_t d = 0; d < dim; d++) {
+                const uint8_t byte = row[d / 2];
+                const uint8_t nib = (d % 2 == 0) ? (byte & 0xF)
+                                                 : ((byte >> 4) & 0xF);
+                want += b[d] * g[nib] + c[d] * g[nib] * g[nib];
+            }
+            EXPECT_NEAR(got, want, std::abs(want) * 1e-5f + 1e-5f)
+                << "dim=" << dim << " shaped=" << shaped;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scalar_scan_gather (Lloyd-Max kernel): full heap vs per-row manual dot.
+// (audit F9: never directly cross-validated.)
+// ---------------------------------------------------------------------------
+TEST(SimdX86, ScalarScanGatherMatchesRef) {
+    Rng r;
+    for (uint32_t dim : {16u, 20u, 768u}) {
+        const uint32_t K = 16;
+        const uint32_t cs = (dim + 1) / 2;
+        const uint32_t count = 37;  // exercises the batch-4 tail
+        std::vector<float> levels(size_t(dim) * K);
+        for (auto& v : levels) v = r.uf(r.g) * 2.f - 1.f;
+        std::vector<float> query(dim);
+        for (auto& q : query) q = r.uf(r.g) * 2.f - 1.f;
+        std::vector<uint8_t> codes(size_t(count) * cs, 0);
+        for (auto& by : codes) by = uint8_t(r.ui8(r.g));
+
+        ScalarScanCtx c{};
+        c.dim = uint16_t(dim);
+        c.cs = cs;
+        c.count = count;
+        c.codes = codes.data();
+        c.levels = levels.data();
+        c.K = K;
+        c.query = query.data();
+        c.slm_arith = false;  // gather path
+        c.c0 = 0.f;
+
+        std::vector<sextant::tree::HeapEntry> heap;
+        sextant::tree::RawScanHeap rh{&heap, count, 0};
+        tree::coders::scalar_scan_gather(c, rh);
+        ASSERT_EQ(heap.size(), count);
+
+        // Manual reference: dot(query, levels[nibble]) per row.
+        // The kernel accumulates in batch-of-4 groups (different fp
+        // ordering than the sequential reference), so keys may differ by
+        // a few ulps of the order-preserving u32 encoding — compare per
+        // row with a tiny key tolerance instead of exact equality.
+        ASSERT_EQ(heap.size(), count);
+        std::unordered_map<uint32_t, uint32_t> got_by_idx;
+        for (const auto& e : heap) got_by_idx[e.local_idx] = e.pq_dist;
+        for (uint32_t i = 0; i < count; i++) {
+            float dot = 0.f;
+            for (uint32_t d = 0; d < dim; d++) {
+                const uint8_t byte = codes[size_t(i) * cs + d / 2];
+                const uint8_t nib = (d % 2 == 0) ? (byte & 0xF)
+                                                 : ((byte >> 4) & 0xF);
+                dot += query[d] * levels[size_t(d) * K + nib];
+            }
+            const uint32_t want_key =
+                sextant::tree::f32_to_dist_key(-dot);
+            const auto it = got_by_idx.find(i);
+            ASSERT_NE(it, got_by_idx.end()) << "row " << i << " missing";
+            const int64_t delta =
+                std::llabs(int64_t(it->second) - int64_t(want_key));
+            EXPECT_LE(delta, 64) << "dim=" << dim << " row=" << i
+                                 << " got=" << it->second
+                                 << " want=" << want_key;
+        }
     }
 }
 

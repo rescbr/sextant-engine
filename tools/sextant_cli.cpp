@@ -1404,10 +1404,18 @@ int cmd_tree_search(int argc, char* argv[]) {
     {
         uint64_t len_sum = 0;
         for (const auto& r : all_results) len_sum += r.size();
-        if (!all_results.empty())
-            std::cerr << "mean results/query: "
-                      << static_cast<double>(len_sum) / all_results.size()
-                      << "\n";
+        if (!all_results.empty()) {
+            const double mean_len =
+                static_cast<double>(len_sum) / all_results.size();
+            std::cerr << "mean results/query: " << mean_len << "\n";
+            // With --adaptive-w-gap the engine deliberately returns
+            // variable-length shortlists of up to W ids (gap-truncated
+            // past k) — mean > k is expected, not a bug.
+            if (mean_len > k + 0.5 && scfg.adaptive_w_gap > 0.0f)
+                std::cerr << "  (adaptive-W shortlists: up to "
+                          << scfg.fastscan_W << " ids, gap-cut past k="
+                          << k << ")\n";
+        }
     }
     if (total_queries > 0) {
         const float recall = float(total_hits) / (total_queries * k);
