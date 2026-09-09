@@ -4289,7 +4289,7 @@ void IVFTreeIndex::search_batch(
                     next_chunk.fetch_add(kChunk, std::memory_order_relaxed);
                 if (start >= n_unique) break;
                 const uint32_t end = std::min(start + kChunk, n_unique);
-                if (pread_sweep && end < n_unique) {
+                if (end < n_unique) {
                     // Read-ahead the NEXT chunk while scanning this one:
                     // each thread's blocking preads serialize against its
                     // scans (measured: read wall ~23% of per-thread time
@@ -4299,15 +4299,32 @@ void IVFTreeIndex::search_batch(
                     // of MB — the per-thread pread then hits warm pages.
                     // No threads, no rings; the engine already relies on
                     // fadvise prefetch on the cache fill path.
-                    const auto& nb = uleaves[end];
-                    const auto& ne = uleaves[std::min(
-                        end + kChunk, n_unique) - 1];
-                    ::posix_fadvise(
-                        fd_,
-                        static_cast<off_t>(nb.page) * kPageSize,
-                        static_cast<off_t>(ne.page + ne.pages - nb.page) *
-                            kPageSize,
-                        POSIX_FADV_WILLNEED);
+                    const uint32_t nend =
+                        std::min(end + kChunk, n_unique);
+                    if (pread_sweep) {
+                        const auto& nb = uleaves[end];
+                        const auto& ne = uleaves[nend - 1];
+                        ::posix_fadvise(
+                            fd_,
+                            static_cast<off_t>(nb.page) * kPageSize,
+                            static_cast<off_t>(
+                                ne.page + ne.pages - nb.page) * kPageSize,
+                            POSIX_FADV_WILLNEED);
+                    } else {
+                        // Cache backend: hint only NON-RESIDENT extents —
+                        // resident leaves would waste disk reads (the
+                        // probe is a cheap shard-lock lookup per leaf).
+                        for (uint32_t li2 = end; li2 < nend; ++li2) {
+                            const auto& nl = uleaves[li2];
+                            if (leaf_cache_->contains(nl.page))
+                                continue;
+                            ::posix_fadvise(
+                                fd_,
+                                static_cast<off_t>(nl.page) * kPageSize,
+                                static_cast<off_t>(nl.pages) * kPageSize,
+                                POSIX_FADV_WILLNEED);
+                        }
+                    }
                 }
                 for (uint32_t li = start; li < end; ++li) {
                     const auto& ul = uleaves[li];
