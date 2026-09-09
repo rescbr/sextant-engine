@@ -1200,6 +1200,7 @@ BuildResult Builder::build_partitioned(VectorSource& source,
     // Shared by both K==1 (graph built directly) and K>1 (merged graph). For
     // K==1, index_.core is already wired to index_.nodes_buffer/index_.codes_buffer.
     snap_entry_points_(params);
+    repair_reachability_(params);
     auto bfs = compute_bfs_reorder_(params);
     write_sidecars_(index_.path, bfs, params);
 
@@ -1241,6 +1242,122 @@ BuildResult Builder::build_partitioned(VectorSource& source,
 // compute_bfs_reorder_ — pure BFS reorder of build IDs → disk positions.
 // write_sidecars_  — streams all four sidecars using the precomputed reorder.
 // ===========================================================================
+
+void Builder::repair_reachability_(const ResolvedParams& params) {
+    const uint32_t n = static_cast<uint32_t>(index_.count);
+    if (n == 0 || !index_.nodes_buffer) return;
+    const auto& entry_points = index_.core->entry_points();
+    if (entry_points.empty()) return;
+
+    auto append_edge = [&](uint32_t from, uint32_t to) {
+        uint8_t* node = index_.nodes_buffer +
+                        static_cast<size_t>(from) * index_.node_size;
+        uint16_t deg = VamanaCore::get_neighbor_count(node);
+        for (uint16_t i = 0; i < deg; i++) {
+            if (VamanaCore::get_neighbor(node, i) == to) return;
+        }
+        if (deg < params.R) {
+            VamanaCore::set_neighbor(node, deg, to);
+            VamanaCore::set_neighbor_count(node, deg + 1);
+        } else {
+            // Replace the farthest neighbor (lists are distance-sorted).
+            VamanaCore::set_neighbor(node, params.R - 1, to);
+        }
+    };
+    auto dist = [&](uint32_t a, uint32_t b) -> float {
+        if (index_.raw_vecs_buffer) {
+            return simd::l2sq_f16(
+                index_.raw_vecs_buffer + static_cast<size_t>(a) * index_.dim,
+                index_.raw_vecs_buffer + static_cast<size_t>(b) * index_.dim,
+                index_.dim);
+        }
+        return index_.quantizer->code_distance(
+            index_.codes_buffer + static_cast<size_t>(a) * index_.code_size,
+            index_.codes_buffer + static_cast<size_t>(b) * index_.code_size);
+    };
+
+    std::vector<uint8_t> reachable(n, 0);
+    std::vector<uint32_t> frontier;
+    uint64_t repaired = 0;
+    // Each pass bridges every unreachable node to its nearest reachable
+    // one; the added in-edge makes it (and anything it reaches) reachable,
+    // so the loop converges — at most a couple of passes in practice.
+    for (int pass = 0; pass < 8; ++pass) {
+        std::fill(reachable.begin(), reachable.end(), 0);
+        frontier.clear();
+        for (uint32_t ep : entry_points) {
+            if (ep < n && !reachable[ep]) {
+                reachable[ep] = 1;
+                frontier.push_back(ep);
+            }
+        }
+        size_t head = 0;
+        while (head < frontier.size()) {
+            const uint32_t cur = frontier[head++];
+            const uint8_t* node = index_.nodes_buffer +
+                static_cast<size_t>(cur) * index_.node_size;
+            const uint16_t deg = VamanaCore::get_neighbor_count(node);
+            for (uint16_t i = 0; i < deg; i++) {
+                const uint32_t nb = VamanaCore::get_neighbor(node, i);
+                if (nb < n && !reachable[nb]) {
+                    reachable[nb] = 1;
+                    frontier.push_back(nb);
+                }
+            }
+        }
+        uint32_t unreachable = 0;
+        uint32_t first = n;
+        for (uint32_t u = 0; u < n; u++) {
+            if (!reachable[u]) { unreachable++; first = u; break; }
+        }
+        if (unreachable == 0) {
+            if (repaired > 0) {
+                spdlog::info("[sextant] reachability repair: {} bridged "
+                             "nodes", repaired);
+            }
+            return;
+        }
+        // Bridge EVERY unreachable node in this pass: nearest reachable
+        // vector by FP16 (or PQ-code) distance, reciprocal edge.
+        for (uint32_t u = 0; u < n; u++) {
+            if (reachable[u]) continue;
+            float best_d = std::numeric_limits<float>::max();
+            uint32_t best_v = n;
+            // Near-neighbors first: an unreachable node's out-edges lead
+            // into the reachable set with high probability (weak
+            // connectivity is already repaired), so check those before
+            // the O(n) scan.
+            const uint8_t* un = index_.nodes_buffer +
+                static_cast<size_t>(u) * index_.node_size;
+            const uint16_t deg = VamanaCore::get_neighbor_count(un);
+            for (uint16_t i = 0; i < deg; i++) {
+                const uint32_t nb = VamanaCore::get_neighbor(un, i);
+                if (nb < n && reachable[nb]) {
+                    const float d = dist(u, nb);
+                    if (d < best_d) { best_d = d; best_v = nb; }
+                }
+            }
+            if (best_v == n) {
+                for (uint32_t v = 0; v < n; v++) {
+                    if (!reachable[v]) continue;
+                    const float d = dist(u, v);
+                    if (d < best_d) { best_d = d; best_v = v; }
+                }
+            }
+            if (best_v == n) break;  // nothing reachable at all (pass 0
+                                     // with no entry points) — give up
+            append_edge(best_v, u);  // makes u findable
+            append_edge(u, best_v);  // reciprocal, keeps beams healthy
+            ++repaired;
+            reachable[u] = 1;  // u now reachable for subsequent picks
+        }
+        (void)first;
+    }
+    if (repaired > 0) {
+        spdlog::warn("[sextant] reachability repair: {} bridged nodes, "
+                     "still not fully converged", repaired);
+    }
+}
 
 Builder::BfsReorder Builder::compute_bfs_reorder_(const ResolvedParams& params) const {
     const uint32_t n = static_cast<uint32_t>(index_.count);

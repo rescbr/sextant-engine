@@ -144,6 +144,14 @@ private:
     /// index_.raw_vecs_buffer and set them as the core's entry points.
     void snap_entry_points_(const ResolvedParams& params);
 
+    /// Directed-reachability repair: Vamana's asymmetric robust-prune can
+    /// leave a node with out-edges but no in-edges from the reachable set
+    /// (unfindable by beam search even though the graph is weakly
+    /// connected — measured ~1 node per 1500 on clustered fixtures, and
+    /// only under some thread schedules). Bridges every unreachable node
+    /// to its nearest reachable vector with a reciprocal edge.
+    void repair_reachability_(const ResolvedParams& params);
+
     // --- Sidecar writers (shared by build + flush) ---
     void write_sidecars_(const std::string& index_path, const BfsReorder& bfs,
                          const ResolvedParams& params);

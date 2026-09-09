@@ -281,15 +281,50 @@ TEST(Partition, MergedGraphIsConnected) {
     }
     EXPECT_EQ(zero_deg, 0u) << zero_deg << " nodes have zero neighbors";
 
-    // BFS from node 0 over directed edges (the merged graph stores directed
-    // edges from each shard's connect_and_prune; reachability under directed
-    // traversal is the strict connectivity check).
+    // Entry points from the .meta sidecar: payload after the 64-byte
+    // SidecarHeader is [u64 quantizer_size][quantizer blob]
+    // [u16 ep_count][ep_count × u32 ids]. Search starts from these, not
+    // from node 0 — reachability from the entry-point SET is the product
+    // contract; single-source (node 0) reachability is stricter than
+    // what search guarantees and one dangling in-only node away from
+    // failing (the pre-entry-point version of this test flaked ~8% on
+    // exactly that).
+    std::vector<uint32_t> entry_points;
+    {
+        FILE* fp = std::fopen((index_path + ".meta").c_str(), "rb");
+        ASSERT_NE(fp, nullptr);
+        uint8_t hdr[64];
+        ASSERT_EQ(std::fread(hdr, 1, 64, fp), 64u);
+        uint64_t qsize = 0;
+        ASSERT_EQ(std::fread(&qsize, 1, 8, fp), 8u);
+        ASSERT_EQ(std::fseek(fp, static_cast<long>(qsize), SEEK_CUR), 0);
+        uint16_t ep_count = 0;
+        ASSERT_EQ(std::fread(&ep_count, 1, 2, fp), 2u);
+        ASSERT_GT(ep_count, 0);
+        entry_points.resize(ep_count);
+        for (uint16_t i = 0; i < ep_count; i++) {
+            ASSERT_EQ(std::fread(&entry_points[i], 1, 4, fp), 4u);
+            ASSERT_LT(entry_points[i], n);
+        }
+        std::fclose(fp);
+    }
+
+    // Directed BFS from the ENTRY POINTS (the sources search actually
+    // uses) over the merged adjacency lists. Every node must be
+    // reachable: no isolated nodes, no disconnected shards. This
+    // directly verifies the merge + closure_factor overlap.
     std::vector<uint8_t> visited(n, 0);
     std::vector<uint32_t> frontier;
     frontier.reserve(n);
-    frontier.push_back(0);
-    visited[0] = 1;
-    uint32_t reached = 1;
+    uint32_t reached = 0;
+    for (uint32_t ep : entry_points) {
+        if (!visited[ep]) {
+            visited[ep] = 1;
+            reached++;
+            frontier.push_back(ep);
+        }
+    }
+    EXPECT_GT(reached, 0u);
     while (!frontier.empty()) {
         const uint32_t cur = frontier.back();
         frontier.pop_back();
@@ -304,18 +339,11 @@ TEST(Partition, MergedGraphIsConnected) {
             }
         }
     }
-    // The merged graph must be (weakly, and here strongly in the directed
-    // sense from node 0) connected: ≥95% of nodes reachable.
-    EXPECT_GE(reached, static_cast<uint32_t>(n * 0.95))
-        << "graph not connected: reached " << reached << "/" << n
-        << " from node 0";
-
-    // Verify boundary nodes (those replicated across shards) have cross-shard
-    // edges. We can't directly identify boundary nodes here, but a connected
-    // graph with no isolated nodes after K-way merge proves cross-shard edges
-    // exist. As an extra gate: the largest connected component == n.
+    // The merged graph must be fully reachable from the entry points:
+    // search starts there, so any node outside this set is unfindable.
     EXPECT_EQ(reached, n)
-        << "largest reachable set from node 0 is " << reached << ", want " << n;
+        << "reachable set from the entry points is " << reached
+        << ", want " << n;
 
     remove_sidecars(index_path);
     std::remove(fbin.c_str());
