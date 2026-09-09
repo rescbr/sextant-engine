@@ -25,6 +25,15 @@ struct ScalarLmCoder::Setup : public ScanSetup {
     std::vector<int8_t> a8, a8_lo;
     float i8_inv = 0.f;
     int i8_mode = 0;
+    // Fused arithmetic rerank (uniform/shape, 4-bit, L2sq):
+    // dist = rr_a + Σ rr_b[d]·gu8[c_d] + Σ rr_c[d]·gu8[c_d]²
+    // with gu8 the same u8 shape table the scan kernel shuffles (identity
+    // nibbles for uniform). Empty arrays = not usable (fallback path).
+    bool rr_ready = false;
+    float rr_a = 0.f;
+    std::vector<float> rr_b, rr_c;   // zero-padded to 16-dim width
+    std::vector<uint8_t> rr_gu8;     // 16-byte pshufb table
+    std::vector<float> rr_g;         // K floats (scalar tail)
 };
 
 ScalarLmCoder::ScalarLmCoder(LevelPolicy policy, const CoderParams& params)
@@ -146,6 +155,46 @@ std::unique_ptr<ScanSetup> ScalarLmCoder::scan_setup(const float* query) {
             s->a_uni[d] = query[d] * steps[d];
             s->c0 += query[d] * levels0[d];
         }
+        // Fused rerank tables (L2sq, 4-bit): level_d[k] = L0_d + step_d·g[k]
+        // with L0_d = levels[d·K] (lo + step·g[0]) and g = f − f[0] for
+        // shape (u8-quantized at the scan's own scale), identity for
+        // uniform. A/B/C absorb the table scale.
+        const uint32_t K = quantizer_->K();
+        if (K == 16 && params_.metric == MetricKind::L2Sq) {
+            const bool shaped = !quantizer_->is_uniform();
+            const float* f = shaped ? quantizer_->shape() : nullptr;
+            s->rr_g.assign(K, 0.f);
+            s->rr_gu8.assign(K, 0);
+            float sg = 1.f;  // g = gu8 / sg
+            if (shaped) {
+                float gmin = f[0], gmax = f[0];
+                for (uint32_t k = 0; k < K; ++k) {
+                    gmin = std::min(gmin, f[k]);
+                    gmax = std::max(gmax, f[k]);
+                }
+                sg = gmax > gmin ? 255.f / (gmax - gmin) : 1.f;
+            }
+            for (uint32_t k = 0; k < K; ++k) {
+                // Match the scan's table exactly: shape_u8 is the affine
+                // u8 map of f; identity nibbles for uniform.
+                const float gu = shaped
+                    ? static_cast<float>(quantizer_->shape_u8()[k])
+                    : static_cast<float>(k);
+                s->rr_g[k] = gu / sg;
+                s->rr_gu8[k] = static_cast<uint8_t>(gu);
+            }
+            const uint32_t padded = (dim + 15) / 16 * 16;
+            s->rr_b.assign(padded, 0.f);
+            s->rr_c.assign(padded, 0.f);
+            for (uint32_t d = 0; d < dim; ++d) {
+                const float u = query[d] - levels0[d * K];
+                const float gscale = 1.f / sg;
+                s->rr_a += u * u;
+                s->rr_b[d] = -2.f * u * steps[d] * gscale;
+                s->rr_c[d] = steps[d] * steps[d] * gscale * gscale;
+            }
+            s->rr_ready = true;
+        }
     }
     // i8 scan-kernel selection: thread-local override, else env-resolved
     // default from CoderParams.scan_i8_mode.
@@ -219,6 +268,27 @@ void ScalarLmCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
     c.shape_u8 = quantizer_->shape_u8();
     c.shape_f32 = quantizer_->shape();
     scalar_scan_leaf(c, heap);
+}
+
+float ScalarLmCoder::rerank(const float* query, const ScanSetup& setup,
+                            const uint8_t* leaf, uint32_t local_idx,
+                            float* scratch_decoded) {
+    // Arithmetic families (uniform/shape, 4-bit, L2sq): fused shuffle-dot
+    // rerank from per-query tables — no decode gather (profiled at 20% of
+    // batch CPU as decode+l2sq before this path).
+    const auto& s = static_cast<const Setup&>(setup);
+    if (s.rr_ready) {
+        const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
+        const uint32_t cs = quantizer_->code_size();
+        const uint8_t* code_ptr =
+            leaf + leaf_codes_offset(lh->summary_size) +
+            static_cast<uint64_t>(local_idx) * cs;
+        return coders::scalar_arith_dist1(code_ptr, params_.dim, cs,
+                                          s.rr_a, s.rr_b.data(),
+                                          s.rr_c.data(), s.rr_gu8.data(),
+                                          s.rr_g.data());
+    }
+    return rerank(query, leaf, local_idx, scratch_decoded);
 }
 
 float ScalarLmCoder::rerank(const float* query, const uint8_t* leaf,

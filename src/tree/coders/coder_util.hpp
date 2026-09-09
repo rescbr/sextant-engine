@@ -535,6 +535,59 @@ inline void scalar_scan_leaf(const ScalarScanCtx& c, RawScanHeap& heap) {
     else scalar_scan_gather(c, heap);
 }
 
+/// Fused decode+L2² rerank for arithmetic (uniform / shared-shape) 4-bit
+/// rows: with level_d[k] = L0_d + step_d·g[k] (g = identity for uniform,
+/// the u8-quantized shared-shape offsets otherwise — the SAME table/scale
+/// the scan kernel uses),
+///   ||q - level(c)||² = A + Σ B_d·g[c_d] + Σ C_d·g[c_d]²
+/// A/B/C are per-query constants (levels are global), so rerank is one
+/// shuffle-dot pass instead of a 768-dim gather decode + l2sq.
+/// `b`/`c` must be zero-padded to the 16-dim kernel width.
+inline float scalar_arith_dist1(const uint8_t* row, uint32_t dim, uint32_t cs,
+                                float a, const float* b, const float* c,
+                                const uint8_t* gu8, const float* g) {
+#if defined(SEXTANT_HAS_AVX512_SCAN)
+    const uint32_t padded = (dim + 15) / 16 * 16;
+    const bool fully_padded = padded / 2 <= cs;
+    const uint32_t d16 = fully_padded ? padded : dim / 16 * 16;
+    const __m128i g_tbl = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(gu8));
+    __m512 acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps();
+    for (uint32_t d = 0; d < d16; d += 16) {
+        const __m512 bb = _mm512_loadu_ps(b + d);
+        const __m512 cc = _mm512_loadu_ps(c + d);
+        __m128i n = avx512_row_nibbles(row, d);
+        n = _mm_shuffle_epi8(g_tbl, n);
+        const __m512 gf =
+            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(n));
+        acc1 = _mm512_fmadd_ps(gf, bb, acc1);
+        acc2 = _mm512_fmadd_ps(_mm512_mul_ps(gf, gf), cc, acc2);
+    }
+    float dist = a + _mm512_reduce_add_ps(acc1) + _mm512_reduce_add_ps(acc2);
+    if (!fully_padded) {
+        for (uint32_t d = d16; d < dim; ++d) {
+            const uint8_t byte = row[d / 2];
+            const uint8_t nib = (d % 2 == 0) ? (byte & 0xF)
+                                             : ((byte >> 4) & 0xF);
+            const float gf = g[nib];
+            dist += b[d] * gf + c[d] * gf * gf;
+        }
+    }
+    return dist;
+#else
+    float dist = a;
+    for (uint32_t d = 0; d < dim; ++d) {
+        const uint8_t byte = row[d / 2];
+        const uint8_t nib = (d % 2 == 0) ? (byte & 0xF)
+                                         : ((byte >> 4) & 0xF);
+        const float gf = g[nib];
+        dist += b[d] * gf + c[d] * gf * gf;
+    }
+    return dist;
+#endif
+}
+
 /// Order-preserving u32 encoding of a float score (the old heap path's
 /// dist_bits trick, factored for reuse).
 inline uint32_t f32_to_dist_key(float dist) {
