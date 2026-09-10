@@ -563,7 +563,12 @@ int main(int argc, char* argv[]) {
         std::vector<double> latencies_us;
         latencies_us.reserve(n_queries);
 
-        const bool have_gt_dists = !gt.dists.empty();
+        // Zero-filled dists (ids-only GT) must not feed proximity gating:
+        // a 0.0 k-th radius would cap every ratio at the floor.
+        const bool have_gt_dists =
+            !gt.dists.empty() &&
+            std::any_of(gt.dists.begin(), gt.dists.end(),
+                        [](float d) { return d != 0.0f; });
 
         // Shared rerank/recall/proximity context. The single-index path
         // routes results through process_results via this struct.

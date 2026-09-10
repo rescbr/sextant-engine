@@ -14,6 +14,12 @@
 ///     always advance by 2×k×4 bytes per row; never assume k=10.
 ///   - ids are u32 on disk but RowId (i64) in memory — widen explicitly.
 ///   - The magic must be validated (legacy headerless files exist).
+///   - DISTS MAY BE ZERO-FILLED: some generators (e.g.
+///     scripts/fix_cohere10m_gt.sh) write real ids but zeros for the
+///     distances — recall only needs ids. Consumers that gate on true
+///     distances must check has_dists() first; a zero-filled file reads
+///     back as all-zero floats, which is indistinguishable from "the
+///     k-th neighbor is at distance 0" if you don't check.
 
 #include "sextant/types.hpp"
 
@@ -66,12 +72,18 @@ public:
                    static_cast<std::streamsize>(k) * 4);
             if (!f) throw std::runtime_error("ground truth '" + path + "' truncated (dists)");
         }
+        gt.dists_valid_ = std::any_of(
+            gt.dists_.begin(), gt.dists_.end(),
+            [](float d) { return d != 0.0f; });
         return gt;
     }
 
     uint32_t n() const { return n_; }
     uint32_t k() const { return k_; }
     bool metric_is_ip() const { return metric_is_ip_; }
+    /// True when the file carried real distances. False for ids-only
+    /// GT (zero-filled dists) — do not use dist() for gating then.
+    bool has_dists() const { return dists_valid_; }
 
     /// Row `q`'s id at rank `r` (0-based). Row ids are widened to RowId.
     RowId id(uint32_t q, uint32_t r) const {
@@ -93,8 +105,9 @@ public:
 private:
     uint32_t n_ = 0, k_ = 0;
     bool metric_is_ip_ = false;
+    bool dists_valid_ = false;
     std::vector<RowId> ids_;     // n × k, row-major
-    std::vector<float> dists_;   // n × k, row-major
+    std::vector<float> dists_;   // n × k, row-major (zeros if !dists_valid_)
 };
 
 }  // namespace sextant
