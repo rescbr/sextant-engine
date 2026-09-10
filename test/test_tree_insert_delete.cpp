@@ -1571,3 +1571,74 @@ TEST(TreeInsertDelete, SplitWithWidePqMNoStackSmash) {
     std::filesystem::remove(tree_path);
 }
 }  // namespace sextant::tree
+
+namespace sextant::tree {
+
+// Regression guard (found in the fragmentation-churn session):
+// add_child_to_parent_ scanned the STALE in-memory root_children_ to
+// find a split leaf's parent — earlier splits in the same batch
+// relocate L2 nodes, so later splits read freed-and-reused pages,
+// failed to find the parent, and ORPHANED the new leaf: allocated in
+// the bitmap + leaf table but unreachable from the tree (~2.7k dead
+// pages per 100k-vector churn; recall silently lost). The parent scan
+// now re-reads the root from disk. This test drives multiple split
+// waves (leaves re-splitting after earlier splits) and requires full
+// page accounting afterwards.
+TEST(TreeInsertDelete, ChurnSplitWavesKeepAccounting) {
+    const uint64_t n = 20000;
+    const uint32_t dim = 64;
+    const std::string base_path = write_test_fbin(
+        "phasej_churn.fbin", n, dim, /*n_clusters=*/6, /*seed=*/9);
+    const std::string tree_path = temp_path("_churn.tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "pq";
+    cfg.params.pq4_m = 32;
+    cfg.params.scan_pq_bits = 8;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 4;
+    cfg.leaf_capacity = 2000;
+    cfg.num_threads = 4;
+    cfg.adaptive_probe_gap = 0.0f;
+
+    ([&]{ FbinSource s(base_path);
+          return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+
+    // Delete ~25% (mix of replicas via closure off), then insert 3x the
+    // leaf capacity per remaining leaf so the split loop cascades (leaves
+    // created by splits get split again).
+    {
+        auto idx = IVFTreeIndex::open(tree_path);
+        std::vector<RowId> del;
+        for (uint64_t i = 0; i < n / 4; ++i) del.push_back(static_cast<RowId>(i));
+        idx->delete_batch(del);
+    }
+    {
+        auto idx = IVFTreeIndex::open(tree_path);
+        const uint32_t n_insert = 24000;
+        std::vector<float> vec_storage(
+            static_cast<size_t>(n_insert) * dim);
+        std::mt19937 rng(4242);
+        for (auto& v : vec_storage)
+            v = std::uniform_real_distribution<float>(-3, 3)(rng);
+        std::vector<IVFTreeIndex::InsertPoint> points;
+        for (uint32_t i = 0; i < n_insert; ++i)
+            points.push_back({&vec_storage[static_cast<size_t>(i) * dim],
+                              static_cast<RowId>(n + i), {}, {}});
+        idx->insert_batch(points);
+        EXPECT_GT(idx->n_leaves(), 12u);  // multiple split waves happened
+    }
+
+    // The gate: every allocated page must be reachable (no orphaned
+    // leaves) and nothing may leak.
+    const auto res = fsck(tree_path);
+    EXPECT_TRUE(res.page_accounting_ok)
+        << "orphans=" << res.orphan_pages << " leaked=" << res.leaked_pages;
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+}  // namespace sextant::tree

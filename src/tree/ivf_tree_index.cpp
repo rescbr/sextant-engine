@@ -5488,12 +5488,25 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
         }
     } else if (manifest_.depth == 2) {
         // Root → L2 nodes → leaves. Grandparent is the root.
+        // NOTE: the root is re-read from FILE here, NOT from root_children_:
+        // earlier splits in the same insert_batch may have relocated L2
+        // nodes (and the root's child entries with them), and the
+        // in-memory root_children_ only refreshes at commit/remap_. A
+        // stale scan read freed-and-reused pages, failed to find the
+        // parent, and ORPHANED the split's new leaf — allocated in the
+        // bitmap and leaf table but unreachable from the tree (measured:
+        // ~2.7k dead pages per 100k-vector churned insert).
         grandparent_page = superblock_.root_node_page();
         grandparent_pages = superblock_.root_node_pages();
-        for (uint32_t c = 0; c < root_children_.size(); ++c) {
-            const auto& rc = root_children_[c];
-            if (rc.is_leaf || rc.page == kInvalidPage) continue;
-            const uint8_t* node_ptr = read_node(rc.page, rc.pages,
+        const uint8_t* root_ptr = read_node(grandparent_page,
+                                            grandparent_pages, node_buf_c);
+        const auto* rh = reinterpret_cast<const TreeNodeHeader*>(root_ptr);
+        const uint8_t* rp = root_ptr + sizeof(TreeNodeHeader);
+        for (uint32_t c = 0; c < rh->n_children; ++c, rp += cesize) {
+            const auto* rce = reinterpret_cast<const ChildEntry*>(rp);
+            if (rce->is_leaf || rce->child_page == kInvalidPage) continue;
+            const uint8_t* node_ptr = read_node(rce->child_page,
+                                                rce->child_pages,
                                                 node_buf_a);
             const auto* nh = reinterpret_cast<const TreeNodeHeader*>(node_ptr);
             const uint8_t* p = node_ptr + sizeof(TreeNodeHeader);
@@ -5501,8 +5514,8 @@ void IVFTreeIndex::add_child_to_parent_(uint32_t leaf_id, uint32_t new_leaf_id,
             for (uint32_t j = 0; j < n_ch; ++j) {
                 const auto* ce = reinterpret_cast<const ChildEntry*>(p);
                 if (ce->is_leaf && ce->child_page == leaf_id) {
-                    parent_page = rc.page;
-                    parent_pages = static_cast<uint32_t>(rc.pages);
+                    parent_page = rce->child_page;
+                    parent_pages = static_cast<uint32_t>(rce->child_pages);
                     child_slot = j;
                     grandparent_slot = c;  // root child c → this L2 node
                     break;
