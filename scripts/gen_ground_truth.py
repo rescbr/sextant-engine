@@ -6,7 +6,7 @@ random sample of query vectors. Vectorized with numpy.
 
 Outputs:
   <prefix>_query.fbin — the query vectors
-  <prefix>_gt.gt      — ground truth [u32 n][u32 k][n*k u32 ids][n*k f32 dists]
+  <prefix>_gt.gtmm    — canonical GTMM ground truth (see include/sextant/ground_truth.hpp)
 
 Usage:
     python3 scripts/gen_ground_truth.py --base data.fbin --prefix out --n-queries 10000 --k 10
@@ -116,18 +116,17 @@ def main():
         f.write(struct.pack('<II', nq, dim))
         f.write(queries.tobytes())
 
-    gt_path = f"{args.prefix}_gt.gt"
+    # Canonical GTMM (see include/sextant/ground_truth.hpp): magic,
+    # n, k, metric byte, then PER-QUERY interleaved [ids k×u32][dists k×f32]
+    # sorted ascending. (The legacy headerless bulk layout is removed.)
+    gt_path = f"{args.prefix}_gt.gtmm"
     with open(gt_path, 'wb') as f:
-        f.write(struct.pack('<II', nq, k))
-        # IDs (sorted by distance ascending).
+        f.write(struct.pack('<III', 0x4D4D5447, nq, k))
+        f.write(struct.pack('<B', 0))  # metric: l2sq
         for q in range(nq):
             order = np.argsort(top_dists[q])
-            for idx in top_ids[q][order]:
-                f.write(struct.pack('<I', int(idx)))
-        for q in range(nq):
-            order = np.argsort(top_dists[q])
-            for d in top_dists[q][order]:
-                f.write(struct.pack('<f', float(d)))
+            f.write(top_ids[q][order].astype('<u4').tobytes())
+            f.write(top_dists[q][order].astype('<f4').tobytes())
 
     print(f"Done: {query_path} ({os.path.getsize(query_path)/1e6:.1f} MB), "
           f"{gt_path} ({os.path.getsize(gt_path)/1e6:.1f} MB)")

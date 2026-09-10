@@ -4,17 +4,18 @@
 //   1. Open the index.
 //   2. Read query vectors from a .fbin file.
 //   3. For each query: search + rerank against base data, take top-k row_ids.
-//   4. Read ground-truth neighbor IDs from a .gt file.
+//   4. Read ground-truth neighbor IDs from a .gtmm file.
 //   5. Compute Recall@k = |results ∩ gt[:k]| / k, averaged over all queries.
 //   6. Report mean recall@k, p50/p99 latency, total search time, QPS.
 //
 // Usage:
 //   benchmark --index myindex --queries query.fbin --base-data base.fbin \
-//             --ground-truth gt.gt --k 10 --L 200 --rerank 10
+//             --ground-truth gt.gtmm --k 10 --L 200 --rerank 10
 
 #include "fbin_io.hpp"
 #include "sextant/config.hpp"
 #include "sextant/crash_handler.hpp"
+#include "sextant/ground_truth.hpp"
 #include "sextant_version.hpp"
 #include "sextant/searcher.hpp"
 #include "sextant/index.hpp"
@@ -61,74 +62,41 @@ using US = std::chrono::duration<double, std::micro>;
 using namespace sextant::fbin_io;  // FbinHeader, read_fbin_header, read_fbin_vector, l2sq_distance
 
 // ---------------------------------------------------------------------------
-// Ground-truth .gt format:
-//   Legacy:  [uint32 n][uint32 k][n×k uint32 ids][n×k float dists]
-//   Current: [magic "GTMM" 4B][uint32 n][uint32 k][uint8 metric][n×k uint32 ids]
-//            [n×k float dists]
-// The magic is detected by peeking the first 4 bytes — old files start with
-// the n field (small), so "GTMM" (= 0x4D4D5447 LE = 1.3 billion) never collides
-// with a real query count. Current files carry the metric the GT was computed
-// under; the benchmark verifies it matches the build's --metric to prevent
-// silent recall artifacts (the Sphere-IP-vs-L2sq bug).
-inline constexpr uint32_t kGtMagic = 0x4D4D5447u;  // "GTMM" LE
-
+// Ground truth: canonical GTMM, read by sextant::GroundTruth (the single
+// canonical reader — include/sextant/ground_truth.hpp):
+//   [magic "GTMM" 4B][uint32 n][uint32 k][uint8 metric]
+//   then n query rows, each: [ids k×u32][dists k×f32]  (INTERLEAVED)
+// The file's metric is verified against the build's --metric to prevent
+// silent recall artifacts (the Sphere-IP-vs-L2sq bug). Dists may be
+// zero-filled (ids-only GT) — has_dists() flags it and proximity metrics
+// disable cleanly. The legacy headerless bulk format is REMOVED; the old
+// bulk-arrays-after-magic variant this tool once accepted was a THIRD
+// layout that silently misparsed canonical interleaved files.
 struct GroundTruth {
     uint32_t n = 0;
     uint32_t k = 0;
-    sextant::MetricKind metric = sextant::MetricKind::L2Sq;  // default for legacy files
+    sextant::MetricKind metric = sextant::MetricKind::L2Sq;
+    bool has_dists = false;
     std::vector<uint32_t> ids;    // n × k, row-major
     std::vector<float> dists;     // n × k, row-major, ascending per row
 };
 
 GroundTruth read_ground_truth(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        throw Error(ErrorCode::IoError,
-                    "cannot open ground-truth '" + path + "'");
-    }
-    GroundTruth gt;
-
-    // Peek the first 4 bytes to detect the magic.
-    uint32_t maybe_magic = 0;
-    f.read(reinterpret_cast<char*>(&maybe_magic), sizeof(uint32_t));
-    if (!f) {
-        throw Error(ErrorCode::CorruptIndex,
-                    "invalid ground-truth header in '" + path + "'");
-    }
-
-    if (maybe_magic == kGtMagic) {
-        // Current format: [magic][n][k][metric][ids][dists]
-        f.read(reinterpret_cast<char*>(&gt.n), sizeof(uint32_t));
-        f.read(reinterpret_cast<char*>(&gt.k), sizeof(uint32_t));
-        uint8_t metric_byte = 0;
-        f.read(reinterpret_cast<char*>(&metric_byte), sizeof(uint8_t));
-        gt.metric = static_cast<sextant::MetricKind>(metric_byte);
-    } else {
-        // Legacy format: the 4 bytes we just read were the n field.
-        gt.n = maybe_magic;
-        f.read(reinterpret_cast<char*>(&gt.k), sizeof(uint32_t));
-        gt.metric = sextant::MetricKind::L2Sq;  // legacy files assumed L2sq
-    }
-    if (!f || gt.n == 0 || gt.k == 0) {
-        throw Error(ErrorCode::CorruptIndex,
-                    "invalid ground-truth header in '" + path + "'");
-    }
-    gt.ids.resize(static_cast<size_t>(gt.n) * gt.k);
-    f.read(reinterpret_cast<char*>(gt.ids.data()),
-           static_cast<std::streamsize>(gt.ids.size() * sizeof(uint32_t)));
-    if (!f) {
-        throw Error(ErrorCode::CorruptIndex,
-                    "short read on ground-truth ids in '" + path + "'");
-    }
-    // Distances are needed for proximity evaluation (k-th NN radius per query).
-    gt.dists.resize(static_cast<size_t>(gt.n) * gt.k);
-    f.read(reinterpret_cast<char*>(gt.dists.data()),
-           static_cast<std::streamsize>(gt.dists.size() * sizeof(float)));
-    if (!f) {
-        // Older GT files without distances: tolerate, disable proximity metrics.
-        gt.dists.clear();
-    }
-    return gt;
+    const sextant::GroundTruth gt = sextant::GroundTruth::load(path);
+    GroundTruth out;
+    out.n = gt.n();
+    out.k = gt.k();
+    out.metric = gt.metric_is_ip() ? sextant::MetricKind::InnerProduct
+                                   : sextant::MetricKind::L2Sq;
+    out.has_dists = gt.has_dists();
+    out.ids.reserve(static_cast<size_t>(out.n) * out.k);
+    for (size_t i = 0; i < static_cast<size_t>(out.n) * out.k; ++i)
+        out.ids.push_back(static_cast<uint32_t>(gt.id_flat(i)));
+    out.dists.reserve(out.ids.size());
+    for (size_t i = 0; i < out.ids.size(); ++i)
+        out.dists.push_back(gt.dist_flat(i));
+    if (!out.has_dists) out.dists.clear();
+    return out;
 }
 
 /// Verify the GT's recorded metric matches what the index was built under.
@@ -136,8 +104,7 @@ GroundTruth read_ground_truth(const std::string& path) {
 /// the Sphere-IP-vs-L2sq ceiling immediately (we wasted ~5h of 8-bit
 /// experiments on that artifact before brute-forcing the GT).
 /// Returns 1 on mismatch (for run_*_benchmark's return-code convention),
-/// 0 on match. Legacy GT files (no metric tag) always match — we can't
-/// know what they were computed under, so we trust the user.
+/// 0 on match.
 int check_gt_metric(const GroundTruth& gt, sextant::MetricKind expected,
                     const std::string& gt_path) {
     if (gt.metric != expected) {
@@ -365,7 +332,7 @@ int main(int argc, char* argv[]) {
     p.add<std::string>("index", 0, "Index name/path prefix", true);
     p.add<std::string>("queries", 0, "Query .fbin file", true);
     p.add<std::string>("base-data", 0, "Original base .fbin for rerank", true);
-    p.add<std::string>("ground-truth", 0, "Ground-truth .gt file", true);
+    p.add<std::string>("ground-truth", 0, "Ground-truth .gtmm file (GTMM format)", true);
     p.add<uint32_t>("topk", 0, "Number of nearest neighbors to return per query (k in ANN literature). Default 100 (VIBE / modern-retrieval convention).", false, 100);
     p.add<uint32_t>("search-beam-width", 0,
         "Search-time beam width (L in Vamana literature). Higher = more accurate, slower.",
@@ -565,10 +532,7 @@ int main(int argc, char* argv[]) {
 
         // Zero-filled dists (ids-only GT) must not feed proximity gating:
         // a 0.0 k-th radius would cap every ratio at the floor.
-        const bool have_gt_dists =
-            !gt.dists.empty() &&
-            std::any_of(gt.dists.begin(), gt.dists.end(),
-                        [](float d) { return d != 0.0f; });
+        const bool have_gt_dists = gt.has_dists;
 
         // Shared rerank/recall/proximity context. The single-index path
         // routes results through process_results via this struct.

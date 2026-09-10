@@ -7,7 +7,7 @@ set -euo pipefail
 # Usage: SEXTANT=... GEN=... PERF=1 ./bench_filtered_large.sh \
 #          <base.fbin> <query.fbin> <gt.gt> <metric> <output_dir> <dataset_name>
 # Example:
-#   ./bench_filtered_large.sh sphere_ip_base.fbin sphere_ip_query.fbin sphere_ip_gt.gt ip /mnt/ssd/results sphere_10m
+#   ./bench_filtered_large.sh sphere_ip_base.fbin sphere_ip_query.fbin sphere_ip_gt.gtmm ip /mnt/ssd/results sphere_10m
 
 BASE="${1:?base .fbin required}"
 QUERY="${2:?query .fbin required}"

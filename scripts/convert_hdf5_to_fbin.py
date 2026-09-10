@@ -47,7 +47,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="Input HDF5 (ann-benchmarks format)")
     ap.add_argument("output_prefix", help="Output prefix; writes "
-                     "<prefix>_base.fbin, _query.fbin, _gt.gt")
+                     "<prefix>_base.fbin, _query.fbin, _gt.gtmm")
     ap.add_argument("--metric", default=None,
                     help="Metric the GT was computed under: l2sq, ip, or "
                     "cosine. If omitted, the HDF5 `distance` attribute is "
@@ -116,8 +116,9 @@ def main():
             fout.write(test.astype(np.float32).tobytes())
         print(f"wrote {query_path}")
 
-        # Write GT (new format: magic + n + k + metric + ids + dists).
-        gt_path = f"{args.output_prefix}_gt.gt"
+        # Canonical GTMM (include/sextant/ground_truth.hpp): per-query
+        # interleaved [ids k×u32][dists k×f32].
+        gt_path = f"{args.output_prefix}_gt.gtmm"
         neighbors = f['neighbors'][:].astype(np.uint32)
         distances = f['distances'][:].astype(np.float32) if 'distances' in f else \
                     np.zeros_like(neighbors, dtype=np.float32)
@@ -125,9 +126,10 @@ def main():
             fout.write(struct.pack('<I', GT_MAGIC))
             fout.write(struct.pack('<II', q, gt_k))
             fout.write(struct.pack('<B', metric_byte))
-            fout.write(neighbors.tobytes())
-            fout.write(distances.tobytes())
-        print(f"wrote {gt_path} (magic=GTMM, metric={metric_name})")
+            for row in range(q):
+                fout.write(neighbors[row].tobytes())
+                fout.write(distances[row].tobytes())
+        print(f"wrote {gt_path} (GTMM interleaved, metric={metric_name})")
 
 
 if __name__ == '__main__':

@@ -112,14 +112,26 @@ static float siftsmall_recall(const std::string& index_path,
     uint32_t gtn = 0, gtk = 0;
     std::vector<uint32_t> gt_ids;
     {
+        // Canonical GTMM: [magic][n][k][metric] + per-query [ids][dists].
         FILE* fp = std::fopen(gt_path.c_str(), "rb");
         EXPECT_NE(fp, nullptr);
+        uint32_t magic = 0;
+        EXPECT_EQ(std::fread(&magic, 4, 1, fp), 1u);
+        EXPECT_EQ(magic, 0x4D4D5447u);
         EXPECT_EQ(std::fread(&gtn, sizeof(gtn), 1, fp), 1u);
         EXPECT_EQ(std::fread(&gtk, sizeof(gtk), 1, fp), 1u);
+        uint8_t metric_byte = 0;
+        EXPECT_EQ(std::fread(&metric_byte, 1, 1, fp), 1u);
         EXPECT_EQ(gtn, nq);
         gt_ids.resize(static_cast<size_t>(gtn) * gtk);
-        EXPECT_EQ(std::fread(gt_ids.data(), sizeof(uint32_t), gt_ids.size(), fp),
-                  gt_ids.size());
+        std::vector<float> dist_scratch(gtk);
+        for (uint32_t q = 0; q < gtn; ++q) {
+            EXPECT_EQ(std::fread(&gt_ids[static_cast<size_t>(q) * gtk],
+                                 sizeof(uint32_t), gtk, fp),
+                      gtk);
+            EXPECT_EQ(std::fread(dist_scratch.data(), sizeof(float), gtk, fp),
+                      gtk);
+        }
         std::fclose(fp);
     }
 

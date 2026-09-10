@@ -37,7 +37,9 @@ inline std::string siftsmall_query() {
 }
 
 inline std::string siftsmall_gt() {
-    return (std::filesystem::path(test_data_dir()) / "siftsmall_gt.gt").string();
+    // Canonical GTMM (include/sextant/ground_truth.hpp); the legacy
+    // headerless bulk .gt fixture was removed.
+    return (std::filesystem::path(test_data_dir()) / "siftsmall_gt.gtmm").string();
 }
 
 }  // namespace test

@@ -15,7 +15,7 @@ Usage:
         --sextant build/sextant \
         --base test/data/siftsmall_base.fbin \
         --query test/data/siftsmall_query.fbin \
-        --gt test/data/siftsmall_gt.gt \
+        --gt test/data/siftsmall_gt.gtmm \
         --output /tmp/selectivity_sweep.txt
 
 The sweep generates synthetic filter data (int32 column with known
@@ -54,14 +54,17 @@ def read_fbin(path: str) -> tuple[int, int, list[list[float]]]:
 
 
 def read_gt(path: str) -> tuple[int, int, list[list[int]]]:
+    """Canonical GTMM: [magic][n][k][metric] + per-query [ids][dists]."""
     with open(path, "rb") as f:
-        n, k = struct.unpack("II", f.read(8))
-        data = f.read()
-    gt = []
-    for i in range(n):
-        offset = i * k * 4
-        row = struct.unpack_from(f"{k}I", data, offset)
-        gt.append(list(row))
+        magic = struct.unpack("<I", f.read(4))[0]
+        assert magic == 0x4D4D5447, f"{path}: missing GTMM magic"
+        n, k = struct.unpack("<II", f.read(8))
+        f.read(1)  # metric byte
+        gt = []
+        for _ in range(n):
+            row = struct.unpack(f"<{k}I", f.read(k * 4))
+            f.read(k * 4)  # dists
+            gt.append(list(row))
     return n, k, gt
 
 
@@ -142,7 +145,7 @@ def main() -> int:
     ap.add_argument("--sextant", required=True, help="Path to sextant binary")
     ap.add_argument("--base", required=True, help="Base vectors (.fbin)")
     ap.add_argument("--query", required=True, help="Query vectors (.fbin)")
-    ap.add_argument("--gt", required=True, help="Ground truth (.gt)")
+    ap.add_argument("--gt", required=True, help="Ground truth (.gtmm, GTMM format)")
     ap.add_argument("--output", default="", help="Output file (default: stdout)")
     ap.add_argument("--selectivities", default="0.001,0.01,0.05,0.1,0.5,1.0",
                     help="Comma-separated selectivity levels")

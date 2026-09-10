@@ -12,7 +12,7 @@
 //
 // Usage:
 //   fvecs_to_fbin --input file.fvecs --output file.fbin
-//   fvecs_to_fbin --input file.ivecs --output file.gt --gt
+//   fvecs_to_fbin --input file.ivecs --output file.gtmm --gt
 
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
@@ -126,9 +126,9 @@ void convert_fvecs(const std::string& input, const std::string& output) {
     std::cout << "wrote " << n << " × " << dim << " → " << output << "\n";
 }
 
-/// Convert .ivecs → .gt ground-truth file.
+/// Convert .ivecs → GTMM ground-truth file (canonical interleaved).
 /// Each record: [int32 k][k × int32 neighbor IDs].
-/// Output: [uint32 n][uint32 k][n×k uint32 ids][n×k float32 distances].
+/// Output: canonical GTMM ([magic][n][k][metric] + per-query [ids][dists]).
 ///
 /// If --base and --queries are provided, distances are computed as L2-squared
 /// between each query vector and its k neighbor vectors in the base. Otherwise
@@ -141,7 +141,7 @@ void convert_ivecs(const std::string& input, const std::string& output,
     const char* end = buf.data() + buf.size();
 
     // Collect all records. k may vary per query in principle; we require a
-    // uniform k for the .gt format and take it from the first record.
+    // uniform k for the GTMM format and take it from the first record.
     std::vector<std::vector<uint32_t>> records;
     uint32_t k = 0;
     const char* q = p;
@@ -293,8 +293,8 @@ int main(int argc, char* argv[]) {
 
     cmdline::parser p;
     p.add<std::string>("input", 0, "Input .fvecs or .ivecs file", true);
-    p.add<std::string>("output", 0, "Output .fbin or .gt file", true);
-    p.add("gt", 0, "Ground-truth mode (.ivecs → .gt)");
+    p.add<std::string>("output", 0, "Output .fbin or .gtmm file", true);
+    p.add("gt", 0, "Ground-truth mode (.ivecs → .gtmm)");
     p.add<std::string>("base", 0, "Base .fbin (for --gt: compute real distances)", false, "");
     p.add<std::string>("queries", 0, "Query .fbin (for --gt: compute real distances)", false, "");
     p.parse_check(argc, argv);

@@ -1,6 +1,6 @@
-"""Compute recall@k from a sextant search output TSV vs ground-truth .gt file.
+"""Compute recall@k from a sextant search output TSV vs a GTMM ground-truth file.
 
-Usage: python3 compute_recall.py <search_output.tsv> <ground_truth.gt> [k]
+Usage: python3 compute_recall.py <search_output.tsv> <ground_truth.gtmm> [k]
 
 search_output.tsv: lines of "qi\\trow_id\\tdist" (qi is the query index).
 ground_truth.gt: fbin format, n×k int32 (first 8 bytes = n, d).
@@ -11,11 +11,17 @@ from collections import defaultdict
 
 
 def read_gt(path):
+    """Canonical GTMM: [magic][n][k][metric] + per-query [ids][dists]."""
     with open(path, "rb") as f:
+        magic = struct.unpack("<I", f.read(4))[0]
+        assert magic == 0x4D4D5447, f"{path}: missing GTMM magic"
         n, d = struct.unpack("<II", f.read(8))
+        f.read(1)  # metric
         import array
         a = array.array("i")
-        a.fromfile(f, n * d)
+        for _ in range(n):
+            a.fromfile(f, d)
+            f.read(d * 4)  # dists
     return a, n, d
 
 

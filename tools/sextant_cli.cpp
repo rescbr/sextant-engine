@@ -773,7 +773,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     cmdline::parser p;
     p.add<std::string>("index", 0, "Tree index file", true);
     p.add<std::string>("query", 0, "Query vectors (.fbin or .parquet)", true);
-    p.add<std::string>("ground-truth", 0, "Ground-truth .gt file", false, "");
+    p.add<std::string>("ground-truth", 0, "Ground-truth .gtmm file (GTMM format)", false, "");
     p.add<uint32_t>("topk", 0, "K nearest neighbors", false, 10);
     p.add<uint32_t>("n-probe", 0, "Root probe count (0=manifest default)", false, 0);
     p.add<uint32_t>("n-probe-ln", 0, "Leaf probe count per root child (0=manifest)", false, 0);
@@ -1016,9 +1016,10 @@ int cmd_tree_search(int argc, char* argv[]) {
     // (queries are read in bulk below for parallel processing)
 
     // Load ground truth if provided.
-    // Supports two formats:
-    //   .gt  — binary: [magic "GTMM"][n:u32][k:u32][metric:u8][ids][dists]
-    //          or legacy [n:u32][k:u32][ids][dists]
+    //   .gtmm — canonical GTMM (see include/sextant/ground_truth.hpp):
+    //          [magic][n][k][metric] + per-query [ids k×u32][dists k×f32].
+    //          (The legacy headerless format is removed; the reader
+    //          hard-errors on it.)
     //   .parquet — carquet-read: requires "neighbors_id" column (int64 list).
     //          Variable-length neighbor lists supported.
     std::vector<std::vector<RowId>> gt;

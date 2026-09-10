@@ -582,11 +582,24 @@ bool load_siftsmall(SiftData& sd) {
 
     fp = std::fopen(gt_path.c_str(), "rb");
     if (!fp) return false;
+    // Canonical GTMM: [magic][n][k][metric] + per-query [ids][dists].
+    {
+        uint32_t magic = 0;
+        if (std::fread(&magic, 4, 1, fp) != 1 || magic != 0x4D4D5447u) {
+            std::fclose(fp); return false;
+        }
+    }
     if (std::fread(&sd.gtn, 4, 1, fp) != 1) { std::fclose(fp); return false; }
     if (std::fread(&sd.gtk, 4, 1, fp) != 1) { std::fclose(fp); return false; }
+    if (std::fseek(fp, 1, SEEK_CUR) != 0) { std::fclose(fp); return false; }
     sd.gt_ids.resize(static_cast<size_t>(sd.gtn) * sd.gtk);
-    if (std::fread(sd.gt_ids.data(), sizeof(uint32_t), sd.gt_ids.size(), fp)
-        != sd.gt_ids.size()) { std::fclose(fp); return false; }
+    for (uint32_t q = 0; q < sd.gtn; ++q) {
+        if (std::fread(&sd.gt_ids[static_cast<size_t>(q) * sd.gtk],
+                       sizeof(uint32_t), sd.gtk, fp) != sd.gtk ||
+            std::fseek(fp, static_cast<long>(sd.gtk) * 4, SEEK_CUR) != 0) {
+            std::fclose(fp); return false;
+        }
+    }
     std::fclose(fp);
 
     return true;

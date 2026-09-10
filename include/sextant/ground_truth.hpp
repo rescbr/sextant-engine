@@ -93,6 +93,10 @@ public:
     float dist(uint32_t q, uint32_t r) const {
         return dists_[static_cast<size_t>(q) * k_ + r];
     }
+    /// Flat access (row-major, n × k) for tools that index by
+    /// (query × k + rank) directly.
+    RowId id_flat(size_t i) const { return ids_[i]; }
+    float dist_flat(size_t i) const { return dists_[i]; }
     /// The first `gk` ids of row `q` as a set (for recall scoring).
     /// `gk` is clamped to the file's k.
     std::vector<RowId> top(uint32_t q, uint32_t gk) const {

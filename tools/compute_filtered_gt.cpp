@@ -2,7 +2,7 @@
 //
 // Given a base .fbin (vectors), query .fbin, and a .fdat filter file,
 // computes the exact top-k nearest neighbors among vectors matching
-// a single int32 equality predicate. Writes a .gt file in standard
+// a single int32 equality predicate. Writes a canonical GTMM file
 // format (magic + n + k + row_ids).
 //
 // This is the "on-the-fly filtered GT" from task 4 — solves the
@@ -11,7 +11,7 @@
 // Usage:
 //   sextant_filtered_gt --base base.fbin --query query.fbin
 //     --fdat filter.fdat --col-name year --col-val 2050
-//     --topk 10 --out filtered.gt
+//     --topk 10 --out filtered.gtmm
 
 #include <cstdint>
 #include <cstdio>
@@ -213,7 +213,9 @@ int main(int argc, char* argv[]) {
     }
 
     // --- Write GT file ---
-    // Format: magic(4) n(4) k(4) metric(1) [n × k × uint32 row_ids]
+    // Canonical GTMM (see include/sextant/ground_truth.hpp):
+    // [magic][n][k][metric] then per query [ids k×u32][dists k×f32].
+    // Dists are zero-filled (ids-only GT — recall does not need them).
     std::ofstream out(out_path, std::ios::binary);
     const uint32_t magic = 0x4D4D5447;  // "GTMM"
     const uint8_t metric = 0;  // IP
@@ -221,8 +223,14 @@ int main(int argc, char* argv[]) {
     out.write(reinterpret_cast<const char*>(&nq), 4);
     out.write(reinterpret_cast<const char*>(&k), 4);
     out.write(reinterpret_cast<const char*>(&metric), 1);
-    out.write(reinterpret_cast<const char*>(gt_results.data()),
-              gt_results.size() * 4);
+    std::vector<float> zero_dists(k, 0.0f);
+    for (uint32_t q = 0; q < nq; ++q) {
+        out.write(reinterpret_cast<const char*>(
+                      &gt_results[static_cast<size_t>(q) * k]),
+                  static_cast<std::streamsize>(k) * 4);
+        out.write(reinterpret_cast<const char*>(zero_dists.data()),
+                  static_cast<std::streamsize>(k) * 4);
+    }
 
     std::cerr << "wrote " << nq << " queries × " << k << " GT to " << out_path << "\n";
     return 0;

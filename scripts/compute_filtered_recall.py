@@ -13,7 +13,7 @@ For queries where fewer than k GT entries match the filter, we divide by
 the number of matching GT entries (not k), giving a fair recall measure.
 
 Usage:
-  python3 compute_filtered_recall.py --results results.txt --gt gt.gt \
+  python3 compute_filtered_recall.py --results results.txt --gt gt.gtmm \
     --fdat filter.fdat --year-val 2050 --k 10
 """
 
@@ -23,17 +23,16 @@ import sys
 
 
 def read_gt(path):
+    """Canonical GTMM: [magic][n][k][metric] + per-query [ids][dists]."""
     with open(path, "rb") as f:
-        maybe_magic = struct.unpack("<I", f.read(4))[0]
-        if maybe_magic == 0x4D4D5447:
-            n, k = struct.unpack("<II", f.read(8))
-            f.read(1)
-        else:
-            n = maybe_magic
-            k = struct.unpack("<I", f.read(4))[0]
+        magic = struct.unpack("<I", f.read(4))[0]
+        assert magic == 0x4D4D5447, f"{path}: missing GTMM magic"
+        n, k = struct.unpack("<II", f.read(8))
+        f.read(1)
         gt = []
         for _ in range(n):
             row = struct.unpack(f"<{k}I", f.read(k * 4))
+            f.read(k * 4)  # dists
             gt.append(list(row))
     return gt, k
 
