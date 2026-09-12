@@ -1257,15 +1257,62 @@ int cmd_tree_search(int argc, char* argv[]) {
             // leaves swept once, page-ordered. Results land in the same
             // all_results slots as the per-query path (recall + output
             // code shared).
-            std::vector<std::vector<Candidate>> win_results;
-            for (uint32_t w = 0; w < qcount; w += batch_window) {
-                const uint32_t n =
-                    std::min(batch_window, qcount - w);
-                idx->search_batch(
-                    &queries[static_cast<size_t>(w) * qdim], n, k, scfg,
-                    win_results);
-                for (uint32_t i = 0; i < n; ++i)
-                    all_results[w + i] = std::move(win_results[i]);
+            //
+            // Depth-2 window pipeline: window w+1's routing (LUT/mask/
+            // sweep/selection — CPU only, never reads leaf pages)
+            // overlaps window w's leaf sweep. The engine serializes the
+            // sweeps themselves (scan_stream_mu_): exactly ONE
+            // page-ordered leaf stream in flight — concurrent sweeps
+            // interleave into random I/O (measured; the pipeline is
+            // only sound with that invariant).
+            {
+                constexpr int kDepth = 2;
+                std::vector<std::vector<Candidate>> buf[kDepth];
+                std::vector<std::future<void>> fut(kDepth);
+                uint32_t base_of[kDepth] = {0, 0};
+                int n_live = 0;
+                int slot = 0;
+                uint32_t next_w = 0;
+                auto start = [&](int s) {
+                    const uint32_t w0 = next_w;
+                    const uint32_t n = std::min(batch_window, qcount - w0);
+                    next_w += batch_window;
+                    base_of[s] = w0;
+                    fut[s] = std::async(std::launch::async,
+                                        [&, w0, n, s] {
+                        idx->search_batch(
+                            &queries[static_cast<size_t>(w0) * qdim],
+                            n, k, scfg, buf[s]);
+                    });
+                    // NB: the CALLER bumps n_live when this is a NEW
+                    // window; a reap-restart replaces a finished window
+                    // and must not (n_live inflated 2->4 and never
+                    // drained — measured).
+                };
+                if (qcount > 0) { start(0); ++n_live; }
+                // Pre-fill every slot BEFORE the first blocking get();
+                // starting the next window only after reaping the
+                // current one degenerates to serial.
+                while (n_live < kDepth && next_w < qcount) {
+                    start(n_live); ++n_live;
+                }
+                while (n_live > 0) {
+                    if (fut[slot].valid()) {
+                        fut[slot].get();
+                        const uint32_t w0 = base_of[slot];
+                        const uint32_t n =
+                            static_cast<uint32_t>(buf[slot].size());
+                        for (uint32_t i = 0; i < n; ++i)
+                            all_results[w0 + i] = std::move(buf[slot][i]);
+                        buf[slot].clear();
+                        buf[slot].shrink_to_fit();
+                        if (next_w < qcount)
+                            start(slot);
+                        else
+                            --n_live;
+                    }
+                    slot = (slot + 1) % kDepth;
+                }
             }
             return;
         }

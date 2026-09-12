@@ -395,6 +395,14 @@ private:
     std::string path_;
     mutable SearchStats search_stats_;  // relaxed atomics; search() is const
     mutable BatchStats batch_stats_;     // relaxed atomics; search_batch() is const
+    // Serializes Phase-3 leaf sweeps ACROSS concurrent search_batch calls
+    // (window pipelining): the sweep's page-ordered pread stream must be
+    // the only leaf I/O in flight — two concurrent sweeps interleave into
+    // random I/O (measured: a depth-2 CLI pipeline failed to finish).
+    // Uncontended for single-window callers. Phases 0-2 (routing) are
+    // untouched and may overlap a sweep freely — they never read leaf
+    // pages, only the (mmap'd) plane extent and centroids.
+    mutable std::mutex scan_stream_mu_;
     int fd_ = -1;
     const uint8_t* mmap_base_ = nullptr;  // mmap'd file base (read-only)
     uint64_t mmap_size_ = 0;

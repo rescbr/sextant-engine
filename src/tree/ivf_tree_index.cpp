@@ -4594,14 +4594,20 @@ void IVFTreeIndex::search_batch(
                             std::make_move_iterator(my_partials.end()));
         };
         const auto t_sweep0 = std::chrono::steady_clock::now();
-        if (T == 1) {
-            sweep_worker();
-        } else {
-            std::vector<std::future<void>> futs;
-            for (uint32_t t = 0; t < T; ++t)
-                futs.push_back(
-                    std::async(std::launch::async, sweep_worker));
-            for (auto& f : futs) f.get();
+        {
+            // Single leaf-stream invariant: at most one Phase-3 sweep in
+            // flight process-wide (see scan_stream_mu_). Concurrent
+            // windows' routing overlaps this; their sweeps queue here.
+            std::lock_guard<std::mutex> stream_lk(scan_stream_mu_);
+            if (T == 1) {
+                sweep_worker();
+            } else {
+                std::vector<std::future<void>> futs;
+                for (uint32_t t = 0; t < T; ++t)
+                    futs.push_back(
+                        std::async(std::launch::async, sweep_worker));
+                for (auto& f : futs) f.get();
+            }
         }
         batch_stats_.on_sweep(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
