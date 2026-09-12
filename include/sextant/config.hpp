@@ -488,8 +488,10 @@ struct SearchConfig {
     /// expensive sequential stage) then runs on survivors only —
     /// expense-ordered composition: centroids -> plane -> leaf scan.
     /// 0 = off (sweep everything). Requires PCA routing data (depth-2
-    /// trees); silently ignored otherwise.
-    float plane_pre_prune = 0.0f;
+    /// trees); silently ignored otherwise. Default 0.25: measured winner
+    /// in every encoding family (b1g/u4lm/u4lm_pv) on cohere10m at both
+    /// probe fractions; recall-neutral, QPS-positive.
+    float plane_pre_prune = 0.25f;
 
     /// IVF-probe merge oversampling: each probed shard is searched at
     /// k_local = k × merge_oversample, then results are merged/deduped and

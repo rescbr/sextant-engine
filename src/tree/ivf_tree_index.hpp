@@ -518,7 +518,9 @@ private:
     /// queries while cache-hot), then per-query fraction selection.
     void plane_route_batch_(const float* queries, uint32_t nq,
                             const SearchConfig& config,
-                            std::vector<std::vector<LeafCandidate>>& out)
+                            std::vector<std::vector<LeafCandidate>>& out,
+                            const std::vector<float>* per_query_fraction =
+                                nullptr)
         const;
 
     /// Expand one internal frontier entry: read the node, score children

@@ -482,6 +482,18 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<std::string>("metrics-file", 0,
         "Append build phase metrics as JSON lines (build.* field names)",
         false, "");
+    p.add("no-plane-attach", 0,
+          "Skip the default routing-plane attachment (b1g). The plane adds "
+          "16 B/vector and buys ~+17% cold QPS at iso-recall (validated on "
+          "cohere/arxiv/deep); attach is skipped automatically for non-fbin "
+          "inputs");
+    p.add<std::string>("plane-enc", 0,
+        "Default plane encoding: b1g (16 B/vec, dominates easy/medium "
+        "corpora) or u4lm (64 B/vec, hard corpora — dbpedia-class)",
+        false, "b1g");
+    p.add<uint32_t>("plane-rank", 0, "Plane PCA rank", false, 128);
+    p.add<uint32_t>("plane-train-rows", 0,
+        "Plane basis/codebook training sample (spread-sampled)", false, 20000);
     p.parse_check(argc, argv);
 
     {
@@ -628,6 +640,60 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
               << "%, src_wait " << result.source_wait_sec << "s, read "
               << result.bytes_read << "B, peak rss " << result.peak_rss_bytes
               << "B)\n";
+
+    // Default routing-plane attachment (fbin inputs; the attach path
+    // needs the raw base in build row order). One extra streaming pass
+    // over the corpus; trees ship ready for plane routing unless opted
+    // out. Parquet inputs skip this with a note (attach them explicitly
+    // via `plane-attach` once exported).
+    if (!input_path.empty() && input_path.size() >= 5 &&
+        input_path.compare(input_path.size() - 5, 5, ".fbin") == 0 &&
+        !p.exist("no-plane-attach")) {
+        const std::string enc_s = p.get<std::string>("plane-enc");
+        tree::PlaneEncoding enc;
+        if (enc_s == "u4lm") enc = tree::PlaneEncoding::U4LM;
+        else if (enc_s == "u4lm_pv") enc = tree::PlaneEncoding::U4LM_PV;
+        else if (enc_s == "b1g") enc = tree::PlaneEncoding::B1G;
+        else {
+            std::cerr << "build-tree: unknown --plane-enc '" << enc_s
+                      << "' (skipping attach)\n";
+            return 0;
+        }
+        fbin_io::FbinHeader hdr;
+        if (!fbin_io::read_fbin_header(input_path, hdr) || hdr.n == 0) {
+            std::cerr << "build-tree: cannot re-read " << input_path
+                      << " for plane attach (skipping)\n";
+            return 0;
+        }
+        int fd = ::open(input_path.c_str(), O_RDONLY);
+        struct stat st;
+        if (fd < 0 || ::fstat(fd, &st) != 0 ||
+            static_cast<uint64_t>(st.st_size) <
+                8 + static_cast<uint64_t>(hdr.n) * hdr.dim * 4) {
+            if (fd >= 0) ::close(fd);
+            std::cerr << "build-tree: base truncated (skipping plane)\n";
+            return 0;
+        }
+        void* m = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (m == MAP_FAILED) {
+            std::cerr << "build-tree: mmap failed (skipping plane)\n";
+            return 0;
+        }
+        const auto* base = reinterpret_cast<const float*>(
+            static_cast<const uint8_t*>(m) + 8);
+        const auto tp0 = std::chrono::steady_clock::now();
+        auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"));
+        idx->attach_plane(base, hdr.n, hdr.dim, enc,
+                          static_cast<uint16_t>(p.get<uint32_t>("plane-rank")),
+                          p.get<uint32_t>("plane-train-rows"));
+        std::cout << "plane-attach: " << enc_s << " rank "
+                  << p.get<uint32_t>("plane-rank") << " in "
+                  << std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - tp0).count()
+                  << "s\n";
+        ::munmap(m, st.st_size);
+    }
     return 0;
 }
 

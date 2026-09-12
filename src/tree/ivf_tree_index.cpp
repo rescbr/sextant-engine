@@ -4303,10 +4303,20 @@ void IVFTreeIndex::search_batch(
                             qs[plane_q[j]].query,
                             manifest_.dim * sizeof(float));
             std::vector<std::vector<LeafCandidate>> pc;
+            // Compact the per-query budgets alongside the queries (the
+            // fraction vector is indexed by original query position).
+            std::vector<float> pf;
+            const std::vector<float>* pfp = nullptr;
+            if (per_query_probe_fraction) {
+                pf.reserve(plane_q.size());
+                for (uint32_t j : plane_q)
+                    pf.push_back((*per_query_probe_fraction)[j]);
+                pfp = &pf;
+            }
             const auto tp0 = std::chrono::steady_clock::now();
             plane_route_batch_(compact.data(),
                                static_cast<uint32_t>(plane_q.size()),
-                               config, pc);
+                               config, pc, pfp);
             const uint64_t pns = static_cast<uint64_t>(
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - tp0).count() * 1e9);
@@ -4837,7 +4847,8 @@ void IVFTreeIndex::plane_route_(const float* query,
 // ===========================================================================
 void IVFTreeIndex::plane_route_batch_(
         const float* queries, uint32_t nq, const SearchConfig& config,
-        std::vector<std::vector<LeafCandidate>>& out) const {
+        std::vector<std::vector<LeafCandidate>>& out,
+        const std::vector<float>* per_query_fraction) const {
     const uint32_t R = plane_->meta().rank;
     const uint32_t n_leaves = static_cast<uint32_t>(leaf_table_.size());
     const PlaneEncoding enc = plane_->meta().encoding;
@@ -5113,7 +5124,14 @@ void IVFTreeIndex::plane_route_batch_(
                               return sc[static_cast<size_t>(a) * nq] >
                                      sc[static_cast<size_t>(b) * nq];
                           });
-                float f = config.probe_fraction;
+                // Per-query budget (caller-chosen, e.g. SLA tiers) falls
+                // back to the shared config, then the manifest.
+                // (Engine-ADAPTIVE per-query budgets are a measured
+                // negative — scan-feedback closed 2026-09-07.)
+                float f = per_query_fraction
+                              ? (*per_query_fraction)[qi]
+                              : 0.0f;
+                if (f <= 0.0f) f = config.probe_fraction;
                 if (f <= 0.0f) f = manifest_.probe_fraction;
                 if (f <= 0.0f) f = 0.5f;
                 auto& candidates = out[static_cast<size_t>(qi)];
