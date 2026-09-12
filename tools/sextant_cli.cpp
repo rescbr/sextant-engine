@@ -532,6 +532,26 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     if (p.exist("prq-lsq-train-iters"))
         cfg.params.prq_lsq_train_iters =
             p.get<uint32_t>("prq-lsq-train-iters");
+
+    // In-build routing plane (default on, any source — fbin AND parquet).
+    // The plane rides the build's training sample + emission pass; no
+    // post-build corpus re-read (that was the v1 attach flow).
+    if (!p.exist("no-plane-attach")) {
+        const std::string enc_s = p.get<std::string>("plane-enc");
+        if (enc_s == "u4lm") cfg.plane_enc = tree::PlaneEncoding::U4LM;
+        else if (enc_s == "u4lm_pv") cfg.plane_enc = tree::PlaneEncoding::U4LM_PV;
+        else if (enc_s == "b1g") cfg.plane_enc = tree::PlaneEncoding::B1G;
+        else {
+            std::cerr << "build-tree: unknown --plane-enc '" << enc_s
+                      << "' (skipping plane)\n";
+            return 1;
+        }
+        cfg.plane_attach = true;
+        cfg.plane_rank = static_cast<uint16_t>(
+            p.get<uint32_t>("plane-rank"));
+        cfg.plane_train_rows = p.get<uint32_t>("plane-train-rows");
+    }
+
     const std::string metric = p.get<std::string>("metric");
     cfg.params.metric = (metric == "ip") ? MetricKind::InnerProduct
                                           : MetricKind::L2Sq;
@@ -660,59 +680,6 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
               << result.bytes_read << "B, peak rss " << result.peak_rss_bytes
               << "B)\n";
 
-    // Default routing-plane attachment (fbin inputs; the attach path
-    // needs the raw base in build row order). One extra streaming pass
-    // over the corpus; trees ship ready for plane routing unless opted
-    // out. Parquet inputs skip this with a note (attach them explicitly
-    // via `plane-attach` once exported).
-    if (!input_path.empty() && input_path.size() >= 5 &&
-        input_path.compare(input_path.size() - 5, 5, ".fbin") == 0 &&
-        !p.exist("no-plane-attach")) {
-        const std::string enc_s = p.get<std::string>("plane-enc");
-        tree::PlaneEncoding enc;
-        if (enc_s == "u4lm") enc = tree::PlaneEncoding::U4LM;
-        else if (enc_s == "u4lm_pv") enc = tree::PlaneEncoding::U4LM_PV;
-        else if (enc_s == "b1g") enc = tree::PlaneEncoding::B1G;
-        else {
-            std::cerr << "build-tree: unknown --plane-enc '" << enc_s
-                      << "' (skipping attach)\n";
-            return 0;
-        }
-        fbin_io::FbinHeader hdr;
-        if (!fbin_io::read_fbin_header(input_path, hdr) || hdr.n == 0) {
-            std::cerr << "build-tree: cannot re-read " << input_path
-                      << " for plane attach (skipping)\n";
-            return 0;
-        }
-        int fd = ::open(input_path.c_str(), O_RDONLY);
-        struct stat st;
-        if (fd < 0 || ::fstat(fd, &st) != 0 ||
-            static_cast<uint64_t>(st.st_size) <
-                8 + static_cast<uint64_t>(hdr.n) * hdr.dim * 4) {
-            if (fd >= 0) ::close(fd);
-            std::cerr << "build-tree: base truncated (skipping plane)\n";
-            return 0;
-        }
-        void* m = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        ::close(fd);
-        if (m == MAP_FAILED) {
-            std::cerr << "build-tree: mmap failed (skipping plane)\n";
-            return 0;
-        }
-        const auto* base = reinterpret_cast<const float*>(
-            static_cast<const uint8_t*>(m) + 8);
-        const auto tp0 = std::chrono::steady_clock::now();
-        auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"));
-        idx->attach_plane(base, hdr.n, hdr.dim, enc,
-                          static_cast<uint16_t>(p.get<uint32_t>("plane-rank")),
-                          p.get<uint32_t>("plane-train-rows"));
-        std::cout << "plane-attach: " << enc_s << " rank "
-                  << p.get<uint32_t>("plane-rank") << " in "
-                  << std::chrono::duration<double>(
-                         std::chrono::steady_clock::now() - tp0).count()
-                  << "s\n";
-        ::munmap(m, st.st_size);
-    }
     return 0;
 }
 

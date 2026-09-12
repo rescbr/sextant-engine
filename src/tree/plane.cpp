@@ -227,6 +227,16 @@ float PlaneWriter::decode_dim_(uint32_t code, uint32_t e) const {
 
 void PlaneWriter::prepare(uint32_t n_leaves) { leaves_.resize(n_leaves); }
 
+void PlaneWriter::transfer_leaf(uint32_t cluster, uint32_t leaf_id) {
+    if (leaf_id >= leaves_.size()) leaves_.resize(leaf_id + 1);
+    // Swap the cluster's accumulated blocks into the global leaf slot;
+    // the cluster staging slot receives the fresh (empty) state that was
+    // at leaf_id. Cluster staging lives OUTSIDE leaves_ so global ids in
+    // 0..k_root-1 cannot clobber other clusters' in-flight blocks.
+    if (cluster < stage_.size())
+        std::swap(stage_[cluster], leaves_[leaf_id]);
+}
+
 void PlaneWriter::project(const float* vec, float* pr) const {
     const uint32_t R = meta_.rank;
     for (uint32_t e = 0; e < R; ++e) pr[e] = 0;
@@ -239,7 +249,20 @@ void PlaneWriter::project(const float* vec, float* pr) const {
 
 void PlaneWriter::encode_from_proj(uint32_t leaf_id, uint32_t slot,
                                    const float* pr) {
-    LeafState& ls = leaves_[leaf_id];
+    // In-build encoding does not know the final leaf count up front
+    // (leaves appear as buffers flush) — grow on demand.
+    if (leaf_id >= leaves_.size()) leaves_.resize(leaf_id + 1);
+    encode_into_(leaves_[leaf_id], slot, pr);
+}
+
+void PlaneWriter::encode_staged(uint32_t cluster, uint32_t slot,
+                                const float* pr) {
+    if (cluster >= stage_.size()) stage_.resize(cluster + 1);
+    encode_into_(stage_[cluster], slot, pr);
+}
+
+void PlaneWriter::encode_into_(PlaneWriter::LeafState& ls, uint32_t slot,
+                               const float* pr) {
     const uint32_t block = slot / kVecsPerBlock;
     const uint32_t lane = slot % kVecsPerBlock;
     if (ls.n_blocks <= block) {

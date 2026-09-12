@@ -71,6 +71,15 @@ public:
     /// encode_member).
     void prepare(uint32_t n_leaves);
 
+    /// In-build emission support: rows are encoded under their CLUSTER id
+    /// (stable during the streaming merge) via encode_staged; when a
+    /// cluster's buffer flushes as global leaf `leaf_id`, transfer_leaf
+    /// moves the accumulated blocks there and resets the cluster slot.
+    /// O(1) swap. Cluster staging is separate from leaves_ so early
+    /// global ids (< k_root) cannot collide with in-flight clusters.
+    void encode_staged(uint32_t cluster, uint32_t slot, const float* pr);
+    void transfer_leaf(uint32_t cluster, uint32_t leaf_id);
+
     /// Projects one vector (rank floats into `pr`).
     void project(const float* vec, float* pr) const;
 
@@ -105,7 +114,10 @@ private:
         uint32_t n_blocks = 0;
     };
     std::vector<LeafState> leaves_;
+    std::vector<LeafState> stage_;    // in-build: per-cluster accumulation
     uint32_t block_bytes_ = 0;
+
+    void encode_into_(LeafState& ls, uint32_t slot, const float* pr);
 
     uint32_t encode_dim_(float v, uint32_t e) const;
     float decode_dim_(uint32_t code, uint32_t e) const;

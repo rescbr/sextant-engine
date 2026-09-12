@@ -573,7 +573,13 @@ void IVFTreeIndex::attach_plane(const float* base, uint32_t n, uint32_t dim,
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t0).count());
 
+    attach_plane_from(writer, leaf_counts);
+}
+
+void IVFTreeIndex::attach_plane_from(PlaneWriter& writer,
+                                     const std::vector<uint32_t>& leaf_counts) {
     auto blob = writer.finalize(leaf_counts);
+    const auto t0 = std::chrono::steady_clock::now();
 
     // The bitmap region is FIXED at format time; a plane extent can
     // outgrow its coverage (10M-scale plane = ~180K pages). When it

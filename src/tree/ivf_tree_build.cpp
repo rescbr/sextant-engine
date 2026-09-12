@@ -208,6 +208,13 @@ struct TreeBuildContext {
     std::vector<float> rotation;    // pca_dims × dim (top-k rows of full R)
     float closure_epsilon = 0.0f;   // global (fallback)
 
+    // --- In-build routing plane (cfg.plane_attach): trained from the
+    //     build's reservoir sample, encoded during the emission pass at
+    //     the same points rows are appended to leaf buffers. ---
+    PlaneWriter plane_writer;
+    bool plane = false;
+    std::vector<uint32_t> plane_leaf_counts;  // per flushed leaf, in order
+
     // --- Phase I: per-cluster d_eff and per-cluster closure epsilon ---
     // d_eff_c = mean gap to 2nd-nearest centroid for vectors in cluster c.
     // Larger gap = lower intrinsic dimensionality = easier to partition.
@@ -379,15 +386,28 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     // first encode).
     uint32_t train_n = std::min<uint64_t>(20'000, n);
     std::vector<float> sample;
+    std::vector<float> plane_sample;  // v1-attach-equivalent stride sample
     {
         ctx.source.reset();
         Chunk chunk;
         std::vector<float> reservoir(size_t(train_n) * dim);
+        // Stride sample for the routing plane, collected in the SAME pass:
+        // rows 0, stride, 2*stride, ... — exactly the rows PlaneWriter::train
+        // would pick from the full corpus (attach_plane). Makes the in-build
+        // basis + codebooks byte-identical to the v1 post-hoc attach.
+        const uint64_t plane_stride = std::max<uint64_t>(1, n / train_n);
+        if (cfg.plane_attach)
+            plane_sample.resize(size_t(train_n) * dim);
         uint64_t seen = 0;
         std::mt19937_64 rng(42);
         while (ctx.source.next(chunk)) {
             for (uint32_t i = 0; i < chunk.count; ++i) {
                 const float* v = chunk.vectors + size_t(i) * dim;
+                if (cfg.plane_attach && seen / plane_stride < train_n
+                    && seen % plane_stride == 0)
+                    std::memcpy(
+                        &plane_sample[size_t(seen / plane_stride) * dim], v,
+                        size_t(dim) * sizeof(float));
                 if (seen < train_n) {
                     std::memcpy(&reservoir[size_t(seen) * dim], v,
                                 size_t(dim) * sizeof(float));
@@ -605,6 +625,28 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     ctx.rotation = std::move(rotation);
     ctx.closure_epsilon = closure_epsilon;
     ctx.root_centroids_pca = std::move(root_centroids_pca);
+
+    // In-build routing plane (phase A): train the basis + codebooks from
+    // the SAME reservoir sample (uniform over the whole source — the
+    // spread-sample property plane.hpp requires; prefix bases lose
+    // containment). Zero extra source passes.
+    if (cfg.plane_attach) {
+        const auto tp = std::chrono::steady_clock::now();
+        PlaneWriter::Config pcfg;
+        pcfg.encoding = cfg.plane_enc;
+        pcfg.rank = cfg.plane_rank;
+        // train_rows = train_n => stride 1 over the pre-strided sample: the
+        // SAME rows attach_plane would sample from the full corpus.
+        pcfg.train_rows = train_n;
+        ctx.plane_writer.train(plane_sample.data(), train_n, dim, pcfg);
+        ctx.plane_writer.prepare(0);  // leaves grow on demand
+        ctx.plane = true;
+        spdlog::info("[sextant] plane: basis+codebooks trained in {:.2}s "
+                     "(in-build, {} sample rows)",
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - tp).count(),
+                     pcfg.train_rows);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1299,11 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
 
         leaf_metas.push_back(LeafMeta{page, npg, std::move(leaf_centroid)});
         leaf_summaries.push_back(std::move(leaf_summary));
+        if (ctx.plane) {
+            const auto leaf_id = static_cast<uint32_t>(leaf_metas.size() - 1);
+            ctx.plane_writer.transfer_leaf(c, leaf_id);
+            ctx.plane_leaf_counts.push_back(count);
+        }
 
         // Reset the buffer for the next leaf in this cluster.
         buf.codes.clear();
@@ -1365,10 +1412,22 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         // source; only the first chunk allocates.
         std::vector<uint8_t> codes_flat;
         std::vector<std::vector<uint32_t>> chunk_targets;
+        // In-build plane projection scratch (rank floats per chunk row);
+        // capacity hoisted like codes_flat. Encoded rows go to the plane
+        // writer's per-leaf blocks at the serial merge (slot = leaf-local
+        // index, same order the codes get flushed in).
+        std::vector<float> plane_proj;
+        const uint32_t plane_rank = ctx.plane ? ctx.plane_writer.meta().rank : 0;
+        if (ctx.plane)
+            plane_proj.resize(static_cast<size_t>(1u << 20) * plane_rank);
         while (true) {
             Chunk chunk;
             if (!ctx.source.next(chunk)) break;
             const uint32_t take = chunk.count;
+            if (ctx.plane && plane_proj.size() <
+                    static_cast<size_t>(take) * plane_rank)
+                plane_proj.resize(static_cast<size_t>(take) *
+                                  plane_rank);
             const float* vec_buf = chunk.vectors;  // NO copy
             const RowId* chunk_row_ids = chunk.row_ids;  // source-assigned ids
             // Capture whether this chunk carries per-chunk filter/payload data
@@ -1445,6 +1504,12 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                                 if (ctx.has_ip_bias)
                                     chunk_biases[i] = float16_t(bias);
                             }
+                            // In-build plane: project on the routing pass
+                            // (read-only basis — thread-safe).
+                            if (ctx.plane)
+                                ctx.plane_writer.project(
+                                    xi, &plane_proj[static_cast<size_t>(i) *
+                                                      plane_rank]);
                             // Find closure targets using per-cluster epsilon.
                             // Phase I: each cluster c has its own closure eps
                             // derived from its local d_eff. A vector is
@@ -1650,6 +1715,17 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                     if (m == 0) continue;
                     for (uint32_t j = 0; j < m; ++j) {
                         auto& buf = buffers[c];
+                        // In-build plane row: encoded under the stable
+                        // CLUSTER id (slot = this row's leaf-local index);
+                        // transfer_leaf moves the blocks to the global
+                        // leaf id at flush. Same replication as v1 attach.
+                        if (ctx.plane) {
+                            ctx.plane_writer.encode_staged(
+                                c,
+                                static_cast<uint32_t>(buf.row_ids.size()),
+                                &plane_proj[static_cast<size_t>(
+                                    tb.local_indices[j]) * plane_rank]);
+                        }
                         if (keep_raw_vecs) {
                             // local families: keep raw FP16 for
                             // per-leaf fitting at flush time.
@@ -2260,6 +2336,14 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
 
     run_emission_pass(ctx, file, alloc);
     BuildResult result = write_tree_structure(ctx, file, alloc);
+
+    // In-build plane tail: the writer holds trained basis + encoded
+    // per-leaf blocks. Reopen the committed tree and append the plane
+    // extent (shared with the post-hoc attach path).
+    if (ctx.plane) {
+        auto idx = IVFTreeIndex::open(output_path);
+        idx->attach_plane_from(ctx.plane_writer, ctx.plane_leaf_counts);
+    }
 
     const double secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();

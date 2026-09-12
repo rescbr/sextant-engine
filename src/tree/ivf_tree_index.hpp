@@ -122,6 +122,15 @@ public:
         /// still accumulate into BuildResult::phases but emit only via the
         /// default log line created inside the build.
         metrics::MetricsSink* metrics_sink = nullptr;
+
+        /// In-build routing-plane encoding (plane v2 phase A: rides the
+        /// build's training sample + emission pass, replaces the post-hoc
+        /// corpus re-read of attach_plane for new trees; works for any
+        /// VectorSource, not just fp32 fbin).
+        bool plane_attach = false;
+        PlaneEncoding plane_enc = PlaneEncoding::B1G;
+        uint16_t plane_rank = 128;
+        uint32_t plane_train_rows = 20000;  // capped at the build sample size
     };
 
     // --- Search observability ---
@@ -316,6 +325,13 @@ public:
     void attach_plane(const float* base, uint32_t n, uint32_t dim,
                       PlaneEncoding enc, uint16_t rank = 128,
                       uint32_t train_rows = 20000);
+
+    /// attach tail shared by post-hoc attach_plane and the in-build
+    /// encoder: serializes the (already-trained + encoded) writer, appends
+    /// the plane extent, re-commits the superblock, re-mmaps and binds.
+    /// leaf_counts = per-leaf stored-member counts in leaf-table order.
+    void attach_plane_from(PlaneWriter& writer,
+                           const std::vector<uint32_t>& leaf_counts);
 
     // --- Dynamic insert/delete (single-writer, multi-reader) ---
 
