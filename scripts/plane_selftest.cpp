@@ -57,11 +57,14 @@ int main() {
         std::vector<float> proj(R);
         pl->project_query(q.data(), proj.data());
 
-        std::vector<float> lut, w;
+        std::vector<float> lut, w, w_qbits_dummy(R);
         std::vector<uint32_t> qbits;
         if (enc == tree::PlaneEncoding::B1G) {
-            w.resize(R); qbits.resize(R);
-            pl->build_sign_ctx(proj.data(), w.data(), qbits.data());
+            w.resize(static_cast<size_t>(R / 4) * 16);
+            pl->build_b1_lut(proj.data(), w.data());
+            qbits.resize(R);
+            pl->build_sign_ctx(proj.data(), w_qbits_dummy.data(),
+                               qbits.data());
         } else {
             lut.resize(static_cast<size_t>(R) * 16);
             pl->build_lut(proj.data(), lut.data());
@@ -78,7 +81,7 @@ int main() {
             sA[li] = pl->scan_leaf_max(l,
                 enc == tree::PlaneEncoding::B1G ? nullptr : lut.data(),
                 enc == tree::PlaneEncoding::B1G ? w.data() : nullptr,
-                enc == tree::PlaneEncoding::B1G ? qbits.data() : nullptr);
+                nullptr);
             ++li;
         }
         // Ranking sanity: the top-scored leaf under the plane must
@@ -125,7 +128,7 @@ int main() {
                     for (uint32_t e = 0; e < R; ++e) {
                         if (enc == tree::PlaneEncoding::B1G) {
                             sc += (pm[e] >= 0 ? 1.0 : -1.0) *
-                                  static_cast<double>(w[e]);
+                                  static_cast<double>(w_qbits_dummy[e]);
                         } else {
                             // nearest of the 16 LUT entries == proj_q *
                             // nearest centroid (LUT is exactly that)
@@ -164,10 +167,15 @@ int main() {
                                   pm.data());
                 const uint32_t block = m / 32, lane = m % 32;
                 for (uint32_t e = 0; e < R; ++e) {
+                    // FastScan nibble layout: group g = e/4, bit t = e%4.
+                    const uint32_t g = e / 4, t = e % 4;
                     const uint8_t byte =
-                        bp[block * pl->debug_block_bytes() + e * 4 +
-                           (lane >> 3)];
-                    const uint32_t bit = (byte >> (lane & 7)) & 1u;
+                        bp[block * pl->debug_block_bytes() + g * 16 +
+                           (lane % 16)];
+                    const uint32_t nib = (lane >= 16)
+                        ? static_cast<uint32_t>(byte >> 4)
+                        : static_cast<uint32_t>(byte & 0xFu);
+                    const uint32_t bit = (nib >> t) & 1u;
                     const uint32_t want = pm[e] >= 0 ? 1u : 0u;
                     if (bit != want) ++ndiff;
                 }

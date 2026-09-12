@@ -4740,22 +4740,23 @@ void IVFTreeIndex::plane_route_batch_(
     std::vector<float> proj(static_cast<size_t>(nq) * R);
     std::vector<uint8_t> lut8;
     std::vector<float> lut;
-    std::vector<float> blut;  // b1g byte-LUTs (16 KB/query)
     std::vector<float> seg_min(R);
     std::vector<float> so_scratch(R);
-    if (fastscan8)
-        lut8.resize(static_cast<size_t>(nq) * R * 16);
+    // BOTH encodings ride the shared FastScan u8 kernel; b1g segments
+    // are rank/4 (sign nibbles), u4lm rank.
+    const uint32_t SEG = is_b1g ? R / 4 : R;
+    if (fastscan8 || is_b1g)
+        lut8.resize(static_cast<size_t>(nq) * SEG * 16);
     if (!fastscan8 && !is_b1g)
         lut.resize(static_cast<size_t>(nq) * R * 16);
-    if (is_b1g)
-        blut.resize(static_cast<size_t>(nq) * (R / 8) * 256);
     for (uint32_t qi = 0; qi < nq; ++qi) {
         float* pr = &proj[static_cast<size_t>(qi) * R];
         plane_->project_query(queries + static_cast<size_t>(qi) *
                                 manifest_.dim, pr);
         if (is_b1g)
-            plane_->build_b1_lut(
-                pr, &blut[static_cast<size_t>(qi) * (R / 8) * 256]);
+            plane_->build_b1_lut8(
+                pr, &lut8[static_cast<size_t>(qi) * SEG * 16],
+                so_scratch.data(), so_scratch.data(), seg_min.data());
         else if (fastscan8)
             plane_->build_lut8(
                 pr, &lut8[static_cast<size_t>(qi) * R * 16],
@@ -4795,19 +4796,14 @@ void IVFTreeIndex::plane_route_batch_(
             float* row = &scores[static_cast<size_t>(l) * nq];
             for (uint32_t qi = 0; qi < nq; ++qi)
                 row[qi] =
-                is_b1g
-                    ? plane_->scan_leaf_max(
-                          static_cast<uint32_t>(l), nullptr,
-                          &blut[static_cast<size_t>(qi) * (R / 8) * 256],
-                          nullptr)
-                    : (fastscan8
-                           ? plane_->scan_leaf_max_u8(
-                                 static_cast<uint32_t>(l),
-                                 &lut8[static_cast<size_t>(qi) * R * 16])
-                           : plane_->scan_leaf_max(
-                                 static_cast<uint32_t>(l),
-                                 &lut[static_cast<size_t>(qi) * R * 16],
-                                 nullptr, nullptr));
+                    (is_b1g || fastscan8)
+                        ? plane_->scan_leaf_max_u8(
+                              static_cast<uint32_t>(l),
+                              &lut8[static_cast<size_t>(qi) * SEG * 16])
+                        : plane_->scan_leaf_max(
+                              static_cast<uint32_t>(l),
+                              &lut[static_cast<size_t>(qi) * R * 16],
+                              nullptr, nullptr);
         }
     };
     {
@@ -4931,17 +4927,108 @@ void IVFTreeIndex::attach_plane(const float* base, uint32_t n, uint32_t dim,
             dest[static_cast<int64_t>(mem[slot])].emplace_back(l, slot);
     }
 
-    // Row-order sequential encode pass. Deliberately SERIAL: u4 nibble
-    // writes are read-modify-write on bytes shared across lanes, so
-    // concurrent encoders into one leaf race (the dead OMP pragmas that
-    // were here ran serial anyway — the engine has no OpenMP). One-time
-    // offline cost: ~60 s at 10M.
-    for (uint32_t r0 = 0; r0 < n; ++r0) {
-        auto it = dest.find(static_cast<int64_t>(r0));
-        if (it == dest.end() || it->second.empty()) continue;
-        const float* v = &base[static_cast<size_t>(r0) * dim];
-        for (const auto& ls : it->second)
-            writer.encode_member(ls.first, ls.second, v, nullptr);
+    // Chunked two-phase parallel encode (scales to 1B; serial was
+    // ~60 s at 10M = ~100 min at 1B). Per chunk: (1) rows projected in
+    // parallel into a BOUNDED buffer (base reads stay sequential);
+    // (2) entries grouped by leaf and encoded LEAF-SHARDED — no two
+    // threads touch one leaf, so the u4 nibble read-modify-writes
+    // cannot race.
+    const uint32_t T = std::max(
+        1u, std::min<uint32_t>(std::thread::hardware_concurrency(), 64u));
+    constexpr uint32_t kChunk = 1u << 21;  // 2M rows -> 1 GB proj buffer
+    std::vector<float> proj_buf(static_cast<size_t>(kChunk) * rank);
+    struct Ent { uint32_t leaf, slot, row_in_chunk; };
+    for (uint32_t c0 = 0; c0 < n; c0 += kChunk) {
+        const uint32_t cn = std::min(kChunk, n - c0);
+        // Phase 1: parallel projection + entry collection.
+        std::vector<std::vector<Ent>> ents(T);
+        {
+            std::vector<std::future<void>> futs;
+            const uint32_t per = (cn + T - 1) / T;
+            for (uint32_t t = 0; t < T; ++t) {
+                const uint32_t b0 = c0 + t * per;
+                const uint32_t b1 = std::min(c0 + cn, b0 + per);
+                if (b0 >= b1) break;
+                if (t == T - 1 || b1 == c0 + cn) {
+                    for (uint32_t r = b0; r < b1; ++r) {
+                        auto it = dest.find(static_cast<int64_t>(r));
+                        if (it == dest.end() || it->second.empty())
+                            continue;
+                        writer.project(
+                            &base[static_cast<size_t>(r) * dim],
+                            &proj_buf[static_cast<size_t>(r - c0) *
+                                      rank]);
+                        for (const auto& ls : it->second)
+                            ents[t].push_back({ls.first, ls.second,
+                                               r - c0});
+                    }
+                    break;
+                }
+                futs.push_back(std::async(std::launch::async, [&, b0, b1, t] {
+                    for (uint32_t r = b0; r < b1; ++r) {
+                        auto it = dest.find(static_cast<int64_t>(r));
+                        if (it == dest.end() || it->second.empty())
+                            continue;
+                        writer.project(
+                            &base[static_cast<size_t>(r) * dim],
+                            &proj_buf[static_cast<size_t>(r - c0) *
+                                      rank]);
+                        for (const auto& ls : it->second)
+                            ents[t].push_back({ls.first, ls.second,
+                                               r - c0});
+                    }
+                }));
+            }
+            for (auto& f : futs) f.get();
+        }
+        // Phase 2: counting-sort by leaf, then leaf-sharded encode.
+        std::vector<Ent> flat;
+        {
+            size_t tot = 0;
+            for (auto& v : ents) tot += v.size();
+            flat.reserve(tot);
+            for (auto& v : ents)
+                flat.insert(flat.end(), v.begin(), v.end());
+        }
+        std::vector<uint32_t> leaf_off(leaf_table_.size() + 1, 0);
+        for (const auto& e : flat) ++leaf_off[e.leaf + 1];
+        for (size_t i = 1; i < leaf_off.size(); ++i)
+            leaf_off[i] += leaf_off[i - 1];
+        std::vector<Ent> sorted(flat.size());
+        {
+            std::vector<uint32_t> cur(leaf_off.begin(),
+                                      leaf_off.end() - 1);
+            for (const auto& e : flat)
+                sorted[cur[e.leaf]++] = e;
+        }
+        {
+            const uint32_t n_leaf_total =
+                static_cast<uint32_t>(leaf_table_.size());
+            const uint32_t lper = (n_leaf_total + T - 1) / T;
+            std::vector<std::future<void>> futs;
+            for (uint32_t t = 0; t < T; ++t) {
+                const uint32_t l0 = t * lper;
+                const uint32_t l1 = std::min(n_leaf_total, l0 + lper);
+                if (l0 >= l1) break;
+                auto shard = [&, l0, l1] {
+                    for (uint32_t l = l0; l < l1; ++l)
+                        for (uint32_t i = leaf_off[l]; i < leaf_off[l + 1];
+                             ++i) {
+                            const Ent& e = sorted[i];
+                            writer.encode_from_proj(
+                                e.leaf, e.slot,
+                                &proj_buf[static_cast<size_t>(e.row_in_chunk) *
+                                          rank]);
+                        }
+                };
+                if (t == T - 1 || l1 == n_leaf_total) {
+                    shard();
+                    break;
+                }
+                futs.push_back(std::async(std::launch::async, shard));
+            }
+            for (auto& f : futs) f.get();
+        }
     }
     spdlog::info("[sextant] plane: encoded {} rows in {:.1}s", n,
                  std::chrono::duration<double>(

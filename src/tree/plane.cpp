@@ -36,9 +36,15 @@ struct PlaneHeaderDisk {
 #pragma pack(pop)
 static_assert(sizeof(PlaneHeaderDisk) == 128, "plane header must be 128 B");
 
+uint32_t fs_segments(PlaneEncoding enc, uint16_t rank) {
+    return enc == PlaneEncoding::B1G ? rank / 4 : rank;
+}
+
 uint32_t block_bytes_for(const PlaneMeta& m) {
-    if (m.encoding == PlaneEncoding::B1G) return m.rank * 4;  // u32/32 vecs
-    return m.rank * 16;                                       // [m][16]
+    // Both encodings are FastScan [m][16] nibble-interleaved:
+    // u4lm m = rank, b1g m = rank/4 (sign nibbles). 64/16 B per vec.
+    if (m.encoding == PlaneEncoding::B1G) return (m.rank / 4) * 16;
+    return m.rank * 16;
 }
 
 }  // namespace
@@ -217,8 +223,18 @@ float PlaneWriter::decode_dim_(uint32_t code, uint32_t e) const {
 
 void PlaneWriter::prepare(uint32_t n_leaves) { leaves_.resize(n_leaves); }
 
-void PlaneWriter::encode_member(uint32_t leaf_id, uint32_t slot,
-                                const float* vec, float* proj_out) {
+void PlaneWriter::project(const float* vec, float* pr) const {
+    const uint32_t R = meta_.rank;
+    for (uint32_t e = 0; e < R; ++e) pr[e] = 0;
+    for (uint32_t d = 0; d < meta_.dim; ++d) {
+        const float vd = vec[d] - static_cast<float>(mean_[d]);
+        const float* brow = &basis_t_[static_cast<size_t>(d) * R];
+        for (uint32_t e = 0; e < R; ++e) pr[e] += vd * brow[e];
+    }
+}
+
+void PlaneWriter::encode_from_proj(uint32_t leaf_id, uint32_t slot,
+                                   const float* pr) {
     LeafState& ls = leaves_[leaf_id];
     const uint32_t block = slot / kVecsPerBlock;
     const uint32_t lane = slot % kVecsPerBlock;
@@ -228,44 +244,48 @@ void PlaneWriter::encode_member(uint32_t leaf_id, uint32_t slot,
     }
     if (ls.proj.size() < static_cast<size_t>(slot + 1) * meta_.rank)
         ls.proj.resize(static_cast<size_t>(slot + 1) * meta_.rank);
-
-    const uint32_t R = meta_.rank;
-    static thread_local std::vector<float> pr;
-    pr.resize(R);
-    for (uint32_t e = 0; e < R; ++e) pr[e] = 0;
-    for (uint32_t d = 0; d < meta_.dim; ++d) {
-        const float vd = vec[d] - static_cast<float>(mean_[d]);
-        const float* brow = &basis_t_[static_cast<size_t>(d) * R];
-        for (uint32_t e = 0; e < R; ++e) pr[e] += vd * brow[e];
-    }
-    if (proj_out) std::memcpy(proj_out, pr.data(), R * sizeof(float));
-    std::memcpy(&ls.proj[static_cast<size_t>(slot) * R], pr.data(),
-                R * sizeof(float));
+    std::memcpy(&ls.proj[static_cast<size_t>(slot) * meta_.rank], pr,
+                meta_.rank * sizeof(float));
 
     uint8_t* blk = &ls.blocks[static_cast<size_t>(block) * block_bytes_];
+    const uint8_t nbi = static_cast<uint8_t>(lane % 16);
+    const bool hi = lane >= 16;
     if (meta_.encoding == PlaneEncoding::B1G) {
-        // Member-major bytes: member `lane` owns bytes [lane*R/8,
-        // (lane+1)*R/8); dim e lives at byte e/8, bit e%8. Same total
-        // bytes/vec; enables the 256-entry byte-LUT scan kernel (the
-        // dim-major bitplane layout forced a per-lane scalar loop —
-        // measured 19 QPS at 10M).
-        uint8_t* mem = blk + static_cast<size_t>(lane) * (R / 8);
-        for (uint32_t e = 0; e < R; ++e)
-            if (encode_dim_(pr[e], e))
-                mem[e >> 3] |= static_cast<uint8_t>(1u << (e & 7));
+        // b1g IS 4-bit PQ over sign groups: each nibble packs 4 sign
+        // bits (dims 4g..4g+3 of group g), so the FastScan [m][16]
+        // interleave with m = rank/4 applies and the pq4_scan_many
+        // kernel scores b1g blocks verbatim. Same 16 B/vec.
+        for (uint32_t g = 0; g < meta_.rank / 4; ++g) {
+            uint8_t nib = 0;
+            for (uint32_t t = 0; t < 4; ++t)
+                if (pr[4 * g + t] >= 0) nib |= static_cast<uint8_t>(1u << t);
+            if (hi) blk[g * 16 + nbi] = static_cast<uint8_t>(
+                (blk[g * 16 + nbi] & 0x0Fu) | (nib << 4));
+            else    blk[g * 16 + nbi] = static_cast<uint8_t>(
+                (blk[g * 16 + nbi] & 0xF0u) | nib);
+        }
     } else {
-        // FastScan [m][16] nibble interleave (same as leaf codes):
+        // u4lm: FastScan [m][16] nibble interleave (same as leaf codes):
         // lane j < 16 -> low nibble of blk[s*16 + j], j >= 16 -> high.
-        const uint8_t nbi = static_cast<uint8_t>(lane % 16);
-        const bool hi = lane >= 16;
-        for (uint32_t s = 0; s < R; ++s) {
-            const uint8_t nib = static_cast<uint8_t>(encode_dim_(pr[s], s));
+        for (uint32_t s = 0; s < meta_.rank; ++s) {
+            const uint8_t nib =
+                static_cast<uint8_t>(encode_dim_(pr[s], s));
             if (hi) blk[s * 16 + nbi] = static_cast<uint8_t>(
                 (blk[s * 16 + nbi] & 0x0Fu) | (nib << 4));
             else    blk[s * 16 + nbi] = static_cast<uint8_t>(
                 (blk[s * 16 + nbi] & 0xF0u) | nib);
         }
     }
+}
+
+void PlaneWriter::encode_member(uint32_t leaf_id, uint32_t slot,
+                                const float* vec, float* proj_out) {
+    static thread_local std::vector<float> pr;
+    pr.resize(meta_.rank);
+    project(vec, pr.data());
+    if (proj_out) std::memcpy(proj_out, pr.data(),
+                              meta_.rank * sizeof(float));
+    encode_from_proj(leaf_id, slot, pr.data());
 }
 
 std::vector<uint8_t> PlaneWriter::finalize(
@@ -318,10 +338,14 @@ std::vector<uint8_t> PlaneWriter::finalize(
         const uint32_t lane = slot % kVecsPerBlock;
         const uint8_t* blk =
             &ls.blocks[static_cast<size_t>(block) * block_bytes_];
-        if (meta_.encoding == PlaneEncoding::B1G)
-            return decode_dim_(
-                (blk[static_cast<size_t>(lane) * (meta_.rank / 8) +
-                     (s >> 3)] >> (s & 7)) & 1u, s);
+        if (meta_.encoding == PlaneEncoding::B1G) {
+            const uint32_t g = s / 4, t = s % 4;
+            const uint8_t nbi2 = static_cast<uint8_t>(lane % 16);
+            const uint8_t byte2 = blk[g * 16 + nbi2];
+            const uint32_t nib = (lane >= 16) ? (byte2 >> 4) & 0xFu
+                                              : byte2 & 0xFu;
+            return decode_dim_((nib >> t) & 1u, s);
+        }
         const uint8_t nbi = static_cast<uint8_t>(lane % 16);
         const uint32_t code = (lane >= 16)
             ? static_cast<uint32_t>(blk[s * 16 + nbi] >> 4)
@@ -467,21 +491,31 @@ void PlaneIndex::build_sign_ctx(const float* proj, float* w_out,
     }
 }
 
-void PlaneIndex::build_b1_lut(const float* proj, float* blut) const {
-    // blut[j*256 + v] = sum over dims e = 8j..8j+7 of
-    // (proj[e] * sign_scale[e]) * (bit_e(v) ? +1 : -1).
-    // Size: (rank/8) * 256 floats (16 KB at rank 128).
-    const uint32_t R = meta_.rank;
-    for (uint32_t j = 0; j < R / 8; ++j)
-        for (int v = 0; v < 256; ++v) {
-            float s = 0;
-            for (uint32_t t = 0; t < 8; ++t) {
-                const uint32_t e = j * 8 + t;
-                const float w = proj[e] * codebook_[e];
-                s += ((v >> t) & 1u) ? w : -w;
+void PlaneIndex::build_b1_lut(const float* proj, float* lut) const {
+    // Nibble LUT (f32, exact): segment g covers dims 4g..4g+3;
+    // lut[g*16+c] = sum over t of (proj*w) * (+1 if bit t of c else -1).
+    const uint32_t G = meta_.rank / 4;
+    for (uint32_t g = 0; g < G; ++g)
+        for (uint32_t c = 0; c < 16; ++c) {
+            float acc = 0;
+            for (uint32_t t = 0; t < 4; ++t) {
+                const float w =
+                    proj[4 * g + t] * codebook_[4 * g + t];
+                acc += ((c >> t) & 1u) ? w : -w;
             }
-            blut[static_cast<size_t>(j) * 256 + v] = s;
+            lut[static_cast<size_t>(g) * 16 + c] = acc;
         }
+}
+
+void PlaneIndex::build_b1_lut8(const float* proj, uint8_t* lut8,
+                               float* scale, float* offset,
+                               float* seg_min) const {
+    // u8-quantized nibble LUT for the shared FastScan kernel
+    // (ranking-monotone per query; same argument as u4lm's lut8).
+    std::vector<float> f32(static_cast<size_t>(meta_.rank / 4) * 16);
+    build_b1_lut(proj, f32.data());
+    sextant::simd::quantize_lut_u8_scaled(
+        f32.data(), meta_.rank / 4, 16, lut8, scale, offset, seg_min);
 }
 
 float PlaneIndex::scan_leaf_max_u4_(uint32_t leaf_id,
@@ -517,28 +551,29 @@ float PlaneIndex::scan_leaf_max_u4_(uint32_t leaf_id,
     return best;
 }
 
-float PlaneIndex::scan_leaf_max_b1_(uint32_t leaf_id, const float* blut)
+float PlaneIndex::scan_leaf_max_b1_(uint32_t leaf_id, const float* lut)
     const {
-    // Byte-LUT kernel: member-major sign bytes, blut[j*256+byte] =
-    // sum over the 8 dims of byte j of w[e]*sign(bit) — one gather per
-    // byte, 16 per member at rank 128 (spike-measured ~1.5G vec/s).
-    const uint32_t R = meta_.rank;
-    const uint32_t bytes_per_member = R / 8;
+    // f32 nibble scan (exact; diagnostics + selftest). The hot path is
+    // scan_leaf_max_u8 with the shared FastScan kernel.
+    const uint32_t G = meta_.rank / 4;
     const uint8_t* blk = blocks_ + block_off_[leaf_id];
     const uint32_t nb = block_cnt_[leaf_id];
     const uint32_t count = leaf_cnt_[leaf_id];
     float best = -std::numeric_limits<float>::max();
     for (uint32_t b = 0; b < nb; ++b) {
-        const uint8_t* mem = blk + static_cast<size_t>(b) * block_bytes_;
+        const uint8_t* bl = blk + static_cast<size_t>(b) * block_bytes_;
         const uint32_t valid =
             std::min(kVecsPerBlock, count - b * kVecsPerBlock);
         for (uint32_t lane = 0; lane < valid; ++lane) {
-            const uint8_t* m = mem + static_cast<size_t>(lane) *
-                                      bytes_per_member;
-            float s = 0;
-            for (uint32_t j = 0; j < bytes_per_member; ++j)
-                s += blut[static_cast<size_t>(j) * 256 + m[j]];
-            best = std::max(best, s);
+            const uint8_t nbi = static_cast<uint8_t>(lane % 16);
+            const uint32_t hi = lane >= 16 ? 4u : 0u;
+            float sc = 0;
+            for (uint32_t g = 0; g < G; ++g) {
+                const uint8_t byte = bl[g * 16 + nbi];
+                sc += lut[static_cast<size_t>(g) * 16 +
+                          ((byte >> hi) & 0xFu)];
+            }
+            best = std::max(best, sc);
         }
     }
     return best;
@@ -547,7 +582,7 @@ float PlaneIndex::scan_leaf_max_b1_(uint32_t leaf_id, const float* blut)
 float PlaneIndex::scan_leaf_max(uint32_t leaf_id, const float* lut,
                                 const float* w, const uint32_t* qbits) const {
     if (meta_.encoding == PlaneEncoding::B1G)
-        return scan_leaf_max_b1_(leaf_id, w);  // w = byte-LUT (16KB)
+        return scan_leaf_max_b1_(leaf_id, w);  // w = nibble LUT staging
     return scan_leaf_max_u4_(leaf_id, lut);
 }
 
@@ -575,7 +610,8 @@ float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
         masks[b] = valid == 32 ? 0xFFFFFFFFu : (1u << valid) - 1u;
     }
     sextant::simd::pq4_scan_many(blocks_ + block_off_[leaf_id], nb, lut8,
-                        meta_.rank, masks.data(), sums.data());
+                        fs_segments(meta_.encoding, meta_.rank),
+                        masks.data(), sums.data());
     // The u8 sums are affine-monotone in the true score per query;
     // return the raw accumulator (callers only rank within a query).
     // NB: pq4_scan_many fills INVALID tail lanes with 0xFFFFFFFF (an

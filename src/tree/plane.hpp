@@ -71,10 +71,16 @@ public:
     /// encode_member).
     void prepare(uint32_t n_leaves);
 
-    /// Encodes one member into its leaf's plane blocks. Call in ROW order
-    /// over the base (sequential I/O); `leaf_id`/`slot` locate the target
-    /// block lane. `proj_out` (optional, rank floats) receives the f32
-    /// projection (used by the alpha pass / diagnostics).
+    /// Projects one vector (rank floats into `pr`).
+    void project(const float* vec, float* pr) const;
+
+    /// Emits codes for an ALREADY-PROJECTED member (chunked parallel
+    /// encode: phase 1 projects rows in parallel, phase 2 encodes
+    /// leaf-sharded — no two threads ever touch one leaf).
+    void encode_from_proj(uint32_t leaf_id, uint32_t slot,
+                          const float* pr);
+
+    /// Convenience: project + encode one member.
     void encode_member(uint32_t leaf_id, uint32_t slot, const float* vec,
                        float* proj_out = nullptr);
 
@@ -124,9 +130,13 @@ public:
     /// replicated query sign bits per dim (rank u32s). u4lm: unused.
     void build_sign_ctx(const float* proj, float* w_out, uint32_t* qbits_out) const;
 
-    /// b1g byte-LUT (rank/8 x 256 floats, 16 KB at rank 128) for the
-    /// member-major sign-byte scan kernel.
-    void build_b1_lut(const float* proj, float* blut) const;
+    /// b1g f32 nibble LUT (rank/4 x 16 floats) — exact scan path.
+    void build_b1_lut(const float* proj, float* lut) const;
+
+    /// b1g u8 nibble LUT (rank/4 x 16 bytes) for the shared FastScan
+    /// kernel (ranking-monotone per query).
+    void build_b1_lut8(const float* proj, uint8_t* lut8, float* scale,
+                       float* offset, float* seg_min) const;
 
     /// u8-quantized LUT (affine-monotone per query) for the FastScan
     /// kernel path. U4LM only. lut8 = rank*16 bytes; scale/offset/
