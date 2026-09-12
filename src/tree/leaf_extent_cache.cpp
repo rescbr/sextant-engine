@@ -320,12 +320,18 @@ void LeafExtentCache::hit_locked(Shard& s, Entry* e, PageId page) {
             s.probation.push_mru(d);
             s.bytes_probation += d->size;
         }
-        // Probation overflow (from the demotion) evicts its LRU —
-        // never a PINNED entry: evicting pinned data frees nothing,
+        // Probation overflow evicts its LRU — but ONLY under main-total
+        // pressure. The probation sub-limit alone fired on the first hit
+        // after a cold fill (probation legitimately holds the whole
+        // admitted working set while protected is still empty) and
+        // mass-evicted it; with admission now keyed off main total, this
+        // loop must use the same pressure signal.
+        // Never evict a PINNED entry: evicting pinned data frees nothing,
         // creates an un-freeable transient, and the pileup OOMs
         // budgeted (partial-residency) runs. Skip to the next LRU;
         // if none is unpinned, leave the list oversized.
-        while (s.bytes_probation > s.max_probation_bytes) {
+        while (s.bytes_probation + s.bytes_protected > s.max_main_bytes &&
+               s.bytes_probation > 0) {
             Entry* v = s.probation.tail;
             while (v != nullptr &&
                    v->refs.load(std::memory_order_relaxed) > 0) {
@@ -469,6 +475,16 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
                 s.bytes_probation + s.bytes_protected + cand->size <=
                 s.max_main_bytes;
             if (main_has_room) {
+                // Admission pressure keys off MAIN TOTAL, not the probation
+                // sub-limit: while main has room, candidates are admitted
+                // freely (Caffeine runs its TinyLFU gate only under
+                // eviction pressure). The sub-lists self-balance via the
+                // protected demotion cascade; enforcing the probation
+                // sub-limit here (either by evicting residents or by
+                // rejecting candidates) measured 0-18% hit rates on an
+                // 8GB cache over a 4.8GB tree — the sweep's leaf access
+                // is round-robin, so any cold-stream pressure churns
+                // everything.
                 cand->status = LeafExtentCacheStatus::PROBATION;
                 s.probation.push_mru(cand);
                 s.bytes_probation += cand->size;
