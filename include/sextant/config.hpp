@@ -482,6 +482,15 @@ struct SearchConfig {
     /// plane is present (A/B knob). Ignored for plane-less indexes.
     bool use_plane = true;
 
+    /// Two-stage plane routing: fraction of leaves (by PCA centroid
+    /// distance, page-weighted) that survive to the plane sweep. The
+    /// centroid filter is RAM-resident and free; the plane sweep (the
+    /// expensive sequential stage) then runs on survivors only —
+    /// expense-ordered composition: centroids -> plane -> leaf scan.
+    /// 0 = off (sweep everything). Requires PCA routing data (depth-2
+    /// trees); silently ignored otherwise.
+    float plane_pre_prune = 0.0f;
+
     /// IVF-probe merge oversampling: each probed shard is searched at
     /// k_local = k × merge_oversample, then results are merged/deduped and
     /// truncated to k. 1 = no oversampling. Ignored for single-shard indexes.

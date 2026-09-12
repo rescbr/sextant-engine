@@ -853,6 +853,11 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add("no-plane", 0,
         "Disable stage-1 plane routing (legacy centroid descent) even "
         "when the index carries a routing plane");
+    p.add<float>("plane-pre-prune", 0,
+        "Two-stage routing: fraction of leaves (by PCA centroid "
+        "distance, page-weighted) surviving to the plane sweep "
+        "(0=off, 0.5 recommended)",
+        false, 0.0f);
     p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
     p.add<std::string>("exact-rerank-base", 0,
         "Original base .fbin (mmap'd read-only): rerank against the TRUE "
@@ -1013,6 +1018,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.rerank = !p.exist("no-rerank");
     scfg.adaptive_w_gap = p.get<float>("adaptive-w-gap");
     scfg.use_plane = !p.exist("no-plane");
+    scfg.plane_pre_prune = p.get<float>("plane-pre-prune");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
     scfg.search_threads = p.get<uint32_t>("search-threads");
     const uint32_t batch_window = p.get<uint32_t>("batch-window");

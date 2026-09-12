@@ -4765,6 +4765,57 @@ void IVFTreeIndex::plane_route_batch_(
             plane_->build_lut(pr, &lut[static_cast<size_t>(qi) * R * 16]);
     }
 
+    // Two-stage: per-query centroid survivor masks (RAM, ~free). The
+    // sweep scores only surviving leaves; non-survivors keep -inf and
+    // are never selected. Page-weighted survivor budget like probe f.
+    std::vector<float> survive;  // [qi][l] 1.0 / 0.0 (f32 for simplicity)
+    if (config.plane_pre_prune > 0.0f && pca_dims_ > 0 &&
+        manifest_.depth == 2 &&
+        pca_leaf_centroids_.size() ==
+            static_cast<size_t>(n_leaves) * pca_dims_) {
+        std::vector<float> qp(pca_dims_);
+        survive.assign(static_cast<size_t>(nq) * n_leaves, 0.0f);
+        uint64_t total = 0;
+        for (const auto& e : leaf_table_)
+            if (e.page != kInvalidPage) total += e.pages;
+        for (uint32_t qi = 0; qi < nq; ++qi) {
+            for (uint32_t k = 0; k < pca_dims_; ++k) {
+                float acc = 0;
+                const float* row = &pca_proj_[static_cast<size_t>(k) *
+                                              manifest_.dim];
+                for (uint32_t d = 0; d < manifest_.dim; ++d)
+                    acc += row[d] *
+                           queries[static_cast<size_t>(qi) *
+                                       manifest_.dim + d];
+                qp[k] = acc - pca_mean_proj_[k];
+            }
+            std::vector<std::pair<float, uint32_t>> cd(n_leaves);
+            for (uint32_t l = 0; l < n_leaves; ++l) {
+                const float* lc =
+                    &pca_leaf_centroids_[static_cast<size_t>(l) *
+                                         pca_dims_];
+                float d2 = 0;
+                for (uint32_t k = 0; k < pca_dims_; ++k) {
+                    const float diff = qp[k] - lc[k];
+                    d2 += diff * diff;
+                }
+                cd[l] = {d2, l};
+            }
+            std::sort(cd.begin(), cd.end());
+            uint64_t cum = 0;
+            float* row = &survive[static_cast<size_t>(qi) * n_leaves];
+            for (const auto& [d2, l] : cd) {
+                if (leaf_table_[l].page == kInvalidPage) continue;
+                row[l] = 1.0f;
+                cum += leaf_table_[l].pages;
+                if (static_cast<double>(cum) >=
+                    static_cast<double>(config.plane_pre_prune) *
+                        static_cast<double>(total))
+                    break;
+            }
+        }
+    }
+
     // Leaf-major sweep: score EVERY query against each leaf's blocks
     // while they are cache-hot (the block read is the batch-shared part).
     // scores layout [l * nq + qi] — LEAF-major: each thread's writes for
@@ -4794,7 +4845,13 @@ void IVFTreeIndex::plane_route_batch_(
             if (leaf_table_[static_cast<uint32_t>(l)].page == kInvalidPage)
                 continue;
             float* row = &scores[static_cast<size_t>(l) * nq];
-            for (uint32_t qi = 0; qi < nq; ++qi)
+            for (uint32_t qi = 0; qi < nq; ++qi) {
+                if (!survive.empty() &&
+                    survive[static_cast<size_t>(qi) * n_leaves + l] ==
+                        0.0f) {
+                    row[qi] = -std::numeric_limits<float>::infinity();
+                    continue;
+                }
                 row[qi] =
                     (is_b1g || fastscan8)
                         ? plane_->scan_leaf_max_u8(
@@ -4804,6 +4861,7 @@ void IVFTreeIndex::plane_route_batch_(
                               static_cast<uint32_t>(l),
                               &lut[static_cast<size_t>(qi) * R * 16],
                               nullptr, nullptr);
+            }
         }
     };
     {
