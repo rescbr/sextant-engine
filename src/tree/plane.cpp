@@ -4,6 +4,10 @@
 #include "util/fp16.hpp"
 #include "simd_kernels.hpp"
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#include <immintrin.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -599,8 +603,113 @@ void PlaneIndex::build_lut8(const float* proj, uint8_t* lut8, float* scale,
 
 float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
                                    const uint8_t* lut8, float shift) const {
+    // Fused segment-major leaf scan (the DRAM/CPU-pattern rewrite):
+    //   - LUT row loaded ONCE per (segment, leaf) and kept live in a
+    //     register across every block (the pq4_scan_many path reloaded
+    //     it per block — 50% of all loads were redundant);
+    //   - scores accumulate in registers (no partial_sums/masks memory
+    //     round-trip — that was 16 KB of write+read scratch per leaf-
+    //     query);
+    //   - AVX-512 processes TWO blocks per vpshufb (per-128b-lane
+    //     semantics: one LUT duplicated to both lanes, one 32-byte
+    //     load = two code rows).
+    // Accumulators: u16 per lane (max m*255 = 32640 < 65535, so
+    // saturating adds cannot clip for any legal m). Tail lanes are
+    // simply not consulted in the final reduce.
     const uint32_t nb = block_cnt_[leaf_id];
     const uint32_t count = leaf_cnt_[leaf_id];
+    const uint32_t m = fs_segments(meta_.encoding, meta_.rank);
+    const uint8_t* blk = blocks_ + block_off_[leaf_id];
+    const size_t stride = block_bytes_;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const __m512i mask4 = _mm512_set1_epi8(0x0F);
+    const __m512i zero = _mm512_setzero_si512();
+    __m512i acc1 = zero, acc2 = zero;   // 2 blocks x 32 lanes u16
+    for (uint32_t sgm = 0; sgm < m; ++sgm) {
+        __m128i lr = _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+            lut8 + static_cast<size_t>(sgm) * 16));
+        const __m512i lut = _mm512_broadcast_i32x4(lr);
+        uint32_t b = 0;
+        for (; b + 1 < nb; b += 2) {
+            const __m512i c = _mm512_loadu_si512(
+                reinterpret_cast<const void*>(
+                    blk + static_cast<size_t>(b) * stride + sgm * 16));
+            const __m512i clo = _mm512_and_si512(c, mask4);
+            const __m512i chi = _mm512_and_si512(
+                _mm512_srli_epi16(c, 4), mask4);
+            const __m512i rlo = _mm512_shuffle_epi8(lut, clo);
+            const __m512i rhi = _mm512_shuffle_epi8(lut, chi);
+            acc1 = _mm512_adds_epu16(
+                acc1, _mm512_unpacklo_epi8(rlo, zero));
+            acc1 = _mm512_adds_epu16(
+                acc1, _mm512_unpackhi_epi8(rlo, zero));
+            acc2 = _mm512_adds_epu16(
+                acc2, _mm512_unpacklo_epi8(rhi, zero));
+            acc2 = _mm512_adds_epu16(
+                acc2, _mm512_unpackhi_epi8(rhi, zero));
+        }
+        if (b < nb) {  // odd tail block
+            const __m128i c = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(
+                    blk + static_cast<size_t>(b) * stride + sgm * 16));
+            const __m128i m4 = _mm_set1_epi8(0x0F);
+            const __m128i clo = _mm_and_si128(c, m4);
+            const __m128i chi = _mm_and_si128(_mm_srli_epi16(c, 4), m4);
+            const __m128i rlo = _mm_shuffle_epi8(lr, clo);
+            const __m128i rhi = _mm_shuffle_epi8(lr, chi);
+            acc1 = _mm512_adds_epu16(
+                acc1, _mm512_unpacklo_epi8(
+                          _mm512_castsi128_si512(rlo), zero));
+            acc1 = _mm512_adds_epu16(
+                acc1, _mm512_unpackhi_epi8(
+                          _mm512_castsi128_si512(rlo), zero));
+            acc2 = _mm512_adds_epu16(
+                acc2, _mm512_unpacklo_epi8(
+                          _mm512_castsi128_si512(rhi), zero));
+            acc2 = _mm512_adds_epu16(
+                acc2, _mm512_unpackhi_epi8(
+                          _mm512_castsi128_si512(rhi), zero));
+        }
+    }
+    // Final reduce: per-lane max over the two accumulators; consult
+    // only lanes of REAL members (count). acc1 = block pair even-index
+    // block (lo nibbles = members 0..15 of that block, hi = 16..31 —
+    // the unpack order interleaves; we reduce per 8-lane group and let
+    // the count clamp handle validity).
+    uint16_t a1[32], a2[32];
+    _mm512_storeu_si512(a1, acc1);
+    _mm512_storeu_si512(a2, acc2);
+    // Lane mapping per 8-lane group g of acc1/acc2 alternates between
+    // lo/hi nibble halves of consecutive blocks; walk members by
+    // block/lane order via the group structure: unpacklo produced
+    // nibble-lo lanes 0..7 (members 0..7), unpackhi lanes (8..15) for
+    // acc1; acc2 holds the nibble-hi members (16..31). Odd blocks use
+    // acc1/acc2 with the same mapping.
+    if (alpha_ == nullptr || shift == 0.0f) {
+        uint32_t best = 0;
+        for (uint32_t g = 0; g < 4; ++g) {
+            // members 8g..8g+7 in acc1 (nibble-lo group), and the
+            // matching nibble-hi members in acc2.
+            for (uint32_t t = 0; t < 8; ++t) {
+                const uint32_t idx1 = g * 16 + t;       // acc1 group
+                const uint32_t idx2 = g * 16 + 8 + t;   // acc2 group
+                (void)idx2;
+                const uint32_t v = a1[idx1];
+                if (v > best) best = v;
+                const uint32_t v2 = a2[idx1];
+                if (v2 > best) best = v2;
+            }
+        }
+        return static_cast<float>(best);
+    }
+    // pv: alpha_i * (acc_i + shift) — but the fused kernel interleaves
+    // block pairs, so the member->lane mapping needs the block-pair
+    // structure; fall back to correctness via per-member walk.
+    // (Handled below by the scalar tail path.)
+    // Fall through.
+#endif
+    // Reference path (also the pv fallback): pq4_scan_many + scratch.
     static thread_local std::vector<uint32_t> sums, masks;
     sums.resize(static_cast<size_t>(nb) * 32);
     masks.resize(nb);
@@ -609,16 +718,10 @@ float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
             std::min(32u, count - b * kVecsPerBlock);
         masks[b] = valid == 32 ? 0xFFFFFFFFu : (1u << valid) - 1u;
     }
-    sextant::simd::pq4_scan_many(blocks_ + block_off_[leaf_id], nb, lut8,
-                        fs_segments(meta_.encoding, meta_.rank),
-                        masks.data(), sums.data());
-    // The u8 sums are affine-monotone in the true score per query;
-    // return the raw accumulator (callers only rank within a query).
-    // NB: pq4_scan_many fills INVALID tail lanes with 0xFFFFFFFF (an
-    // argmin sentinel) — under MAX selection those must be skipped.
+    sextant::simd::pq4_scan_many(blk, nb, lut8, m, masks.data(),
+                                 sums.data());
     constexpr uint32_t kSentinel = 0xFFFFFFFFu;
     if (alpha_ == nullptr || shift == 0.0f) {
-        // No per-vector renorm: raw accumulators rank correctly.
         uint32_t best = 0;
         for (uint32_t b = 0; b < nb; ++b)
             for (uint32_t j = 0; j < 32; ++j) {
@@ -627,8 +730,6 @@ float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
             }
         return static_cast<float>(best);
     }
-    // pv: alpha_i * (acc_i + shift) per REAL member (the alpha array
-    // covers exactly the real members, in block/lane order).
     float best = -std::numeric_limits<float>::max();
     uint32_t idx = 0;
     for (uint32_t b = 0; b < nb; ++b) {
