@@ -19,6 +19,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <ctpl/ctpl_stl_tls.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -423,6 +425,16 @@ struct HeapEntryFull {
 // namespace so it does not pollute the class header with build-only internals.
 // ===========================================================================
 namespace {
+
+/// Per-worker scratch for the streaming build passes, carried in the
+/// ctpl pool's TLS slots. Reused across chunks and passes — replaces the
+/// per-chunk std::vector allocations that dominated build-time page-fault
+/// overhead (measured: ~50% of cycles in kernel mm paths at 10M scale
+/// when each 2048-vector chunk spawned fresh std::async threads).
+struct StreamTLS {
+    std::vector<float> proj;    // PCA projection scratch (pca_dims)
+    std::vector<float> dists;   // per-centroid distances (k_root, emission)
+};
 
 /// Per-leaf metadata captured at flush time and consumed by the tree-write
 /// phase (page, page count, and the leaf centroid in original FP16 space).
@@ -960,28 +972,36 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
                 root_centroids_pca[c].data(),
                 root_centroids_pca[c].data(), pca_dims);
 
+        // Persistent worker pool for the assign+accumulate loop. Spawning
+        // std::async threads per 2048-vector chunk (4883 chunks × hw spawns
+        // per pass) put ~half of all build cycles into thread-lifecycle page
+        // faults; a fixed pool amortizes spawn cost to once per build phase.
+        ctpl::thread_pool_tls<StreamTLS> pool(hw);
+
         while (vectors_done < n) {
             Chunk chunk;
             if (!ctx.source.next(chunk)) break;
             const uint32_t take = chunk.count;
             const float* vec_buf = chunk.vectors;  // valid until next next()
 
-            // Parallel assign + accumulate.
+            // Parallel assign + accumulate. Tasks are indexed by POOL thread
+            // id for the accumulators (t_sums/t_counts), so any task→thread
+            // mapping is correct; shard boundaries stay as the work split.
             std::vector<std::future<void>> futs;
-            const uint32_t n_threads = std::min(hw, take);
-            const uint32_t per = (take + n_threads - 1) / n_threads;
-            for (uint32_t t = 0; t < n_threads; ++t) {
+            const uint32_t n_shards = std::min(hw, take);
+            const uint32_t per = (take + n_shards - 1) / n_shards;
+            for (uint32_t t = 0; t < n_shards; ++t) {
                 const uint32_t start = t * per;
                 const uint32_t end = std::min(start + per, take);
                 if (start >= end) break;
-                futs.push_back(std::async(std::launch::async,
-                    [&](uint32_t tid, uint32_t s, uint32_t e) {
-                        double* sums = t_sums[tid].data();
-                        uint64_t* counts = t_counts[tid].data();
-                        // Hoisted scratch (one allocation per chunk, not
-                        // per vector — the per-vector vector<> cost ~2.5x
-                        // on this loop at 10M scale).
-                        std::vector<float> proj(pca_dims);
+                futs.push_back(pool.push(
+                    [&](size_t, StreamTLS& tls, uint32_t sh,
+                        uint32_t s, uint32_t e) {
+                        double* sums = t_sums[sh].data();
+                        uint64_t* counts = t_counts[sh].data();
+                        if (tls.proj.size() < pca_dims)
+                            tls.proj.resize(pca_dims);
+                        float* proj = tls.proj.data();
                         for (uint32_t i = s; i < e; ++i) {
                             const float* xi = &vec_buf[i * dim];
                             for (uint32_t k = 0; k < pca_dims; ++k)
@@ -991,7 +1011,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
                             uint32_t best_c = 0;
                             for (uint32_t c = 0; c < k_root; ++c) {
                                 const float dot = simd::dot_f32(
-                                    proj.data(), root_centroids_pca[c].data(), pca_dims);
+                                    proj, root_centroids_pca[c].data(), pca_dims);
                                 const float d = cent_norms[c] - 2.0f * dot;
                                 if (d < best_d) { best_d = d; best_c = c; }
                             }
@@ -1644,6 +1664,16 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
 
         uint64_t offset = 0;
         uint64_t prev_million = 0;
+        // Persistent pool for the whole emission pass (see Lloyd note: fresh
+        // std::async threads per chunk spent more cycles in the kernel mm
+        // path than in the routing arithmetic itself).
+        ctpl::thread_pool_tls<StreamTLS> pool(hw);
+        // Hoisted per-chunk staging: flat code buffer (fixed code_size stride)
+        // and a per-vector target list whose capacity persists across chunks.
+        // The old per-chunk vector<vector> reallocation was a top page-fault
+        // source; only the first chunk allocates.
+        std::vector<uint8_t> codes_flat;
+        std::vector<std::vector<uint32_t>> chunk_targets;
         while (true) {
             Chunk chunk;
             if (!ctx.source.next(chunk)) break;
@@ -1666,8 +1696,12 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             // per vector for serial append below.
             // Per-vector result: the nearest centroid (+closure matches) and code.
             // Format: for each vector, a list of target centroid IDs + the code.
-            std::vector<std::vector<uint8_t>> chunk_codes(take);
-            std::vector<std::vector<uint32_t>> chunk_targets(take);
+            if (!keep_raw_vecs)
+                codes_flat.resize(static_cast<size_t>(take) * code_size);
+            if (chunk_targets.size() < take)
+                chunk_targets.resize(take);
+            else
+                for (uint32_t i = 0; i < take; ++i) chunk_targets[i].clear();
             std::vector<float16_t> chunk_biases(
                 ctx.has_ip_bias ? take : 0, float16_t(1.0f));
 
@@ -1678,34 +1712,39 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                 const uint32_t start = t * per;
                 const uint32_t end = std::min(start + per, take);
                 if (start >= end) break;
-                futs.push_back(std::async(std::launch::async,
-                    [&](uint32_t s, uint32_t e) {
-                        std::vector<float> proj(pca_dims);
+                futs.push_back(pool.push(
+                    [&](size_t, StreamTLS& tls, uint32_t s, uint32_t e) {
+                        if (tls.proj.size() < pca_dims)
+                            tls.proj.resize(pca_dims);
+                        if (tls.dists.size() < k_root)
+                            tls.dists.resize(k_root);
+                        float* proj = tls.proj.data();
+                        float* dists = tls.dists.data();
                         for (uint32_t i = s; i < e; ++i) {
                             const float* xi = &vec_buf[i * dim];
                             // Project to PCA space.
                             for (uint32_t k = 0; k < pca_dims; ++k)
                                 proj[k] = simd::dot_f32(
                                     &rotation[k * dim], xi, dim) - mean_proj[k];
-                            // Route: find nearest + closure matches.
+                            // Route: single pass computes every centroid
+                            // distance once (the old form ran the k_root dot
+                            // loop twice — once for the min, once for closure).
                             float min_d = std::numeric_limits<float>::max();
                             for (uint32_t c = 0; c < k_root; ++c) {
                                 const float dot = simd::dot_f32(
-                                    proj.data(), root_centroids_pca[c].data(), pca_dims);
+                                    proj, root_centroids_pca[c].data(), pca_dims);
                                 const float d = cent_norms[c] - 2.0f * dot;
+                                dists[c] = d;
                                 if (d < min_d) min_d = d;
                             }
                             // Encode scan code (skipped for local families:
                             // raw vectors are kept and encoded per-leaf at
                             // flush).
                             if (!keep_raw_vecs) {
-                                std::vector<uint8_t> code(code_size);
                                 float bias = 0.f;
-                                ctx.coder->encode(xi, code.data(),
-                                                  ctx.has_ip_bias ? &bias
-                                                                  : nullptr);
-                                chunk_codes[i].assign(code.begin(),
-                                                      code.end());
+                                ctx.coder->encode(xi,
+                                    &codes_flat[static_cast<size_t>(i) * code_size],
+                                    ctx.has_ip_bias ? &bias : nullptr);
                                 if (ctx.has_ip_bias)
                                     chunk_biases[i] = float16_t(bias);
                             }
@@ -1715,9 +1754,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                             // replicated into c if dist(v,c) is within
                             // cluster_closure_eps[c] of the nearest distance.
                             for (uint32_t c = 0; c < k_root; ++c) {
-                                const float dot = simd::dot_f32(
-                                    proj.data(), root_centroids_pca[c].data(), pca_dims);
-                                const float d = cent_norms[c] - 2.0f * dot;
+                                const float d = dists[c];
                                 const float eps = (c < per_cluster_eps.size())
                                     ? per_cluster_eps[c] : closure_epsilon;
                                 if (std::fabs(d - min_d) <= eps)
@@ -1749,8 +1786,12 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                     const uint32_t start = t * per;
                     const uint32_t end = std::min(start + per, take);
                     if (start >= end) break;
-                    afuts.push_back(std::async(std::launch::async,
-                        [&](uint32_t s, uint32_t e, uint32_t tid) {
+                    // Shard-indexed buffers: the serial merge below replays
+                    // shards in order 0..n_threads-1 to reproduce global
+                    // vector order, so this task must write thread_buffers[t]
+                    // regardless of which pool worker runs it.
+                    afuts.push_back(pool.push(
+                        [&](size_t, StreamTLS&, uint32_t s, uint32_t e, uint32_t tid) {
                             auto& tbufs = thread_buffers[tid];
                             CardinalityTable* tcard = has_filter
                                 ? &thread_cards[tid] : nullptr;
@@ -1854,9 +1895,10 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                                 for (uint32_t c : chunk_targets[i]) {
                                     auto& tb = tbufs[c];
                                     if (!keep_raw_vecs) {
+                                        const uint8_t* cd =
+                                            &codes_flat[static_cast<size_t>(i) * code_size];
                                         tb.codes.insert(tb.codes.end(),
-                                                        chunk_codes[i].begin(),
-                                                        chunk_codes[i].end());
+                                                        cd, cd + code_size);
                                     }
                                     if (ctx.has_ip_bias)
                                         tb.ip_biases.push_back(chunk_biases[i]);
