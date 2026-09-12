@@ -154,6 +154,15 @@ public:
     float scan_leaf_max_u8(uint32_t leaf_id, const uint8_t* lut8,
                            float shift = 0.0f) const;
 
+    /// Query-tiled variant: Q queries against one leaf's blocks per
+    /// pass — code loads amortize across the tile, LUT rows stay
+    /// register-resident per (segment, tile). `luts[q]` = rank-dep
+    /// u8 LUTs; out[q] = per-query max (alpha-aware when the plane
+    /// carries pv). Callers with Q < 4 should use scan_leaf_max_u8.
+    void scan_leaf_max_u8_q(uint32_t leaf_id, const uint8_t* const* luts,
+                            uint32_t Q, const float* shifts,
+                            float* out) const;
+
     /// Max ADC score over one leaf's plane blocks (masked tail lanes).
     /// `lut` from build_lut (u4lm*) or `w`/`qbits` from build_sign_ctx
     /// (b1g). Leaf offsets are computed at bind() time.

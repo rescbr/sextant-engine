@@ -118,7 +118,7 @@ int main() {
             double worst = 0;
             for (uint32_t l = 0, li = 0; l < info.size(); ++l) {
                 if (info[l].page == tree::kInvalidPage) continue;
-                ++li;
+                (void)li;
                 double exp_best = -1e30;
                 for (RowId r : idx->debug_leaf_row_ids(l)) {
                     std::vector<float> pm(R);
@@ -146,7 +146,7 @@ int main() {
                     exp_best = std::max(exp_best, sc);
                 }
                 if (enc == tree::PlaneEncoding::B1G) {
-                    const double got = sA[li - 1];
+                    const double got = sA[li];
                     worst = std::max(worst, std::fabs(got - exp_best));
                     if (li <= 3)
                         std::printf("leaf %u: got=%.4f exp=%.4f diff=%.4f\n",
@@ -203,6 +203,45 @@ int main() {
                            static_cast<double>(w[e]);
                 std::printf("b1g emu=%.4f ana=%.4f\n", emu, ana);
             }
+        }
+        // TILED vs SINGLE check: 4 copies of the same query LUT must
+        // reproduce the single-query scores exactly.
+        {
+            std::vector<uint8_t> lut1;
+            if (enc == tree::PlaneEncoding::B1G) {
+                lut1.resize(static_cast<size_t>(R / 4) * 16);
+                pl->build_b1_lut8(proj.data(), lut1.data(),
+                                  w_qbits_dummy.data(),
+                                  w_qbits_dummy.data(),
+                                  w_qbits_dummy.data());
+            } else {
+                lut1.resize(static_cast<size_t>(R) * 16);
+                pl->build_lut8(proj.data(), lut1.data(),
+                               w_qbits_dummy.data(),
+                               w_qbits_dummy.data(),
+                               w_qbits_dummy.data());
+            }
+            const uint8_t* luts[4] = {lut1.data(), lut1.data(),
+                                      lut1.data(), lut1.data()};
+            const float sh[4] = {0, 0, 0, 0};
+            float out[4];
+            double worst = 0;
+            for (uint32_t l = 0, li = 0; l < info.size(); ++l) {
+                if (info[l].page == tree::kInvalidPage) continue;
+                pl->scan_leaf_max_u8_q(l, luts, 4, sh, out);
+                for (int t = 0; t < 4; ++t) {
+                    const float single = pl->scan_leaf_max_u8(l,
+                        lut1.data(), 0.0f);
+                    const double d =
+                        std::fabs(static_cast<double>(out[t]) - single);
+                    if (d > worst && (li < 3))
+                        std::printf("leaf %u: tiled=%.0f single=%.0f\n",
+                                    li, out[t], single);
+                    worst = std::max(worst, d);
+                }
+                ++li;
+            }
+            std::printf("tiled-vs-single max |diff| = %.6g\n", worst);
         }
         uint32_t hits_top1 = 0, hits_top5leaves = 0;
         std::vector<uint32_t> leafids;

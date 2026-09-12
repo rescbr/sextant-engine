@@ -4875,11 +4875,45 @@ void IVFTreeIndex::plane_route_batch_(
                            : std::thread::hardware_concurrency())
         : 1u;
     auto sweep_worker = [&](uint64_t l0, uint64_t l1) {
+        constexpr uint32_t kQTile = 4;
+        std::vector<const uint8_t*> tluts(kQTile);
+        std::vector<float> tshifts(kQTile, 0.0f);
+        std::vector<float> tout(kQTile);
         for (uint64_t l = l0; l < l1; ++l) {
             if (leaf_table_[static_cast<uint32_t>(l)].page == kInvalidPage)
                 continue;
             float* row = &scores[static_cast<size_t>(l) * nq];
-            for (uint32_t qi = 0; qi < nq; ++qi) {
+            const uint32_t leaf = static_cast<uint32_t>(l);
+            uint32_t qi = 0;
+            // Query-tiled pass: one code load serves kQTile queries.
+            for (; qi + kQTile <= nq; qi += kQTile) {
+                bool any = false;
+                for (uint32_t t = 0; t < kQTile; ++t) {
+                    tluts[t] = &lut8[static_cast<size_t>(qi + t) *
+                                     SEG * 16];
+                    tshifts[t] = pv8 ? shifts[qi + t] : 0.0f;
+                    any = any ||
+                          (survive.empty() ||
+                           survive[static_cast<size_t>(qi + t) *
+                                        n_leaves + l] != 0.0f);
+                }
+                if (!any) {
+                    for (uint32_t t = 0; t < kQTile; ++t)
+                        row[qi + t] =
+                            -std::numeric_limits<float>::infinity();
+                    continue;
+                }
+                plane_->scan_leaf_max_u8_q(leaf, tluts.data(), kQTile,
+                                           tshifts.data(), tout.data());
+                for (uint32_t t = 0; t < kQTile; ++t)
+                    row[qi + t] = (!survive.empty() &&
+                                   survive[static_cast<size_t>(qi + t) *
+                                                n_leaves + l] == 0.0f)
+                                      ? -std::numeric_limits<float>::
+                                            infinity()
+                                      : tout[t];
+            }
+            for (; qi < nq; ++qi) {
                 if (!survive.empty() &&
                     survive[static_cast<size_t>(qi) * n_leaves + l] ==
                         0.0f) {
@@ -4889,11 +4923,11 @@ void IVFTreeIndex::plane_route_batch_(
                 row[qi] =
                     (is_b1g || fastscan8 || pv8)
                         ? plane_->scan_leaf_max_u8(
-                              static_cast<uint32_t>(l),
+                              leaf,
                               &lut8[static_cast<size_t>(qi) * SEG * 16],
                               pv8 ? shifts[qi] : 0.0f)
                         : plane_->scan_leaf_max(
-                              static_cast<uint32_t>(l),
+                              leaf,
                               &lut[static_cast<size_t>(qi) * R * 16],
                               nullptr, nullptr);
             }
