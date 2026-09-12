@@ -767,6 +767,71 @@ bool parse_filter_predicate(const std::string& filter_str, sextant::Predicate& p
 
 }  // namespace
 
+int cmd_plane_attach(int argc, char* argv[]) {
+    using namespace sextant;
+
+    cmdline::parser p;
+    p.add<std::string>("index", 0, "Tree index file (must be plane-less)",
+                      true);
+    p.add<std::string>("base", 0, "Base .fbin the tree was built from "
+                      "(build row order)", true);
+    p.add<std::string>("enc", 0, "Plane encoding: u4lm (64 B/vec, best), "
+                      "u4lm_pv (+per-vector renorm), b1g (16 B/vec)",
+                      false, "u4lm");
+    p.add<uint32_t>("rank", 0, "PCA plane rank", false, 128);
+    p.add<uint32_t>("train-rows", 0, "Basis/codebook training sample "
+                    "(spread-sampled)", false, 20000);
+    p.parse_check(argc, argv);
+
+    const std::string index_path = p.get<std::string>("index");
+    const std::string base_path = p.get<std::string>("base");
+    const std::string enc_s = p.get<std::string>("enc");
+    tree::PlaneEncoding enc;
+    if (enc_s == "u4lm") enc = tree::PlaneEncoding::U4LM;
+    else if (enc_s == "u4lm_pv") enc = tree::PlaneEncoding::U4LM_PV;
+    else if (enc_s == "b1g") enc = tree::PlaneEncoding::B1G;
+    else {
+        std::cerr << "plane-attach: unknown encoding '" << enc_s << "'\n";
+        return 1;
+    }
+
+    fbin_io::FbinHeader hdr;
+    if (!fbin_io::read_fbin_header(base_path, hdr) || hdr.n == 0) {
+        std::cerr << "plane-attach: cannot read " << base_path << "\n";
+        return 1;
+    }
+    int fd = ::open(base_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        std::cerr << "plane-attach: open failed\n";
+        return 1;
+    }
+    struct stat st;
+    if (::fstat(fd, &st) != 0 ||
+        static_cast<uint64_t>(st.st_size) <
+            8 + static_cast<uint64_t>(hdr.n) * hdr.dim * 4) {
+        ::close(fd);
+        std::cerr << "plane-attach: base file truncated\n";
+        return 1;
+    }
+    void* m = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (m == MAP_FAILED) {
+        std::cerr << "plane-attach: mmap failed\n";
+        return 1;
+    }
+    const auto* base = reinterpret_cast<const float*>(
+        static_cast<const uint8_t*>(m) + 8);
+
+    auto idx = tree::IVFTreeIndex::open(index_path);
+    idx->attach_plane(base, hdr.n, hdr.dim, enc,
+                      static_cast<uint16_t>(p.get<uint32_t>("rank")),
+                      p.get<uint32_t>("train-rows"));
+    ::munmap(m, st.st_size);
+    std::cout << "plane-attach: OK (" << enc_s << ", rank "
+              << p.get<uint32_t>("rank") << ")\n";
+    return 0;
+}
+
 int cmd_tree_search(int argc, char* argv[]) {
     using namespace sextant;
 
@@ -785,6 +850,9 @@ int cmd_tree_search(int argc, char* argv[]) {
         "f=0.25 ≈0.96, f=0.5 ≈0.99 recall@10). Ignored when --n-probe > 0.",
         false, 0.0f);
     p.add<uint32_t>("fastscan-w", 0, "Rerank shortlist per shard (0=300)", false, 0);
+    p.add("no-plane", 0,
+        "Disable stage-1 plane routing (legacy centroid descent) even "
+        "when the index carries a routing plane");
     p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
     p.add<std::string>("exact-rerank-base", 0,
         "Original base .fbin (mmap'd read-only): rerank against the TRUE "
@@ -944,6 +1012,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
     scfg.rerank = !p.exist("no-rerank");
     scfg.adaptive_w_gap = p.get<float>("adaptive-w-gap");
+    scfg.use_plane = !p.exist("no-plane");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
     scfg.search_threads = p.get<uint32_t>("search-threads");
     const uint32_t batch_window = p.get<uint32_t>("batch-window");
@@ -2481,6 +2550,8 @@ int main(int argc, char* argv[]) {
             return cmd_autobuild(sub_argc, sub_argv.data());
         } else if (cmd == "search") {
             return cmd_search(sub_argc, sub_argv.data());
+        } else if (cmd == "plane-attach") {
+            return cmd_plane_attach(sub_argc, sub_argv.data());
         } else if (cmd == "tree-search") {
             return cmd_tree_search(sub_argc, sub_argv.data());
         } else if (cmd == "sweep") {

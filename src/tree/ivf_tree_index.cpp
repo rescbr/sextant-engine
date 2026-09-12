@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -238,6 +239,40 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
                         std::strerror(errno));
     }
     idx->mmap_base_ = static_cast<const uint8_t*>(addr);
+
+    // Load the routing plane if present (optional extent, "0 pages =
+    // absent"). Blocks point straight into the mmap — zero copies.
+    if (idx->superblock_.plane_page() != kInvalidPage &&
+        idx->superblock_.plane_pages() > 0) {
+        const uint8_t* pb = idx->mmap_base_ +
+            static_cast<uint64_t>(idx->superblock_.plane_page()) * kPageSize;
+        const size_t plen = static_cast<size_t>(
+            idx->superblock_.plane_pages()) * kPageSize;
+        idx->plane_ = PlaneIndex::parse(pb, plen);
+        if (!idx->plane_) {
+            throw Error(ErrorCode::CorruptIndex,
+                "tree index has a corrupt/unsupported routing plane");
+        }
+        std::vector<uint32_t> counts;
+        counts.reserve(idx->leaf_table_.size());
+        for (const auto& e : idx->leaf_table_) {
+            uint32_t count = 0;
+            if (e.page != kInvalidPage) {
+                const auto* lh =
+                    reinterpret_cast<const TreeLeafHeader*>(
+                        idx->mmap_base_ +
+                        static_cast<uint64_t>(e.page) * kPageSize);
+                count = static_cast<uint32_t>(lh->count);
+            }
+            counts.push_back(count);
+        }
+        idx->plane_->bind(counts);
+        spdlog::info("[sextant] IVFTreeIndex: routing plane attached "
+                     "(enc={} rank={} {} B/vec)",
+                     static_cast<unsigned>(idx->plane_->meta().encoding),
+                     idx->plane_->meta().rank,
+                     idx->plane_->meta().bytes_per_vec());
+    }
 
     // Parse the root node from the mmap.
     idx->load_root_from_mmap();
@@ -2943,8 +2978,23 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // --- Route: shared descent (route_query_, also used by search_batch) ---
     const MetricKind metric = coder_->metric();
     {
-        const RouteStatus rstatus =
-            route_query_(query, config, scratch, scratch.candidates);
+        // Plane stage-1 (predicate-free queries only in v1 — see
+        // plane_route_). Feedback probing is descent-based and not
+        // meaningful under plane routing.
+        const bool plane_active = plane_ != nullptr && config.use_plane &&
+                                  config.predicates.empty();
+        RouteStatus rstatus;
+        if (plane_active) {
+            scratch.route_feedback = false;
+            scratch.selectivity = 1.0f;
+            scratch.route_gap = 0.0f;
+            scratch.root_dists.clear();
+            rstatus = RouteStatus::Ok;
+            plane_route_(query, config, scratch.candidates);
+            if (scratch.candidates.empty()) rstatus = RouteStatus::Empty;
+        } else {
+            rstatus = route_query_(query, config, scratch, scratch.candidates);
+        }
         qguard.t_route_end = std::chrono::steady_clock::now();
         qguard.route_done = true;
         qguard.node_bytes += scratch.route_node_bytes;
@@ -4602,6 +4652,268 @@ void IVFTreeIndex::search_batch(
 // Routing diagnostics — loss-decomposition harness support.
 // ===========================================================================
 
+// ===========================================================================
+// Routing plane attach (plane.hpp). Post-build pass: trains on a
+// spread-sampled covariance, encodes members in ROW order (sequential
+// base reads — leaf-order member passes are random-access page-fault
+// storms at 10M scale), writes the extent, re-commits the superblock.
+// ===========================================================================
+// ===========================================================================
+// Plane stage-1 routing (see declaration for the contract).
+// ===========================================================================
+void IVFTreeIndex::plane_route_(const float* query,
+                                const SearchConfig& config,
+                                std::vector<LeafCandidate>& candidates)
+    const {
+    candidates.clear();
+    const uint32_t R = plane_->meta().rank;
+    const bool is_b1g = plane_->meta().encoding == PlaneEncoding::B1G;
+
+    std::vector<float> proj(R);
+    plane_->project_query(query, proj.data());
+    std::vector<float> lut;
+    std::vector<float> w;
+    std::vector<uint32_t> qbits;
+    if (is_b1g) {
+        w.resize(R);
+        qbits.resize(R);
+        plane_->build_sign_ctx(proj.data(), w.data(), qbits.data());
+    } else {
+        lut.resize(static_cast<size_t>(R) * 16);
+        plane_->build_lut(proj.data(), lut.data());
+    }
+
+    // Per-leaf max scores (leaf-parallel).
+    const uint32_t n_leaves = static_cast<uint32_t>(leaf_table_.size());
+    std::vector<float> score(n_leaves,
+                             -std::numeric_limits<float>::max());
+#pragma omp parallel for schedule(dynamic)
+    for (int64_t l = 0; l < static_cast<int64_t>(n_leaves); ++l) {
+        if (leaf_table_[static_cast<uint32_t>(l)].page == kInvalidPage)
+            continue;
+        score[static_cast<uint32_t>(l)] = plane_->scan_leaf_max(
+            static_cast<uint32_t>(l),
+            is_b1g ? nullptr : lut.data(),
+            is_b1g ? w.data() : nullptr,
+            is_b1g ? qbits.data() : nullptr);
+    }
+
+    // Score-ordered selection under the page-weighted fraction budget.
+    std::vector<uint32_t> order(n_leaves);
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return score[a] > score[b];
+    });
+    float f = config.probe_fraction;
+    if (f <= 0.0f) f = manifest_.probe_fraction;
+    if (f <= 0.0f) f = 0.5f;
+    uint64_t total = 0;
+    for (const auto& e : leaf_table_)
+        if (e.page != kInvalidPage) total += e.pages;
+    uint64_t cum = 0;
+    candidates.reserve(n_leaves);
+    for (uint32_t l : order) {
+        const auto& e = leaf_table_[l];
+        if (e.page == kInvalidPage) continue;
+        candidates.push_back({e.page, e.pages, score[l], nullptr});
+        cum += e.pages;
+        if (static_cast<double>(cum) >=
+            static_cast<double>(f) * static_cast<double>(total) - 0.5)
+            break;
+    }
+    // Restore the scan-friendly page order (fill planning merges runs).
+    std::sort(candidates.begin(), candidates.end(),
+              [](const LeafCandidate& a, const LeafCandidate& b) {
+                  return a.page < b.page;
+              });
+}
+
+void IVFTreeIndex::attach_plane(const float* base, uint32_t n, uint32_t dim,
+                                PlaneEncoding enc, uint16_t rank,
+                                uint32_t train_rows) {
+    if (plane_) {
+        throw Error(ErrorCode::InvalidParam,
+            "attach_plane: index already carries a routing plane");
+    }
+    if (dim != manifest_.dim) {
+        throw Error(ErrorCode::InvalidParam,
+            "attach_plane: base dim does not match index dim");
+    }
+    // Fail-loud precondition (F3/F4 class): the bitmap must cover the
+    // whole file before we allocate anything. Trees built before the
+    // bitmap upper-bound fix have bitmaps that cover only a prefix —
+    // the allocator would hand out LIVE tree pages for the plane extent
+    // (measured: 185K pages of leaves overwritten on cohere-10m). Run
+    // `sextant fsck --repair` on such trees first.
+    if (static_cast<uint64_t>(superblock_.alloc_bitmap_pages()) *
+            static_cast<uint64_t>(kPageSize) * 8 <
+        superblock_.n_pages()) {
+        throw Error(ErrorCode::CorruptIndex,
+            "attach_plane: allocation bitmap covers only a prefix of the "
+            "file (under-provisioned at build time) — run "
+            "`sextant fsck --repair` on this index first");
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    PlaneWriter::Config pcfg;
+    pcfg.encoding = enc;
+    pcfg.rank = rank;
+    pcfg.train_rows = train_rows;
+    PlaneWriter writer;
+    writer.train(base, n, dim, pcfg);
+    writer.prepare(static_cast<uint32_t>(leaf_table_.size()));
+    spdlog::info("[sextant] plane: basis+codebooks trained in {:.1}s",
+                 std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - t0).count());
+
+    // Members per leaf + row -> (leaf, slot) destinations. Leaf-ordered
+    // reads of the row_ids are random-access: warm the file sequentially
+    // with a background WILLNEED sweep while building the dest map.
+    {
+        const int pfd = fd_;
+        struct stat pst;
+        if (::fstat(pfd, &pst) == 0) {
+            const auto psize = static_cast<uint64_t>(pst.st_size);
+            std::thread([pfd, psize] {
+                const uint64_t kChunk = 256u << 20;
+                for (uint64_t off = 0; off < psize; off += kChunk) {
+                    ::posix_fadvise(pfd, static_cast<off_t>(off),
+                                    static_cast<off_t>(kChunk),
+                                    POSIX_FADV_WILLNEED);
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(50));
+                }
+            }).detach();
+        }
+    }
+    std::vector<uint32_t> leaf_counts(leaf_table_.size(), 0);
+    std::unordered_map<int64_t, std::vector<std::pair<uint32_t, uint32_t>>>
+        dest;  // row -> [(leaf, slot)]
+    dest.reserve(static_cast<size_t>(n) / 3 * 4 + 1);
+    for (uint32_t l = 0; l < leaf_table_.size(); ++l) {
+        const auto mem = debug_leaf_row_ids(l);
+        leaf_counts[l] = static_cast<uint32_t>(mem.size());
+        for (uint32_t slot = 0; slot < mem.size(); ++slot)
+            dest[static_cast<int64_t>(mem[slot])].emplace_back(l, slot);
+    }
+
+    // Row-order sequential encode pass (OMP over row blocks).
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+        for (int64_t r0 = 0; r0 < static_cast<int64_t>(n); ++r0) {
+            auto it = dest.find(static_cast<int64_t>(r0));
+            if (it == dest.end() || it->second.empty()) continue;
+            const float* v = &base[static_cast<size_t>(r0) * dim];
+            for (const auto& ls : it->second)
+                writer.encode_member(ls.first, ls.second, v, nullptr);
+        }
+    }
+    spdlog::info("[sextant] plane: encoded {} rows in {:.1}s", n,
+                 std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - t0).count());
+
+    auto blob = writer.finalize(leaf_counts);
+
+    // The bitmap region is FIXED at format time; a plane extent can
+    // outgrow its coverage (10M-scale plane = ~180K pages). When it
+    // would, relocate the bitmap: append a larger one at EOF, free the
+    // old region's pages, update the superblock pointers.
+    const uint32_t npg0 = static_cast<uint32_t>(
+        (blob.size() + kPageSize - 1) / kPageSize);
+    const uint64_t kBitsPerBitmapPage =
+        static_cast<uint64_t>(kPageSize) * 8;
+    {
+        const uint64_t covered =
+            static_cast<uint64_t>(superblock_.alloc_bitmap_pages()) *
+            kBitsPerBitmapPage;
+        const uint64_t est_total = superblock_.n_pages() + npg0 + 64;
+        if (est_total > covered) {
+            const uint32_t new_nbm = static_cast<uint32_t>(
+                est_total / kBitsPerBitmapPage + 2);
+            const PageId old_bm_page = superblock_.alloc_bitmap_page();
+            const uint32_t old_nbm = superblock_.alloc_bitmap_pages();
+            const PageId new_bm_page = file_.num_pages();
+            std::vector<uint8_t> nbm(
+                static_cast<size_t>(new_nbm) * kPageSize, 0);
+            std::vector<uint8_t> obm(
+                static_cast<size_t>(old_nbm) * kPageSize, 0);
+            file_.read_pages(old_bm_page, old_nbm, obm.data());
+            const size_t copy_bits = std::min<uint64_t>(
+                superblock_.n_pages(),
+                static_cast<uint64_t>(old_nbm) * kBitsPerBitmapPage);
+            std::memcpy(nbm.data(), obm.data(), (copy_bits + 7) / 8);
+            for (uint64_t p = new_bm_page;
+                 p < new_bm_page + new_nbm; ++p) {
+                nbm[p / 8] |= static_cast<uint8_t>(1u << (p % 8));
+            }
+            file_.truncate(new_bm_page + new_nbm);
+            file_.write_pages(new_bm_page, new_nbm, nbm.data());
+            const PageId old_flh = superblock_.free_list_head();
+            const uint64_t old_nfree = superblock_.n_free_pages();
+            superblock_.set_bitmap(new_bm_page, new_nbm);
+            superblock_.set_n_pages(file_.num_pages());
+            // Reload the allocator over the new geometry, then push the
+            // old bitmap pages onto the free list (maintains the
+            // persisted chain + bitmap bits).
+            PageAllocator alloc2;
+            alloc2.load(file_, new_bm_page, new_nbm,
+                        file_.num_pages(), old_flh, old_nfree);
+            alloc2.free_extent(file_, old_bm_page, old_nbm);
+            alloc2.flush_bitmap(file_);
+            superblock_.set_free_list(alloc2.free_list_head(),
+                                      alloc2.n_free_pages());
+            superblock_.commit(file_);
+            spdlog::info("[sextant] plane: bitmap relocated {} -> {} pages "
+                         "(@page {})", old_nbm, new_nbm, new_bm_page);
+        }
+    }
+
+    // Allocate the extent, write, re-commit the superblock.
+    PageAllocator alloc;
+    alloc.load(file_, superblock_.alloc_bitmap_page(),
+               superblock_.alloc_bitmap_pages(), superblock_.n_pages(),
+               superblock_.free_list_head(), superblock_.n_free_pages());
+    const uint32_t npg = static_cast<uint32_t>(
+        (blob.size() + kPageSize - 1) / kPageSize);
+    const PageId ppage = alloc.alloc_extent(file_, npg);
+    std::vector<uint8_t> padded(static_cast<size_t>(npg) * kPageSize, 0);
+    std::memcpy(padded.data(), blob.data(), blob.size());
+    file_.write_pages(ppage, npg, padded.data());
+    alloc.flush_bitmap(file_);
+
+    superblock_.set_plane(ppage, npg);
+    superblock_.set_n_pages(file_.num_pages());
+    superblock_.set_free_list(alloc.free_list_head(), alloc.n_free_pages());
+    superblock_.commit(file_);
+    file_.sync();
+
+    // Reload in-memory state: re-mmap (the plane pages may extend the
+    // file) and parse + bind.
+    ::munmap(const_cast<uint8_t*>(mmap_base_), mmap_size_);
+    mmap_size_ = file_.num_pages() * kPageSize;
+    void* addr = ::mmap(nullptr, mmap_size_, PROT_READ, MAP_SHARED,
+                        file_.fd(), 0);
+    if (addr == MAP_FAILED) {
+        throw Error(ErrorCode::IoError,
+            "attach_plane: re-mmap failed: " +
+                std::string(std::strerror(errno)));
+    }
+    mmap_base_ = static_cast<const uint8_t*>(addr);
+    plane_ = PlaneIndex::parse(mmap_base_ + static_cast<uint64_t>(ppage) *
+                              kPageSize,
+                              static_cast<size_t>(npg) * kPageSize);
+    if (!plane_) {
+        throw Error(ErrorCode::CorruptIndex,
+            "attach_plane: written plane failed to parse");
+    }
+    plane_->bind(leaf_counts);
+    spdlog::info("[sextant] plane: attached ({} pages, {} B/vec) in {:.1}s",
+                 npg, plane_->meta().bytes_per_vec(),
+                 std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - t0).count());
+}
+
 std::vector<IVFTreeIndex::DebugLeafInfo> IVFTreeIndex::debug_leaf_info()
     const {
     std::vector<DebugLeafInfo> out;
@@ -5681,6 +5993,11 @@ void IVFTreeIndex::update_internal_child_(PageId node_page, uint32_t node_pages,
 
 void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
     if (points.empty()) return;
+    if (plane_) {
+        throw Error(ErrorCode::NotImplemented,
+            "insert_batch not supported while a routing plane is attached "
+            "(v1 planes are immutable)");
+    }
     const auto t0 = std::chrono::steady_clock::now();
 
     const uint32_t summary_size = manifest_.summary_size;
@@ -6101,6 +6418,11 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
 
 void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
     if (row_ids.empty()) return;
+    if (plane_) {
+        throw Error(ErrorCode::NotImplemented,
+            "delete_batch not supported while a routing plane is attached "
+            "(v1 planes are immutable)");
+    }
     const auto t0 = std::chrono::steady_clock::now();
 
     if (coder_->family() != CoderFamily::GlobalPq) {
@@ -6267,6 +6589,11 @@ uint64_t IVFTreeIndex::live_count() const {
 
 IVFTreeIndex::VacuumResult IVFTreeIndex::vacuum(const VacuumConfig& config) {
     VacuumResult res;
+    if (plane_) {
+        throw Error(ErrorCode::NotImplemented,
+            "vacuum not supported while a routing plane is attached "
+            "(v1 planes are immutable)");
+    }
     const auto t0 = std::chrono::steady_clock::now();
 
     const uint32_t summary_size = manifest_.summary_size;
@@ -6456,6 +6783,11 @@ IVFTreeIndex::VacuumResult IVFTreeIndex::vacuum(const VacuumConfig& config) {
 
 IVFTreeIndex::DefragResult IVFTreeIndex::defrag(const DefragConfig& config) {
     DefragResult res;
+    if (plane_) {
+        throw Error(ErrorCode::NotImplemented,
+            "defrag not supported while a routing plane is attached "
+            "(v1 planes are immutable)");
+    }
     const auto t0 = std::chrono::steady_clock::now();
 
     PageAllocator alloc;

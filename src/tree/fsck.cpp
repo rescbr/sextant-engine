@@ -4,6 +4,7 @@
 #include "superblock.hpp"
 #include "tree_manifest.hpp"
 #include "tree_nodes.hpp"
+#include "plane.hpp"
 
 #include <sextant/error.hpp>
 
@@ -31,6 +32,7 @@ struct TreeWalkResult {
     uint64_t n_nodes = 0;
     uint64_t n_leaves = 0;
     uint64_t total_leaf_count = 0;
+    uint64_t total_leaf_blocks = 0;  // Σ ceil(count/32) — plane sizing
     uint32_t max_depth = 0;
     uint64_t magic_failures = 0;
     uint64_t crc_failures = 0;
@@ -75,6 +77,7 @@ void validate_leaf(const PageFile& file, PageId physical_page,
     }
 
     result.total_leaf_count += lh->count;
+    result.total_leaf_blocks += (lh->count + 31) / 32;
 
     if (lh->payload_extent_page != kInvalidPage &&
         lh->payload_extent_pages > 0) {
@@ -313,6 +316,29 @@ FsckResult fsck(const std::string& path, bool repair) {
     if (sb.cardinality_page() != kInvalidPage)
         all_allocated.push_back(
             {sb.cardinality_page(), sb.cardinality_pages()});
+    // Routing plane: register the extent and cross-check its sizing
+    // against the walk (blocks = Σ ceil(count/32), alpha = 2×count).
+    if (sb.plane_page() != kInvalidPage && sb.plane_pages() > 0) {
+        all_allocated.push_back({sb.plane_page(), sb.plane_pages()});
+        auto blob = read_extent(file, sb.plane_page(),
+                                std::min<uint32_t>(sb.plane_pages(), 1));
+        PlaneMeta pm;
+        uint64_t blocks_bytes = 0, cb_bytes = 0, alpha_bytes = 0;
+        if (parse_plane_header(blob.data(), blob.size(), &pm, &blocks_bytes,
+                               &cb_bytes, &alpha_bytes)) {
+            const uint64_t bb = (pm.encoding == PlaneEncoding::B1G)
+                ? static_cast<uint64_t>(pm.rank) * 4
+                : static_cast<uint64_t>(pm.rank) * 16;
+            const bool blocks_ok =
+                blocks_bytes == walk.total_leaf_blocks * bb;
+            const bool alpha_ok =
+                pm.encoding != PlaneEncoding::U4LM_PV ||
+                alpha_bytes == walk.total_leaf_count * 2;
+            if (!blocks_ok || !alpha_ok) ++result.magic_failures;
+        } else {
+            ++result.magic_failures;
+        }
+    }
     all_allocated.push_back(
         {sb.leaf_table_page(), sb.leaf_table_pages()});
 
@@ -364,24 +390,54 @@ FsckResult fsck(const std::string& path, bool repair) {
     if (repair && !result.page_accounting_ok &&
         sb.alloc_bitmap_page() != kInvalidPage &&
         sb.alloc_bitmap_pages() > 0) {
+        // The old bitmap extent may be under-provisioned (pre-fix trees
+        // cover only a prefix of the file — writing the rebuilt bits
+        // back there silently DROPS every page past its coverage, the
+        // exact F3/F4 pattern). When it can't hold the full file,
+        // RELOCATE: new larger extent at EOF, old pages freed.
+        const uint64_t kBitsPerBitmapPage =
+            static_cast<uint64_t>(kPageSize) * 8;
+        const uint64_t bits_needed = file.num_pages();
+        PageId bmp = sb.alloc_bitmap_page();
+        uint32_t nbm = sb.alloc_bitmap_pages();
+        const PageId old_bmp = bmp;
+        bool relocated = false;
+        if (static_cast<uint64_t>(nbm) * kPageSize <
+            (bits_needed + 7) / 8) {
+            nbm = static_cast<uint32_t>(bits_needed / kBitsPerBitmapPage + 2);
+            bmp = file.num_pages();
+            file.truncate(bmp + nbm);
+            relocated = true;
+        }
         // Rebuild bitmap: clear, then set every allocated page.
-        std::fill(bitmap.begin(), bitmap.end(), 0);
+        std::vector<uint8_t> rebuilt(static_cast<size_t>(nbm) * kPageSize, 0);
+        std::vector<bool> alloc2(file.num_pages(), false);
         for (const auto& r : all_allocated) {
+            if (relocated && r.start == old_bmp) continue;  // old extent freed
             for (uint32_t i = 0; i < r.count; ++i) {
                 PageId p = r.start + i;
-                if (p / 8 < bitmap.size())
-                    bitmap[p / 8] |= static_cast<uint8_t>(1u << (p % 8));
+                if (p / 8 < rebuilt.size()) {
+                    rebuilt[p / 8] |= static_cast<uint8_t>(1u << (p % 8));
+                    alloc2[p] = true;
+                }
             }
         }
-        file.write_pages(sb.alloc_bitmap_page(), sb.alloc_bitmap_pages(),
-                         bitmap.data());
+        if (relocated) {
+            for (uint64_t p = bmp; p < bmp + nbm; ++p) {
+                rebuilt[p / 8] |= static_cast<uint8_t>(1u << (p % 8));
+                alloc2[p] = true;
+            }
+        }
+        file.write_pages(bmp, nbm, rebuilt.data());
+        sb.set_bitmap(bmp, nbm);
+        sb.set_n_pages(file.num_pages());
 
         // Rebuild free list: every page not in the allocated set, chained LIFO
         // (matches PageAllocator::free_page ordering).
         PageId prev_free = kInvalidPage;
         result.total_free = 0;
         for (uint64_t p = file.num_pages(); p-- > 0;) {
-            if (p < allocated.size() && allocated[p]) continue;
+            if (p < alloc2.size() && alloc2[p]) continue;
             // Free page — write next pointer, push to head.
             write_free_next(file, p, prev_free);
             prev_free = p;

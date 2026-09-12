@@ -82,8 +82,13 @@ struct SuperblockDisk {
     PageId   leaf_table_page;        // leaf table blob start
     uint32_t leaf_table_pages;       // leaf table extent length
 
+    // Routing plane (0 pages = no plane; see plane.hpp). Stage-1 leaf
+    // ranking over a per-vector quantized PCA plane (u4lm / b1g).
+    PageId   plane_page;                 // plane blob start
+    uint32_t plane_pages;                // plane extent length
+
     // Reserved for future use.
-    uint8_t  reserved2[3940];  // fill to exactly kPageSize
+    uint8_t  reserved2[3924];  // fill to exactly kPageSize
 };
 static_assert(sizeof(SuperblockDisk) == kPageSize,
               "SuperblockDisk must be exactly one page");
@@ -166,6 +171,13 @@ public:
     void set_leaf_table(PageId page, uint32_t pages) {
         disk_.leaf_table_page = page;
         disk_.leaf_table_pages = pages;
+    }
+
+    PageId plane_page() const { return disk_.plane_page; }
+    uint32_t plane_pages() const { return disk_.plane_pages; }
+    void set_plane(PageId page, uint32_t pages) {
+        disk_.plane_page = page;
+        disk_.plane_pages = pages;
     }
 
 private:

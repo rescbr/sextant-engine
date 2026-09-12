@@ -474,6 +474,14 @@ struct SearchConfig {
     /// exhaustive take precedence.
     float probe_fraction = 0.0f;
 
+    /// Stage-1 routing plane (plane.hpp): when the index carries a plane
+    /// extent, rank leaves by max query·proj over the per-vector plane
+    /// and select the probe set by page-weighted probe_fraction (the
+    /// plane composes with this contract directly — f becomes the
+    /// stage-2 cut). False forces legacy centroid routing even when a
+    /// plane is present (A/B knob). Ignored for plane-less indexes.
+    bool use_plane = true;
+
     /// IVF-probe merge oversampling: each probed shard is searched at
     /// k_local = k × merge_oversample, then results are merged/deduped and
     /// truncated to k. 1 = no oversampling. Ignored for single-shard indexes.

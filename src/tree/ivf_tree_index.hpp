@@ -18,6 +18,7 @@
 
 #include "tree/page_file.hpp"
 #include "tree/page_allocator.hpp"
+#include "tree/plane.hpp"
 #include "tree/superblock.hpp"
 #include "tree/tree_manifest.hpp"
 #include "tree/tree_nodes.hpp"
@@ -291,6 +292,25 @@ public:
     /// present at build time. Used for predicate selectivity estimation.
     const CardinalityTable& cardinality() const { return card_table_; }
 
+    // --- Stage-1 routing plane (plane.hpp) ---
+
+    /// True when the index carries a plane extent (superblock plane_page).
+    /// Plane-bearing indexes rank leaves by max query·proj over the
+    /// per-vector quantized PCA plane instead of centroid distance.
+    bool has_plane() const { return plane_ != nullptr; }
+    const PlaneIndex* plane() const { return plane_.get(); }
+
+    /// Attaches a routing plane to an ALREADY-BUILT, plane-less index:
+    /// trains the PCA basis + per-dim codebooks on `base` (n×dim
+    /// row-major, spread-sampled), encodes every stored member
+    /// (sequential row-order pass over `base`), writes the plane extent
+    /// and re-commits the superblock. The index is IMMUTABLE afterwards
+    /// (mutable ops throw while a plane is attached) — v1 semantics.
+    /// Reopen (or rely on the in-place reload) to search with the plane.
+    void attach_plane(const float* base, uint32_t n, uint32_t dim,
+                      PlaneEncoding enc, uint16_t rank = 128,
+                      uint32_t train_rows = 20000);
+
     // --- Dynamic insert/delete (single-writer, multi-reader) ---
 
     /// A single point to insert: vector + row_id + optional filter column
@@ -386,6 +406,7 @@ private:
     Superblock superblock_;
     TreeManifest manifest_;
     CardinalityTable card_table_;  // per-value frequencies for selectivity (Phase D)
+    std::unique_ptr<PlaneIndex> plane_;  // stage-1 routing plane (optional)
     // Single per-family coder: owns the quantizer objects + all
     // family-specific leaf layout / scan / mutation logic.
     std::unique_ptr<LeafCoder> coder_;
@@ -461,6 +482,16 @@ private:
     RouteStatus route_query_(const float* query, const SearchConfig& config,
                              SearchScratch& scratch,
                              std::vector<LeafCandidate>& candidates) const;
+
+    /// Plane stage-1 routing: rank ALL leaves by max query·proj over the
+    /// routing plane, then select in score order until the cumulative
+    /// leaf extent reaches probe_fraction of the corpus (the plane makes
+    /// f the direct stage-2 cut). Predicate queries fall back to legacy
+    /// descent (plane + predicate composition lands with the batch
+    /// sweep). Sets the scratch side channels to their no-filter
+    /// defaults; feedback probing is not meaningful (no descent).
+    void plane_route_(const float* query, const SearchConfig& config,
+                      std::vector<LeafCandidate>& candidates) const;
 
     /// Expand one internal frontier entry: read the node, score children
     /// (PCA leaf centroids when use_pca_leaves, else inline FP16), keep the
