@@ -2978,11 +2978,11 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     // --- Route: shared descent (route_query_, also used by search_batch) ---
     const MetricKind metric = coder_->metric();
     {
-        // Plane stage-1 (predicate-free queries only in v1 — see
-        // plane_route_). Feedback probing is descent-based and not
+        // Plane stage-1. Predicates compose by summary-pruning the
+        // plane-selected candidates (same conservative filter the
+        // descent applies). Feedback probing is descent-based and not
         // meaningful under plane routing.
-        const bool plane_active = plane_ != nullptr && config.use_plane &&
-                                  config.predicates.empty();
+        const bool plane_active = plane_ != nullptr && config.use_plane;
         RouteStatus rstatus;
         if (plane_active) {
             scratch.route_feedback = false;
@@ -2991,6 +2991,31 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             scratch.root_dists.clear();
             rstatus = RouteStatus::Ok;
             plane_route_(query, config, scratch.candidates);
+            if (!config.predicates.empty() &&
+                !scratch.candidates.empty()) {
+                (void)resolve_pred_columns_(config,
+                                            scratch.pred_col_indices,
+                                            scratch.geo_lng_col_indices);
+                auto& pruned = scratch.pruned_candidates;
+                pruned.clear();
+                pruned.reserve(scratch.candidates.size());
+                for (const auto& cand : scratch.candidates) {
+                    if (cand.page == kInvalidPage) continue;
+                    LeafExtentCache::Handle h;
+                    const uint8_t* leaf_ptr =
+                        pin_leaf_(cand.page,
+                                  static_cast<uint32_t>(cand.pages), h);
+                    if (h.entry) scratch.pins.push_back(h);
+                    const uint8_t* summary = leaf_ptr + leaf_filter_offset();
+                    if (summary_may_match(
+                            summary, manifest_.summary_size,
+                            manifest_.schema, config.predicates,
+                            scratch.pred_col_indices,
+                            scratch.geo_lng_col_indices))
+                        pruned.push_back(cand);
+                }
+                scratch.candidates = std::move(pruned);
+            }
             if (scratch.candidates.empty()) rstatus = RouteStatus::Empty;
         } else {
             rstatus = route_query_(query, config, scratch, scratch.candidates);
@@ -4185,8 +4210,7 @@ void IVFTreeIndex::search_batch(
     const bool plane_active = plane_ != nullptr && config.use_plane;
     if (plane_active) {
         std::vector<uint32_t> plane_q;      // indexes into qs
-        for (uint32_t i = 0; i < nq; ++i)
-            if (qs[i].predicates->empty()) plane_q.push_back(i);
+        for (uint32_t i = 0; i < nq; ++i) plane_q.push_back(i);
         if (!plane_q.empty()) {
             std::vector<const float*> qptr;
             qptr.reserve(plane_q.size());

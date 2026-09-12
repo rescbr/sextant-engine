@@ -261,6 +261,87 @@ inline void scalar_heap_push4(RawScanHeap& heap, const ScalarScanCtx& c,
     }
 }
 
+/// Buffered top-W admission (replaces the per-candidate heap branch).
+/// Candidates buffer per LEAF (raw f32 dists); the flush vectorizes the
+/// monotone f32->u32 key transform + threshold filter (AVX-512) and only
+/// the survivors (~W out of thousands once the heap fills) touch the
+/// branchy heap. Bit-exact with the incremental path: heaps are
+/// sentinel-prefilled, so the bounded survivor set is the W smallest by
+/// heap_entry_less INDEPENDENT of arrival order (see heap_init).
+struct ScalarCandBuf {
+    std::vector<float> dist;
+    std::vector<uint32_t> idx;
+    void reset() { dist.clear(); idx.clear(); }
+};
+
+inline void scalar_cand_push4(ScalarCandBuf& b, const ScalarScanCtx& c,
+                              const uint32_t i, const uint32_t nv,
+                              const float* dots) {
+    for (uint32_t v = 0; v < nv; ++v) {
+        const float score = dots[v] + c.c0;
+        b.dist.push_back(c.ip_bias
+            ? -(score * static_cast<float>(c.ip_bias[i + v]))
+            : -score);
+        b.idx.push_back(i + v);
+    }
+}
+
+inline void scalar_cand_flush(ScalarCandBuf& b, RawScanHeap& heap) {
+    const size_t n = b.dist.size();
+    if (!heap_full(heap)) {
+        // Cold start: fill (front is the sentinel 0xFFFFFFFF until full).
+        for (size_t j = 0; j < n; ++j)
+            heap_push(heap, f32_to_dist_key(b.dist[j]), b.idx[j]);
+        b.reset();
+        return;
+    }
+    // Threshold taken once: the max-heap front only DECREASES during the
+    // flush, so a stale threshold merely admits a few candidates the
+    // guarded replace then rejects.
+    const uint32_t thr = heap_front(heap);
+#if defined(__AVX512F__)
+    const __m512i sgn = _mm512_set1_epi32(static_cast<int>(0x80000000u));
+    size_t j = 0;
+    for (; j + 16 <= n; j += 16) {
+        const __m512i bits = _mm512_castps_si512(
+            _mm512_loadu_ps(&b.dist[j]));
+        const __m512i keys = _mm512_xor_si512(
+            bits, _mm512_or_si512(_mm512_srai_epi32(bits, 31), sgn));
+        // Strictly-smaller lanes take the guarded replace; EQUAL keys
+        // need the (dist, slot, idx) tie-break, so route them through
+        // the scalar check too (rare).
+        uint32_t k16[16];
+        _mm512_storeu_si512(k16, keys);
+        __mmask16 m = _mm512_cmplt_epu32_mask(
+            keys, _mm512_set1_epi32(thr));
+        while (m) {
+            const int l = __builtin_ctz(m);
+            m &= m - 1;
+            heap_replace_top(heap, k16[l], b.idx[j + l]);
+        }
+        m = _mm512_cmpeq_epu32_mask(keys, _mm512_set1_epi32(thr));
+        while (m) {
+            const int l = __builtin_ctz(m);
+            m &= m - 1;
+            if (heap_should_replace(heap, k16[l], b.idx[j + l]))
+                heap_replace_top(heap, k16[l], b.idx[j + l]);
+        }
+    }
+    for (; j < n; ++j) {
+        const uint32_t key = f32_to_dist_key(b.dist[j]);
+        if (heap_should_replace(heap, key, b.idx[j]))
+            heap_replace_top(heap, key, b.idx[j]);
+    }
+#else
+    for (size_t j = 0; j < n; ++j) {
+        const uint32_t key = f32_to_dist_key(b.dist[j]);
+        if (heap_should_replace(heap, key, b.idx[j]))
+            heap_replace_top(heap, key, b.idx[j]);
+    }
+#endif
+    b.reset();
+}
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -473,12 +554,14 @@ inline void scalar_scan_i8(const ScalarScanCtx& c, RawScanHeap& heap) {
     static thread_local std::vector<uint8_t> pad_row_buf;
     if (pad_row_buf.size() < cs) pad_row_buf.assign(cs, 0);
     const uint8_t* pad_row = pad_row_buf.data();
+    static thread_local detail::ScalarCandBuf cbuf;
     for (uint32_t i = 0; i < c.count; i += 4) {
         const auto r = detail::scalar_rows(c, i, pad_row);
         float dots[4];
         scalar_i8_dots4(c, r.cp, dots);
-        detail::scalar_heap_push4(heap, c, i, r.nv, dots);
+        detail::scalar_cand_push4(cbuf, c, i, r.nv, dots);
     }
+    detail::scalar_cand_flush(cbuf, heap);
 }
 
 inline void scalar_scan_arith(const ScalarScanCtx& c, RawScanHeap& heap) {
@@ -486,15 +569,18 @@ inline void scalar_scan_arith(const ScalarScanCtx& c, RawScanHeap& heap) {
     static thread_local std::vector<uint8_t> pad_row_buf;
     if (pad_row_buf.size() < cs) pad_row_buf.assign(cs, 0);
     const uint8_t* pad_row = pad_row_buf.data();
+    static thread_local detail::ScalarCandBuf cbuf;
     for (uint32_t i = 0; i < c.count; i += 4) {
         const auto r = detail::scalar_rows(c, i, pad_row);
         float dots[4];
         scalar_arith_dots4(c, r.cp, dots);
-        detail::scalar_heap_push4(heap, c, i, r.nv, dots);
+        detail::scalar_cand_push4(cbuf, c, i, r.nv, dots);
     }
+    detail::scalar_cand_flush(cbuf, heap);
 }
 
 inline void scalar_scan_gather(const ScalarScanCtx& c, RawScanHeap& heap) {
+    static thread_local detail::ScalarCandBuf cbuf;
     const uint32_t dim = c.dim;
     const uint32_t cs = c.cs;
     const uint32_t d4 = dim / 4 * 4;
@@ -525,8 +611,9 @@ inline void scalar_scan_gather(const ScalarScanCtx& c, RawScanHeap& heap) {
                 dots[v] += query[d] * levels[d*K + nib];
             }
         }
-        detail::scalar_heap_push4(heap, c, i, r.nv, dots);
+        detail::scalar_cand_push4(cbuf, c, i, r.nv, dots);
     }
+    detail::scalar_cand_flush(cbuf, heap);
 }
 
 inline void scalar_scan_leaf(const ScalarScanCtx& c, RawScanHeap& heap) {
