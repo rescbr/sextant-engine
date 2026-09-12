@@ -889,6 +889,10 @@ int cmd_tree_search(int argc, char* argv[]) {
         "with a cache must be labeled with this size (BENCHMARK_RULES)", false, 0);
     p.add<uint32_t>("cache-window-pct", 0,
         "LeafCache W-TinyLFU window as % of capacity (default 1, Caffeine)", false, 1);
+    p.add<uint32_t>("plane-cache-mb", 0,
+        "Independent W-TinyLFU cache for plane row blocks (routing tier, "
+        "~16 B/vec at b1g; 0=off: mmap the plane). Warms hot leaves' "
+        "routing rows under skewed traffic", false, 0);
     p.add<uint32_t>("passes", 0,
         "Run the query set N times. N>=2 discards the first pass as warmup "
         "and times the rest (BENCHMARK_RULES warm measurement; combine with "
@@ -944,7 +948,8 @@ int cmd_tree_search(int argc, char* argv[]) {
         ? p.get<int>("scan-i8") : -1);
     auto idx = tree::IVFTreeIndex::open(p.get<std::string>("index"),
         static_cast<uint64_t>(p.get<uint32_t>("cache-mb")) * 1024 * 1024,
-        p.get<uint32_t>("cache-window-pct"));
+        p.get<uint32_t>("cache-window-pct"),
+        static_cast<uint64_t>(p.get<uint32_t>("plane-cache-mb")) * 1024 * 1024);
 
     // Read query file (.fbin or .parquet).
     const std::string query_path = p.get<std::string>("query");
@@ -1445,6 +1450,14 @@ int cmd_tree_search(int argc, char* argv[]) {
                       << " hit=" << (100.0 * hit_rate) << "%"
                       << " disk_bytes/query="
                       << (st.queries ? double(st.cache_bytes_filled) / st.queries : 0.0);
+        }
+    }
+    if (p.get<uint32_t>("plane-cache-mb") > 0) {
+        uint64_t ph = 0, pm = 0;
+        idx->plane_cache_hitmiss(ph, pm);
+        if (ph + pm > 0) {
+            std::cerr << " PlaneCache=" << p.get<uint32_t>("plane-cache-mb")
+                      << "MB hit=" << (100.0 * ph / (ph + pm)) << "%";
         }
     }
     std::cerr << " cpu=" << cpu_win << "s util=" << (100.0 * util) << "%";

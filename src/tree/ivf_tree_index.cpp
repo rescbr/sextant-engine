@@ -104,7 +104,8 @@ void IVFTreeIndex::close() {
 
 std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
                                               uint64_t leaf_cache_bytes,
-                                              uint32_t cache_window_pct) {
+                                              uint32_t cache_window_pct,
+                                              uint64_t plane_cache_bytes) {
     auto idx = std::unique_ptr<IVFTreeIndex>(new IVFTreeIndex());
     // Fail fast on a missing path: PageFile opens O_RDWR|O_CREAT (the
     // build/vacuum write path needs creation), so opening a typo'd name
@@ -296,6 +297,19 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
         idx->leaf_cache_->set_expected_entries(idx->manifest_.n_leaves);
         spdlog::info("[sextant] IVFTreeIndex: leaf cache {} bytes ({} shards)",
                      leaf_cache_bytes, kLeafCacheShards);
+    }
+
+    // Independent cache for plane row blocks (routing tier). Keyed by
+    // the plane extent's page ids — disjoint from leaf extent pages, so
+    // it never competes with the leaf budget. Same W-TinyLFU policy.
+    if (plane_cache_bytes > 0 && idx->plane_) {
+        constexpr uint32_t kPlaneCacheShards = 16;
+        idx->plane_cache_ = std::make_unique<LeafExtentCache>(
+            plane_cache_bytes, kPlaneCacheShards, idx->file_.fd(),
+            cache_window_pct);
+        idx->plane_cache_->set_expected_entries(idx->manifest_.n_leaves);
+        spdlog::info("[sextant] IVFTreeIndex: plane cache {} bytes",
+                     plane_cache_bytes);
     }
 
     // If PCA routing: build leaf_id mapping for depth=2 trees.
@@ -4986,11 +5000,55 @@ void IVFTreeIndex::plane_route_batch_(
         // compare + -inf store, never a block sweep. (A query-tiled
         // variant was tried; scanning all tile members when any survive
         // multiplies sweep work ~kQTile at prune budgets.)
+        // Plane cache active: pin each leaf's row blocks ONCE (fill on
+        // miss preads them; fallback = the mmap'd blob pointer), scan all
+        // surviving queries against the pinned rows, unpin. Under skewed
+        // traffic the hot leaves' routing rows stay resident at ~16 B/vec
+        // — 10x denser coverage per byte than leaf extents.
+        const bool pc = plane_cache_ != nullptr;
+        const PageId plane_pg0 = superblock_.plane_page();
         for (uint64_t l = l0; l < l1; ++l) {
             if (leaf_table_[static_cast<uint32_t>(l)].page == kInvalidPage)
                 continue;
             float* row = &scores[static_cast<size_t>(l) * nq];
             const uint32_t leaf = static_cast<uint32_t>(l);
+            const uint8_t* pinned = nullptr;
+            LeafExtentCache::Handle ph;
+            if (pc) {
+                // Pin only when at least one query survives this leaf —
+                // a pin on an all-masked leaf would fill data nobody reads.
+                bool any = false;
+                if (survive.empty()) {
+                    any = true;
+                } else {
+                    for (uint32_t qi = 0; qi < nq; ++qi) {
+                        if (survive[static_cast<size_t>(qi) * n_leaves +
+                                    l] != 0.0f) {
+                            any = true;
+                            break;
+                        }
+                    }
+                }
+                if (any) {
+                    const uint64_t off = plane_->leaf_block_offset(leaf);
+                    const uint32_t nb = plane_->leaf_block_count(leaf);
+                    const uint64_t bytes =
+                        uint64_t(nb) * plane_->debug_block_bytes();
+                    const uint64_t fbyte = uint64_t(plane_pg0) * kPageSize +
+                        plane_->blocks_offset_in_blob() + off;
+                    const uint32_t pgoff = fbyte % kPageSize;
+                    const PageId pg = fbyte / kPageSize;
+                    const uint32_t pages = static_cast<uint32_t>(
+                        (pgoff + bytes + kPageSize - 1) / kPageSize);
+                    // pin() returns a PAGE-ALIGNED pointer; the rows start
+                    // pgoff bytes into the first page (leaf extents are
+                    // page-aligned, plane rows are not).
+                    pinned = plane_cache_->pin(
+                                 pg, pages, ph,
+                                 mmap_base_ + fbyte)  // fallback: mmap rows
+                             + pgoff;
+                }
+            }
             for (uint32_t qi = 0; qi < nq; ++qi) {
                 if (!survive.empty() &&
                     survive[static_cast<size_t>(qi) * n_leaves + l] ==
@@ -5000,15 +5058,23 @@ void IVFTreeIndex::plane_route_batch_(
                 }
                 row[qi] =
                     (is_b1g || fastscan8 || pv8)
-                        ? plane_->scan_leaf_max_u8(
-                              leaf,
-                              &lut8[static_cast<size_t>(qi) * SEG * 16],
-                              pv8 ? shifts[qi] : 0.0f)
+                        ? (pinned
+                               ? plane_->scan_leaf_max_u8_at(
+                                     leaf, pinned,
+                                     &lut8[static_cast<size_t>(qi) * SEG *
+                                            16],
+                                     pv8 ? shifts[qi] : 0.0f)
+                               : plane_->scan_leaf_max_u8(
+                                     leaf,
+                                     &lut8[static_cast<size_t>(qi) * SEG *
+                                            16],
+                                     pv8 ? shifts[qi] : 0.0f))
                         : plane_->scan_leaf_max(
                               leaf,
                               &lut[static_cast<size_t>(qi) * R * 16],
                               nullptr, nullptr);
             }
+            if (pinned) plane_cache_->unpin(ph);
         }
     };
     {
@@ -5359,6 +5425,15 @@ void IVFTreeIndex::attach_plane(const float* base, uint32_t n, uint32_t dim,
                  npg, plane_->meta().bytes_per_vec(),
                  std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t0).count());
+}
+
+void IVFTreeIndex::plane_cache_hitmiss(uint64_t& hits,
+                                       uint64_t& misses) const {
+    hits = misses = 0;
+    if (!plane_cache_) return;
+    const auto st = plane_cache_->stats();
+    hits = st.hits;
+    misses = st.misses;
 }
 
 std::vector<IVFTreeIndex::DebugLeafInfo> IVFTreeIndex::debug_leaf_info()

@@ -363,15 +363,42 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
     Mutex& stripe = fill_stripes_[fill_stripe(page)];
 
     // Fast path: hit (write lock — hits mutate LRU order + SLRU promotion).
+    // COVERAGE check: an entry found under `page` may be SHORTER than the
+    // requested range (plane-row pins of adjacent leaves overlap with
+    // different spans; leaf extents never overlap, which is why this only
+    // surfaced with the plane cache). A short incumbent is replaced by the
+    // wider fill below if unpinned; if pinned, this pin falls back.
     {
         ScopedWriteLock lock(s.mu);
         auto it = s.map.find(page);
         if (it != s.map.end()) {
             Entry* e = it->second;
-            hit_locked(s, e, page);
-            if (was_hit) *was_hit = true;
-            h.entry = e;
-            return entry_ptr(e, page);
+            const uint64_t need =
+                (static_cast<uint64_t>(page) - e->page) * kPageSize +
+                static_cast<uint64_t>(pages) * kPageSize;
+            if (need <= e->buf_cap) {
+                hit_locked(s, e, page);
+                if (was_hit) *was_hit = true;
+                h.entry = e;
+                return entry_ptr(e, page);
+            }
+            if (e->refs.load(std::memory_order_relaxed) == 0) {
+                // Retire the short incumbent so the wider fill can take
+                // the key. Unlink from its list + bytes; drop keys.
+                switch (e->status) {
+                case LeafExtentCacheStatus::WINDOW:
+                    List::unlink(e, s.window);
+                    s.bytes_window -= e->size; break;
+                case LeafExtentCacheStatus::PROBATION:
+                    List::unlink(e, s.probation);
+                    s.bytes_probation -= e->size; break;
+                case LeafExtentCacheStatus::PROTECTED:
+                    List::unlink(e, s.protected_);
+                    s.bytes_protected -= e->size; break;
+                }
+                erase_keys(s, e);
+                drop_entry(e);
+            }
         }
     }
 
@@ -393,11 +420,20 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
         auto it = s.map.find(page);
         if (it != s.map.end()) {
             Entry* e = it->second;
-            hit_locked(s, e, page);
-            if (was_hit) *was_hit = true;
-            h.entry = e;
-            stripe.unlock();
-            return entry_ptr(e, page);
+            const uint64_t need =
+                (static_cast<uint64_t>(page) - e->page) * kPageSize +
+                static_cast<uint64_t>(pages) * kPageSize;
+            if (need <= e->buf_cap) {
+                hit_locked(s, e, page);
+                if (was_hit) *was_hit = true;
+                h.entry = e;
+                stripe.unlock();
+                return entry_ptr(e, page);
+            }
+            // Short incumbent: left in place (the fast path already tried
+            // to retire it; if it is still here it was pinned). Our fill
+            // below proceeds; its map emplace is a no-op for this key, so
+            // the short entry keeps serving smaller pins.
         }
     }
 
@@ -416,15 +452,25 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
     {
         ScopedWriteLock lock(s.mu);
         // Duplicate-insert race (lost the stripe gate, or a wider run fill
-        // covered this page): keep the incumbent.
+        // covered this page): keep the incumbent — but only if it actually
+        // COVERS the requested range (short plane-row incumbents must not
+        // swallow wider pins; see the fast-path coverage note).
         auto it = s.map.find(page);
         if (it != s.map.end()) {
             Entry* winner = it->second;
-            hit_locked(s, winner, page);
-            h.entry = winner;
-            drop_filled(e);  // our buffer never became visible
-            if (gated) stripe.unlock();
-            return entry_ptr(winner, page);
+            const uint64_t need =
+                (static_cast<uint64_t>(page) - winner->page) * kPageSize +
+                static_cast<uint64_t>(pages) * kPageSize;
+            if (need <= winner->buf_cap) {
+                hit_locked(s, winner, page);
+                h.entry = winner;
+                drop_filled(e);  // our buffer never became visible
+                if (gated) stripe.unlock();
+                return entry_ptr(winner, page);
+            }
+            // Fall through: insert ours (emplace for `page` no-ops while
+            // the short incumbent holds the key; ours still serves THIS
+            // caller and ages out via eviction).
         }
         s.sketch->increment(page);
 

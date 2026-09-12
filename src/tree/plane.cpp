@@ -418,6 +418,7 @@ std::unique_ptr<PlaneIndex> PlaneIndex::parse(const uint8_t* data,
     std::memcpy(&h, data, sizeof(h));
     if (h.magic != kPlaneMagic || h.version != kPlaneVersion) return nullptr;
     auto p = std::unique_ptr<PlaneIndex>(new PlaneIndex());
+    p->blob_ = data;  // blocks-offset bookkeeping for the plane cache
     p->meta_.encoding = static_cast<PlaneEncoding>(h.encoding);
     p->meta_.rank = h.rank;
     p->meta_.dim = h.dim;
@@ -603,6 +604,14 @@ void PlaneIndex::build_lut8(const float* proj, uint8_t* lut8, float* scale,
 
 float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
                                    const uint8_t* lut8, float shift) const {
+    return scan_leaf_max_u8_at(leaf_id, blocks_ + block_off_[leaf_id],
+                               lut8, shift);
+}
+
+float PlaneIndex::scan_leaf_max_u8_at(uint32_t leaf_id,
+                                     const uint8_t* blk,
+                                     const uint8_t* lut8,
+                                     float shift) const {
     // Correct kernel: pq4_scan_many (per-block u32 sums in memory, LUT
     // cache-hot). A register-accumulator "fused" variant was attempted
     // and REVERTED: per-member accumulation can't span block pairs
@@ -613,7 +622,6 @@ float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
     const uint32_t nb = block_cnt_[leaf_id];
     const uint32_t count = leaf_cnt_[leaf_id];
     const uint32_t m = fs_segments(meta_.encoding, meta_.rank);
-    const uint8_t* blk = blocks_ + block_off_[leaf_id];
     static thread_local std::vector<uint32_t> sums, masks;
     sums.resize(static_cast<size_t>(nb) * 32);
     masks.resize(nb);

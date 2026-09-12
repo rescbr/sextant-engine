@@ -154,6 +154,13 @@ public:
     float scan_leaf_max_u8(uint32_t leaf_id, const uint8_t* lut8,
                            float shift = 0.0f) const;
 
+    /// scan_leaf_max_u8 with the caller-supplied block pointer (e.g. rows
+    /// pinned in the plane cache) instead of the mmap'd blob. leaf_id
+    /// still supplies the block count, member count, and pv alpha base.
+    float scan_leaf_max_u8_at(uint32_t leaf_id, const uint8_t* blk,
+                              const uint8_t* lut8,
+                              float shift = 0.0f) const;
+
     /// Query-tiled variant: Q queries against one leaf's blocks per
     /// pass — code loads amortize across the tile, LUT rows stay
     /// register-resident per (segment, tile). `luts[q]` = rank-dep
@@ -173,6 +180,14 @@ public:
     /// Must be called once after parse(), before scanning.
     void bind(const std::vector<uint32_t>& leaf_counts);
 
+    /// Byte offset of the blocks region within the plane blob (the blob
+    /// starts with header/basis/mean/codebook). Callers converting a leaf's
+    /// block offset into a FILE offset must add this to the extent's page
+    /// base (the plane cache does exactly that).
+    uint64_t blocks_offset_in_blob() const {
+        return static_cast<uint64_t>(blocks_ - blob_);
+    }
+
     /// Diagnostics: block byte offset of a leaf (fsck cross-check).
     uint64_t leaf_block_offset(uint32_t leaf_id) const;
     /// Debug: raw block bytes for a leaf (selftest bit verification).
@@ -184,6 +199,7 @@ public:
 
 private:
     PlaneMeta meta_{};
+    const uint8_t* blob_ = nullptr;    // parse() input (offset base)
     const uint8_t* blocks_ = nullptr;  // into blob
     const uint16_t* alpha_ = nullptr;  // u4lm_pv: per real member, leaf-aligned
     const float* basis_t_ = nullptr;

@@ -136,6 +136,11 @@ public:
     /// as search_stats(): snapshot_and_reset() per window.
     const BatchStats& batch_stats() const { return batch_stats_; }
 
+    /// Plane-cache hit/miss counters (cumulative since open; zeros when
+    /// the plane cache is off). Lets benchmarks report leaf-tier and
+    /// plane-tier hit rates separately.
+    void plane_cache_hitmiss(uint64_t& hits, uint64_t& misses) const;
+
     /// PCA-preconditioned streaming build: project vectors onto top-k PCs
     /// before routing. On high-LID data (d_eff≈2), this exposes the manifold
     /// structure so k-means converges. Scan codes stay in original space.
@@ -157,7 +162,8 @@ public:
     /// invalidate the cache wholesale via remap_().
     static std::unique_ptr<IVFTreeIndex> open(const std::string& path,
                                               uint64_t leaf_cache_bytes = 0,
-                                              uint32_t cache_window_pct = 1);
+                                              uint32_t cache_window_pct = 1,
+                                              uint64_t plane_cache_bytes = 0);
 
     // --- Search ---
 
@@ -409,6 +415,12 @@ private:
     // Engine-owned leaf-extent cache (null = off: search reads leaves via
     // mmap_base_, exactly the pre-cache behavior). See open().
     std::unique_ptr<class LeafExtentCache> leaf_cache_;
+    /// Independent W-TinyLFU cache for PLANE row blocks (routing tier):
+    /// leaf-aligned, ~10x denser per byte than leaf extents at b1g — hot
+    /// leaves' routing rows stay resident under skewed traffic without
+    /// competing with the leaf-extent budget. Keyed by the plane extent's
+    /// page ids (disjoint from leaf extent pages).
+    std::unique_ptr<class LeafExtentCache> plane_cache_;
 
     PageFile file_;
     Superblock superblock_;
