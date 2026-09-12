@@ -41,12 +41,6 @@ uint32_t block_bytes_for(const PlaneMeta& m) {
     return m.rank * 16;                                       // [m][16]
 }
 
-uint32_t read_u32(const uint8_t* p) {
-    uint32_t v;
-    std::memcpy(&v, p, 4);
-    return v;
-}
-
 }  // namespace
 
 uint32_t PlaneMeta::bytes_per_vec() const {
@@ -250,10 +244,15 @@ void PlaneWriter::encode_member(uint32_t leaf_id, uint32_t slot,
 
     uint8_t* blk = &ls.blocks[static_cast<size_t>(block) * block_bytes_];
     if (meta_.encoding == PlaneEncoding::B1G) {
+        // Member-major bytes: member `lane` owns bytes [lane*R/8,
+        // (lane+1)*R/8); dim e lives at byte e/8, bit e%8. Same total
+        // bytes/vec; enables the 256-entry byte-LUT scan kernel (the
+        // dim-major bitplane layout forced a per-lane scalar loop —
+        // measured 19 QPS at 10M).
+        uint8_t* mem = blk + static_cast<size_t>(lane) * (R / 8);
         for (uint32_t e = 0; e < R; ++e)
             if (encode_dim_(pr[e], e))
-                blk[e * 4 + (lane >> 3)] |=
-                    static_cast<uint8_t>(1u << (lane & 7));
+                mem[e >> 3] |= static_cast<uint8_t>(1u << (e & 7));
     } else {
         // FastScan [m][16] nibble interleave (same as leaf codes):
         // lane j < 16 -> low nibble of blk[s*16 + j], j >= 16 -> high.
@@ -320,8 +319,9 @@ std::vector<uint8_t> PlaneWriter::finalize(
         const uint8_t* blk =
             &ls.blocks[static_cast<size_t>(block) * block_bytes_];
         if (meta_.encoding == PlaneEncoding::B1G)
-            return decode_dim_((blk[s * 4 + (lane >> 3)] >> (lane & 7)) & 1u,
-                               s);
+            return decode_dim_(
+                (blk[static_cast<size_t>(lane) * (meta_.rank / 8) +
+                     (s >> 3)] >> (s & 7)) & 1u, s);
         const uint8_t nbi = static_cast<uint8_t>(lane % 16);
         const uint32_t code = (lane >= 16)
             ? static_cast<uint32_t>(blk[s * 16 + nbi] >> 4)
@@ -458,11 +458,30 @@ void PlaneIndex::build_lut(const float* proj, float* lut) const {
 
 void PlaneIndex::build_sign_ctx(const float* proj, float* w_out,
                                 uint32_t* qbits_out) const {
+    // w_out doubles as the byte-LUT staging area is NOT used; see
+    // build_b1_lut. Kept: fills per-dim weights (used by diagnostics).
     const uint32_t R = meta_.rank;
     for (uint32_t e = 0; e < R; ++e) {
         w_out[e] = proj[e] * codebook_[e];
         qbits_out[e] = proj[e] >= 0 ? 0xFFFFFFFFu : 0u;
     }
+}
+
+void PlaneIndex::build_b1_lut(const float* proj, float* blut) const {
+    // blut[j*256 + v] = sum over dims e = 8j..8j+7 of
+    // (proj[e] * sign_scale[e]) * (bit_e(v) ? +1 : -1).
+    // Size: (rank/8) * 256 floats (16 KB at rank 128).
+    const uint32_t R = meta_.rank;
+    for (uint32_t j = 0; j < R / 8; ++j)
+        for (int v = 0; v < 256; ++v) {
+            float s = 0;
+            for (uint32_t t = 0; t < 8; ++t) {
+                const uint32_t e = j * 8 + t;
+                const float w = proj[e] * codebook_[e];
+                s += ((v >> t) & 1u) ? w : -w;
+            }
+            blut[static_cast<size_t>(j) * 256 + v] = s;
+        }
 }
 
 float PlaneIndex::scan_leaf_max_u4_(uint32_t leaf_id,
@@ -498,25 +517,27 @@ float PlaneIndex::scan_leaf_max_u4_(uint32_t leaf_id,
     return best;
 }
 
-float PlaneIndex::scan_leaf_max_b1_(uint32_t leaf_id, const float* w,
-                                    const uint32_t* qbits) const {
+float PlaneIndex::scan_leaf_max_b1_(uint32_t leaf_id, const float* blut)
+    const {
+    // Byte-LUT kernel: member-major sign bytes, blut[j*256+byte] =
+    // sum over the 8 dims of byte j of w[e]*sign(bit) — one gather per
+    // byte, 16 per member at rank 128 (spike-measured ~1.5G vec/s).
     const uint32_t R = meta_.rank;
+    const uint32_t bytes_per_member = R / 8;
     const uint8_t* blk = blocks_ + block_off_[leaf_id];
     const uint32_t nb = block_cnt_[leaf_id];
     const uint32_t count = leaf_cnt_[leaf_id];
     float best = -std::numeric_limits<float>::max();
     for (uint32_t b = 0; b < nb; ++b) {
-        const uint8_t* bl = blk + static_cast<size_t>(b) * block_bytes_;
+        const uint8_t* mem = blk + static_cast<size_t>(b) * block_bytes_;
         const uint32_t valid =
             std::min(kVecsPerBlock, count - b * kVecsPerBlock);
         for (uint32_t lane = 0; lane < valid; ++lane) {
+            const uint8_t* m = mem + static_cast<size_t>(lane) *
+                                      bytes_per_member;
             float s = 0;
-            for (uint32_t e = 0; e < R; ++e) {
-                const uint32_t bits = read_u32(&bl[e * 4]);
-                const uint32_t mism =
-                    ((bits >> lane) & 1u) ^ ((qbits[e] >> lane) & 1u);
-                s += mism ? -w[e] : w[e];
-            }
+            for (uint32_t j = 0; j < bytes_per_member; ++j)
+                s += blut[static_cast<size_t>(j) * 256 + m[j]];
             best = std::max(best, s);
         }
     }
@@ -526,7 +547,7 @@ float PlaneIndex::scan_leaf_max_b1_(uint32_t leaf_id, const float* w,
 float PlaneIndex::scan_leaf_max(uint32_t leaf_id, const float* lut,
                                 const float* w, const uint32_t* qbits) const {
     if (meta_.encoding == PlaneEncoding::B1G)
-        return scan_leaf_max_b1_(leaf_id, w, qbits);
+        return scan_leaf_max_b1_(leaf_id, w);  // w = byte-LUT (16KB)
     return scan_leaf_max_u4_(leaf_id, lut);
 }
 

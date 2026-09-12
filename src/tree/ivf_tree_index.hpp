@@ -493,6 +493,14 @@ private:
     void plane_route_(const float* query, const SearchConfig& config,
                       std::vector<LeafCandidate>& candidates) const;
 
+    /// Batched plane stage-1 (deployment shape): ONE leaf-major plane
+    /// sweep for the whole batch (blocks read once, scored against all
+    /// queries while cache-hot), then per-query fraction selection.
+    void plane_route_batch_(const float* queries, uint32_t nq,
+                            const SearchConfig& config,
+                            std::vector<std::vector<LeafCandidate>>& out)
+        const;
+
     /// Expand one internal frontier entry: read the node, score children
     /// (PCA leaf centroids when use_pca_leaves, else inline FP16), keep the
     /// top-n_probe_ln with gap pruning, resolve leaf ids to physical pages.

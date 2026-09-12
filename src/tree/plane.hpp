@@ -124,6 +124,10 @@ public:
     /// replicated query sign bits per dim (rank u32s). u4lm: unused.
     void build_sign_ctx(const float* proj, float* w_out, uint32_t* qbits_out) const;
 
+    /// b1g byte-LUT (rank/8 x 256 floats, 16 KB at rank 128) for the
+    /// member-major sign-byte scan kernel.
+    void build_b1_lut(const float* proj, float* blut) const;
+
     /// u8-quantized LUT (affine-monotone per query) for the FastScan
     /// kernel path. U4LM only. lut8 = rank*16 bytes; scale/offset/
     /// seg_min are scratch (rank floats each / rank for seg_min).
@@ -147,6 +151,11 @@ public:
 
     /// Diagnostics: block byte offset of a leaf (fsck cross-check).
     uint64_t leaf_block_offset(uint32_t leaf_id) const;
+    /// Debug: raw block bytes for a leaf (selftest bit verification).
+    const uint8_t* debug_block_ptr(uint32_t leaf_id) const {
+        return blocks_ + block_off_[leaf_id];
+    }
+    uint32_t debug_block_bytes() const { return block_bytes_; }
     uint32_t leaf_block_count(uint32_t leaf_id) const;
 
 private:
@@ -161,8 +170,7 @@ private:
     std::vector<uint32_t> leaf_cnt_;   // real member counts (tail clamps)
     uint32_t block_bytes_ = 0;
     float scan_leaf_max_u4_(uint32_t leaf_id, const float* lut) const;
-    float scan_leaf_max_b1_(uint32_t leaf_id, const float* w,
-                            const uint32_t* qbits) const;
+    float scan_leaf_max_b1_(uint32_t leaf_id, const float* blut) const;
 };
 
 /// Parse just the header (fsck sizing checks). Returns false on mismatch.
