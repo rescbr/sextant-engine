@@ -106,6 +106,13 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
                                               uint64_t leaf_cache_bytes,
                                               uint32_t cache_window_pct) {
     auto idx = std::unique_ptr<IVFTreeIndex>(new IVFTreeIndex());
+    // Fail fast on a missing path: PageFile opens O_RDWR|O_CREAT (the
+    // build/vacuum write path needs creation), so opening a typo'd name
+    // would silently leave a zero-byte file behind.
+    if (!std::filesystem::exists(path)) {
+        throw Error(ErrorCode::InvalidParam,
+                    "IVFTreeIndex::open: no such file: " + path);
+    }
     idx->path_ = path;
     idx->file_ = PageFile(path);
     // fd for the search path's posix_fadvise prefetch calls (open-issued

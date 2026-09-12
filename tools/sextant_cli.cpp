@@ -1266,7 +1266,7 @@ int cmd_tree_search(int argc, char* argv[]) {
             // interleave into random I/O (measured; the pipeline is
             // only sound with that invariant).
             {
-                constexpr int kDepth = 2;
+                constexpr int kDepth = 3;
                 std::vector<std::vector<Candidate>> buf[kDepth];
                 std::vector<std::future<void>> fut(kDepth);
                 uint32_t base_of[kDepth] = {0, 0};
