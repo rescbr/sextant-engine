@@ -26,6 +26,8 @@ namespace sextant {
 
 struct ParquetSourceConfig {
     std::string vector_col = "embedding";
+    std::string payload_col;             // string/binary col streamed as opaque
+                                        // per-row payload blobs ("" = off)
     int32_t batch_size = 8192;
     bool use_mmap = true;
     bool verify_checksums = false;  // off by default — CRC is pure waste for builds
@@ -100,7 +102,11 @@ private:
     Schema schema_;
     int32_t vec_col_idx_ = -1;
     int32_t vec_type_len_ = 0;
-    std::vector<int32_t> filter_col_indices_;
+    int32_t payload_col_idx_ = -1;   // file column index of the payload col
+    int32_t payload_type_len_ = 0;   // FIXED_LEN_BYTE_ARRAY stride (0 for BYTE_ARRAY)
+    std::vector<uint8_t> payload_data_;     // per-batch packed payload bytes
+    std::vector<uint32_t> payload_offsets_;  // n+1 cumulative offsets
+    std::vector<int32_t> filter_col_indices_;  // file col idx per filter col
 
     // When the batch reader returns a zero-copy view (mmap + uncompressed +
     // FIXED_LEN_BYTE_ARRAY + no nulls), vec_ptr_ aliases the mmap directly.

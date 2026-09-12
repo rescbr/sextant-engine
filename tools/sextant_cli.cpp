@@ -477,6 +477,10 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<uint32_t>("max-lloyd-passes", 0, "Max streaming Lloyd passes (default 10)", false, 10);
     p.add<float>("closure-mult", 0, "Closure epsilon multiplier (default 0.15)", false, 0.15f);
     p.add<std::string>("filter-data", 0, "Filter column data sidecar (.fdat)", false, "");
+    p.add<std::string>("payload-col", 0,
+        "Parquet string/binary column streamed into per-leaf payload "
+        "extents (fetched at search via --with-payload). Parquet inputs "
+        "only; mutually exclusive with --filter-data.", false, "");
     p.add<std::string>("label-file", 0, "Parquet file with filter columns (joined by row position)", false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
     p.add<std::string>("metrics-file", 0,
@@ -593,6 +597,19 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     cfg.metrics_sink = metrics_json.get();  // null = default log line only
 
     BuildResult result;
+    const std::string payload_col = p.get<std::string>("payload-col");
+    if (!payload_col.empty()) {
+        if (!fdat_path.empty()) {
+            std::cerr << "build-tree: --payload-col and --filter-data are "
+                         "mutually exclusive (payload comes from the parquet "
+                         "column OR the fdat sidecar)\n";
+            return 1;
+        }
+        if (!is_parquet) {
+            std::cerr << "build-tree: --payload-col requires a parquet input\n";
+            return 1;
+        }
+    }
     if (is_parquet) {
         auto shard_paths = expand_glob(input_path);
         bool use_glob = shard_paths.size() > 1 || !label_file.empty();
@@ -600,6 +617,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
         if (use_glob) {
             ParquetGlobSource::Config gcfg;
             gcfg.vector_col = vector_col;
+            gcfg.payload_col = payload_col;
             gcfg.normalize = need_normalize;
             gcfg.label_file = label_file;
             gcfg.batch_size = 8192;
@@ -615,6 +633,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
         } else {
             ParquetSourceConfig pcfg;
             pcfg.vector_col = vector_col;
+            pcfg.payload_col = payload_col;
             pcfg.normalize = need_normalize;
             ParquetSource source(shard_paths[0], pcfg);
             if (fdat_path.empty()) {
@@ -981,6 +1000,8 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<std::string>("vector-col", 0, "Vector column name for parquet queries (default: emb)", false, "emb");
     p.add("with-payload", 0,
           "Fetch + print opaque payload blobs with results");
+    p.add("payload-text", 0,
+          "With --with-payload: print blobs as raw text instead of hex");
     // The cmdline library only keeps the LAST value of a repeated option, so
     // collect every --filter occurrence from argv ourselves (supports AND of
     // multiple predicates). Both "--filter X" and "--filter=X" forms are
@@ -1006,6 +1027,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     }
 
     const bool with_payload = p.exist("with-payload");
+    const bool payload_text = p.exist("payload-text");
 
     // Scalar scan kernel selection: resolved into the coder's params at
     // open (must precede open — the factory reads the override once).
@@ -1467,12 +1489,16 @@ int cmd_tree_search(int argc, char* argv[]) {
             if (with_payload) {
                 auto blob = idx->fetch_payload(all_payload_locs[qi][ri].first,
                                                 all_payload_locs[qi][ri].second);
-                *out << '\t' << blob.size();
-                // Hex-encode the payload (handles arbitrary binary content).
-                for (char bch : blob) {
-                    const uint8_t b = static_cast<uint8_t>(bch);
-                    *out << "0123456789abcdef"[b >> 4]
-                         << "0123456789abcdef"[b & 0x0f];
+                *out << '\t' << blob.size() << '\t';
+                if (payload_text) {
+                    *out << std::string_view(blob);
+                } else {
+                    // Hex-encode the payload (handles arbitrary binary content).
+                    for (char bch : blob) {
+                        const uint8_t b = static_cast<uint8_t>(bch);
+                        *out << "0123456789abcdef"[b >> 4]
+                             << "0123456789abcdef"[b & 0x0f];
+                    }
                 }
             }
             *out << '\n';

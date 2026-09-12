@@ -85,6 +85,7 @@ ParquetGlobSource::ParquetGlobSource(
     // Create vector shard sources
     ParquetSourceConfig pcfg;
     pcfg.vector_col = config_.vector_col;
+    pcfg.payload_col = config_.payload_col;
     pcfg.normalize = config_.normalize;
     pcfg.batch_size = config_.batch_size;
     pcfg.num_threads = config_.num_threads;

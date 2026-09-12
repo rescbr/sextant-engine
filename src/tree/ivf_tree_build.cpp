@@ -963,8 +963,12 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     const bool has_filter = cfg.filter_schema.n_filter_columns() > 0;
     const uint32_t n_schema_cols =
         static_cast<uint32_t>(cfg.filter_schema.columns.size());
-    const bool has_payload =
-        cfg.filter_schema.has_payload && cfg.payload_data && cfg.payload_offsets;
+    // Payload comes from either the fdat sidecar (cfg.payload_data/
+    // payload_offsets, indexed by build row) or per-chunk source blobs
+    // (chunk.payload_data — ParquetSource --payload-col). The schema flag
+    // drives the extents; the per-chunk dual-path is resolved below.
+    const bool has_payload = cfg.filter_schema.has_payload;
+    const bool cfg_payload = cfg.payload_data && cfg.payload_offsets;
     ctx.has_filter = has_filter;
     ctx.has_payload = has_payload;
     ctx.n_schema_cols = n_schema_cols;
@@ -983,9 +987,12 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         uint32_t centroid_count = 0;
         // Filter column data for the rows in this buffer (Phase C).
         std::vector<ColumnData> filter_cols;
-        // Payload info for the rows in this buffer (Phase E).
+        // Payload info for the rows in this buffer (Phase E). Bytes are
+        // COPIED into payload_store: source chunk payload buffers are
+        // reused across chunks, so pointers would dangle at flush time.
         std::vector<uint32_t> payload_lens;
-        std::vector<const uint8_t*> payload_ptrs;
+        std::vector<uint32_t> payload_offs;  // start offset into payload_store
+        std::vector<uint8_t> payload_store;
         // For local_pq: raw FP16 vectors (for per-leaf codebook training at flush).
         // Empty when not local_pq.
         std::vector<float16_t> fp16_vecs;
@@ -1177,7 +1184,9 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                 const uint32_t plen = buf.payload_lens[i];
                 offsets[i] = acc;
                 lengths[i] = plen;
-                std::memcpy(pdata + acc, buf.payload_ptrs[i], plen);
+                std::memcpy(pdata + acc,
+                            buf.payload_store.data() + buf.payload_offs[i],
+                            plen);
                 acc += plen;
             }
         }
@@ -1257,7 +1266,8 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         std::fill(buf.centroid_sum.begin(), buf.centroid_sum.end(), 0.0);
         buf.centroid_count = 0;
         buf.payload_lens.clear();
-        buf.payload_ptrs.clear();
+        buf.payload_offs.clear();
+        buf.payload_store.clear();
         if (has_filter) {
             buf.filter_cols.assign(n_schema_cols, ColumnData{});
             for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
@@ -1326,11 +1336,12 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             std::vector<RowId> row_ids;
             std::vector<uint32_t> local_indices;
             std::vector<uint32_t> payload_lens;
-            std::vector<const uint8_t*> payload_ptrs;
+            std::vector<uint32_t> payload_offs;
+            std::vector<uint8_t> payload_store;
             void clear() {
                 codes.clear(); ip_biases.clear(); fp16_vecs.clear();
                 row_ids.clear(); local_indices.clear(); payload_lens.clear();
-                payload_ptrs.clear();
+                payload_offs.clear(); payload_store.clear();
             }
         };
         // Hoisted outside the chunk loop so capacity is reused across chunks.
@@ -1365,6 +1376,12 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             chunk_has_filter = (chunk.filter_columns != nullptr);
             chunk_fcols = chunk.filter_columns;
             const bool chunk_has_payload = (chunk.payload_data != nullptr);
+            if (has_payload && !chunk_has_payload && !cfg_payload) {
+                throw Error(ErrorCode::InvalidParam,
+                            "run_emission_pass: schema declares payloads but "
+                            "neither sidecar buffers nor chunk payloads are "
+                            "present (missing --payload-col / fdat?)");
+            }
             const uint8_t* chunk_pdata = chunk.payload_data;
             const uint32_t* chunk_poffsets = chunk.payload_offsets;
             if (fp16_buf.size() < static_cast<size_t>(take) * dim)
@@ -1603,8 +1620,15 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                                             pdata = cfg.payload_data
                                                   + cfg.payload_offsets[r];
                                         }
+                                        // Copy now — the source payload
+                                        // buffer is reused next chunk.
+                                        tb.payload_offs.push_back(
+                                            static_cast<uint32_t>(
+                                                tb.payload_store.size()));
+                                        tb.payload_store.insert(
+                                            tb.payload_store.end(), pdata,
+                                            pdata + plen);
                                         tb.payload_lens.push_back(plen);
-                                        tb.payload_ptrs.push_back(pdata);
                                     }
                                 }
                             }
@@ -1650,8 +1674,16 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                             append_filter_row(buf.filter_cols, tb.row_ids[j],
                                               tb.local_indices[j]);
                         if (has_payload) {
-                            buf.payload_lens.push_back(tb.payload_lens[j]);
-                            buf.payload_ptrs.push_back(tb.payload_ptrs[j]);
+                            const uint32_t plen = tb.payload_lens[j];
+                            buf.payload_offs.push_back(
+                                static_cast<uint32_t>(
+                                    buf.payload_store.size()));
+                            buf.payload_store.insert(
+                                buf.payload_store.end(),
+                                tb.payload_store.data() + tb.payload_offs[j],
+                                tb.payload_store.data() + tb.payload_offs[j]
+                                    + plen);
+                            buf.payload_lens.push_back(plen);
                         }
                         if (buf.row_ids.size() >= leaf_cap)
                             flush_buffer(c);

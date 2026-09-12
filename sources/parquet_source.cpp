@@ -161,9 +161,10 @@ ParquetSource::ParquetSource(const std::string& path,
     }
 
     spdlog::debug("ParquetSource: opened '{}' n={} dim={} vec_col={} "
-                  "filter_cols={} list={} normalize={}",
+                  "filter_cols={} list={} normalize={} payload_col={}",
                   path_, count_, dim_, vec_col_idx_,
-                  filter_col_indices_.size(), vec_is_list_, config_.normalize);
+                  filter_col_indices_.size(), vec_is_list_, config_.normalize,
+                  payload_col_idx_);
 }
 
 void ParquetSource::init_schema_() {
@@ -172,6 +173,70 @@ void ParquetSource::init_schema_() {
 
     vec_col_idx_ = carquet_schema_find_column(file_schema,
                                                config_.vector_col.c_str());
+
+    // Resolve the payload column (optional). Must be a plain BYTE_ARRAY
+    // (string/binary) or FIXED_LEN_BYTE_ARRAY leaf; it is excluded from the
+    // filter columns and streamed as opaque per-row blobs via
+    // Chunk::payload_data/payload_offsets.
+    if (!config_.payload_col.empty()) {
+        payload_col_idx_ = carquet_schema_find_column(
+            file_schema, config_.payload_col.c_str());
+        if (payload_col_idx_ < 0) {
+            throw Error(ErrorCode::InvalidParam,
+                        "ParquetSource: payload column '" +
+                            config_.payload_col + "' not found in '" + path_ +
+                            "'");
+        }
+        if (payload_col_idx_ == vec_col_idx_) {
+            throw Error(ErrorCode::InvalidParam,
+                        "ParquetSource: payload column '" +
+                            config_.payload_col +
+                            "' is the vector column");
+        }
+        const carquet_schema_node_t* pnode = nullptr;
+        {
+            // Map leaf column index -> schema element index (same dance as
+            // the vector column path below).
+            const int32_t n_elem =
+                carquet_schema_num_elements(file_schema);
+            int32_t leaf_seen = 0;
+            for (int32_t e = 1; e < n_elem; ++e) {
+                const carquet_schema_node_t* node =
+                    carquet_schema_get_element(file_schema, e);
+                if (carquet_schema_node_is_leaf(node)) {
+                    if (leaf_seen == payload_col_idx_) {
+                        pnode = node;
+                        break;
+                    }
+                    ++leaf_seen;
+                }
+            }
+            if (!pnode) {
+                throw Error(ErrorCode::InvalidParam,
+                            "ParquetSource: cannot find element for payload "
+                            "column '" + config_.payload_col + "'");
+            }
+        }
+        carquet_physical_type_t pphys =
+            carquet_schema_column_type(file_schema, payload_col_idx_);
+        if (pphys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY) {
+            payload_type_len_ = carquet_schema_node_type_length(pnode);
+            if (payload_type_len_ <= 0) {
+                throw Error(ErrorCode::InvalidParam,
+                            "ParquetSource: payload column '" +
+                                config_.payload_col +
+                                "' has invalid type length");
+            }
+        } else if (pphys != CARQUET_PHYSICAL_BYTE_ARRAY) {
+            throw Error(ErrorCode::InvalidParam,
+                        "ParquetSource: payload column '" +
+                            config_.payload_col +
+                            "' must be BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY, "
+                            "got physical type " +
+                            std::to_string(static_cast<int>(pphys)));
+        }
+        schema_.has_payload = true;
+    }
 
     // For list<float> columns, find_column matches the leaf name (e.g. "item"),
     // not the parent field name (e.g. "emb"). Fall back to searching by
@@ -195,6 +260,7 @@ void ParquetSource::init_schema_() {
 
     for (int32_t i = 0; i < n; ++i) {
         if (i == vec_col_idx_) continue;
+        if (i == payload_col_idx_) continue;
 
         const char* name = carquet_schema_column_name(file_schema, i);
         carquet_physical_type_t phys =
@@ -309,8 +375,13 @@ bool ParquetSource::next(Chunk& out) {
     } else {
         out.filter_columns = nullptr;
     }
-    out.payload_data = nullptr;
-    out.payload_offsets = nullptr;
+    if (payload_col_idx_ >= 0) {
+        out.payload_data = payload_data_.data();
+        out.payload_offsets = payload_offsets_.data();
+    } else {
+        out.payload_data = nullptr;
+        out.payload_offsets = nullptr;
+    }
 
     cursor_ += n;
     return true;
@@ -576,6 +647,76 @@ void ParquetSource::materialize_batch_(carquet_row_batch_t* batch) {
             ssc.total_elements = total_elems;
             ssc.total_data_bytes = total_bytes;
             chunk_col_ptrs_[fi] = &ssc;
+        }
+    }
+
+    // --- Payload column (optional) ---
+    // Packed as [n+1 u32 offsets][bytes]; nulls map to empty blobs. Both
+    // BYTE_ARRAY (per-row ptr+len) and FIXED_LEN_BYTE_ARRAY (contiguous
+    // stride) are accepted.
+    if (payload_col_idx_ >= 0) {
+        const void* data = nullptr;
+        const uint8_t* nulls = nullptr;
+        int64_t count = 0;
+        carquet_status_t s = carquet_row_batch_column(
+            batch, payload_col_idx_, &data, &nulls, &count);
+        if (s != CARQUET_OK) {
+            carquet_error_t err = {};
+            err.code = s;
+            throw_carquet_error(err, "ParquetSource: read payload column " +
+                                          std::to_string(payload_col_idx_));
+        }
+
+        payload_offsets_.resize(n + 1);
+        auto is_null = [&](uint32_t i) {
+            return nulls && !(nulls[i / 8] & (1 << (i % 8)));
+        };
+
+        if (payload_type_len_ > 0) {  // FIXED_LEN_BYTE_ARRAY
+            const auto* rows = static_cast<const uint8_t*>(data);
+            payload_data_.resize(
+                static_cast<size_t>(n) * payload_type_len_);
+            uint32_t off = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                payload_offsets_[i] = off;
+                if (!is_null(i)) {
+                    if (static_cast<uint64_t>(off) + payload_type_len_ >
+                        UINT32_MAX) {
+                        throw Error(ErrorCode::InvalidParam,
+                                    "ParquetSource: payload column total "
+                                    "exceeds u32 offsets");
+                    }
+                    std::memcpy(payload_data_.data() + off,
+                                rows + static_cast<size_t>(i) * payload_type_len_,
+                                static_cast<size_t>(payload_type_len_));
+                    off += static_cast<uint32_t>(payload_type_len_);
+                }
+            }
+            payload_offsets_[n] = off;
+            payload_data_.resize(off);
+        } else {  // BYTE_ARRAY
+            const auto* barr =
+                static_cast<const carquet_byte_array_t*>(data);
+            uint64_t total = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                payload_offsets_[i] = static_cast<uint32_t>(total);
+                total += is_null(i) ? 0
+                                    : static_cast<uint64_t>(barr[i].length);
+                if (total > UINT32_MAX) {
+                    throw Error(ErrorCode::InvalidParam,
+                                "ParquetSource: payload column batch total "
+                                "exceeds u32 offsets");
+                }
+            }
+            payload_offsets_[n] = static_cast<uint32_t>(total);
+            payload_data_.resize(total);
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t len = payload_offsets_[i + 1] - payload_offsets_[i];
+                if (len > 0) {
+                    std::memcpy(payload_data_.data() + payload_offsets_[i],
+                                barr[i].data, len);
+                }
+            }
         }
     }
 }

@@ -25,6 +25,7 @@ class ParquetGlobSource : public VectorSource {
 public:
     struct Config {
         std::string vector_col = "emb";
+        std::string payload_col;             // optional payload column (per shard)
         std::string label_file;               // optional: parquet with filter columns
         std::vector<std::string> label_cols;  // which columns from label_file (empty = all non-id)
         bool normalize = false;
