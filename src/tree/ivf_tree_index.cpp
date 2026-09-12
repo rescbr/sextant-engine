@@ -4761,13 +4761,16 @@ void IVFTreeIndex::plane_route_batch_(
     const bool fastscan8 = enc == PlaneEncoding::U4LM;
     const bool pv8 = enc == PlaneEncoding::U4LM_PV;
 
-    // Per-query projections + LUTs.
-    std::vector<float> proj(static_cast<size_t>(nq) * R);
+    // Worker count for every parallelizable phase below (LUT build,
+    // survivor masks, leaf sweep, selection). nq == 1 stays serial —
+    // single-query callers parallelize across queries themselves.
+    const uint32_t T = nq > 1
+        ? std::max(1u, config.search_threads > 0
+                           ? config.search_threads
+                           : std::thread::hardware_concurrency())
+        : 1u;
     std::vector<uint8_t> lut8;
     std::vector<float> lut;
-    std::vector<float> seg_min(R);
-    std::vector<float> so_scale(1), so_offset(1);
-    std::vector<float> so_scale_q(1), so_offset_q(1);
     std::vector<float> shifts(nq, 0.0f);  // pv: scale*offset per query
     // ALL nibble encodings ride the shared FastScan u8 kernel; b1g
     // segments are rank/4 (sign nibbles), u4lm/u4lm_pv rank. pv needs
@@ -4778,25 +4781,49 @@ void IVFTreeIndex::plane_route_batch_(
         lut8.resize(static_cast<size_t>(nq) * SEG * 16);
     if (!fastscan8 && !is_b1g && !pv8)
         lut.resize(static_cast<size_t>(nq) * R * 16);
-    for (uint32_t qi = 0; qi < nq; ++qi) {
-        float* pr = &proj[static_cast<size_t>(qi) * R];
-        plane_->project_query(queries + static_cast<size_t>(qi) *
-                                manifest_.dim, pr);
-        if (is_b1g)
-            plane_->build_b1_lut8(
-                pr, &lut8[static_cast<size_t>(qi) * SEG * 16],
-                so_scale.data(), so_offset.data(), seg_min.data());
-        else if (fastscan8)
-            plane_->build_lut8(
-                pr, &lut8[static_cast<size_t>(qi) * R * 16],
-                so_scale_q.data(), so_offset_q.data(), seg_min.data());
-        else if (pv8) {
-            plane_->build_lut8(
-                pr, &lut8[static_cast<size_t>(qi) * R * 16],
-                so_scale_q.data(), so_offset_q.data(), seg_min.data());
-            shifts[qi] = so_scale_q[0] * so_offset_q[0];
-        } else
-            plane_->build_lut(pr, &lut[static_cast<size_t>(qi) * R * 16]);
+    {
+        // Per-query projections + LUTs, query-parallel (each worker owns
+        // its quantizer scratch — the so_*/seg_min outputs are per-query
+        // intermediates, only shifts[] survives the phase).
+        auto lut_worker = [&](uint32_t q0, uint32_t q1) {
+            std::vector<float> pr(R);
+            std::vector<float> seg_min(R);
+            std::vector<float> so_scale(1), so_offset(1);
+            for (uint32_t qi = q0; qi < q1; ++qi) {
+                plane_->project_query(queries + static_cast<size_t>(qi) *
+                                                manifest_.dim, pr.data());
+                if (is_b1g)
+                    plane_->build_b1_lut8(
+                        pr.data(), &lut8[static_cast<size_t>(qi) * SEG * 16],
+                        so_scale.data(), so_offset.data(), seg_min.data());
+                else if (fastscan8)
+                    plane_->build_lut8(
+                        pr.data(), &lut8[static_cast<size_t>(qi) * R * 16],
+                        so_scale.data(), so_offset.data(), seg_min.data());
+                else if (pv8) {
+                    plane_->build_lut8(
+                        pr.data(), &lut8[static_cast<size_t>(qi) * R * 16],
+                        so_scale.data(), so_offset.data(), seg_min.data());
+                    shifts[qi] = so_scale[0] * so_offset[0];
+                } else
+                    plane_->build_lut(
+                        pr.data(), &lut[static_cast<size_t>(qi) * R * 16]);
+            }
+        };
+        std::vector<std::future<void>> futs;
+        const uint32_t per = (nq + T - 1) / T;
+        for (uint32_t t = 0; t < T; ++t) {
+            const uint32_t q0 = t * per;
+            const uint32_t q1 = std::min(nq, q0 + per);
+            if (q0 >= q1) break;
+            if (t == T - 1 || q1 == nq) {
+                lut_worker(q0, q1);
+                break;
+            }
+            futs.push_back(std::async(std::launch::async, lut_worker,
+                                      q0, q1));
+        }
+        for (auto& f : futs) f.get();
     }
 
     // Two-stage: per-query centroid survivor masks (RAM, ~free). The
@@ -4812,42 +4839,60 @@ void IVFTreeIndex::plane_route_batch_(
         uint64_t total = 0;
         for (const auto& e : leaf_table_)
             if (e.page != kInvalidPage) total += e.pages;
-        for (uint32_t qi = 0; qi < nq; ++qi) {
-            for (uint32_t k = 0; k < pca_dims_; ++k) {
-                float acc = 0;
-                const float* row = &pca_proj_[static_cast<size_t>(k) *
-                                              manifest_.dim];
-                for (uint32_t d = 0; d < manifest_.dim; ++d)
-                    acc += row[d] *
-                           queries[static_cast<size_t>(qi) *
-                                       manifest_.dim + d];
-                qp[k] = acc - pca_mean_proj_[k];
-            }
-            std::vector<std::pair<float, uint32_t>> cd(n_leaves);
-            for (uint32_t l = 0; l < n_leaves; ++l) {
-                const float* lc =
-                    &pca_leaf_centroids_[static_cast<size_t>(l) *
-                                         pca_dims_];
-                float d2 = 0;
+        // Query-parallel: each worker fills its query rows of survive.
+        auto mask_worker = [&](uint32_t q0, uint32_t q1) {
+            std::vector<float> qp(pca_dims_);
+            for (uint32_t qi = q0; qi < q1; ++qi) {
                 for (uint32_t k = 0; k < pca_dims_; ++k) {
-                    const float diff = qp[k] - lc[k];
-                    d2 += diff * diff;
+                    float acc = 0;
+                    const float* row = &pca_proj_[static_cast<size_t>(k) *
+                                                  manifest_.dim];
+                    for (uint32_t d = 0; d < manifest_.dim; ++d)
+                        acc += row[d] *
+                               queries[static_cast<size_t>(qi) *
+                                           manifest_.dim + d];
+                    qp[k] = acc - pca_mean_proj_[k];
                 }
-                cd[l] = {d2, l};
+                std::vector<std::pair<float, uint32_t>> cd(n_leaves);
+                for (uint32_t l = 0; l < n_leaves; ++l) {
+                    const float* lc =
+                        &pca_leaf_centroids_[static_cast<size_t>(l) *
+                                             pca_dims_];
+                    float d2 = 0;
+                    for (uint32_t k = 0; k < pca_dims_; ++k) {
+                        const float diff = qp[k] - lc[k];
+                        d2 += diff * diff;
+                    }
+                    cd[l] = {d2, l};
+                }
+                std::sort(cd.begin(), cd.end());
+                uint64_t cum = 0;
+                float* row = &survive[static_cast<size_t>(qi) * n_leaves];
+                for (const auto& [d2, l] : cd) {
+                    if (leaf_table_[l].page == kInvalidPage) continue;
+                    row[l] = 1.0f;
+                    cum += leaf_table_[l].pages;
+                    if (static_cast<double>(cum) >=
+                        static_cast<double>(config.plane_pre_prune) *
+                            static_cast<double>(total))
+                        break;
+                }
             }
-            std::sort(cd.begin(), cd.end());
-            uint64_t cum = 0;
-            float* row = &survive[static_cast<size_t>(qi) * n_leaves];
-            for (const auto& [d2, l] : cd) {
-                if (leaf_table_[l].page == kInvalidPage) continue;
-                row[l] = 1.0f;
-                cum += leaf_table_[l].pages;
-                if (static_cast<double>(cum) >=
-                    static_cast<double>(config.plane_pre_prune) *
-                        static_cast<double>(total))
-                    break;
+        };
+        std::vector<std::future<void>> mfuts;
+        const uint32_t mper = (nq + T - 1) / T;
+        for (uint32_t t = 0; t < T; ++t) {
+            const uint32_t q0 = t * mper;
+            const uint32_t q1 = std::min(nq, q0 + mper);
+            if (q0 >= q1) break;
+            if (t == T - 1 || q1 == nq) {
+                mask_worker(q0, q1);
+                break;
             }
+            mfuts.push_back(std::async(std::launch::async, mask_worker,
+                                       q0, q1));
         }
+        for (auto& f : mfuts) f.get();
     }
 
     // Leaf-major sweep: score EVERY query against each leaf's blocks
@@ -4865,55 +4910,18 @@ void IVFTreeIndex::plane_route_batch_(
     // Threading: batch mode parallelizes the sweep over leaf chunks with
     // the engine's std::async worker pattern (the engine does NOT build
     // with OpenMP — pragmas are silent no-ops on x86, measured: the
-    // batched sweep ran single-threaded until this was noticed). For
-    // nq == 1 the sweep stays SERIAL: single-query callers (CLI
-    // tree-search) parallelize across queries themselves, and a full
-    // team per query would oversubscribe.
-    const uint32_t T = nq > 1
-        ? std::max(1u, config.search_threads > 0
-                           ? config.search_threads
-                           : std::thread::hardware_concurrency())
-        : 1u;
+    // batched sweep ran single-threaded until this was noticed).
     auto sweep_worker = [&](uint64_t l0, uint64_t l1) {
-        constexpr uint32_t kQTile = 4;
-        std::vector<const uint8_t*> tluts(kQTile);
-        std::vector<float> tshifts(kQTile, 0.0f);
-        std::vector<float> tout(kQTile);
+        // Per-query scan with survivor skip: a masked query costs one
+        // compare + -inf store, never a block sweep. (A query-tiled
+        // variant was tried; scanning all tile members when any survive
+        // multiplies sweep work ~kQTile at prune budgets.)
         for (uint64_t l = l0; l < l1; ++l) {
             if (leaf_table_[static_cast<uint32_t>(l)].page == kInvalidPage)
                 continue;
             float* row = &scores[static_cast<size_t>(l) * nq];
             const uint32_t leaf = static_cast<uint32_t>(l);
-            uint32_t qi = 0;
-            // Query-tiled pass: one code load serves kQTile queries.
-            for (; qi + kQTile <= nq; qi += kQTile) {
-                bool any = false;
-                for (uint32_t t = 0; t < kQTile; ++t) {
-                    tluts[t] = &lut8[static_cast<size_t>(qi + t) *
-                                     SEG * 16];
-                    tshifts[t] = pv8 ? shifts[qi + t] : 0.0f;
-                    any = any ||
-                          (survive.empty() ||
-                           survive[static_cast<size_t>(qi + t) *
-                                        n_leaves + l] != 0.0f);
-                }
-                if (!any) {
-                    for (uint32_t t = 0; t < kQTile; ++t)
-                        row[qi + t] =
-                            -std::numeric_limits<float>::infinity();
-                    continue;
-                }
-                plane_->scan_leaf_max_u8_q(leaf, tluts.data(), kQTile,
-                                           tshifts.data(), tout.data());
-                for (uint32_t t = 0; t < kQTile; ++t)
-                    row[qi + t] = (!survive.empty() &&
-                                   survive[static_cast<size_t>(qi + t) *
-                                                n_leaves + l] == 0.0f)
-                                      ? -std::numeric_limits<float>::
-                                            infinity()
-                                      : tout[t];
-            }
-            for (; qi < nq; ++qi) {
+            for (uint32_t qi = 0; qi < nq; ++qi) {
                 if (!survive.empty() &&
                     survive[static_cast<size_t>(qi) * n_leaves + l] ==
                         0.0f) {
@@ -4956,32 +4964,53 @@ void IVFTreeIndex::plane_route_batch_(
     for (const auto& e : leaf_table_)
         if (e.page != kInvalidPage) total += e.pages;
     out.resize(nq);
-    for (uint32_t qi = 0; qi < nq; ++qi) {
-        const float* sc = &scores[qi];  // column of the [l][nq] grid
-        std::vector<uint32_t> order(n_leaves);
-        std::iota(order.begin(), order.end(), 0u);
-        std::sort(order.begin(), order.end(),
-                  [&](uint32_t a, uint32_t b) {
-                      return sc[static_cast<size_t>(a) * nq] >
-                             sc[static_cast<size_t>(b) * nq];
-                  });
-        float f = config.probe_fraction;
-        if (f <= 0.0f) f = manifest_.probe_fraction;
-        if (f <= 0.0f) f = 0.5f;
-        auto& candidates = out[static_cast<size_t>(qi)];
-        candidates.reserve(n_leaves);
-        uint64_t cum = 0;
-        for (uint32_t l : order) {
-            const auto& e = leaf_table_[l];
-            if (e.page == kInvalidPage) continue;
-            candidates.push_back({e.page, e.pages,
-                                  sc[static_cast<size_t>(l) * nq],
-                                  nullptr});
-            cum += e.pages;
-            if (static_cast<double>(cum) >=
-                static_cast<double>(f) * static_cast<double>(total) - 0.5)
+    {
+        // Query-parallel selection (each query's full leaf-score sort is
+        // independent; a serial pass here starved the sweep workers).
+        auto select_worker = [&](uint32_t q0, uint32_t q1) {
+            std::vector<uint32_t> order(n_leaves);
+            for (uint32_t qi = q0; qi < q1; ++qi) {
+                const float* sc = &scores[qi];  // column of the [l][nq] grid
+                std::iota(order.begin(), order.end(), 0u);
+                std::sort(order.begin(), order.end(),
+                          [&](uint32_t a, uint32_t b) {
+                              return sc[static_cast<size_t>(a) * nq] >
+                                     sc[static_cast<size_t>(b) * nq];
+                          });
+                float f = config.probe_fraction;
+                if (f <= 0.0f) f = manifest_.probe_fraction;
+                if (f <= 0.0f) f = 0.5f;
+                auto& candidates = out[static_cast<size_t>(qi)];
+                candidates.reserve(n_leaves);
+                uint64_t cum = 0;
+                for (uint32_t l : order) {
+                    const auto& e = leaf_table_[l];
+                    if (e.page == kInvalidPage) continue;
+                    candidates.push_back({e.page, e.pages,
+                                          sc[static_cast<size_t>(l) * nq],
+                                          nullptr});
+                    cum += e.pages;
+                    if (static_cast<double>(cum) >=
+                        static_cast<double>(f) * static_cast<double>(total)
+                            - 0.5)
+                        break;
+                }
+            }
+        };
+        std::vector<std::future<void>> futs;
+        const uint32_t per = (nq + T - 1) / T;
+        for (uint32_t t = 0; t < T; ++t) {
+            const uint32_t q0 = t * per;
+            const uint32_t q1 = std::min(nq, q0 + per);
+            if (q0 >= q1) break;
+            if (t == T - 1 || q1 == nq) {
+                select_worker(q0, q1);
                 break;
+            }
+            futs.push_back(std::async(std::launch::async, select_worker,
+                                      q0, q1));
         }
+        for (auto& f : futs) f.get();
     }
 }
 

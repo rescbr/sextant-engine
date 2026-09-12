@@ -1363,7 +1363,12 @@ int cmd_tree_search(int argc, char* argv[]) {
 
     const auto t1 = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(t1 - t0).count();
-    const double qps = (secs > 0) ? qcount / secs : 0;
+    // secs spans every TIMED pass (warmup discarded); report mean
+    // per-pass throughput, not qcount/secs (which under-reports by
+    // the pass count — passes=3 halved every number vs passes=1/2).
+    const uint32_t timed_passes = passes > 1 ? passes - 1 : passes;
+    const double qps = (secs > 0)
+        ? static_cast<double>(qcount) * timed_passes / secs : 0;
 
     // Search window metrics: engine counters (queries/leaves/bytes_touched/
     // rerank) + window CPU via rusage (accurate at window granularity;
