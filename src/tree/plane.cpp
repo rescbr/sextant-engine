@@ -598,7 +598,7 @@ void PlaneIndex::build_lut8(const float* proj, uint8_t* lut8, float* scale,
 }
 
 float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
-                                   const uint8_t* lut8) const {
+                                   const uint8_t* lut8, float shift) const {
     const uint32_t nb = block_cnt_[leaf_id];
     const uint32_t count = leaf_cnt_[leaf_id];
     static thread_local std::vector<uint32_t> sums, masks;
@@ -617,13 +617,34 @@ float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
     // NB: pq4_scan_many fills INVALID tail lanes with 0xFFFFFFFF (an
     // argmin sentinel) — under MAX selection those must be skipped.
     constexpr uint32_t kSentinel = 0xFFFFFFFFu;
-    uint32_t best = 0;
-    for (uint32_t b = 0; b < nb; ++b)
-        for (uint32_t j = 0; j < 32; ++j) {
-            const uint32_t v = sums[static_cast<size_t>(b) * 32 + j];
-            if (v != kSentinel) best = std::max(best, v);
+    if (alpha_ == nullptr || shift == 0.0f) {
+        // No per-vector renorm: raw accumulators rank correctly.
+        uint32_t best = 0;
+        for (uint32_t b = 0; b < nb; ++b)
+            for (uint32_t j = 0; j < 32; ++j) {
+                const uint32_t v = sums[static_cast<size_t>(b) * 32 + j];
+                if (v != kSentinel) best = std::max(best, v);
+            }
+        return static_cast<float>(best);
+    }
+    // pv: alpha_i * (acc_i + shift) per REAL member (the alpha array
+    // covers exactly the real members, in block/lane order).
+    float best = -std::numeric_limits<float>::max();
+    uint32_t idx = 0;
+    for (uint32_t b = 0; b < nb; ++b) {
+        const uint32_t valid =
+            std::min(kVecsPerBlock, count - b * kVecsPerBlock);
+        for (uint32_t j = 0; j < valid; ++j, ++idx) {
+            float16_t h16;
+            std::memcpy(&h16, &alpha_[idx], 2);
+            const float a = static_cast<float>(h16);
+            best = std::max(
+                best, a * (static_cast<float>(
+                            sums[static_cast<size_t>(b) * 32 + j]) +
+                           shift));
         }
-    return static_cast<float>(best);
+    }
+    return best;
 }
 
 uint64_t PlaneIndex::leaf_block_offset(uint32_t leaf_id) const {

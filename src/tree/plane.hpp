@@ -144,10 +144,15 @@ public:
     void build_lut8(const float* proj, uint8_t* lut8, float* scale,
                     float* offset, float* seg_min) const;
 
-    /// FastScan-kernel leaf max (U4LM only). Returns the raw u32
-    /// accumulator — affine-monotone in the true score, so rankings
-    /// within one query are exact; cross-query comparisons are not.
-    float scan_leaf_max_u8(uint32_t leaf_id, const uint8_t* lut8) const;
+    /// FastScan-kernel leaf max (U4LM + U4LM_PV). Without alpha:
+    /// returns the raw u32 accumulator (affine-monotone per query).
+    /// With alpha (pv): per-member alpha * (acc + shift), where shift
+    /// = scale*offset from build_lut8 UNDOES the per-segment min
+    /// subtraction exactly (lut8 = A*(lut - min_s) => true =
+    /// acc/A + B; alpha * (acc + A*B) ranks identically). shift must
+    /// be 0 for non-pv (callers rank on raw accumulators).
+    float scan_leaf_max_u8(uint32_t leaf_id, const uint8_t* lut8,
+                           float shift = 0.0f) const;
 
     /// Max ADC score over one leaf's plane blocks (masked tail lanes).
     /// `lut` from build_lut (u4lm*) or `w`/`qbits` from build_sign_ctx

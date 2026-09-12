@@ -4759,19 +4759,24 @@ void IVFTreeIndex::plane_route_batch_(
     const PlaneEncoding enc = plane_->meta().encoding;
     const bool is_b1g = enc == PlaneEncoding::B1G;
     const bool fastscan8 = enc == PlaneEncoding::U4LM;
+    const bool pv8 = enc == PlaneEncoding::U4LM_PV;
 
     // Per-query projections + LUTs.
     std::vector<float> proj(static_cast<size_t>(nq) * R);
     std::vector<uint8_t> lut8;
     std::vector<float> lut;
     std::vector<float> seg_min(R);
-    std::vector<float> so_scratch(R);
-    // BOTH encodings ride the shared FastScan u8 kernel; b1g segments
-    // are rank/4 (sign nibbles), u4lm rank.
+    std::vector<float> so_scale(1), so_offset(1);
+    std::vector<float> so_scale_q(1), so_offset_q(1);
+    std::vector<float> shifts(nq, 0.0f);  // pv: scale*offset per query
+    // ALL nibble encodings ride the shared FastScan u8 kernel; b1g
+    // segments are rank/4 (sign nibbles), u4lm/u4lm_pv rank. pv needs
+    // the affine shift (scale*offset) to undo the per-segment min
+    // subtraction before the per-member alpha multiply.
     const uint32_t SEG = is_b1g ? R / 4 : R;
-    if (fastscan8 || is_b1g)
+    if (fastscan8 || is_b1g || pv8)
         lut8.resize(static_cast<size_t>(nq) * SEG * 16);
-    if (!fastscan8 && !is_b1g)
+    if (!fastscan8 && !is_b1g && !pv8)
         lut.resize(static_cast<size_t>(nq) * R * 16);
     for (uint32_t qi = 0; qi < nq; ++qi) {
         float* pr = &proj[static_cast<size_t>(qi) * R];
@@ -4780,12 +4785,17 @@ void IVFTreeIndex::plane_route_batch_(
         if (is_b1g)
             plane_->build_b1_lut8(
                 pr, &lut8[static_cast<size_t>(qi) * SEG * 16],
-                so_scratch.data(), so_scratch.data(), seg_min.data());
+                so_scale.data(), so_offset.data(), seg_min.data());
         else if (fastscan8)
             plane_->build_lut8(
                 pr, &lut8[static_cast<size_t>(qi) * R * 16],
-                so_scratch.data(), so_scratch.data(), seg_min.data());
-        else
+                so_scale_q.data(), so_offset_q.data(), seg_min.data());
+        else if (pv8) {
+            plane_->build_lut8(
+                pr, &lut8[static_cast<size_t>(qi) * R * 16],
+                so_scale_q.data(), so_offset_q.data(), seg_min.data());
+            shifts[qi] = so_scale_q[0] * so_offset_q[0];
+        } else
             plane_->build_lut(pr, &lut[static_cast<size_t>(qi) * R * 16]);
     }
 
@@ -4877,10 +4887,11 @@ void IVFTreeIndex::plane_route_batch_(
                     continue;
                 }
                 row[qi] =
-                    (is_b1g || fastscan8)
+                    (is_b1g || fastscan8 || pv8)
                         ? plane_->scan_leaf_max_u8(
                               static_cast<uint32_t>(l),
-                              &lut8[static_cast<size_t>(qi) * SEG * 16])
+                              &lut8[static_cast<size_t>(qi) * SEG * 16],
+                              pv8 ? shifts[qi] : 0.0f)
                         : plane_->scan_leaf_max(
                               static_cast<uint32_t>(l),
                               &lut[static_cast<size_t>(qi) * R * 16],
