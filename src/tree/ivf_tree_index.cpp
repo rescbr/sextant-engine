@@ -4931,17 +4931,17 @@ void IVFTreeIndex::attach_plane(const float* base, uint32_t n, uint32_t dim,
             dest[static_cast<int64_t>(mem[slot])].emplace_back(l, slot);
     }
 
-    // Row-order sequential encode pass (OMP over row blocks).
-#pragma omp parallel
-    {
-#pragma omp for schedule(static)
-        for (int64_t r0 = 0; r0 < static_cast<int64_t>(n); ++r0) {
-            auto it = dest.find(static_cast<int64_t>(r0));
-            if (it == dest.end() || it->second.empty()) continue;
-            const float* v = &base[static_cast<size_t>(r0) * dim];
-            for (const auto& ls : it->second)
-                writer.encode_member(ls.first, ls.second, v, nullptr);
-        }
+    // Row-order sequential encode pass. Deliberately SERIAL: u4 nibble
+    // writes are read-modify-write on bytes shared across lanes, so
+    // concurrent encoders into one leaf race (the dead OMP pragmas that
+    // were here ran serial anyway — the engine has no OpenMP). One-time
+    // offline cost: ~60 s at 10M.
+    for (uint32_t r0 = 0; r0 < n; ++r0) {
+        auto it = dest.find(static_cast<int64_t>(r0));
+        if (it == dest.end() || it->second.empty()) continue;
+        const float* v = &base[static_cast<size_t>(r0) * dim];
+        for (const auto& ls : it->second)
+            writer.encode_member(ls.first, ls.second, v, nullptr);
     }
     spdlog::info("[sextant] plane: encoded {} rows in {:.1}s", n,
                  std::chrono::duration<double>(
