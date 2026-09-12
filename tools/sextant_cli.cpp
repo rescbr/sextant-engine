@@ -454,7 +454,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
         "thread-spawn boundaries in the streaming passes)", false, 2048);
     p.add<uint16_t>("pq4-m", 0, "PQ subquantizers (0=dim/4)", false, 0);
     p.add<uint32_t>("pq-bits", 0, "PQ bits (4 or 8)", false, 4);
-    p.add<std::string>("quantizer", 0, "pq / prq / local_pq / scalar_lloydmax / scalar_uniform / scalar_shape / anisotropic_pq", false, "pq");
+    p.add<std::string>("quantizer", 0, "scalar_shape / scalar_lloydmax / scalar_uniform / pq / prq / local_pq / anisotropic_pq", false, "scalar_shape");
     p.add<uint32_t>("prq-nsplits", 0,
         "PRQ nsplits (sub-space count) for --quantizer prq. 0 = auto. "
         "Must divide both dim and m4.", false, 0);
