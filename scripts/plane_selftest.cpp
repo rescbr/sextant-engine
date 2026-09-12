@@ -76,13 +76,55 @@ int main() {
         // scan_leaf_max (f32) vs scan_leaf_max_u8 (u8, monotone).
         double spear_ok = 0, tot = 0;
         std::vector<float> sA(L), sB(L);
+        std::vector<uint8_t> lut8(static_cast<size_t>(
+            (enc == tree::PlaneEncoding::B1G ? R / 4 : R)) * 16);
+        if (enc == tree::PlaneEncoding::B1G) {
+            float sc, of;
+            std::vector<float> seg_min(R);
+            pl->build_b1_lut8(proj.data(), lut8.data(), &sc, &of,
+                              seg_min.data());
+        } else {
+            float sc, of;
+            std::vector<float> seg_min(R);
+            pl->build_lut8(proj.data(), lut8.data(), &sc, &of,
+                           seg_min.data());
+        }
         for (uint32_t l = 0, li = 0; l < info.size(); ++l) {
             if (info[l].page == tree::kInvalidPage) continue;
             sA[li] = pl->scan_leaf_max(l,
                 enc == tree::PlaneEncoding::B1G ? nullptr : lut.data(),
                 enc == tree::PlaneEncoding::B1G ? w.data() : nullptr,
                 nullptr);
+            sB[li] = pl->scan_leaf_max_u8(l, lut8.data(), 0.0f);
             ++li;
+        }
+        // Cross-path agreement: rank correlation between the f32 diag
+        // path and the PRODUCTION u8 path (the engine only uses u8; a
+        // rotten f32 diag shows as a constant/uniform sA).
+        {
+            std::vector<uint32_t> ord(L);
+            std::iota(ord.begin(), ord.end(), 0u);
+            std::sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) {
+                return sA[a] > sA[b];
+            });
+            const float a_min = *std::min_element(sA.begin(), sA.end());
+            const float a_max = *std::max_element(sA.begin(), sA.end());
+            const float b_min = *std::min_element(sB.begin(), sB.end());
+            const float b_max = *std::max_element(sB.begin(), sB.end());
+            // Does the u8 top-1 leaf sit in the f32 top-3 (12 leaves)?
+            uint32_t u8_top = 0;
+            for (uint32_t li = 1; li < L; ++li)
+                if (sB[li] > sB[u8_top]) u8_top = li;
+            uint32_t rank_of_top = 0;
+            for (; rank_of_top < L; ++rank_of_top)
+                if (ord[rank_of_top] == u8_top) break;
+            std::printf("cross-path enc=%d: f32 range [%.4f,%.4f] u8 range "
+                        "[%.4f,%.4f] u8top@f32rank=%u %s\n",
+                        static_cast<int>(enc), a_min, a_max, b_min, b_max,
+                        rank_of_top,
+                        (a_max - a_min < 1e-6f && L > 1)
+                            ? "F32-DIAG-DEGENERATE"
+                            : (rank_of_top < 3 ? "OK" : "RANK-MISMATCH"));
         }
         // Ranking sanity: the top-scored leaf under the plane must
         // contain a member among the brute-force top-50 of the SAME
@@ -118,7 +160,6 @@ int main() {
             double worst = 0;
             for (uint32_t l = 0, li = 0; l < info.size(); ++l) {
                 if (info[l].page == tree::kInvalidPage) continue;
-                (void)li;
                 double exp_best = -1e30;
                 for (RowId r : idx->debug_leaf_row_ids(l)) {
                     std::vector<float> pm(R);
@@ -150,8 +191,10 @@ int main() {
                     worst = std::max(worst, std::fabs(got - exp_best));
                     if (li <= 3)
                         std::printf("leaf %u: got=%.4f exp=%.4f diff=%.4f\n",
-                                    li - 1, got, exp_best, got - exp_best);
+                                    l, got, exp_best, got - exp_best);
                 }
+                ++li;  // (this increment was missing — got read sA[0]
+                       //  for every leaf and manufactured diff=19.8)
             }
             if (enc == tree::PlaneEncoding::B1G)
                 std::printf("b1g exact score max |diff| = %.6g\n", worst);
@@ -182,26 +225,32 @@ int main() {
             }
             std::printf("b1g bit mismatches (3 members x rank): %u\n",
                         ndiff);
-            // Emulate scan_leaf_max_b1_ EXACTLY on verified bits and
-            // compare to the analytic score for member 0.
+            // Emulate scan_leaf_max_b1_ on member 0 through the SAME
+            // nibble layout as the bit check above, and compare to the
+            // analytic per-member score. (An earlier version read a
+            // stale bit-major layout and indexed the nibble-LUT staging
+            // per-dim — both wrong; it printed emu=8.2 ana=-39.7.)
             {
                 const uint32_t lane = 0, block = 0;
                 double emu = 0, ana = 0;
-                for (uint32_t e = 0; e < R; ++e) {
-                    const uint8_t byte = bp[block * pl->debug_block_bytes() +
-                                           e * 4 + (lane >> 3)];
-                    const uint32_t bit = (byte >> (lane & 7)) & 1u;
-                    const uint32_t qb = (qbits[e] >> lane) & 1u;
-                    emu += (bit ^ qb) ? -static_cast<double>(w[e])
-                                      : static_cast<double>(w[e]);
+                const uint32_t G = R / 4;
+                for (uint32_t g = 0; g < G; ++g) {
+                    const uint8_t byte =
+                        bp[block * pl->debug_block_bytes() + g * 16 +
+                           (lane % 16)];
+                    const uint32_t nib = (lane >= 16)
+                        ? static_cast<uint32_t>(byte >> 4)
+                        : static_cast<uint32_t>(byte & 0xFu);
+                    emu += static_cast<double>(w[g * 16 + nib]);
                 }
                 std::vector<float> pm(R);
                 pl->project_query(&base[static_cast<size_t>(mem0[0]) * D],
                                   pm.data());
                 for (uint32_t e = 0; e < R; ++e)
                     ana += (pm[e] >= 0 ? 1.0 : -1.0) *
-                           static_cast<double>(w[e]);
-                std::printf("b1g emu=%.4f ana=%.4f\n", emu, ana);
+                           static_cast<double>(w_qbits_dummy[e]);
+                std::printf("b1g emu=%.4f ana=%.4f |diff|=%.6g\n",
+                            emu, ana, std::fabs(emu - ana));
             }
         }
         // TILED vs SINGLE check: 4 copies of the same query LUT must

@@ -125,6 +125,12 @@ spike_routing_ceiling = executable('spike_routing_ceiling',
     link_args: ['-fopenmp'],
 )
 
+plane_selftest = executable('plane_selftest',
+    'plane_selftest.cpp',
+    include_directories: [engine_inc, src_inc, third_party_inc],
+    dependencies: sextant_dep,
+)
+
 spike_slm_roundtrip = executable('spike_slm_roundtrip',
     'spike_slm_roundtrip.cpp',
     include_directories: [engine_inc, src_inc],
