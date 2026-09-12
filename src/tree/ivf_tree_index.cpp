@@ -436,6 +436,54 @@ struct StreamTLS {
     std::vector<float> dists;   // per-centroid distances (k_root, emission)
 };
 
+/// Parallel nearest-centroid assignment over a row block of a sample
+/// matrix (n_rows × pca_dims row-major) against per-cluster centroid
+/// vectors. Each row task runs the EXACT scalar distance loop the old
+/// serial code ran (same accumulation order, same tie handling), so the
+/// winners are bit-identical; callers aggregate the per-row outputs
+/// serially in row order to keep sums deterministic.
+/// Outputs: best[i] = argmin cluster; gap[i] = (2nd-nearest − nearest)
+/// squared distance (nullptr to skip — one extra compare per centroid).
+void parallel_sample_assign(
+    const float* rows, uint32_t n_rows, uint32_t pca_dims,
+    const std::vector<std::vector<float>>& cents,
+    uint32_t* best, float* gap,
+    ctpl::thread_pool_tls<StreamTLS>& pool, uint32_t hw)
+{
+    const uint32_t k = static_cast<uint32_t>(cents.size());
+    if (k == 0 || n_rows == 0) return;
+    const uint32_t n_shards = std::min(hw, n_rows);
+    const uint32_t per = (n_rows + n_shards - 1) / n_shards;
+    std::vector<std::future<void>> futs;
+    for (uint32_t t = 0; t < n_shards; ++t) {
+        const uint32_t start = t * per;
+        const uint32_t end = std::min(start + per, n_rows);
+        if (start >= end) break;
+        futs.push_back(pool.push(
+            [&](size_t, StreamTLS&, uint32_t s, uint32_t e) {
+                for (uint32_t i = s; i < e; ++i) {
+                    const float* vi = rows + size_t(i) * pca_dims;
+                    float d1 = std::numeric_limits<float>::max();
+                    float d2 = d1;
+                    uint32_t best_c = 0;
+                    for (uint32_t c = 0; c < k; ++c) {
+                        const float* cc = cents[c].data();
+                        float d = 0.0f;
+                        for (uint32_t dd = 0; dd < pca_dims; ++dd) {
+                            const float diff = vi[dd] - cc[dd];
+                            d += diff * diff;
+                        }
+                        if (d < d1) { d2 = d1; d1 = d; best_c = c; }
+                        else if (d < d2) d2 = d;
+                    }
+                    best[i] = best_c;
+                    if (gap) gap[i] = d2 - d1;
+                }
+            }, start, end));
+    }
+    for (auto& fut : futs) fut.get();
+}
+
 /// Per-leaf metadata captured at flush time and consumed by the tree-write
 /// phase (page, page count, and the leaf centroid in original FP16 space).
 struct LeafMeta {
@@ -780,20 +828,23 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     // Each vector: pca_dims dot products of length dim.
     // With train_n=20k, dim=768, pca_dims=32 this is ~490M MACs —
     // serial it takes ~2s, parallel across all cores it's <0.3s.
+    // The pool persists through k-means and closure-epsilon (the sample
+    // phases share it; one spawn set per build).
     std::vector<float> sample_pca(static_cast<size_t>(train_n) * pca_dims);
+    const uint32_t hw = cfg.num_threads > 0
+        ? cfg.num_threads
+        : std::max(1u, std::thread::hardware_concurrency());
+    ctpl::thread_pool_tls<StreamTLS> sample_pool(hw);
     {
-        const uint32_t proj_hw = cfg.num_threads > 0
-            ? cfg.num_threads
-            : std::max(1u, std::thread::hardware_concurrency());
-        const uint32_t n_threads = std::min(proj_hw, train_n);
+        const uint32_t n_threads = std::min(hw, train_n);
         std::vector<std::future<void>> futs;
         const uint32_t per = (train_n + n_threads - 1) / n_threads;
         for (uint32_t t = 0; t < n_threads; ++t) {
             const uint32_t start = t * per;
             const uint32_t end = std::min(start + per, train_n);
             if (start >= end) break;
-            futs.push_back(std::async(std::launch::async,
-                [&](uint32_t s, uint32_t e) {
+            futs.push_back(sample_pool.push(
+                [&](size_t, StreamTLS&, uint32_t s, uint32_t e) {
                     for (uint32_t i = s; i < e; ++i) {
                         const float* xi = &sample[i * dim];
                         float* pi = &sample_pca[i * pca_dims];
@@ -818,24 +869,17 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     }
 
     std::vector<uint32_t> prev_assign(train_n, UINT32_MAX);
+    std::vector<uint32_t> best(train_n);
     for (uint32_t iter = 0; iter < 10; ++iter) {
         std::vector<std::vector<uint32_t>> assigns(k_root);
         uint32_t n_changed = 0;
+        parallel_sample_assign(sample_pca.data(), train_n, pca_dims,
+                                root_centroids_pca, best.data(), nullptr,
+                                sample_pool, hw);
         for (uint32_t i = 0; i < train_n; ++i) {
-            const float* vi = &sample_pca[i * pca_dims];
-            float best_d = std::numeric_limits<float>::max();
-            uint32_t best_c = 0;
-            for (uint32_t c = 0; c < k_root; ++c) {
-                float d = 0.0f;
-                for (uint32_t k = 0; k < pca_dims; ++k) {
-                    const float diff = vi[k] - root_centroids_pca[c][k];
-                    d += diff * diff;
-                }
-                if (d < best_d) { best_d = d; best_c = c; }
-            }
-            assigns[best_c].push_back(i);
-            if (iter > 0 && best_c != prev_assign[i]) ++n_changed;
-            prev_assign[i] = best_c;
+            assigns[best[i]].push_back(i);
+            if (iter > 0 && best[i] != prev_assign[i]) ++n_changed;
+            prev_assign[i] = best[i];
         }
         for (uint32_t c = 0; c < k_root; ++c) {
             if (assigns[c].empty()) {
@@ -874,22 +918,13 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
     float closure_epsilon = 0.0f;
     {
         const uint32_t s = std::min<uint32_t>(4096, train_n);
+        std::vector<uint32_t> best_gap_rows(s);
+        std::vector<float> gap(s);
+        parallel_sample_assign(sample_pca.data(), s, pca_dims,
+                                root_centroids_pca, best_gap_rows.data(),
+                                gap.data(), sample_pool, hw);
         double sum_gap = 0.0;
-        for (uint32_t i = 0; i < s; ++i) {
-            const float* vi = &sample_pca[i * pca_dims];
-            float d1 = std::numeric_limits<float>::max();
-            float d2 = std::numeric_limits<float>::max();
-            for (uint32_t c = 0; c < k_root; ++c) {
-                float d = 0.0f;
-                for (uint32_t k = 0; k < pca_dims; ++k) {
-                    const float diff = vi[k] - root_centroids_pca[c][k];
-                    d += diff * diff;
-                }
-                if (d < d1) { d2 = d1; d1 = d; }
-                else if (d < d2) d2 = d;
-            }
-            sum_gap += (d2 - d1);
-        }
+        for (uint32_t i = 0; i < s; ++i) sum_gap += gap[i];
         closure_epsilon = static_cast<float>(sum_gap / s *
             (cfg.closure_multiplier > 0 ? cfg.closure_multiplier : 0.15f));
     }
@@ -941,6 +976,19 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
     std::vector<uint64_t> cluster_counts(k_root, 0);
     std::vector<uint32_t> prev_assignment;  // for change tracking (sampled)
 
+    // Worker pool + shard accumulators for the whole refinement phase
+    // (all passes, the convergence check, and d_eff below). One spawn set;
+    // t_sums are zeroed at the top of each pass. Accumulators are indexed
+    // by SHARD, so the reduction order — and the resulting centroids — is
+    // independent of which worker runs which shard.
+    const uint32_t hw = cfg.num_threads > 0
+        ? cfg.num_threads
+        : std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::vector<double>> t_sums(
+        hw, std::vector<double>(k_root * pca_dims, 0.0));
+    std::vector<std::vector<uint64_t>> t_counts(hw, std::vector<uint64_t>(k_root, 0));
+    ctpl::thread_pool_tls<StreamTLS> pool(hw);
+
     for (uint32_t pass = 0; pass < max_lloyd_passes; ++pass) {
         const auto pass_t0 = std::chrono::steady_clock::now();
         // Reset accumulators.
@@ -948,18 +996,14 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
             std::fill(cluster_sums[c].begin(), cluster_sums[c].end(), 0.0);
             cluster_counts[c] = 0;
         }
+        for (uint32_t t = 0; t < hw; ++t) {
+            std::fill(t_sums[t].begin(), t_sums[t].end(), 0.0);
+            std::fill(t_counts[t].begin(), t_counts[t].end(), 0);
+        }
 
         // Stream all vectors: project + assign + accumulate (parallel).
         ctx.source.reset();
         uint64_t vectors_done = 0;
-
-        // Per-thread accumulators (avoid false sharing: pad to cache line).
-        const uint32_t hw = cfg.num_threads > 0
-            ? cfg.num_threads
-            : std::max(1u, std::thread::hardware_concurrency());
-        std::vector<std::vector<double>> t_sums(
-            hw, std::vector<double>(k_root * pca_dims, 0.0));
-        std::vector<std::vector<uint64_t>> t_counts(hw, std::vector<uint64_t>(k_root, 0));
 
         // Centroid norms are constant per pass: compute once, share
         // across threads and chunks (was per-thread per-chunk).
@@ -971,12 +1015,6 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
             cent_norms[c] = simd::dot_f32(
                 root_centroids_pca[c].data(),
                 root_centroids_pca[c].data(), pca_dims);
-
-        // Persistent worker pool for the assign+accumulate loop. Spawning
-        // std::async threads per 2048-vector chunk (4883 chunks × hw spawns
-        // per pass) put ~half of all build cycles into thread-lifecycle page
-        // faults; a fixed pool amortizes spawn cost to once per build phase.
-        ctpl::thread_pool_tls<StreamTLS> pool(hw);
 
         while (vectors_done < n) {
             Chunk chunk;
@@ -1062,24 +1100,19 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
                      "({:.1f}s, {} empty clusters)", pass + 1, pass_secs, n_empty);
 
         // Early exit: check convergence by sampling.
-        // Project a small sample and check how many changed cluster.
+        // Assign the sample once (parallel; identical winners to the old
+        // serial loop) and reuse the result for both the change count and
+        // the prev_assignment update (the old code computed it twice).
         if (pass >= 1) {
-            uint32_t sample_sz = std::min<uint32_t>(4096, train_n);
+            const uint32_t sample_sz = std::min<uint32_t>(4096, train_n);
+            std::vector<uint32_t> best(sample_sz);
+            parallel_sample_assign(ctx.sample_pca.data(), sample_sz,
+                                   pca_dims, root_centroids_pca,
+                                   best.data(), nullptr, pool, hw);
             uint32_t n_changed = 0;
             for (uint32_t i = 0; i < sample_sz; ++i) {
-                const float* vi = &ctx.sample_pca[i * pca_dims];
-                float best_d = std::numeric_limits<float>::max();
-                uint32_t best_c = 0;
-                for (uint32_t c = 0; c < k_root; ++c) {
-                    float d = 0.0f;
-                    for (uint32_t k = 0; k < pca_dims; ++k) {
-                        const float diff = vi[k] - root_centroids_pca[c][k];
-                        d += diff * diff;
-                    }
-                    if (d < best_d) { best_d = d; best_c = c; }
-                }
-                if (pass == 1) prev_assignment.push_back(best_c);
-                else if (best_c != prev_assignment[i % prev_assignment.size()])
+                if (pass == 1) prev_assignment.push_back(best[i]);
+                else if (best[i] != prev_assignment[i % prev_assignment.size()])
                     ++n_changed;
             }
             if (pass >= 2 && prev_assignment.size() > 0) {
@@ -1092,20 +1125,8 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
                     break;
                 }
                 // Update prev_assignment for next comparison.
-                for (uint32_t i = 0; i < sample_sz; ++i) {
-                    const float* vi = &ctx.sample_pca[i * pca_dims];
-                    float best_d = std::numeric_limits<float>::max();
-                    uint32_t best_c = 0;
-                    for (uint32_t c = 0; c < k_root; ++c) {
-                        float d = 0.0f;
-                        for (uint32_t k = 0; k < pca_dims; ++k) {
-                            const float diff = vi[k] - root_centroids_pca[c][k];
-                            d += diff * diff;
-                        }
-                        if (d < best_d) { best_d = d; best_c = c; }
-                    }
-                    prev_assignment[i] = best_c;
-                }
+                for (uint32_t i = 0; i < sample_sz; ++i)
+                    prev_assignment[i] = best[i];
             }
         }
     }
@@ -1123,22 +1144,16 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
         const uint32_t s = std::min<uint32_t>(8192, train_n);
         std::vector<double> sum_gap(k_root, 0.0);
         std::vector<uint64_t> gap_count(k_root, 0);
+        std::vector<uint32_t> best(s);
+        std::vector<float> gap(s);
+        parallel_sample_assign(ctx.sample_pca.data(), s, pca_dims,
+                               root_centroids_pca, best.data(), gap.data(),
+                               pool, hw);
+        // Aggregate serially in row order — identical accumulation order
+        // to the old serial loop.
         for (uint32_t i = 0; i < s; ++i) {
-            const float* vi = &ctx.sample_pca[i * pca_dims];
-            float d1 = std::numeric_limits<float>::max();
-            float d2 = std::numeric_limits<float>::max();
-            uint32_t best_c = 0;
-            for (uint32_t c = 0; c < k_root; ++c) {
-                float d = 0.0f;
-                for (uint32_t k = 0; k < pca_dims; ++k) {
-                    const float diff = vi[k] - root_centroids_pca[c][k];
-                    d += diff * diff;
-                }
-                if (d < d1) { d2 = d1; d1 = d; best_c = c; }
-                else if (d < d2) d2 = d;
-            }
-            sum_gap[best_c] += (d2 - d1);
-            ++gap_count[best_c];
+            sum_gap[best[i]] += gap[i];
+            ++gap_count[best[i]];
         }
         ctx.cluster_d_eff.resize(k_root);
         ctx.cluster_closure_eps.resize(k_root);
