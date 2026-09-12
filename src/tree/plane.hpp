@@ -124,6 +124,17 @@ public:
     /// replicated query sign bits per dim (rank u32s). u4lm: unused.
     void build_sign_ctx(const float* proj, float* w_out, uint32_t* qbits_out) const;
 
+    /// u8-quantized LUT (affine-monotone per query) for the FastScan
+    /// kernel path. U4LM only. lut8 = rank*16 bytes; scale/offset/
+    /// seg_min are scratch (rank floats each / rank for seg_min).
+    void build_lut8(const float* proj, uint8_t* lut8, float* scale,
+                    float* offset, float* seg_min) const;
+
+    /// FastScan-kernel leaf max (U4LM only). Returns the raw u32
+    /// accumulator — affine-monotone in the true score, so rankings
+    /// within one query are exact; cross-query comparisons are not.
+    float scan_leaf_max_u8(uint32_t leaf_id, const uint8_t* lut8) const;
+
     /// Max ADC score over one leaf's plane blocks (masked tail lanes).
     /// `lut` from build_lut (u4lm*) or `w`/`qbits` from build_sign_ctx
     /// (b1g). Leaf offsets are computed at bind() time.

@@ -4672,12 +4672,20 @@ void IVFTreeIndex::plane_route_(const float* query,
     std::vector<float> proj(R);
     plane_->project_query(query, proj.data());
     std::vector<float> lut;
+    std::vector<uint8_t> lut8;
+    std::vector<float> lut8_scratch(R);  // scale/offset share rank floats
+    std::vector<float> seg_min(R);
     std::vector<float> w;
     std::vector<uint32_t> qbits;
+    const bool fastscan8 = plane_->meta().encoding == PlaneEncoding::U4LM;
     if (is_b1g) {
         w.resize(R);
         qbits.resize(R);
         plane_->build_sign_ctx(proj.data(), w.data(), qbits.data());
+    } else if (fastscan8) {
+        lut8.resize(static_cast<size_t>(R) * 16);
+        plane_->build_lut8(proj.data(), lut8.data(), lut8_scratch.data(),
+                           lut8_scratch.data() + 0, seg_min.data());
     } else {
         lut.resize(static_cast<size_t>(R) * 16);
         plane_->build_lut(proj.data(), lut.data());
@@ -4691,11 +4699,15 @@ void IVFTreeIndex::plane_route_(const float* query,
     for (int64_t l = 0; l < static_cast<int64_t>(n_leaves); ++l) {
         if (leaf_table_[static_cast<uint32_t>(l)].page == kInvalidPage)
             continue;
-        score[static_cast<uint32_t>(l)] = plane_->scan_leaf_max(
-            static_cast<uint32_t>(l),
-            is_b1g ? nullptr : lut.data(),
-            is_b1g ? w.data() : nullptr,
-            is_b1g ? qbits.data() : nullptr);
+        score[static_cast<uint32_t>(l)] =
+            is_b1g ? plane_->scan_leaf_max(
+                         static_cast<uint32_t>(l), nullptr, w.data(),
+                         qbits.data())
+          : fastscan8 ? plane_->scan_leaf_max_u8(
+                         static_cast<uint32_t>(l), lut8.data())
+          : plane_->scan_leaf_max(
+                         static_cast<uint32_t>(l), lut.data(), nullptr,
+                         nullptr);
     }
 
     // Score-ordered selection under the page-weighted fraction budget.

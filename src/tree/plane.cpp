@@ -2,6 +2,7 @@
 
 #include "sextant/types.hpp"
 #include "util/fp16.hpp"
+#include "simd_kernels.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -527,6 +528,45 @@ float PlaneIndex::scan_leaf_max(uint32_t leaf_id, const float* lut,
     if (meta_.encoding == PlaneEncoding::B1G)
         return scan_leaf_max_b1_(leaf_id, w, qbits);
     return scan_leaf_max_u4_(leaf_id, lut);
+}
+
+void PlaneIndex::build_lut8(const float* proj, uint8_t* lut8, float* scale,
+                            float* offset, float* seg_min) const {
+    // u8-quantized LUT: affine per segment, monotone within one query's
+    // ranking (see quantize_lut_u8_scaled). U4LM only (the pv alpha
+    // multiply needs f32 lanes).
+    std::vector<float> f32(static_cast<size_t>(meta_.rank) * 16);
+    build_lut(proj, f32.data());
+    sextant::simd::quantize_lut_u8_scaled(f32.data(), meta_.rank, 16, lut8,
+                                 scale, offset, seg_min);
+}
+
+float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
+                                   const uint8_t* lut8) const {
+    const uint32_t nb = block_cnt_[leaf_id];
+    const uint32_t count = leaf_cnt_[leaf_id];
+    static thread_local std::vector<uint32_t> sums, masks;
+    sums.resize(static_cast<size_t>(nb) * 32);
+    masks.resize(nb);
+    for (uint32_t b = 0; b < nb; ++b) {
+        const uint32_t valid =
+            std::min(32u, count - b * kVecsPerBlock);
+        masks[b] = valid == 32 ? 0xFFFFFFFFu : (1u << valid) - 1u;
+    }
+    sextant::simd::pq4_scan_many(blocks_ + block_off_[leaf_id], nb, lut8,
+                        meta_.rank, masks.data(), sums.data());
+    // The u8 sums are affine-monotone in the true score per query;
+    // return the raw accumulator (callers only rank within a query).
+    // NB: pq4_scan_many fills INVALID tail lanes with 0xFFFFFFFF (an
+    // argmin sentinel) — under MAX selection those must be skipped.
+    constexpr uint32_t kSentinel = 0xFFFFFFFFu;
+    uint32_t best = 0;
+    for (uint32_t b = 0; b < nb; ++b)
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t v = sums[static_cast<size_t>(b) * 32 + j];
+            if (v != kSentinel) best = std::max(best, v);
+        }
+    return static_cast<float>(best);
 }
 
 uint64_t PlaneIndex::leaf_block_offset(uint32_t leaf_id) const {

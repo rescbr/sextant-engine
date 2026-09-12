@@ -1674,6 +1674,48 @@ inline void pq4_block32(const uint8_t* code_block, const uint8_t* lut4,
     vst1q_u32(out + 20, vmovl_u16(vget_high_u16(acc_hi_a)));
     vst1q_u32(out + 24, vmovl_u16(vget_low_u16 (acc_hi_b)));
     vst1q_u32(out + 28, vmovl_u16(vget_high_u16(acc_hi_b)));
+#elif defined(SEXTANT_HAS_AVX2)
+    // AVX2 vpshufb path (mirrors the NEON structure): per segment, one
+    // 16-byte code row -> low/high nibbles -> 16-lane LUT lookup -> u16
+    // accumulate across all segments (max = m*255 = 32640 < 65535, so
+    // u16 accumulators cannot overflow for any legal m).
+    {
+        const __m128i zero = _mm_setzero_si128();
+        // Four 8-lane u16 accumulators: lo lanes 0..7 / 8..15, hi lanes
+        // 16..23 / 24..31 (a 128-bit u16 register holds only 8 lanes).
+        __m128i alo_a = zero, alo_b = zero, ahi_a = zero, ahi_b = zero;
+        const __m128i mask4 = _mm_set1_epi8(0x0F);
+        for (uint32_t s = 0; s < m; s++) {
+            const __m128i c = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(code_block + s * 16));
+            const __m128i l = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(lut4 + s * 16));
+            const __m128i clo = _mm_and_si128(c, mask4);
+            const __m128i chi = _mm_and_si128(_mm_srli_epi16(c, 4), mask4);
+            const __m128i rlo = _mm_shuffle_epi8(l, clo);
+            const __m128i rhi = _mm_shuffle_epi8(l, chi);
+            alo_a = _mm_adds_epu16(alo_a, _mm_unpacklo_epi8(rlo, zero));
+            alo_b = _mm_adds_epu16(alo_b, _mm_unpackhi_epi8(rlo, zero));
+            ahi_a = _mm_adds_epu16(ahi_a, _mm_unpacklo_epi8(rhi, zero));
+            ahi_b = _mm_adds_epu16(ahi_b, _mm_unpackhi_epi8(rhi, zero));
+        }
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out),
+                         _mm_unpacklo_epi16(alo_a, zero));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 4),
+                         _mm_unpackhi_epi16(alo_a, zero));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 8),
+                         _mm_unpacklo_epi16(alo_b, zero));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 12),
+                         _mm_unpackhi_epi16(alo_b, zero));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 16),
+                         _mm_unpacklo_epi16(ahi_a, zero));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 20),
+                         _mm_unpackhi_epi16(ahi_a, zero));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 24),
+                         _mm_unpacklo_epi16(ahi_b, zero));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 28),
+                         _mm_unpackhi_epi16(ahi_b, zero));
+    }
 #else
     for (uint32_t j = 0; j < 16; j++) out[j] = 0;
     for (uint32_t j = 0; j < 16; j++) out[16 + j] = 0;
