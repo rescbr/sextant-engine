@@ -42,6 +42,7 @@ public:
     Dim dim() const override;
     uint64_t count() const override;
     Schema schema() const override;
+    uint64_t payload_total_bytes() const override;
     void reset() override;
     bool next(Chunk& out) override;
 
@@ -51,7 +52,9 @@ private:
 
     Config config_;
     std::vector<std::unique_ptr<ParquetSource>> shards_;
+    std::vector<uint64_t> shard_base_;  // global row-id base per shard
     size_t cur_shard_ = 0;
+    std::vector<RowId> rid_buf_;  // re-based ids handed to the consumer
 
     Dim dim_ = 0;
     uint64_t total_count_ = 0;

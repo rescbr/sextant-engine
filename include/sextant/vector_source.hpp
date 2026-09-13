@@ -41,6 +41,15 @@ public:
     /// Sources that provide filter data override this.
     virtual Schema schema() const { return {}; }
 
+    /// Upper-bound estimate of the total decoded payload bytes this source
+    /// will stream (0 = no payload column, or unknown). Used by the build to
+    /// size the fixed allocation-bitmap region — the estimate must never
+    /// undershoot. Parquet sources derive it from column-chunk metadata
+    /// (total_uncompressed_size, no data pages read); dictionary-encoded
+    /// chunks are boosted because the payload extents store raw per-row
+    /// strings while the chunk may store dict + indices.
+    virtual uint64_t payload_total_bytes() const { return 0; }
+
     // --- I/O observability (monotone across the source's lifetime; used
     //     by metrics::MetricsCollector for per-phase attribution). All
     //     default to 0; sources with real backing I/O override. ---

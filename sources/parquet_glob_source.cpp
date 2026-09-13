@@ -102,6 +102,7 @@ ParquetGlobSource::ParquetGlobSource(
             }
         }
         total_count_ += src->count();
+        shard_base_.push_back(total_count_ - src->count());
         shards_.push_back(std::move(src));
     }
 
@@ -173,6 +174,15 @@ uint64_t ParquetGlobSource::count() const { return total_count_; }
 
 Schema ParquetGlobSource::schema() const { return schema_; }
 
+uint64_t ParquetGlobSource::payload_total_bytes() const {
+    // Sum across shards only — the label reader carries filter columns, not
+    // payload. Estimates compose exactly since each shard's ParquetSource
+    // derives its own upper bound from column-chunk metadata.
+    uint64_t total = 0;
+    for (const auto& s : shards_) total += s->payload_total_bytes();
+    return total;
+}
+
 void ParquetGlobSource::reset() {
     for (auto& s : shards_) s->reset();
     cur_shard_ = 0;
@@ -217,6 +227,24 @@ bool ParquetGlobSource::next(Chunk& out) {
     // Advance to next shard if current is exhausted
     while (cur_shard_ < shards_.size()) {
         if (shards_[cur_shard_]->next(out)) {
+            // ParquetSource assigns row ids from a per-file cursor, so each
+            // shard emits ids 0..n_shard-1. Re-base them to GLOBAL ids here:
+            // the build treats source-assigned ids as corpus-wide row ids
+            // (row ids index filter/payload sidecars and ground-truth
+            // comparisons). Without this, every shard's rows collide into
+            // the first shard's id space — searches return vectors with
+            // correct codes but wrong (shard-local) row ids. The offset is
+            // the shard's BASE (rows in all previous shards), a constant:
+            // adding the running rows-served total would double-count the
+            // current shard's own already-emitted prefix.
+            if (out.row_ids) {
+                rid_buf_.resize(out.count);
+                const uint64_t base = shard_base_[cur_shard_];
+                for (uint32_t i = 0; i < out.count; ++i)
+                    rid_buf_[i] = static_cast<RowId>(
+                        static_cast<uint64_t>(out.row_ids[i]) + base);
+                out.row_ids = rid_buf_.data();
+            }
             // When vectors_only is set (filter data from sidecar), suppress
             // shard-local filter columns so the builder uses cfg.filter_column_data.
             if (config_.vectors_only) {

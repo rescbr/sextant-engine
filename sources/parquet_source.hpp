@@ -77,6 +77,7 @@ public:
     uint64_t count() const override { return count_; }
     std::string path() const override { return path_; }
     Schema schema() const override { return schema_; }
+    uint64_t payload_total_bytes() const override { return payload_total_bytes_; }
 
     void reset() override;
     bool next(Chunk& out) override;
@@ -104,6 +105,7 @@ private:
     int32_t vec_type_len_ = 0;
     int32_t payload_col_idx_ = -1;   // file column index of the payload col
     int32_t payload_type_len_ = 0;   // FIXED_LEN_BYTE_ARRAY stride (0 for BYTE_ARRAY)
+    uint64_t payload_total_bytes_ = 0;  // upper-bound estimate (chunk metadata)
     std::vector<uint8_t> payload_data_;     // per-batch packed payload bytes
     std::vector<uint32_t> payload_offsets_;  // n+1 cumulative offsets
     std::vector<int32_t> filter_col_indices_;  // file col idx per filter col

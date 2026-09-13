@@ -238,6 +238,61 @@ void ParquetSource::init_schema_() {
         schema_.has_payload = true;
     }
 
+    // Upper-bound payload byte estimate for bitmap-region sizing. Derived
+    // purely from column-chunk metadata (no data pages read): the summed
+    // uncompressed size of the payload column across row groups. For
+    // BYTE_ARRAY this includes 4-byte length prefixes and page overhead — a
+    // slight overestimate of raw string bytes, i.e. the safe direction.
+    //
+    // Dictionary-encoded chunks are the exception: the chunk stores dict +
+    // indices while the payload extents store raw per-row strings, so the
+    // uncompressed size can undershoot badly on duplicate-heavy columns.
+    // Boost those chunks 8x — over-provisioning is near-free (4 KiB of
+    // bitmap addresses 128 MiB of file).
+    if (payload_col_idx_ >= 0) {
+        const int32_t n_rg = carquet_reader_num_row_groups(reader_.get());
+        bool dict_warned = false;
+        for (int32_t rg = 0; rg < n_rg; ++rg) {
+            carquet_column_chunk_metadata_t md;
+            carquet_status_t st = carquet_reader_column_chunk_metadata(
+                reader_.get(), rg, payload_col_idx_, &md);
+            if (st != CARQUET_OK) {
+                carquet_error_t err = {};
+                err.code = st;
+                throw_carquet_error(
+                    err, "ParquetSource: cannot read payload column chunk "
+                         "metadata for '" +
+                             path_ + "' row group " + std::to_string(rg));
+            }
+            bool dict = md.has_dictionary_page;
+            for (int32_t e = 0; e < md.num_encodings && e < 4; ++e) {
+                if (md.encodings[e] == CARQUET_ENCODING_PLAIN_DICTIONARY ||
+                    md.encodings[e] == CARQUET_ENCODING_RLE_DICTIONARY) {
+                    dict = true;
+                }
+            }
+            if (dict) {
+                payload_total_bytes_ +=
+                    static_cast<uint64_t>(md.total_uncompressed_size) * 8;
+                // Note: pyarrow and most writers dictionary-encode string
+                // columns by default, so this is the COMMON case, not a
+                // pathology — log once per file, not per row group.
+                if (!dict_warned) {
+                    dict_warned = true;
+                    spdlog::warn(
+                        "ParquetSource: payload column '{}' in '{}' is "
+                        "dictionary-encoded — payload byte estimate boosted "
+                        "8x for bitmap sizing (use --bitmap-pages to "
+                        "override)",
+                        config_.payload_col, path_);
+                }
+            } else {
+                payload_total_bytes_ +=
+                    static_cast<uint64_t>(md.total_uncompressed_size);
+            }
+        }
+    }
+
     // For list<float> columns, find_column matches the leaf name (e.g. "item"),
     // not the parent field name (e.g. "emb"). Fall back to searching by
     // path prefix: a leaf whose path starts with the vector column name
