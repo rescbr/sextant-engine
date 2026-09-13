@@ -226,18 +226,22 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
             throw Error(ErrorCode::CorruptIndex,
                 "tree index has a corrupt/unsupported routing plane");
         }
+        idx->leaf_plane_offset_.reserve(idx->leaf_table_.size());
         std::vector<uint32_t> counts;
         counts.reserve(idx->leaf_table_.size());
         for (const auto& e : idx->leaf_table_) {
             uint32_t count = 0;
+            uint32_t poff = 0;
             if (e.page != kInvalidPage) {
                 const auto* lh =
                     reinterpret_cast<const TreeLeafHeader*>(
                         idx->mmap_base_ +
                         static_cast<uint64_t>(e.page) * kPageSize);
                 count = static_cast<uint32_t>(lh->count);
+                poff = lh->plane_offset;
             }
             counts.push_back(count);
+            idx->leaf_plane_offset_.push_back(poff);
         }
         idx->plane_->bind(counts);
         spdlog::info("[sextant] IVFTreeIndex: routing plane attached "
@@ -265,7 +269,9 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
     // Independent cache for plane row blocks (routing tier). Keyed by
     // the plane extent's page ids — disjoint from leaf extent pages, so
     // it never competes with the leaf budget. Same W-TinyLFU policy.
-    if (plane_cache_bytes > 0 && idx->plane_) {
+    // v2 layouts need no plane cache: the rows live inside the leaf
+    // extents, so the leaf cache already covers them.
+    if (plane_cache_bytes > 0 && idx->plane_ && !idx->plane_->v2_layout()) {
         constexpr uint32_t kPlaneCacheShards = 16;
         idx->plane_cache_ = std::make_unique<LeafExtentCache>(
             plane_cache_bytes, kPlaneCacheShards, idx->file_.fd(),

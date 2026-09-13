@@ -99,6 +99,19 @@ public:
     /// leaf; tail lanes are zero-coded and must be masked at scan time.
     std::vector<uint8_t> finalize(const std::vector<uint32_t>& leaf_counts);
 
+    /// Plane v2 (blocks-in-leaf layout): serializes the HEADER-ONLY blob
+    /// (header + basis + mean + codebook; no blocks, no alpha). Per-leaf
+    /// blocks are detached at flush time via detach_leaf_blocks instead.
+    std::vector<uint8_t> finalize_header_only();
+
+    /// Plane v2: detach cluster `c`'s staged rows for a leaf of `count`
+    /// members — ceil(count/32) padded blocks, followed by count fp16
+    /// alphas for u4lm_pv. Resets the cluster's staging. The staged slots
+    /// are leaf-local (they reset at every flush), so at flush time the
+    /// staging holds exactly this leaf's rows.
+    std::vector<uint8_t> detach_leaf_blocks(uint32_t cluster,
+                                            uint32_t count);
+
     const PlaneMeta& meta() const { return meta_; }
 
 private:
@@ -131,6 +144,11 @@ public:
     static std::unique_ptr<PlaneIndex> parse(const uint8_t* data, size_t len);
 
     const PlaneMeta& meta() const { return meta_; }
+
+    /// v2 layout: per-leaf blocks live inside the leaf extents (suffix at
+    /// TreeLeafHeader::plane_offset) — no blob blocks region, no blob
+    /// alpha; scans must supply per-leaf pointers (scan_leaf_max_u8_at).
+    bool v2_layout() const { return v2_; }
 
     /// Projects an original-space query to the plane (rank floats).
     void project_query(const float* q, float* proj_out) const;
@@ -168,10 +186,13 @@ public:
 
     /// scan_leaf_max_u8 with the caller-supplied block pointer (e.g. rows
     /// pinned in the plane cache) instead of the mmap'd blob. leaf_id
-    /// still supplies the block count, member count, and pv alpha base.
+    /// still supplies the block count and member count; `alpha_override`
+    /// (v2: per-leaf alphas inside the leaf extent) replaces the blob's
+    /// leaf-aligned alpha base when non-null.
     float scan_leaf_max_u8_at(uint32_t leaf_id, const uint8_t* blk,
                               const uint8_t* lut8,
-                              float shift = 0.0f) const;
+                              float shift = 0.0f,
+                              const uint16_t* alpha_override = nullptr) const;
 
     /// Query-tiled variant: Q queries against one leaf's blocks per
     /// pass — code loads amortize across the tile, LUT rows stay
@@ -221,6 +242,7 @@ private:
     std::vector<uint32_t> block_cnt_;
     std::vector<uint32_t> leaf_cnt_;   // real member counts (tail clamps)
     uint32_t block_bytes_ = 0;
+    bool v2_ = false;  // blocks live in leaf extents, not in this blob
     float scan_leaf_max_u4_(uint32_t leaf_id, const float* lut) const;
     float scan_leaf_max_b1_(uint32_t leaf_id, const float* blut) const;
 };
@@ -229,6 +251,7 @@ private:
 bool parse_plane_header(const uint8_t* data, size_t len, PlaneMeta* meta,
                         uint64_t* blocks_bytes = nullptr,
                         uint64_t* codebook_bytes = nullptr,
-                        uint64_t* alpha_bytes = nullptr);
+                        uint64_t* alpha_bytes = nullptr,
+                        uint8_t* flags = nullptr);
 
 }  // namespace sextant::tree

@@ -20,13 +20,15 @@ namespace {
 constexpr uint32_t kPlaneMagic = 0x314C5053u;  // 'SPL1'
 constexpr uint32_t kPlaneVersion = 1;
 constexpr uint32_t kVecsPerBlock = 32;
+constexpr uint8_t kFlagAlpha = 1;
+constexpr uint8_t kFlagV2Layout = 2;
 
 #pragma pack(push, 1)
 struct PlaneHeaderDisk {
     uint32_t magic;
     uint32_t version;
     uint8_t  encoding;
-    uint8_t  flags;      // bit0: alpha present
+    uint8_t  flags;      // bit0: alpha present; bit1: v2 layout (blocks in leaf extents)
     uint16_t rank;
     uint32_t dim;
     uint64_t basis_off, basis_bytes;
@@ -344,7 +346,7 @@ std::vector<uint8_t> PlaneWriter::finalize(
     h->magic = kPlaneMagic;
     h->version = kPlaneVersion;
     h->encoding = static_cast<uint8_t>(meta_.encoding);
-    h->flags = pv ? 1 : 0;
+    h->flags = pv ? kFlagAlpha : 0;
     h->rank = static_cast<uint16_t>(R);
     h->dim = meta_.dim;
     h->basis_off = header;  h->basis_bytes = basis_bytes;
@@ -410,13 +412,97 @@ std::vector<uint8_t> PlaneWriter::finalize(
     return blob;
 }
 
+std::vector<uint8_t> PlaneWriter::finalize_header_only() {
+    const uint32_t R = meta_.rank;
+    const size_t header = sizeof(PlaneHeaderDisk);
+    const uint64_t basis_bytes = static_cast<uint64_t>(meta_.dim) * R * 4;
+    const uint64_t mean_bytes = static_cast<uint64_t>(meta_.dim) * 4;
+    const uint64_t cb_bytes = static_cast<uint64_t>(codebook_.size()) * 4;
+
+    std::vector<uint8_t> blob(static_cast<size_t>(
+        header + basis_bytes + mean_bytes + cb_bytes), 0);
+    auto* h = reinterpret_cast<PlaneHeaderDisk*>(blob.data());
+    h->magic = kPlaneMagic;
+    h->version = kPlaneVersion;
+    h->encoding = static_cast<uint8_t>(meta_.encoding);
+    h->flags = kFlagV2Layout;  // no blob alpha either — per-leaf in extents
+    h->rank = static_cast<uint16_t>(R);
+    h->dim = meta_.dim;
+    h->basis_off = header;  h->basis_bytes = basis_bytes;
+    h->mean_off = header + basis_bytes;  h->mean_bytes = mean_bytes;
+    h->codebook_off = h->mean_off + mean_bytes;  h->codebook_bytes = cb_bytes;
+    h->alpha_off = 0;  h->alpha_bytes = 0;
+    h->blocks_off = h->codebook_off + cb_bytes;  // == blob size
+    h->blocks_bytes = 0;
+    h->n_blocks = 0;
+    std::memcpy(blob.data() + h->basis_off, basis_t_.data(), basis_bytes);
+    std::memcpy(blob.data() + h->mean_off, mean_.data(), mean_bytes);
+    std::memcpy(blob.data() + h->codebook_off, codebook_.data(), cb_bytes);
+    return blob;
+}
+
+std::vector<uint8_t> PlaneWriter::detach_leaf_blocks(uint32_t cluster,
+                                                     uint32_t count) {
+    if (cluster >= stage_.size())
+        throw std::runtime_error("plane: detach of unstaged cluster");
+    LeafState& ls = stage_[cluster];
+    const uint32_t nb =
+        (count + kVecsPerBlock - 1) / kVecsPerBlock;
+    if (ls.blocks.size() < static_cast<size_t>(nb) * block_bytes_)
+        throw std::runtime_error("plane: staging shorter than leaf count");
+
+    const bool pv = meta_.encoding == PlaneEncoding::U4LM_PV;
+    std::vector<uint8_t> out(static_cast<size_t>(nb) * block_bytes_ +
+                             (pv ? static_cast<size_t>(count) * 2 : 0));
+    std::memcpy(out.data(), ls.blocks.data(),
+                static_cast<size_t>(nb) * block_bytes_);
+
+    if (pv) {
+        // Same per-member alpha as finalize(): the least-squares scalar
+        // that best reconstructs the projected row from its own decoded
+        // code. Mirrors finalize's decode_slot against the detached
+        // bytes (byte-identical to ls.blocks).
+        const uint32_t R = meta_.rank;
+        auto decode_slot = [&](uint32_t slot, uint32_t s) -> float {
+            const uint32_t block = slot / kVecsPerBlock;
+            const uint32_t lane = slot % kVecsPerBlock;
+            const uint8_t* blk =
+                out.data() + static_cast<size_t>(block) * block_bytes_;
+            const uint8_t nbi = static_cast<uint8_t>(lane % 16);
+            const uint32_t code = (lane >= 16)
+                ? static_cast<uint32_t>(blk[s * 16 + nbi] >> 4)
+                : static_cast<uint32_t>(blk[s * 16 + nbi] & 0xFu);
+            return decode_dim_(code, s);
+        };
+        uint8_t* alpha_cur = out.data() +
+            static_cast<size_t>(nb) * block_bytes_;
+        for (uint32_t i = 0; i < count; ++i) {
+            const float* v = &ls.proj[static_cast<size_t>(i) * R];
+            double dvc = 0, dcc = 0;
+            for (uint32_t s = 0; s < R; ++s) {
+                const float dc = decode_slot(i, s);
+                dvc += static_cast<double>(v[s]) * dc;
+                dcc += static_cast<double>(dc) * dc;
+            }
+            const float a = dcc > 1e-12
+                ? static_cast<float>(dvc / dcc) : 1.0f;
+            const float16_t h16 = static_cast<float16_t>(a);
+            std::memcpy(alpha_cur, &h16, 2);
+            alpha_cur += 2;
+        }
+    }
+    ls = LeafState{};  // staging resets: slots are leaf-local
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // PlaneIndex
 // ---------------------------------------------------------------------------
 
 bool parse_plane_header(const uint8_t* data, size_t len, PlaneMeta* meta,
                         uint64_t* blocks_bytes, uint64_t* codebook_bytes,
-                        uint64_t* alpha_bytes) {
+                        uint64_t* alpha_bytes,
+                        uint8_t* flags) {
     if (len < sizeof(PlaneHeaderDisk)) return false;
     PlaneHeaderDisk h;
     std::memcpy(&h, data, sizeof(h));
@@ -431,6 +517,7 @@ bool parse_plane_header(const uint8_t* data, size_t len, PlaneMeta* meta,
     if (blocks_bytes) *blocks_bytes = h.blocks_bytes;
     if (codebook_bytes) *codebook_bytes = h.codebook_bytes;
     if (alpha_bytes) *alpha_bytes = h.alpha_bytes;
+    if (flags) *flags = h.flags;
     return true;
 }
 
@@ -446,6 +533,7 @@ std::unique_ptr<PlaneIndex> PlaneIndex::parse(const uint8_t* data,
     p->meta_.rank = h.rank;
     p->meta_.dim = h.dim;
     p->block_bytes_ = block_bytes_for(p->meta_);
+    p->v2_ = (h.flags & kFlagV2Layout) != 0;
 
     const auto in_range = [&](uint64_t off, uint64_t bytes) {
         return off >= sizeof(h) && off + bytes <= len;
@@ -454,17 +542,30 @@ std::unique_ptr<PlaneIndex> PlaneIndex::parse(const uint8_t* data,
         h.mean_bytes != static_cast<uint64_t>(h.dim) * 4 ||
         h.codebook_bytes != ((p->meta_.encoding == PlaneEncoding::B1G)
             ? static_cast<uint64_t>(h.rank) * 4
-            : static_cast<uint64_t>(h.rank) * 16 * 4) ||
-        h.blocks_bytes != h.n_blocks * p->block_bytes_)
+            : static_cast<uint64_t>(h.rank) * 16 * 4))
         return nullptr;
+    if (p->v2_) {
+        // Header-only blob: no blocks region, no alpha (both live in the
+        // leaf extents). Everything else validates as v1.
+        if (h.blocks_off != h.codebook_off + h.codebook_bytes ||
+            h.blocks_bytes != 0 || h.n_blocks != 0 || h.alpha_bytes != 0)
+            return nullptr;
+    } else if (h.blocks_bytes != h.n_blocks * p->block_bytes_) {
+        return nullptr;
+    }
     if (!in_range(h.basis_off, h.basis_bytes) ||
         !in_range(h.mean_off, h.mean_bytes) ||
         !in_range(h.codebook_off, h.codebook_bytes) ||
-        !in_range(h.blocks_off, h.blocks_bytes))
+        (!p->v2_ && !in_range(h.blocks_off, h.blocks_bytes)))
         return nullptr;
     if (p->meta_.encoding == PlaneEncoding::U4LM_PV) {
-        if (!in_range(h.alpha_off, h.alpha_bytes)) return nullptr;
-        p->alpha_ = reinterpret_cast<const uint16_t*>(data + h.alpha_off);
+        if (p->v2_) {
+            // per-member alphas ride the leaf extents (after the blocks)
+            p->alpha_ = nullptr;
+        } else {
+            if (!in_range(h.alpha_off, h.alpha_bytes)) return nullptr;
+            p->alpha_ = reinterpret_cast<const uint16_t*>(data + h.alpha_off);
+        }
     } else if (h.alpha_bytes != 0) {
         return nullptr;
     }
@@ -634,7 +735,8 @@ float PlaneIndex::scan_leaf_max_u8(uint32_t leaf_id,
 float PlaneIndex::scan_leaf_max_u8_at(uint32_t leaf_id,
                                      const uint8_t* blk,
                                      const uint8_t* lut8,
-                                     float shift) const {
+                                     float shift,
+                                     const uint16_t* alpha_override) const {
     // Correct kernel: pq4_scan_many (per-block u32 sums in memory, LUT
     // cache-hot). A register-accumulator "fused" variant was attempted
     // and REVERTED: per-member accumulation can't span block pairs
@@ -655,8 +757,9 @@ float PlaneIndex::scan_leaf_max_u8_at(uint32_t leaf_id,
     }
     sextant::simd::pq4_scan_many(blk, nb, lut8, m, masks.data(),
                                  sums.data());
+    const uint16_t* alpha = alpha_override ? alpha_override : alpha_;
     constexpr uint32_t kSentinel = 0xFFFFFFFFu;
-    if (alpha_ == nullptr) {
+    if (alpha == nullptr) {
         uint32_t best = 0;
         for (uint32_t b = 0; b < nb; ++b)
             for (uint32_t j = 0; j < 32; ++j) {
@@ -672,7 +775,7 @@ float PlaneIndex::scan_leaf_max_u8_at(uint32_t leaf_id,
             std::min(kVecsPerBlock, count - b * kVecsPerBlock);
         for (uint32_t j = 0; j < valid; ++j, ++idx) {
             float16_t h16;
-            std::memcpy(&h16, &alpha_[idx], 2);
+            std::memcpy(&h16, &alpha[idx], 2);
             const float a = static_cast<float>(h16);
             best = std::max(
                 best, a * (static_cast<float>(

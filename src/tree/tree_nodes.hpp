@@ -172,8 +172,10 @@ struct TreeLeafHeader {
     /// Byte offset of the local codebook within the leaf extent (0 = none).
     /// For CODED_LOCAL leaves: m4 × K × sub_dim × 4 bytes at this offset.
     uint32_t codebook_offset = 0;
-    /// Reserved for future use.
-    uint32_t reserved2 = 0;
+    /// Plane v2: byte offset of this leaf's routing-plane blocks within
+    /// the leaf extent (a suffix after row_ids / filter regions; for
+    /// u4lm_pv the fp16 alphas follow the blocks). 0 = no plane rows.
+    uint32_t plane_offset = 0;
     uint32_t header_crc;             // CRC32 of bytes [0 .. offsetof(header_crc))
 };
 static_assert(sizeof(TreeLeafHeader) == 112);

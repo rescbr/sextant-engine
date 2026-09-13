@@ -33,6 +33,8 @@ struct TreeWalkResult {
     uint64_t n_leaves = 0;
     uint64_t total_leaf_count = 0;
     uint64_t total_leaf_blocks = 0;  // Σ ceil(count/32) — plane sizing
+    uint64_t plane_v2_leaves = 0;    // leaves with in-extent plane rows
+    uint64_t plane_offset_bad = 0;   // plane_offset beyond extent bounds
     uint32_t max_depth = 0;
     uint64_t magic_failures = 0;
     uint64_t crc_failures = 0;
@@ -78,6 +80,17 @@ void validate_leaf(const PageFile& file, PageId physical_page,
 
     result.total_leaf_count += lh->count;
     result.total_leaf_blocks += (lh->count + 31) / 32;
+
+    // Plane v2: the routing rows are a suffix of this extent. Bound-check
+    // here (encoding-independent); the plane section cross-checks the
+    // exact size once the block geometry is known.
+    if (lh->plane_offset != 0) {
+        ++result.plane_v2_leaves;
+        if (lh->plane_offset >=
+            static_cast<uint64_t>(physical_pages) * kPageSize) {
+            ++result.plane_offset_bad;
+        }
+    }
 
     if (lh->payload_extent_page != kInvalidPage &&
         lh->payload_extent_pages > 0) {
@@ -318,23 +331,33 @@ FsckResult fsck(const std::string& path, bool repair) {
             {sb.cardinality_page(), sb.cardinality_pages()});
     // Routing plane: register the extent and cross-check its sizing
     // against the walk (blocks = Σ ceil(count/32), alpha = 2×count).
+    // v2 layout: the extent is header-only; the blocks live in the leaf
+    // extents (every live leaf must carry a plane_offset, in bounds, and
+    // large enough for its blocks + pv alphas).
     if (sb.plane_page() != kInvalidPage && sb.plane_pages() > 0) {
         all_allocated.push_back({sb.plane_page(), sb.plane_pages()});
         auto blob = read_extent(file, sb.plane_page(),
                                 std::min<uint32_t>(sb.plane_pages(), 1));
         PlaneMeta pm;
         uint64_t blocks_bytes = 0, cb_bytes = 0, alpha_bytes = 0;
+        uint8_t pflags = 0;
         if (parse_plane_header(blob.data(), blob.size(), &pm, &blocks_bytes,
-                               &cb_bytes, &alpha_bytes)) {
+                               &cb_bytes, &alpha_bytes, &pflags)) {
             const uint64_t bb = (pm.encoding == PlaneEncoding::B1G)
                 ? static_cast<uint64_t>(pm.rank) * 4
                 : static_cast<uint64_t>(pm.rank) * 16;
-            const bool blocks_ok =
-                blocks_bytes == walk.total_leaf_blocks * bb;
-            const bool alpha_ok =
-                pm.encoding != PlaneEncoding::U4LM_PV ||
-                alpha_bytes == walk.total_leaf_count * 2;
-            if (!blocks_ok || !alpha_ok) ++result.magic_failures;
+            if (pflags & 2) {
+                if (walk.plane_v2_leaves != walk.n_leaves ||
+                    walk.plane_offset_bad > 0)
+                    ++result.magic_failures;
+            } else {
+                const bool blocks_ok =
+                    blocks_bytes == walk.total_leaf_blocks * bb;
+                const bool alpha_ok =
+                    pm.encoding != PlaneEncoding::U4LM_PV ||
+                    alpha_bytes == walk.total_leaf_count * 2;
+                if (!blocks_ok || !alpha_ok) ++result.magic_failures;
+            }
         } else {
             ++result.magic_failures;
         }

@@ -213,7 +213,8 @@ struct TreeBuildContext {
     //     the same points rows are appended to leaf buffers. ---
     PlaneWriter plane_writer;
     bool plane = false;
-    std::vector<uint32_t> plane_leaf_counts;  // per flushed leaf, in order
+    // v1 (blob) build path: leaf counts in flush order for attach_plane_from.
+    std::vector<uint32_t> plane_leaf_counts;
 
     // --- Phase I: per-cluster d_eff and per-cluster closure epsilon ---
     // d_eff_c = mean gap to 2nd-nearest centroid for vectors in cluster c.
@@ -1183,9 +1184,24 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                          leaf_metas.size(), fcb, pq_code_bytes);
         }
 
+        // Plane v2 sizing: the leaf extent grows by this leaf's plane
+        // rows (ceil(count/32) FastScan blocks + pv alphas) plus the
+        // 64-byte alignment slack before the suffix.
+        uint64_t plane_extent_bytes = 0;
+        if (ctx.plane && cfg.plane_layout == 1) {
+            const auto& pm = ctx.plane_writer.meta();
+            const uint64_t bbp = (pm.encoding == PlaneEncoding::B1G)
+                ? static_cast<uint64_t>(pm.rank) / 4 * 16
+                : static_cast<uint64_t>(pm.rank) * 16;
+            plane_extent_bytes =
+                ((static_cast<uint64_t>(count) + 31) / 32) * bbp + 63 +
+                ((pm.encoding == PlaneEncoding::U4LM_PV)
+                     ? static_cast<uint64_t>(count) * 2
+                     : 0);
+        }
         const uint32_t npg = static_cast<uint32_t>(
             (ctx.coder->extent_bytes(count, summary_size, fcb) +
-             kPageSize - 1) / kPageSize);
+             plane_extent_bytes + kPageSize - 1) / kPageSize);
         if (npg > 512) {
             spdlog::warn("[sextant] build_streaming_pca: leaf {} extent = {} "
                          "pages (> 512)", leaf_metas.size(), npg);
@@ -1280,6 +1296,28 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             lh->filter_columns_offset = 0;
         }
 
+        // Plane v2: this leaf's routing-plane rows ride the leaf extent
+        // as a suffix (64-byte aligned) — per-leaf read locality. Blocks
+        // (and pv alphas) are detached from the cluster staging; slots are
+        // leaf-local so staging holds exactly this flush's rows.
+        std::vector<uint8_t> plane_rows;
+        uint64_t plane_off = 0;
+        if (ctx.plane && cfg.plane_layout == 1) {
+            plane_rows = ctx.plane_writer.detach_leaf_blocks(c, count);
+            plane_off = (fcb > 0)
+                ? lh->filter_columns_offset + fcb
+                : rowids_off + static_cast<uint64_t>(count) * sizeof(RowId);
+            plane_off = (plane_off + 63) & ~uint64_t(63);
+            if (plane_off + plane_rows.size() >
+                static_cast<uint64_t>(npg) * kPageSize) {
+                throw Error(ErrorCode::CorruptIndex,
+                    "build_streaming_pca: plane rows overflow leaf extent");
+            }
+            lh->plane_offset = static_cast<uint32_t>(plane_off);
+            std::memcpy(obuf.data() + plane_off, plane_rows.data(),
+                        plane_rows.size());
+        }
+
         lh->header_crc = header_crc(lh, offsetof(TreeLeafHeader, header_crc));
         file.write_pages(page, npg, obuf.data());
 
@@ -1299,7 +1337,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
 
         leaf_metas.push_back(LeafMeta{page, npg, std::move(leaf_centroid)});
         leaf_summaries.push_back(std::move(leaf_summary));
-        if (ctx.plane) {
+        if (ctx.plane && cfg.plane_layout == 0) {
             const auto leaf_id = static_cast<uint32_t>(leaf_metas.size() - 1);
             ctx.plane_writer.transfer_leaf(c, leaf_id);
             ctx.plane_leaf_counts.push_back(count);
@@ -2218,6 +2256,27 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     { std::vector<uint8_t> b(cfg_npg*kPageSize, 0); std::memcpy(b.data(),cfg_toml.data(),cfg_toml.size());
       file.write_pages(cfg_page, cfg_npg, b.data()); }
 
+    // --- Write the plane v2 extent (header-only blob) ---
+    // Per-leaf blocks already rode the leaf extents at flush time; this
+    // carries just the shared basis/mean/codebook (~400 KB at rank 128 /
+    // dim 768) that the search side parses + projects with.
+    // Routing plane: only the v2 (leaf) layout commits its plane extent
+    // here. The v1 (blob) path must NOT touch the plane fields — its plane
+    // lands via the reopen+attach tail, exactly like the phase-A builds
+    // (byte-identity gate: deep10m rebuild must equal the phase-A
+    // reference bit-for-bit, stale shadow copies included).
+    PageId plane_page = kInvalidPage;
+    uint32_t plane_npg = 0;
+    if (ctx.plane && ctx.cfg.plane_layout == 1) {
+        auto pblob = ctx.plane_writer.finalize_header_only();
+        plane_npg = static_cast<uint32_t>(
+            (pblob.size() + kPageSize - 1) / kPageSize);
+        plane_page = alloc.alloc_extent(file, plane_npg);
+        std::vector<uint8_t> pb(plane_npg * kPageSize, 0);
+        std::memcpy(pb.data(), pblob.data(), pblob.size());
+        file.write_pages(plane_page, plane_npg, pb.data());
+    }
+
     alloc.flush_bitmap(file);
     Superblock sb;
     sb.init_fresh(alloc.bitmap_page(), alloc.bitmap_pages());
@@ -2232,6 +2291,7 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     sb.set_pca(pca_page, pca_npg);
     sb.set_cardinality(card_page, card_npg);
     sb.set_leaf_table(lt_page, lt_npg);
+    if (ctx.cfg.plane_layout == 1) sb.set_plane(plane_page, plane_npg);
     sb.commit(file);
     file.sync();
 
@@ -2336,11 +2396,11 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
 
     run_emission_pass(ctx, file, alloc);
     BuildResult result = write_tree_structure(ctx, file, alloc);
-
-    // In-build plane tail: the writer holds trained basis + encoded
-    // per-leaf blocks. Reopen the committed tree and append the plane
-    // extent (shared with the post-hoc attach path).
-    if (ctx.plane) {
+    // Plane tail. v1 (blob, default): reopen the committed tree and append
+    // the contiguous blocks extent (shared with the post-hoc attach path).
+    // v2 (leaf): blocks already rode the leaf extents and the header-only
+    // extent was committed by write_tree_structure — nothing to do.
+    if (ctx.plane && cfg.plane_layout == 0) {
         auto idx = IVFTreeIndex::open(output_path);
         idx->attach_plane_from(ctx.plane_writer, ctx.plane_leaf_counts);
     }

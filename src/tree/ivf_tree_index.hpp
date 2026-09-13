@@ -131,6 +131,12 @@ public:
         PlaneEncoding plane_enc = PlaneEncoding::B1G;
         uint16_t plane_rank = 128;
         uint32_t plane_train_rows = 20000;  // capped at the build sample size
+        /// 0 = blob (v1, default): blocks in one contiguous plane extent —
+        /// optimal for the sweep-everything stage-1 (measured 335 vs 152
+        /// cold QPS @10M on 1M-record ZFS). 1 = leaf (v2): blocks ride the
+        /// leaf extents — parity on small-record storage, prerequisite for
+        /// in-leaf mutation experiments.
+        uint8_t plane_layout = 0;
     };
 
     // --- Search observability ---
@@ -443,6 +449,10 @@ private:
     TreeManifest manifest_;
     CardinalityTable card_table_;  // per-value frequencies for selectivity (Phase D)
     std::unique_ptr<PlaneIndex> plane_;  // stage-1 routing plane (optional)
+    // v2 layouts: per-leaf plane-suffix offset, cached from the leaf
+    // headers at open (the same pass that reads counts) — the sweep then
+    // never faults a leaf header.
+    std::vector<uint32_t> leaf_plane_offset_;
     // Single per-family coder: owns the quantizer objects + all
     // family-specific leaf layout / scan / mutation logic.
     std::unique_ptr<LeafCoder> coder_;

@@ -498,6 +498,11 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<uint32_t>("plane-rank", 0, "Plane PCA rank", false, 128);
     p.add<uint32_t>("plane-train-rows", 0,
         "Plane basis/codebook training sample (spread-sampled)", false, 20000);
+    p.add<std::string>("plane-layout", 0,
+        "Plane block storage: blob (v1, default — one contiguous extent, "
+        "optimal cold sweep) or leaf (v2 — blocks ride the leaf extents; "
+        "parity on small-record storage, needed for in-leaf mutation)",
+        false, "blob");
     p.parse_check(argc, argv);
 
     {
@@ -550,6 +555,14 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
         cfg.plane_rank = static_cast<uint16_t>(
             p.get<uint32_t>("plane-rank"));
         cfg.plane_train_rows = p.get<uint32_t>("plane-train-rows");
+        const std::string layout_s = p.get<std::string>("plane-layout");
+        if (layout_s == "blob") cfg.plane_layout = 0;
+        else if (layout_s == "leaf") cfg.plane_layout = 1;
+        else {
+            std::cerr << "build-tree: unknown --plane-layout '" << layout_s
+                      << "' (expected blob|leaf)\n";
+            return 1;
+        }
     }
 
     const std::string metric = p.get<std::string>("metric");

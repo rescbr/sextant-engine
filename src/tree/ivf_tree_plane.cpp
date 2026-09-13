@@ -240,20 +240,39 @@ void IVFTreeIndex::plane_route_batch_(
         // compare + -inf store, never a block sweep. (A query-tiled
         // variant was tried; scanning all tile members when any survive
         // multiplies sweep work ~kQTile at prune budgets.)
+        const bool pc = plane_cache_ != nullptr;
+        const bool pv2 = plane_->v2_layout();
+        const PageId plane_pg0 = superblock_.plane_page();
         // Plane cache active: pin each leaf's row blocks ONCE (fill on
         // miss preads them; fallback = the mmap'd blob pointer), scan all
         // surviving queries against the pinned rows, unpin. Under skewed
         // traffic the hot leaves' routing rows stay resident at ~16 B/vec
         // — 10x denser coverage per byte than leaf extents.
-        const bool pc = plane_cache_ != nullptr;
-        const PageId plane_pg0 = superblock_.plane_page();
+        // v2: this leaf's plane rows are a suffix of its own extent;
+        // the offset comes from the open-time cache (the header page is
+        // never faulted by the sweep). No plane cache tier in v2: the
+        // leaf cache already covers these pages.
+        const uint8_t* pinned = nullptr;
+        LeafExtentCache::Handle ph;
         for (uint64_t l = l0; l < l1; ++l) {
             if (leaf_table_[static_cast<uint32_t>(l)].page == kInvalidPage)
                 continue;
             float* row = &scores[static_cast<size_t>(l) * nq];
             const uint32_t leaf = static_cast<uint32_t>(l);
-            const uint8_t* pinned = nullptr;
-            LeafExtentCache::Handle ph;
+            const uint8_t* v2_blk = nullptr;
+            const uint16_t* v2_alpha = nullptr;
+            if (pv2) {
+                v2_blk = mmap_base_ +
+                    static_cast<uint64_t>(leaf_table_[leaf].page) *
+                        kPageSize +
+                    leaf_plane_offset_[leaf];
+                if (pv8)
+                    v2_alpha = reinterpret_cast<const uint16_t*>(
+                        v2_blk +
+                        static_cast<uint64_t>(
+                            plane_->leaf_block_count(leaf)) *
+                            plane_->debug_block_bytes());
+            }
             if (pc) {
                 // Pin only when at least one query survives this leaf —
                 // a pin on an all-masked leaf would fill data nobody reads.
@@ -298,17 +317,23 @@ void IVFTreeIndex::plane_route_batch_(
                 }
                 row[qi] =
                     (is_b1g || fastscan8 || pv8)
-                        ? (pinned
+                        ? (pv2
                                ? plane_->scan_leaf_max_u8_at(
-                                     leaf, pinned,
-                                     &lut8[static_cast<size_t>(qi) * SEG *
-                                            16],
-                                     pv8 ? shifts[qi] : 0.0f)
-                               : plane_->scan_leaf_max_u8(
-                                     leaf,
-                                     &lut8[static_cast<size_t>(qi) * SEG *
-                                            16],
-                                     pv8 ? shifts[qi] : 0.0f))
+                                    leaf, v2_blk,
+                                    &lut8[static_cast<size_t>(qi) * SEG *
+                                           16],
+                                    pv8 ? shifts[qi] : 0.0f, v2_alpha)
+                               : pinned
+                                    ? plane_->scan_leaf_max_u8_at(
+                                          leaf, pinned,
+                                          &lut8[static_cast<size_t>(qi) *
+                                                 SEG * 16],
+                                          pv8 ? shifts[qi] : 0.0f)
+                                    : plane_->scan_leaf_max_u8(
+                                          leaf,
+                                          &lut8[static_cast<size_t>(qi) *
+                                                 SEG * 16],
+                                          pv8 ? shifts[qi] : 0.0f))
                         : plane_->scan_leaf_max(
                               leaf,
                               &lut[static_cast<size_t>(qi) * R * 16],
