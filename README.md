@@ -154,6 +154,42 @@ meson test -C build                             # run the test suite (31 files)
 | `--filter` | — | Filter predicate (repeatable, AND-ed) |
 | `--with-payload` / `--payload-text` | off | Fetch payload blobs with results / print as text |
 
+## Performance guide
+
+Every recipe below assumes the measured-best defaults: `scalar_shape`
+quantizer, b1g r128 plane auto-attached, plane routing with pre-prune 0.25,
+engine caches off (zero DRAM). Zero flags = the validated config; each flag
+is an explicit contract choice
+([docs/blog-cold-path.md](docs/blog-cold-path.md), canonical-table-v3).
+
+| Goal | Command sketch | Expected result |
+|---|---|---|
+| Fastest build | `build-tree corpus.fbin --threads 16` | Default tree (best quantizer + plane, streaming, bounded RSS). arxiv-1M × 768: ~28 s wall at 16 threads ([results/build_cpu_attribution_20260909.md](results/build_cpu_attribution_20260909.md)) |
+| Highest throughput | `tree-search tree queries.fbin --batch-window 256 --threads 16 --probe-fraction 0.05` | Canonical numbers measured at bw 256, 16 threads, t8: f=.05 → **401 cold / 525 warm QPS** @ recall@10 0.8921 (b1g plane, 16 threads) |
+| Balanced (default operating point) | `tree-search ... --batch-window 256 --probe-fraction 0.1` | **332 cold / 397 warm QPS @ 0.9174**; 462 MB leaf/q vs legacy f=.2's 917 MB at 260/276 @ 0.9202 |
+| Warm serving | `tree-search ... --batch-window 256 --cache-mb 8192 --plane-cache-mb 512` | Zero-DRAM by default; caches never lose to mmap. Full residency: 397 → 457 QPS (+15%), +8–13% at half a gigabyte |
+| Max recall | `--probe-fraction 0.2+`, or `--exact-rerank-base corpus.fbin` | Exact rerank = 1.000 recall (containment-bound) but the resident fp32 base is 6.5× the tree at 10M (30 GB vs 4.6 GB) — [docs/design_decisions.md](docs/design_decisions.md) |
+
+Notes:
+
+- **Build**: `--threads` defaults to 0 (auto = hardware_concurrency); the
+  canonical numbers use 16. Build is parallel and streaming — bounded RSS
+  (~224 MB peak over a 3.8 GB corpus read at 1B scale). Use
+  `--no-plane-attach` only if you need mutation commands: attached v1
+  planes are immutable.
+- **Throughput/quality dial**: `--probe-fraction`. f=.05 vs f=.1 trades
+  ~2.5 pp recall for +21% cold QPS (401 vs 332) at half the leaf bytes.
+- **Batch window 256** is the deployment shape; canonical-table-v3 measured
+  at `--batch-window 256`. `--search-threads` (0=serial) parallelizes the
+  within-query leaf scan, orthogonal to `--threads`.
+- **Rerank is on by default**; `--no-rerank` trades recall for a cheaper
+  scan. Keep it on unless you re-score externally.
+- **Measurement honesty**: follow [docs/BENCHMARK_RULES.md](docs/BENCHMARK_RULES.md)
+  — cold means drop_caches + sync before measured passes; warm is valid
+  only with engine caches and must be labeled with `--cache-mb`. QPS is
+  per-pass throughput (`qcount × timed_passes / secs`); numbers from
+  different `--passes` counts are not comparable.
+
 ## Quantizers
 
 The `--quantizer` flag selects the leaf-code representation
