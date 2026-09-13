@@ -1,5 +1,7 @@
 # Proximity in-band vs. id-recall@k: why the standard metric fails on modern data
 
+> **Status: historical (flat-engine era methodology) — kept for reference; the proximity-vs-id-recall argument is durable.**
+
 ## The problem with id-recall@k
 
 **id-recall@k** — the fraction of true top-k ids returned by the search — has

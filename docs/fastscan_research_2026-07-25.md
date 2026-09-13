@@ -1,5 +1,7 @@
 # PQ-FastScan for 8-bit codes — feasibility research (2026-07-25)
 
+> **Status: historical (July 2026 flat-graph era) — kept for reference; the 4-bank `vqtbl4q_u8` design carried into the tree path: src/tree/plane.hpp, leaf_coder.hpp.**
+
 > Decided design: **4-bank `vqtbl4q_u8` split-table** (Quicker-ADC port).
 > This doc records the analysis that selected it, the alternatives ruled
 > out, and the empirical verifications. Lives behind

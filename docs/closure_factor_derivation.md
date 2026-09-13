@@ -1,5 +1,7 @@
 # K-Dependent Closure Factor for IVF Partitioning: Analytical Derivation
 
+> **Status: historical (July 2026 flat-graph era) — kept for reference; `closure_factor` is live in src/engine/estimator.cpp and src/tree/tree_estimator.hpp.**
+
 > **Status:** Derived 2026-07-31. Validates the `np ∝ √K` law's boundary-loss
 > correction and identifies the absolute-margin closure scheme (SPANN) as
 > structurally superior to the ratio-based scheme.

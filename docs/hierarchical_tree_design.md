@@ -1,6 +1,6 @@
 # Hierarchical IVF Tree Design (v3)
 
-> **Status:** Design (plan mode). Not yet implemented.
+> **Status: IMPLEMENTED** (Sept 2026) — tree, leaf splits, insert/delete, vacuum/defrag, fsck shipped; see src/tree/ and test/test_tree_insert_delete.cpp, test_vacuum_defrag.cpp, test_fsck.cpp.
 > **Goal:** Replace flat K-shard partitioning with a hierarchical tree that
 > partitions along the data manifold, enabling better routing quality at scale
 > and dynamic growth (insert/delete via leaf splits).
