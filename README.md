@@ -42,7 +42,10 @@ remains unstarted future work — there is no code for it in this repo.
 - **Mutations**: batch insert (`tree-insert`), delete by row id
   (`tree-delete`), `tree-vacuum` (repair stale filter summaries after
   deletes), `tree-defrag` (compact fragmented leaf extents and shrink the
-  file), and `fsck --repair` (rebuild bitmap/free-list from a tree walk).
+  file), and `fsck --repair 1` (rebuild bitmap/free-list from a tree walk).
+  **Mutation commands require a plane-less tree** (`--no-plane-attach` at
+  build): attached routing planes are immutable. `tree-delete` additionally
+  requires a global PQ/PRQ quantizer (not the scalar/local families).
 - **Filtered search**: `--filter column:op:value` predicates (repeatable,
   AND-ed; ops include `eq/ne/lt/le/gt/ge/between/prefix/in/not_in/
   contains/contains_any/contains_all/geo_radius/geo_box`) against filter
@@ -72,15 +75,18 @@ meson test -C build                             # run the test suite (31 files)
 # Search (recall computed if --ground-truth given, GTMM format)
 ./build/tools/sextant tree-search --index mytree --query q.fbin --topk 10
 
-# Mutate + maintain
+# Mutate + maintain (mutation commands need a plane-less build: add --no-plane-attach
+# above; tree-delete also needs --quantizer pq/prq/anisotropic_pq)
 ./build/tools/sextant tree-insert --index mytree --vectors more.fbin --start-row-id 1000000
 ./build/tools/sextant tree-delete  --index mytree --row-ids ids.txt
 ./build/tools/sextant tree-vacuum  --index mytree
 ./build/tools/sextant tree-defrag  --index mytree
-./build/tools/sextant fsck        --file mytree
+./build/tools/sextant fsck        --file mytree          # add --repair 1 to rebuild the bitmap/free-list
 
 # Parameter sweep: n-probe × fastscan-W recall/QPS grid with shared scans
-./build/tools/sextant sweep --index mytree --query q.fbin --ground-truth gt.gtmm
+# (--fastscan-w plus a probe spec, e.g. --probe-fraction, are required)
+./build/tools/sextant sweep --index mytree --query q.fbin --ground-truth gt.gtmm \
+    --probe-fraction 0.1 --fastscan-w 100,300
 ```
 
 ## CLI commands
@@ -89,12 +95,12 @@ meson test -C build                             # run the test suite (31 files)
 |---|---|
 | `build-tree` (alias `build-tree-pca`) | Build a hierarchical IVF tree index (single file). PCA streaming build; `.fbin` or parquet input. |
 | `tree-search` | Search a tree index; computes recall with `--ground-truth`. |
-| `tree-insert` / `tree-delete` | Batch-insert vectors (`.fbin`) / delete by row ID into a tree index. |
+| `tree-insert` / `tree-delete` | Batch-insert vectors (`.fbin`) / delete by row ID into a plane-less tree (v1 planes are immutable). |
 | `tree-vacuum` | Repair stale filter summaries after deletes. |
 | `tree-defrag` | Compact fragmented leaf extents + shrink the file. |
-| `fsck` | Check a tree index file; `--repair` rebuilds the bitmap/free-list. |
-| `plane-attach` | Attach a routing plane to an existing plane-less tree (`--enc b1g\|u4lm`, `--rank`, `--train-rows`). |
-| `sweep` | n-probe × W recall/QPS grid with shared scans (one scan per n-probe serves all W); scan-feedback rows via `--feedback fixed:F\|stall:M\|kth:M`. |
+| `fsck` | Check a tree index file; `--repair 1` rebuilds the bitmap/free-list. |
+| `plane-attach` | Attach a routing plane to an existing plane-less tree (`--enc b1g\|u4lm`, `--rank`, `--train-rows`; also needs `--index` and `--base`). |
+| `sweep` | n-probe × W recall/QPS grid with shared scans (one scan per n-probe serves all W); requires `--fastscan-w` plus a probe spec (`--n-probe` or `--probe-fraction`); scan-feedback rows via `--feedback fixed:F\|stall:M\|kth:M`. |
 | `trace` | Replay scan-feedback stop rules on an EngineTrace file. |
 | `analyze` | Read-only dataset-adaptive parameter advisory (flat-engine params). |
 | `autobuild` | `analyze` + `build` in-process. |
@@ -120,7 +126,7 @@ meson test -C build                             # run the test suite (31 files)
 | `--payload-col` | — | Parquet column streamed into per-leaf payload extents |
 | `--plane-enc` | `b1g` | Plane encoding: `b1g` (16 B/vec) or `u4lm` (64 B/vec, hard corpora) |
 | `--plane-rank` / `--plane-train-rows` | 128 / 20000 | Plane PCA rank / training sample |
-| `--plane-layout` | `blob` | Plane block storage: `blob` (v1, contiguous extent) or `leaf` (v2, rides leaf extents; needed for in-leaf mutation) |
+| `--plane-layout` | `blob` | Plane block storage: `blob` (v1, contiguous extent) or `leaf` (v2, rides leaf extents) |
 | `--no-plane-attach` | off | Skip the default routing-plane attachment |
 | `--metrics-file` | — | Append build phase metrics as JSON lines |
 
