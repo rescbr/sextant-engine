@@ -2,7 +2,8 @@
 
 > Reference for the locking disciplines in the storage layer. Distilled from
 > the multithread-scaling work (see `docs/scaling_fix_results.md` and
-> `docs/profiling_findings.md`).
+> `docs/profiling_findings.md` — both archived 2026-09-13 to workspace
+> `old-docs/`).
 
 ## nsync reader-writer locks
 

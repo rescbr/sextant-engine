@@ -139,7 +139,7 @@ leading order.
 
 Since closure replication doesn't degrade with K, the 2.86 pp recall loss at
 K=4096 must come from a different mechanism. The answer is documented in
-`docs/ivf_k_sweep.md:33–35`: **routing recall drops with K**.
+`docs/ivf_k_sweep.md:33–35` (doc archived 2026-09-13 to workspace `old-docs/`): **routing recall drops with K**.
 
 At K=8…64 (measured), routing recall drops from 0.99 to 0.92 at matched
 probe fraction. The mechanism: more centroids = more Voronoi cells = more
@@ -230,7 +230,7 @@ scheme is the principled fix.
 | Claim | Evidence |
 |-------|----------|
 | `c` is K-independent at leading order | Shell count `μ(c) = c^{d_eff} − 1` is K-free (§2.3) |
-| Recall loss at K=4096 is routing, not closure | `docs/ivf_k_sweep.md:33–35` + §4 |
+| Recall loss at K=4096 is routing, not closure | `docs/ivf_k_sweep.md:33–35` (archived to `old-docs/`) + §4 |
 | `d_eff = 5` is miscalibrated for Sphere | Predicted 15% replication, measured 5.4% (§4.1) |
 | Defensive `c(K)` grows as `K^{0.05}` | Covering-radius correction (§5) |
 | SPANN absolute-margin is structurally superior | `ε/d₁ → ∞` as K grows (§6) |
@@ -241,4 +241,4 @@ scheme is the principled fix.
   Nearest Neighbor Search", NeurIPS 2021.
 - The `np ∝ √K` law: `docs/np-sqrt-k-law-2026-07-28.md` (this workspace).
 - Existing closure derivation: `docs/design_decisions.md:518–553`.
-- K-sweep routing recall drop: `docs/ivf_k_sweep.md:33–35`.
+- K-sweep routing recall drop: `docs/ivf_k_sweep.md:33–35` (archived 2026-09-13 to workspace `old-docs/`).

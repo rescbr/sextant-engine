@@ -15,7 +15,8 @@
 
 ## Setup
 
-After the multithread-scaling fix (see `docs/scaling_fix_results.md`),
+After the multithread-scaling fix (see `docs/scaling_fix_results.md`,
+archived 2026-09-13 to workspace `old-docs/`),
 `PqQuantizer::lut_distance` became the #1 hot spot at **28.99% of 1t cycles**
 (was masked at ~5% by atomic contention). The plan was to vectorize it.
 
