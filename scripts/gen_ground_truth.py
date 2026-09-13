@@ -59,9 +59,16 @@ def main():
     # For each chunk of base vectors, compute dists to all queries (chunk × nq),
     # then merge into per-query top-k arrays.
     print(f"Pass 2: brute-force KNN ({nq} queries × {n} base, k={k})...")
-    # Store top-k as (k, nq) arrays of distances and ids, maintaining max-heap
-    # property via the max distance in each query's current top-k.
-    top_dists = np.full((nq, k), np.inf, dtype=np.float32)   # max-heap: largest at [:,0]
+    # Store top-k as (nq, k) arrays kept SORTED ASCENDING by distance
+    # after every merge. The merge gate is the LAST column (the worst
+    # retained distance). BUG FIXED 2026-09-13: this used to gate on
+    # [:,0], which after the ascending sort is the BEST distance — the
+    # top-k then froze at the first chunk's values (bias toward early
+    # rows; catastrophic on clustered-order bases, silently wrong on
+    # shuffled ones). Detected via engine-vs-exact decomposition: engine
+    # exh-raw hit 9/10 of exact truth while the GT agreed with exact on
+    # only 2-5/10.
+    top_dists = np.full((nq, k), np.inf, dtype=np.float32)
     top_ids = np.full((nq, k), -1, dtype=np.int32)
 
     with open(args.base, 'rb') as f:
@@ -82,7 +89,7 @@ def main():
             dists = dists.T  # (nq, chunk_n)
 
             # For each query, find candidates better than current worst top-k.
-            current_worst = top_dists[:, 0]  # (nq,) max dist in each query's top-k
+            current_worst = top_dists[:, -1]  # (nq,) max retained dist (sorted asc)
             # Mask: which chunk entries beat the current worst for each query.
             better = dists < current_worst[:, None]  # (nq, chunk_n)
 
