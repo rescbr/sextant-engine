@@ -15,6 +15,7 @@
 #include "fbin_source.hpp"
 
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -24,6 +25,7 @@
 #include <fstream>
 #include <random>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -70,12 +72,24 @@ struct TempPageFile {
     }
 };
 
-LeafExtentCache::Handle pin_ok(LeafExtentCache& c, PageId page,
+LeafExtentCache::Handle pin_ok(LeafExtentCache& c, int fd, PageId page,
                                uint32_t pages, const uint8_t** out) {
+    // Since admission-before-fill (2026-09-13), a pin under eviction
+    // pressure can be REJECTED and returns the fallback pointer instead
+    // of filling. Unit tests verify CONTENT either way, so provide the
+    // same fallback the integration paths use: a mapping of the file.
     LeafExtentCache::Handle h;
-    // No fallback in unit tests: a refused fill returning nullptr is itself
-    // a testable outcome (integration paths pass the mmap fallback).
-    *out = c.pin(page, pages, h);
+    thread_local std::unordered_map<int, const uint8_t*> maps;
+    auto it = maps.find(fd);
+    if (it == maps.end()) {
+        struct stat st;
+        ::fstat(fd, &st);
+        void* m = ::mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) { perror("test mmap"); abort(); }
+        it = maps.emplace(fd, static_cast<const uint8_t*>(m)).first;
+    }
+    *out = c.pin(page, pages, h, it->second +
+                 static_cast<uint64_t>(page) * kPageSize);
     return h;
 }
 
@@ -90,11 +104,11 @@ TEST(LeafExtentCache, HitMissCountersAndData) {
     cache.set_expected_entries(64);
 
     const uint8_t* p = nullptr;
-    auto h = pin_ok(cache, 10, kExtentPages, &p);
+    auto h = pin_ok(cache, tf.fd, 10, kExtentPages, &p);
     TempPageFile::expect_page(p, 10, kExtentPages);
     cache.unpin(h);
 
-    h = pin_ok(cache, 10, kExtentPages, &p);
+    h = pin_ok(cache, tf.fd, 10, kExtentPages, &p);
     TempPageFile::expect_page(p, 10, kExtentPages);
     cache.unpin(h);
 
@@ -117,13 +131,13 @@ TEST(LeafExtentCache, PinnedEntrySurvivesEviction) {
     cache.set_expected_entries(16);
 
     const uint8_t* pa = nullptr;
-    auto ha = pin_ok(cache, 100, kExtentPages, &pa);
+    auto ha = pin_ok(cache, tf.fd, 100, kExtentPages, &pa);
     // Fill past capacity with distinct extents. With strict-> admission the
     // one-timer scan TIES against pinned A and must not evict it (that's the
     // fix — ties keep the incumbent); older `>=` semantics evicted it.
     for (PageId pg = 200; pg < 240; pg += kExtentPages) {
         const uint8_t* px = nullptr;
-        auto hx = pin_ok(cache, pg, kExtentPages, &px);
+        auto hx = pin_ok(cache, tf.fd, pg, kExtentPages, &px);
         cache.unpin(hx);
     }
     // Whether A is still linked or evicted-but-pinned, its data must be
@@ -132,7 +146,7 @@ TEST(LeafExtentCache, PinnedEntrySurvivesEviction) {
     cache.unpin(ha);
 
     const uint8_t* p2 = nullptr;
-    auto h2 = pin_ok(cache, 100, kExtentPages, &p2);
+    auto h2 = pin_ok(cache, tf.fd, 100, kExtentPages, &p2);
     TempPageFile::expect_page(p2, 100, kExtentPages);
     cache.unpin(h2);
 }
@@ -150,13 +164,13 @@ TEST(LeafExtentCache, TinyLfuProtectsHotEntry) {
     // Warm the hot entry's frequency.
     for (int i = 0; i < 8; ++i) {
         const uint8_t* p = nullptr;
-        auto h = pin_ok(cache, 42 * kExtentPages, kExtentPages, &p);
+        auto h = pin_ok(cache, tf.fd, 42 * kExtentPages, kExtentPages, &p);
         cache.unpin(h);
     }
     // Scan of one-timers, 3x the capacity.
     for (PageId pg = 1000; pg < 1000 + 9 * kExtentPages; pg += kExtentPages) {
         const uint8_t* p = nullptr;
-        auto h = pin_ok(cache, pg, kExtentPages, &p);
+        auto h = pin_ok(cache, tf.fd, pg, kExtentPages, &p);
         cache.unpin(h);
     }
     EXPECT_TRUE(cache.contains(42 * kExtentPages))
@@ -196,10 +210,10 @@ TEST(LeafExtentCache, AdmissionTieKeepsIncumbent) {
 
     for (PageId pg = 16; pg < 16 + 3 * kExtentPages; pg += kExtentPages) {
         const uint8_t* p = nullptr;
-        auto h = pin_ok(cache, pg, kExtentPages, &p);
+        auto h = pin_ok(cache, tf.fd, pg, kExtentPages, &p);
         cache.unpin(h);
         const uint8_t* p2 = nullptr;
-        auto h2 = pin_ok(cache, pg, kExtentPages, &p2);  // 2 hits each: equal freq
+        auto h2 = pin_ok(cache, tf.fd, pg, kExtentPages, &p2);  // 2 hits each: equal freq
         cache.unpin(h2);
     }
     auto st0 = cache.stats();
@@ -208,7 +222,7 @@ TEST(LeafExtentCache, AdmissionTieKeepsIncumbent) {
     // 4th extent: same sketch frequency as the probation LRU (all tie) →
     // rejected, no eviction of the incumbents.
     const uint8_t* p = nullptr;
-    auto h = pin_ok(cache, 400, kExtentPages, &p);
+    auto h = pin_ok(cache, tf.fd, 400, kExtentPages, &p);
     cache.unpin(h);
 
     auto st = cache.stats();
@@ -237,7 +251,7 @@ TEST(LeafExtentCache, SingleFlightTryLockContract) {
             ++go;
             while (go.load() < 8) std::this_thread::yield();
             const uint8_t* p = nullptr;
-            auto h = pin_ok(cache, 200, kExtentPages, &p);
+            auto h = pin_ok(cache, tf.fd, 200, kExtentPages, &p);
             TempPageFile::expect_page(p, 200, kExtentPages);
             cache.unpin(h);
         });
@@ -250,9 +264,9 @@ TEST(LeafExtentCache, SingleFlightTryLockContract) {
     EXPECT_LE(st.bytes_filled, 8u * kExtentPages * kPageSize);
     // Uncontended sequential access dedups trivially: second pin hits.
     const uint8_t* p = nullptr;
-    auto h = pin_ok(cache, 300, kExtentPages, &p);
+    auto h = pin_ok(cache, tf.fd, 300, kExtentPages, &p);
     cache.unpin(h);
-    h = pin_ok(cache, 300, kExtentPages, &p);
+    h = pin_ok(cache, tf.fd, 300, kExtentPages, &p);
     cache.unpin(h);
     auto st2 = cache.stats();
     EXPECT_EQ(st2.misses, st.misses + 1u);
@@ -276,7 +290,7 @@ TEST(LeafExtentCache, RunAliasMergedFill) {
     TempPageFile::expect_page(run, p1, kExtentPages);
 
     const uint8_t* p2ptr = nullptr;
-    auto h2 = pin_ok(cache, p2, kExtentPages, &p2ptr);
+    auto h2 = pin_ok(cache, tf.fd, p2, kExtentPages, &p2ptr);
     TempPageFile::expect_page(p2ptr, p2, kExtentPages);  // offset correct
     EXPECT_NE(p2ptr, run);
     EXPECT_EQ(p2ptr, run + kExtentPages * kPageSize);
@@ -302,9 +316,9 @@ TEST(LeafExtentCache, InvalidateAll) {
     cache.set_expected_entries(32);
 
     const uint8_t* p1 = nullptr;
-    auto h1 = pin_ok(cache, 16, kExtentPages, &p1);
+    auto h1 = pin_ok(cache, tf.fd, 16, kExtentPages, &p1);
     const uint8_t* p2 = nullptr;
-    auto h2 = pin_ok(cache, 48, kExtentPages, &p2);
+    auto h2 = pin_ok(cache, tf.fd, 48, kExtentPages, &p2);
     cache.unpin(h2);  // only p1 stays pinned
 
     cache.invalidate_all();
@@ -318,7 +332,7 @@ TEST(LeafExtentCache, InvalidateAll) {
     // Refetch = miss (counters moved).
     const uint64_t misses_before = cache.stats().misses;
     const uint8_t* p3 = nullptr;
-    auto h3 = pin_ok(cache, 16, kExtentPages, &p3);
+    auto h3 = pin_ok(cache, tf.fd, 16, kExtentPages, &p3);
     cache.unpin(h3);
     EXPECT_GT(cache.stats().misses, misses_before);
 }
@@ -340,7 +354,7 @@ TEST(LeafExtentCache, ConcurrentPinsUnderEviction) {
             for (int i = 0; i < 300; ++i) {
                 const PageId pg = (rng() % 900) * kExtentPages;
                 const uint8_t* p = nullptr;
-                auto h = pin_ok(cache, pg, kExtentPages, &p);
+                auto h = pin_ok(cache, tf.fd, pg, kExtentPages, &p);
                 // Verify content while pinned.
                 for (uint32_t q = 0; q < kExtentPages; ++q) {
                     if (p[q * kPageSize + 3] !=

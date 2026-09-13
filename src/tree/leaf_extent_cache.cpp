@@ -437,10 +437,48 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
         }
     }
 
+    // --- Admission BEFORE fill (2026-09-13 perf profile) ---
+    // At sub-residency, ~30% of all cycles were pread fills (kernel
+    // _copy_to_iter + filemap lookups) of extents evicted before reuse —
+    // copying out of the very page cache the zero-copy fallback reads
+    // anyway (per-query zipf: 140 QPS mmap vs 73 QPS cached at 61% hit).
+    // Gate the fill on the SAME TinyLFU logic that would admit the entry
+    // at eviction: fill only when main has room, or when the candidate's
+    // sketch frequency strictly beats the current probation-LRU victim.
+    // Rejected extents serve from the caller's fallback (mmap) at zero
+    // fill cost; the sketch still counts the access, so an extent that
+    // heats up wins its next contest.
+    misses_.fetch_add(1, std::memory_order_relaxed);
+    {
+        // Heuristic gate: sketch ops are atomic and the list walk is a
+        // racy read — a READ lock suffices and keeps the miss path off
+        // the write-lock fast path.
+        ScopedReadLock lock(s.mu);
+        s.sketch->increment(page);
+        const uint64_t want = static_cast<uint64_t>(pages) * kPageSize;
+        const bool main_has_room =
+            s.bytes_probation + s.bytes_protected + want <=
+            s.max_main_bytes;
+        if (!main_has_room) {
+            Entry* victim = s.probation.tail;
+            while (victim != nullptr &&
+                   victim->refs.load(std::memory_order_relaxed) > 0)
+                victim = victim->prev;
+            const bool beats =
+                victim != nullptr &&
+                s.sketch->frequency(page) >
+                    s.sketch->frequency(victim->page);
+            if (!beats) {
+                rejections_.fetch_add(1, std::memory_order_relaxed);
+                if (gated) stripe.unlock();
+                return fallback;
+            }
+        }
+    }
+
     // Fill holding ONLY the stripe (pread latency must not serialize a
     // shard). A fill that is later refused is NOT wasted I/O — it warmed
     // the page cache that the fallback (mmap) read will hit.
-    misses_.fetch_add(1, std::memory_order_relaxed);
     Entry* e = new_entry(s, page, pages);
     bytes_filled_.fetch_add(e->size, std::memory_order_relaxed);
     if (filled_bytes) *filled_bytes = e->size;
@@ -472,7 +510,6 @@ const uint8_t* LeafExtentCache::pin(PageId page, uint32_t pages, Handle& h,
             // the short incumbent holds the key; ours still serves THIS
             // caller and ages out via eviction).
         }
-        s.sketch->increment(page);
 
         // Too big to ever cache → serve from the fallback.
         if (e->size > s.max_window_bytes + s.max_main_bytes) {
