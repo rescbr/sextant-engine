@@ -1,8 +1,10 @@
 #!/bin/bash
 # Canonical cold smoke — cohere10m, 1000q, 16t, batch 256, prune .25
-# (canonical-table-v2 protocol). Reference bands (box noise ±10%):
-#   b1g  f=.1 : 286 cold QPS @ recall 0.9212
-#   legacy f=.2 : 244 cold QPS @ recall 0.9254
+# (canonical-table-v3 protocol: current-defaults trees @ cfdfb03+, built
+# 2026-09-13; v2 trees predate the defaults drift). Reference bands (box
+# noise ±10%; cold on pastry/largefiles):
+#   b1g  f=.1 : ~332 cold QPS @ recall 0.9174   (v2: 286 @ 0.9212)
+#   legacy f=.2 : ~260 cold QPS @ recall 0.9202 (v2: 244 @ 0.9254)
 # Usage: scripts/canonical_smoke.sh [--warm]
 set -euo pipefail
 CD=$(dirname "$0")/..
@@ -25,7 +27,7 @@ run() { # name tree extra-flags...
 MODE="${1:-}"
 if [[ "$MODE" == "--warm" ]]; then WARM=1; fi
 
-run "b1g f=.1 prune.25" "$IDX/cohere_10m_shape_b1g.tree" \
+run "b1g f=.1 prune.25" "$IDX/cohere_10m_b1g_v3.tree" \
     --probe-fraction 0.1 --plane-pre-prune 0.25 ${WARM:+}
-run "legacy f=.2 (manifest gap)" "$IDX/cohere_10m_shape.norm.tree" \
+run "legacy f=.2 (manifest gap)" "$IDX/cohere_10m_noplane_v3.tree" \
     --no-plane --probe-fraction 0.2
