@@ -921,8 +921,8 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<float>("plane-pre-prune", 0,
         "Two-stage routing: fraction of leaves (by PCA centroid "
         "distance, page-weighted) surviving to the plane sweep "
-        "(0=off, 0.5 recommended)",
-        false, 0.0f);
+        "(0.25=measured best, 0=off)",
+        false, 0.25f);
     p.add("no-rerank", 0, "Disable FP32 rerank (use raw PQ distances)");
     p.add<std::string>("exact-rerank-base", 0,
         "Original base .fbin (mmap'd read-only): rerank against the TRUE "
