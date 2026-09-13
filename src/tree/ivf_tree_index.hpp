@@ -137,6 +137,13 @@ public:
         /// leaf extents — parity on small-record storage, prerequisite for
         /// in-leaf mutation experiments.
         uint8_t plane_layout = 0;
+
+        /// Allocation-bitmap region size override (0 = auto). Pages of bitmap
+        /// reserved at format time; one bitmap page addresses 32768 file
+        /// pages (128 MiB). Auto sizing accounts for vectors, codebooks and
+        /// payload; set manually only to work around a bad estimate (build
+        /// fails loudly at flush if the region is too small).
+        uint32_t bitmap_pages = 0;
     };
 
     // --- Search observability ---

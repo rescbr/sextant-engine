@@ -2385,11 +2385,47 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
         ctx.n / std::max<uint64_t>(1, ctx.leaf_cap / 2) + 2;
     const uint64_t leaf_overhead =
         n_leaves_est * (4ull * ctx.dim * 17 + 2 * kPageSize);
+    // Payload bytes: per-leaf payload extents are missing from the estimate
+    // above. Upper bound = source payload estimate (column-chunk metadata,
+    // dictionary chunks pre-boosted) + the fdat sidecar when present, with
+    // 25% headroom for per-leaf extent page rounding (~1 page/leaf) and the
+    // per-row length tables. Undershooting here is the F3/F4 failure mode.
+    uint64_t payload_bytes = ctx.source.payload_total_bytes();
+    if (cfg.payload_offsets)  // fdat sidecar: last of N+1 offsets = total
+        payload_bytes += cfg.payload_offsets[ctx.n];
+    payload_bytes += payload_bytes / 4;
     const uint64_t upper_pages =
-        (vec_bytes + leaf_overhead) / kPageSize + 64;
-    const uint32_t bitmap_pages = static_cast<uint32_t>(
+        (vec_bytes + leaf_overhead + payload_bytes) / kPageSize + 64;
+    uint32_t bitmap_pages = static_cast<uint32_t>(
         upper_pages / kPagesPerBitmapPage + 2);
+    if (cfg.bitmap_pages > 0) {
+        bitmap_pages = cfg.bitmap_pages;
+        const uint32_t auto_pages = static_cast<uint32_t>(
+            upper_pages / kPagesPerBitmapPage + 2);
+        if (bitmap_pages < auto_pages)
+            spdlog::warn(
+                "build: --bitmap-pages {} is below the computed estimate {} "
+                "(upper bound {} pages) — build will fail at flush if the "
+                "file outgrows the region",
+                bitmap_pages, auto_pages, upper_pages);
+    }
+    spdlog::info(
+        "build: bitmap region sizing — vec={} MiB leaf-overhead={} MiB "
+        "payload-est={} MiB => upper bound {} pages => {} bitmap pages "
+        "({} GiB addressed)",
+        vec_bytes >> 20, leaf_overhead >> 20, payload_bytes >> 20,
+        upper_pages, bitmap_pages,
+        (bitmap_pages * kPagesPerBitmapPage * kPageSize) >> 30);
     PageFile file(output_path);
+    // Formatting fresh: wipe any superblock copies left over from a previous
+    // tree in this file. Superblock::load picks the copy with the higher
+    // commit_seq, and this build's first commit is seq 1 — a stale copy from
+    // an older tree (e.g. seq 2 after a plane attach) would win and point
+    // root/plane at pages the new build has since overwritten.
+    {
+        std::vector<uint8_t> zero(2 * kPageSize, 0);
+        file.write_pages(0, 2, zero.data());
+    }
     PageAllocator alloc;
     file.truncate(bitmap_page + bitmap_pages);
     alloc.init(file, bitmap_page, bitmap_pages);

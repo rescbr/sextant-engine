@@ -481,6 +481,11 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
         "Parquet string/binary column streamed into per-leaf payload "
         "extents (fetched at search via --with-payload). Parquet inputs "
         "only; mutually exclusive with --filter-data.", false, "");
+    p.add<uint32_t>("bitmap-pages", 0,
+        "Override the allocation-bitmap region size (0 = auto). One bitmap "
+        "page addresses 128 MiB of index file. Only use this to work "
+        "around a bad auto estimate — build fails loudly at flush if the "
+        "region is too small.", false, 0);
     p.add<std::string>("label-file", 0, "Parquet file with filter columns (joined by row position)", false, "");
     p.add<std::string>("log-level", 0, "debug/info/warn/error", false, "info");
     p.add<std::string>("metrics-file", 0,
@@ -631,6 +636,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
 
     BuildResult result;
     const std::string payload_col = p.get<std::string>("payload-col");
+    cfg.bitmap_pages = p.get<uint32_t>("bitmap-pages");
     if (!payload_col.empty()) {
         if (!fdat_path.empty()) {
             std::cerr << "build-tree: --payload-col and --filter-data are "

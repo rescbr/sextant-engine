@@ -85,6 +85,27 @@ void PageAllocator::load(PageFile& file, PageId bitmap_page,
     free_list_head_ = free_list_head;
     n_free_pages_ = n_free_pages;
 
+    // Loud-fail when the file outgrew its bitmap coverage (spec §4.1 rule 3:
+    // open/fsck must fail on region/file-size mismatch, never silently
+    // treat uncovered pages as free). This is the v1 failure mode: an
+    // under-provisioned region makes every page past coverage look FREE on
+    // disk, so insert/delete would hand out live leaf pages.
+    if (bitmap_pages_ > 0) {
+        const uint64_t covered_pages =
+            static_cast<uint64_t>(bitmap_pages_) * kPageSize * 8;
+        if (n_pages_ > covered_pages) {
+            throw Error(ErrorCode::CorruptIndex,
+                "PageAllocator::load: file has " +
+                    std::to_string(n_pages_) +
+                    " pages but the bitmap region (start " +
+                    std::to_string(bitmap_page_) + ", " +
+                    std::to_string(bitmap_pages_) +
+                    " pages) only addresses " + std::to_string(covered_pages) +
+                    " — file outgrew its bitmap (under-provisioned at "
+                    "format time? rebuild with a larger --bitmap-pages)");
+        }
+    }
+
     // Load the bitmap from disk into memory.
     grow_bitmap(n_pages_);
     // The on-disk bitmap occupies bitmap_pages_ × kPageSize bytes, but

@@ -263,6 +263,24 @@ FsckResult fsck(const std::string& path, bool repair) {
         return result;  // Can't continue without superblock.
     }
 
+    // Bitmap coverage invariant (spec §4.1 rule 3): the file must not claim
+    // more pages than its bitmap region can address. An under-provisioned
+    // region makes every page past coverage look FREE — insert/delete would
+    // hand out live leaf pages (the v1 silent-corruption mode).
+    if (sb.alloc_bitmap_pages() > 0) {
+        const uint64_t covered =
+            static_cast<uint64_t>(sb.alloc_bitmap_pages()) * kPageSize * 8;
+        if (sb.n_pages() > covered) {
+            spdlog::warn(
+                "fsck: file claims {} pages but the bitmap region ({} pages "
+                "at {}) only addresses {} — bitmap under-provisioned",
+                sb.n_pages(), sb.alloc_bitmap_pages(),
+                sb.alloc_bitmap_page(), covered);
+            result.superblock_ok = false;
+            return result;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Load manifest (needed for child_entry_size).
     // -----------------------------------------------------------------------
