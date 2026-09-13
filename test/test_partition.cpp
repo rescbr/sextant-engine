@@ -376,16 +376,29 @@ TEST(Partition, K1VsK4RecallParity) {
     cfg_mono.R = 32;
     cfg_mono.pq_m = 64; cfg_mono.pq_bits = 8;
     cfg_mono.build_ram_budget = static_cast<uint64_t>(1) << 40;  // 1 TiB → K=1
-    const float recall_mono = measure_recall(fbin, n, dim, base, idx_mono,
-                                             cfg_mono, k, n_queries, 300);
+    // The graph build is timing-nondeterministic (chunked work-stealing:
+    // single-draw recall wobbles ~4pp around its mode — measured part
+    // 0.778-0.826, mono 0.787-0.856 at fixed config). A 5pp gate on TWO
+    // SINGLE DRAWS flakes by construction (mono-high + part-low draws
+    // 7.8pp apart ~5% of the time). Compare means of 3 builds per arm:
+    // worst-case means (0.830 vs 0.784) sit inside the gate and the
+    // all-tails case is ~1e-5.
+    float recall_mono = 0.f;
+    for (int rep = 0; rep < 3; ++rep)
+        recall_mono += measure_recall(fbin, n, dim, base, idx_mono,
+                                      cfg_mono, k, n_queries, 300);
+    recall_mono /= 3.f;
 
     // Partitioned (K=4): budget = 500×160 → max_per_partition=500 → K=ceil(2000/500)=4.
     BuildConfig cfg_part;
     cfg_part.R = 32;
     cfg_part.pq_m = 64; cfg_part.pq_bits = 8;
     cfg_part.build_ram_budget = 80000;
-    const float recall_part = measure_recall(fbin, n, dim, base, idx_part,
-                                             cfg_part, k, n_queries, 300);
+    float recall_part = 0.f;
+    for (int rep = 0; rep < 3; ++rep)
+        recall_part += measure_recall(fbin, n, dim, base, idx_part,
+                                      cfg_part, k, n_queries, 300);
+    recall_part /= 3.f;
 
     std::fprintf(stderr, "[partition-test] recall mono(K=1)=%.4f part(K=4)=%.4f\n",
                  recall_mono, recall_part);
