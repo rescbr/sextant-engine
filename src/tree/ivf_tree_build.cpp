@@ -733,7 +733,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
         // mapping. Falls back to the serial loop below otherwise.
         std::atomic<uint64_t> par_done{0};
         const bool par = ctx.source.parallel_for_each_chunk(
-            std::min<uint32_t>(8, hw),
+            std::min<uint32_t>(4, hw),
             [&](const Chunk& chunk) {
                 const uint32_t take = chunk.count;
                 const float* vec_buf = chunk.vectors;
