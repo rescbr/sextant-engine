@@ -55,78 +55,75 @@ std::vector<ColumnView> parse_filter_columns(const uint8_t* filter_base,
     std::vector<ColumnView> views(schema.columns.size());
     const uint8_t* p = filter_base;
 
-    // Pass 1: fixed-width columns (in schema order).
+    // Single pass in SCHEMA ORDER, mirroring write_filter_columns /
+    // filter_columns_bytes exactly: columns are laid out in the order they
+    // appear in the schema, each followed by align4 padding. (The old
+    // three-pass form — fixed, then strings, then sets — only agreed with
+    // the writer when the schema happened to be type-grouped; a schema like
+    // [String, String, String, Int64, ...] misaligned every parse.)
     for (uint32_t c = 0; c < schema.columns.size(); ++c) {
         const auto& col = schema.columns[c];
-        if (!is_fixed_width(col.type)) continue;
-        views[c].type = col.type;
-        views[c].fixed_width = column_type_width(col.type);
-        views[c].fixed_base = p;
-        p += static_cast<uint64_t>(count) * views[c].fixed_width;
-        p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
-    }
-
-    // Pass 2: string columns (in schema order).
-    for (uint32_t c = 0; c < schema.columns.size(); ++c) {
-        const auto& col = schema.columns[c];
-        if (col.type != ColumnType::String) continue;
-        views[c].type = ColumnType::String;
-        views[c].str_offsets = reinterpret_cast<const uint32_t*>(p);
-        p += static_cast<uint64_t>(count) * 4;
-        views[c].str_lengths = reinterpret_cast<const uint16_t*>(p);
-        p += static_cast<uint64_t>(count) * 2;
-        // Align hashes to 4 bytes (u16 array may leave p 2-aligned).
-        p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
-        views[c].str_hashes = reinterpret_cast<const uint32_t*>(p);
-        p += static_cast<uint64_t>(count) * 4;
-        views[c].str_data = reinterpret_cast<const char*>(p);
-        // Advance past the packed string data: last string's offset + length.
-        if (count > 0) {
-            const uint32_t last_off = views[c].str_offsets[count - 1];
-            const uint16_t last_len = views[c].str_lengths[count - 1];
-            p += last_off + last_len;
-        }
-        p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
-    }
-
-    // Pass 3: set columns (in schema order).
-    for (uint32_t c = 0; c < schema.columns.size(); ++c) {
-        const auto& col = schema.columns[c];
-        if (col.type != ColumnType::Set) continue;
-        views[c].type = ColumnType::Set;
-        views[c].set_counts = p;
-        p += static_cast<uint64_t>(count) * 1;
-        // Align offsets to 4 bytes (u8 array may leave p misaligned).
-        p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
-        views[c].set_offsets = reinterpret_cast<const uint32_t*>(p);
-        p += static_cast<uint64_t>(count) * 4;
-        // Total elements across all rows.
-        uint32_t total_elem = 0;
-        for (uint32_t i = 0; i < count; ++i)
-            total_elem += views[c].set_counts[i];
-        views[c].set_hashes = reinterpret_cast<const uint32_t*>(p);
-        p += static_cast<uint64_t>(total_elem) * 4;
-        views[c].set_data = p;
-        // Advance past the packed element data. Each element is [u16 len][bytes].
-        // We don't need to advance p further — this is the last column of this
-        // type, and subsequent set columns are handled in their own iteration.
-        // Actually, there can be multiple set columns. We need to skip past
-        // the data region.
-        if (total_elem > 0) {
-            uint64_t data_bytes = 0;
-            for (uint32_t e = 0; e < total_elem; ++e) {
-                // Read element length from set_data at the current data position.
-                // Element data layout: [u16 len][bytes], packed.
-                // We need to walk through element data to compute total size.
-                // But we don't have element lengths inline in a separate array —
-                // they're embedded in set_data as [u16 len][bytes].
-                // So we read from set_data + data_bytes.
-                uint16_t elen;
-                std::memcpy(&elen, views[c].set_data + data_bytes, 2);
-                data_bytes += 2 + elen;
+        switch (col.type) {
+            case ColumnType::Int32:
+            case ColumnType::Int64:
+            case ColumnType::Float:
+            case ColumnType::Bool: {
+                views[c].type = col.type;
+                views[c].fixed_width = column_type_width(col.type);
+                views[c].fixed_base = p;
+                p += static_cast<uint64_t>(count) * views[c].fixed_width;
+                break;
             }
-            p += data_bytes;
+            case ColumnType::String: {
+                views[c].type = ColumnType::String;
+                views[c].str_offsets = reinterpret_cast<const uint32_t*>(p);
+                p += static_cast<uint64_t>(count) * 4;
+                views[c].str_lengths = reinterpret_cast<const uint16_t*>(p);
+                p += static_cast<uint64_t>(count) * 2;
+                // Align hashes to 4 bytes (u16 array may leave p 2-aligned).
+                p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
+                views[c].str_hashes = reinterpret_cast<const uint32_t*>(p);
+                p += static_cast<uint64_t>(count) * 4;
+                views[c].str_data = reinterpret_cast<const char*>(p);
+                // Advance past the packed string data: last string's offset
+                // + length.
+                if (count > 0) {
+                    const uint32_t last_off = views[c].str_offsets[count - 1];
+                    const uint16_t last_len = views[c].str_lengths[count - 1];
+                    p += last_off + last_len;
+                }
+                break;
+            }
+            case ColumnType::Set: {
+                views[c].type = ColumnType::Set;
+                views[c].set_counts = p;
+                p += static_cast<uint64_t>(count) * 1;
+                // Align offsets to 4 bytes (u8 array may leave p misaligned).
+                p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
+                views[c].set_offsets = reinterpret_cast<const uint32_t*>(p);
+                p += static_cast<uint64_t>(count) * 4;
+                // Total elements across all rows.
+                uint32_t total_elem = 0;
+                for (uint32_t i = 0; i < count; ++i)
+                    total_elem += views[c].set_counts[i];
+                views[c].set_hashes = reinterpret_cast<const uint32_t*>(p);
+                p += static_cast<uint64_t>(total_elem) * 4;
+                views[c].set_data = p;
+                // Advance past the packed element data. Each element is
+                // [u16 len][bytes] — walk the records to total the size.
+                if (total_elem > 0) {
+                    uint64_t data_bytes = 0;
+                    for (uint32_t e = 0; e < total_elem; ++e) {
+                        uint16_t elen;
+                        std::memcpy(&elen, views[c].set_data + data_bytes, 2);
+                        data_bytes += 2 + elen;
+                    }
+                    p += data_bytes;
+                }
+                break;
+            }
         }
+        // Align after EVERY column, matching the writer's per-column pad.
         p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
     }
 

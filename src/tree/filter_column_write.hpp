@@ -143,6 +143,11 @@ inline uint64_t write_filter_columns(uint8_t* buf, uint32_t count,
                 if (count > 0)
                     std::memcpy(p, fc.fixed_data.data(), static_cast<size_t>(count) * w);
                 p += static_cast<uint64_t>(count) * w;
+                // Align after EVERY column, matching filter_columns_bytes and
+                // parse_filter_columns — a Bool column (odd byte count) left
+                // unaligned shifts every subsequent string column by 1 byte
+                // and turns their u32 offsets into garbage.
+                p = buf + align4(static_cast<uint64_t>(p - buf));
                 break;
             }
             case ColumnType::String: {
