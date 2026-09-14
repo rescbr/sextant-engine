@@ -440,4 +440,12 @@ std::string_view IVFTreeIndex::fetch_payload(const uint8_t* leaf_ptr,
     return std::string_view(reinterpret_cast<const char*>(data + off), len);
 }
 
+bool IVFTreeIndex::fetch_vector(const uint8_t* leaf_ptr, uint32_t slot,
+                                float* out) const {
+    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
+    if (slot >= lh->count) return false;
+    coder_->decode_one(leaf_ptr, slot, out);
+    return true;
+}
+
 }  // namespace sextant::tree

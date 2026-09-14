@@ -285,6 +285,15 @@ public:
     std::string_view fetch_payload(const uint8_t* leaf_ptr,
                                     uint32_t slot) const;
 
+    /// Decode the stored (fp16-accurate) vector for a result. O(1) per
+    /// result: decodes from the leaf's code region. `leaf_ptr`/`slot` come
+    /// from a search payload_loc, same as fetch_payload. Writes `dim()`
+    /// floats to `out`. Returns false when the slot is out of range.
+    /// Purpose: diversity rerank (MMR) and client-side clustering without
+    /// keeping the raw embedding matrix.
+    bool fetch_vector(const uint8_t* leaf_ptr, uint32_t slot,
+                      float* out) const;
+
     // --- Accessors ---
 
     uint32_t dim() const { return manifest_.dim; }

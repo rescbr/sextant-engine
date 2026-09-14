@@ -988,6 +988,10 @@ int cmd_tree_search(int argc, char* argv[]) {
           "Fetch + print opaque payload blobs with results");
     p.add("payload-text", 0,
           "With --with-payload: print blobs as raw text instead of hex");
+    p.add("with-vectors", 0,
+          "Decode + append the stored (fp16-accurate) vector of each result "
+          "as a comma-separated float column — enables client-side MMR / "
+          "diversity rerank without keeping the raw embedding matrix");
     // The cmdline library only keeps the LAST value of a repeated option, so
     // collect every --filter occurrence from argv ourselves (supports AND of
     // multiple predicates). Both "--filter X" and "--filter=X" forms are
@@ -1014,6 +1018,7 @@ int cmd_tree_search(int argc, char* argv[]) {
 
     const bool with_payload = p.exist("with-payload");
     const bool payload_text = p.exist("payload-text");
+    const bool with_vectors = p.exist("with-vectors");
 
     // Scalar scan kernel selection: resolved into the coder's params at
     // open (must precede open — the factory reads the override once).
@@ -1105,6 +1110,11 @@ int cmd_tree_search(int argc, char* argv[]) {
         if (with_payload) {
             std::cerr << "tree-search: --batch-window is incompatible with "
                          "payload output (per-query mmap locations)\n";
+            return 1;
+        }
+        if (with_vectors) {
+            std::cerr << "tree-search: --batch-window is incompatible with "
+                         "vector output (per-query mmap locations)\n";
             return 1;
         }
         // Batch mode has no cross-query thread pool: search_batch
@@ -1327,7 +1337,8 @@ int cmd_tree_search(int argc, char* argv[]) {
     std::vector<std::vector<Candidate>> all_results(qcount);
     using PayloadLoc = std::pair<const uint8_t*, uint32_t>;
     std::vector<std::vector<PayloadLoc>> all_payload_locs;
-    if (with_payload) all_payload_locs.resize(qcount);
+    const bool with_locs = with_payload || with_vectors;
+    if (with_locs) all_payload_locs.resize(qcount);
 
     const uint32_t passes = std::max(1u, p.get<uint32_t>("passes"));
     auto run_pass = [&]() {
@@ -1397,7 +1408,7 @@ int cmd_tree_search(int argc, char* argv[]) {
         }
         if (num_threads <= 1) {
             for (uint32_t qi = 0; qi < qcount; ++qi) {
-                if (with_payload) {
+                if (with_locs) {
                     all_results[qi] = idx->search(
                         &queries[static_cast<size_t>(qi) * qdim], k, scfg,
                         &all_payload_locs[qi]);
@@ -1415,7 +1426,7 @@ int cmd_tree_search(int argc, char* argv[]) {
                     while (true) {
                         const uint32_t qi = next_qi.fetch_add(1);
                         if (qi >= qcount) break;
-                        if (with_payload) {
+                        if (with_locs) {
                             all_results[qi] = idx->search(
                                 &queries[static_cast<size_t>(qi) * qdim], k,
                                 scfg, &all_payload_locs[qi]);
@@ -1472,6 +1483,18 @@ int cmd_tree_search(int argc, char* argv[]) {
         for (uint32_t ri = 0; ri < results.size(); ++ri) {
             const auto& c = results[ri];
             *out << qi << '\t' << c.row_id << '\t' << c.dist;
+            if (with_vectors) {
+                std::vector<float> vec(idx->dim());
+                if (idx->fetch_vector(all_payload_locs[qi][ri].first,
+                                      all_payload_locs[qi][ri].second,
+                                      vec.data())) {
+                    *out << '\t';
+                    for (uint32_t d = 0; d < vec.size(); ++d) {
+                        if (d) *out << ',';
+                        *out << vec[d];
+                    }
+                }
+            }
             if (with_payload) {
                 auto blob = idx->fetch_payload(all_payload_locs[qi][ri].first,
                                                 all_payload_locs[qi][ri].second);
