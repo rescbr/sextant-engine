@@ -13,6 +13,7 @@
 // The CLI catches all exceptions, prints to stderr, returns non-zero.
 
 #include "fbin_source.hpp"
+#include <malloc.h>
 #include "fbin_io.hpp"
 #include "parquet_source.hpp"
 #include "parquet_glob_source.hpp"
@@ -2704,6 +2705,17 @@ int run_analyze(int argc, char* argv[]);
 int main(int argc, char* argv[]) {
     sextant::install_crash_handler();
     sextant::init_logging();
+
+    // Heap hygiene for the streaming build: the emission pass churns
+    // multi-MB leaf buffers (payload stores, codes) that glibc keeps in
+    // brk arenas after free — measured 1.7 GB of freed-but-held RSS on the
+    // CulturaX 2.9M build. A low mmap threshold routes big allocations to
+    // mmap (returned to the OS on free); a low trim threshold returns
+    // arena tops. Peak RSS 7.1 -> 5.4 GB, build time unchanged.
+#ifdef __GLIBC__
+    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+#endif
 
     if (argc < 2) {
         print_usage();

@@ -1511,8 +1511,10 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         // index, same order the codes get flushed in).
         std::vector<float> plane_proj;
         const uint32_t plane_rank = ctx.plane ? ctx.plane_writer.meta().rank : 0;
-        if (ctx.plane)
-            plane_proj.resize(static_cast<size_t>(1u << 20) * plane_rank);
+        // NOTE: no preallocation here. An earlier 1M-row preallocation
+        // (1<<20 × rank floats = 512 MB at rank 128) was the single largest
+        // standing allocation of the build; the adaptive resize in the loop
+        // below sizes it to the actual chunk batch (~8K rows, a few MB).
         while (true) {
             Chunk chunk;
             if (!ctx.source.next(chunk)) break;
@@ -2441,7 +2443,12 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
     const uint64_t kPagesPerBitmapPage =
         static_cast<uint64_t>(kPageSize) * 8;
     const uint64_t vec_bytes =
-        ctx.n * (2ull * ctx.dim + 24);  // fp16 vec + rowid/ip-bias/slack
+        // Local-family extents carry fp16 raw + codes per vector, plus
+        // rowid/ip-bias/plane row and per-leaf extent page rounding. The
+        // measured no-payload scalar_shape build on CulturaX lands at
+        // ~2.3 KiB/vec all-in (fp16 1536 + codes 384 + ~380 overhead);
+        // undershooting fails at flush (F3/F4).
+        ctx.n * (2ull * ctx.dim + ctx.coder->code_size() + 512);
     const uint64_t n_leaves_est =
         ctx.n / std::max<uint64_t>(1, ctx.leaf_cap / 2) + 2;
     const uint64_t leaf_overhead =
