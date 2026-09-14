@@ -9,6 +9,8 @@
 #include <sextant/types.hpp>
 #include <sextant/schema.hpp>
 
+#include <functional>
+
 namespace sextant {
 
 /// A readable stream of vectors. The engine pulls from this.
@@ -60,6 +62,27 @@ public:
     virtual uint64_t wait_count() const { return 0; }
     /// Bytes actually read from the backing store (raw, pre-cast).
     virtual uint64_t bytes_read() const { return 0; }
+
+    /// Toggle vector-only streaming: subsequent chunks carry vectors (and
+    /// row ids) but NO filter columns or payloads. Sources that decode
+    /// columns (parquet) use this to project only the vector column,
+    /// skipping filter/payload decompression entirely — training/Lloyd
+    /// passes re-read the corpus many times and never touch those columns.
+    /// Takes effect at the next reset().
+    virtual void set_vector_only(bool) {}
+
+    /// Stream the whole corpus through `fn`, with up to `workers` chunks
+    /// being processed CONCURRENTLY on different threads. Chunk order is
+    /// NOT preserved (and row ids may be shard-local); each chunk's
+    /// buffers are valid only for the duration of the call. Returns false
+    /// when unsupported — the caller falls back to reset()+next() passes.
+    /// Intended for order-free training passes (Lloyd refinement): a
+    /// serial-decoding source is a single-core bottleneck that this
+    /// parallelizes across independent files/shards.
+    virtual bool parallel_for_each_chunk(
+        uint32_t, const std::function<void(const Chunk&)>&) {
+        return false;
+    }
 };
 
 }  // namespace sextant

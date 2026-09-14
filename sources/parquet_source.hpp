@@ -81,6 +81,9 @@ public:
 
     void reset() override;
     bool next(Chunk& out) override;
+    /// Vector-only projection: reset() configures the batch reader to read
+    /// ONLY the vector column (skip filter/payload decompression).
+    void set_vector_only(bool on) override { vector_only_ = on; }
 
 private:
     void init_schema_();
@@ -109,6 +112,8 @@ private:
     std::vector<uint8_t> payload_data_;     // per-batch packed payload bytes
     std::vector<uint32_t> payload_offsets_;  // n+1 cumulative offsets
     std::vector<int32_t> filter_col_indices_;  // file col idx per filter col
+
+    bool vector_only_ = false;  // project only the vector column (set at reset)
 
     // When the batch reader returns a zero-copy view (mmap + uncompressed +
     // FIXED_LEN_BYTE_ARRAY + no nulls), vec_ptr_ aliases the mmap directly.

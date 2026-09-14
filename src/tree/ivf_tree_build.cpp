@@ -724,6 +724,60 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
                 root_centroids_pca[c].data(),
                 root_centroids_pca[c].data(), pca_dims);
 
+        // Order-free parallel consumption: when the source supports it,
+        // chunks stream from W independent shard decoders concurrently
+        // (a serial-decoding parquet source is otherwise a single-core
+        // wall: measured ~1.6 GB/s consumer-bound per shard chain). The
+        // assign work is still dispatched to the shared pool with
+        // per-pool-thread accumulators, correct under any chunk→thread
+        // mapping. Falls back to the serial loop below otherwise.
+        std::atomic<uint64_t> par_done{0};
+        const bool par = ctx.source.parallel_for_each_chunk(
+            std::min<uint32_t>(8, hw),
+            [&](const Chunk& chunk) {
+                const uint32_t take = chunk.count;
+                const float* vec_buf = chunk.vectors;
+
+                std::vector<std::future<void>> futs;
+                const uint32_t n_shards = std::min(hw, take);
+                const uint32_t per = (take + n_shards - 1) / n_shards;
+                for (uint32_t t = 0; t < n_shards; ++t) {
+                    const uint32_t start = t * per;
+                    const uint32_t end = std::min(start + per, take);
+                    if (start >= end) break;
+                    futs.push_back(pool.push(
+                        [&](size_t, StreamTLS& tls, uint32_t sh,
+                            uint32_t s, uint32_t e) {
+                            double* sums = t_sums[sh].data();
+                            uint64_t* counts = t_counts[sh].data();
+                            if (tls.proj.size() < pca_dims)
+                                tls.proj.resize(pca_dims);
+                            float* proj = tls.proj.data();
+                            for (uint32_t i = s; i < e; ++i) {
+                                const float* xi = &vec_buf[i * dim];
+                                for (uint32_t k = 0; k < pca_dims; ++k)
+                                    proj[k] = simd::dot_f32(
+                                        &rotation[k * dim], xi, dim) - mean_proj[k];
+                                float best_d = std::numeric_limits<float>::max();
+                                uint32_t best_c = 0;
+                                for (uint32_t c = 0; c < k_root; ++c) {
+                                    const float dot = simd::dot_f32(
+                                        proj, root_centroids_pca[c].data(), pca_dims);
+                                    const float d = cent_norms[c] - 2.0f * dot;
+                                    if (d < best_d) { best_d = d; best_c = c; }
+                                }
+                                for (uint32_t k = 0; k < pca_dims; ++k)
+                                    sums[best_c * pca_dims + k] += proj[k];
+                                ++counts[best_c];
+                            }
+                        }, t, start, end));
+                }
+                for (auto& fut : futs) fut.get();
+                par_done += take;
+            });
+        if (par) {
+            vectors_done = par_done.load();
+        } else {
         while (vectors_done < n) {
             Chunk chunk;
             if (!ctx.source.next(chunk)) break;
@@ -770,6 +824,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
             for (auto& fut : futs) fut.get();
             vectors_done += take;
         }
+        }  // serial fallback
 
         // Reduce per-thread accumulators into cluster_sums/cluster_counts.
         for (uint32_t c = 0; c < k_root; ++c) {
@@ -2361,8 +2416,14 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
     auto m_total = ctx.metrics.start("total");
 
     resolve_build_params(ctx);
+    // Training + Lloyd passes re-read the whole corpus many times and only
+    // consume vectors — project the vector column only (parquet sources
+    // skip filter/payload decompression; ~half the decode bytes).
+    ctx.source.set_vector_only(true);
     train_quantizer_and_pca(ctx);
     run_lloyd_refinement(ctx);
+    // Emission needs filter columns + payloads again.
+    ctx.source.set_vector_only(false);
 
     // The PageFile + PageAllocator are initialized before the emission pass so
     // leaves can be allocated + written at flush time. The file starts with

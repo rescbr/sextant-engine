@@ -15,6 +15,9 @@
 
 #include "parquet_source.hpp"
 #include <sextant/vector_source.hpp>
+#include <atomic>
+#include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,6 +46,16 @@ public:
     uint64_t count() const override;
     Schema schema() const override;
     uint64_t payload_total_bytes() const override;
+    void set_vector_only(bool on) override {
+        vector_only_ = on;
+        if (cur_src_) cur_src_->set_vector_only(on);
+    }
+
+    /// Parallel order-free streaming (Lloyd passes): shards are independent
+    /// files, so W threads each decode their own shards concurrently.
+    bool parallel_for_each_chunk(
+        uint32_t workers,
+        const std::function<void(const Chunk&)>& fn) override;
     void reset() override;
     bool next(Chunk& out) override;
 
@@ -56,6 +69,7 @@ private:
     uint64_t payload_total_bytes_ = 0;        // cached sum (footer metadata)
     std::vector<uint64_t> shard_base_;  // global row-id base per shard
     size_t cur_shard_ = 0;
+    bool vector_only_ = false;  // forwarded to lazily-opened shards
     std::vector<RowId> rid_buf_;  // re-based ids handed to the consumer
 
     Dim dim_ = 0;

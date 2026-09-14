@@ -399,6 +399,7 @@ void ParquetSource::detect_list_dim_() {
 void ParquetSource::reset() {
     cursor_ = 0;
     batch_reader_.reset();
+    chunk_col_ptrs_.clear();
 
     carquet_error_t err = {};
     carquet_batch_reader_config_t bcfg;
@@ -406,6 +407,13 @@ void ParquetSource::reset() {
     bcfg.batch_size = config_.batch_size;
     bcfg.num_threads = config_.num_threads;
     bcfg.use_mmap = config_.use_mmap;
+    // Vector-only streaming (training/Lloyd passes): project just the
+    // vector column so carquet never decompresses filter/payload pages.
+    const char* vec_name = config_.vector_col.c_str();
+    if (vector_only_) {
+        bcfg.column_names = &vec_name;
+        bcfg.num_column_names = 1;
+    }
 
     batch_reader_.reset(
         carquet_batch_reader_create(reader_.get(), &bcfg, &err));
@@ -452,7 +460,7 @@ bool ParquetSource::next(Chunk& out) {
     } else {
         out.filter_columns = nullptr;
     }
-    if (payload_col_idx_ >= 0) {
+    if (payload_col_idx_ >= 0 && !vector_only_) {
         out.payload_data = payload_data_.data();
         out.payload_offsets = payload_offsets_.data();
     } else {
@@ -561,8 +569,11 @@ void ParquetSource::materialize_batch_(carquet_row_batch_t* batch) {
     }
 
     // --- Filter columns ---
-    const uint32_t n_filter =
-        static_cast<uint32_t>(filter_col_indices_.size());
+    // Skipped entirely in vector-only mode (the columns are not projected —
+    // reading them would fail).
+    const uint32_t n_filter = vector_only_
+        ? 0u
+        : static_cast<uint32_t>(filter_col_indices_.size());
 
     if (fixed_data_.size() < n_filter) fixed_data_.resize(n_filter);
     if (str_cols_.size() < n_filter) str_cols_.resize(n_filter);
@@ -731,7 +742,8 @@ void ParquetSource::materialize_batch_(carquet_row_batch_t* batch) {
     // Packed as [n+1 u32 offsets][bytes]; nulls map to empty blobs. Both
     // BYTE_ARRAY (per-row ptr+len) and FIXED_LEN_BYTE_ARRAY (contiguous
     // stride) are accepted.
-    if (payload_col_idx_ >= 0) {
+    // Skipped in vector-only mode (the column is not projected).
+    if (payload_col_idx_ >= 0 && !vector_only_) {
         const void* data = nullptr;
         const uint8_t* nulls = nullptr;
         int64_t count = 0;

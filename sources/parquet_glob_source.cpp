@@ -3,6 +3,7 @@
 #include <sextant/error.hpp>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
+#include <future>
 
 namespace sextant {
 
@@ -96,22 +97,52 @@ ParquetGlobSource::ParquetGlobSource(
     pcfg.num_threads = config_.num_threads;
     pcfg.use_mmap = config_.use_mmap;
 
+    // Probes are independent files — run them concurrently (serial probing
+    // cost ~1.5-2 s per shard x 59 shards on CulturaX).
+    struct ProbeResult {
+        uint64_t count = 0;
+        Dim dim = 0;
+        uint64_t payload_bytes = 0;
+        std::string error;
+    };
+    std::vector<std::future<ProbeResult>> futures;
+    futures.reserve(shard_paths.size());
     for (const auto& path : shard_paths) {
-        ParquetSource probe(path, pcfg);
-        if (shard_paths_.empty()) {
-            dim_ = probe.dim();
-            schema_ = probe.schema();
-        } else {
-            if (probe.dim() != dim_) {
-                throw Error(ErrorCode::InvalidParam,
-                            "ParquetGlobSource: dimension mismatch across shards");
+        futures.push_back(std::async(std::launch::async, [&pcfg, &path]() {
+            ProbeResult r;
+            try {
+                ParquetSource probe(path, pcfg);
+                r.count = probe.count();
+                r.dim = probe.dim();
+                r.payload_bytes = probe.payload_total_bytes();
+            } catch (const std::exception& e) {
+                r.error = e.what();
             }
+            return r;
+        }));
+    }
+    const Schema first_schema = [&]() {
+        ParquetSource probe(shard_paths.front(), pcfg);
+        return probe.schema();
+    }();
+    shard_paths_ = shard_paths;
+    for (size_t i = 0; i < futures.size(); ++i) {
+        ProbeResult r = futures[i].get();
+        if (!r.error.empty()) {
+            throw Error(ErrorCode::InvalidParam,
+                        "ParquetGlobSource: " + r.error);
         }
-        total_count_ += probe.count();
-        shard_base_.push_back(total_count_ - probe.count());
-        payload_total_bytes_ += probe.payload_total_bytes();
-        shard_paths_.push_back(path);
-    }  // `probe` destroyed here: reader + mmap closed
+        if (i == 0) {
+            dim_ = r.dim;
+            schema_ = first_schema;
+        } else if (r.dim != dim_) {
+            throw Error(ErrorCode::InvalidParam,
+                        "ParquetGlobSource: dimension mismatch across shards");
+        }
+        total_count_ += r.count;
+        shard_base_.push_back(total_count_ - r.count);
+        payload_total_bytes_ += r.payload_bytes;
+    }
 
     // Set up label reader if specified
     if (!config_.label_file.empty()) {
@@ -281,6 +312,39 @@ bool ParquetGlobSource::next(Chunk& out) {
     }
     out.count = 0;
     return false;
+}
+
+bool ParquetGlobSource::parallel_for_each_chunk(
+    uint32_t workers, const std::function<void(const Chunk&)>& fn) {
+    if (shard_paths_.size() < 2 || workers < 2) return false;
+    const uint32_t W = std::min<uint32_t>(workers,
+                                          (uint32_t)shard_paths_.size());
+
+    std::atomic<uint32_t> next_shard{0};
+    std::vector<std::future<void>> futs;
+    futs.reserve(W);
+    for (uint32_t w = 0; w < W; ++w) {
+        futs.push_back(std::async(std::launch::async, [&]() {
+            ParquetSourceConfig pcfg;
+            pcfg.vector_col = config_.vector_col;
+            pcfg.payload_col = config_.payload_col;
+            pcfg.normalize = config_.normalize;
+            pcfg.batch_size = config_.batch_size;
+            pcfg.num_threads = config_.num_threads;
+            pcfg.use_mmap = config_.use_mmap;
+            for (;;) {
+                const uint32_t s = next_shard.fetch_add(1);
+                if (s >= shard_paths_.size()) break;
+                ParquetSource src(shard_paths_[s], pcfg);
+                src.set_vector_only(vector_only_);
+                Chunk ch;
+                while (src.next(ch))
+                    if (ch.count) fn(ch);
+            }
+        }));
+    }
+    for (auto& f : futs) f.get();
+    return true;
 }
 
 }  // namespace sextant
