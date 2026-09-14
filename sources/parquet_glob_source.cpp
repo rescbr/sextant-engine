@@ -96,6 +96,7 @@ ParquetGlobSource::ParquetGlobSource(
     pcfg.batch_size = config_.batch_size;
     pcfg.num_threads = config_.num_threads;
     pcfg.use_mmap = config_.use_mmap;
+    pcfg.vector_fp16 = config_.vector_fp16;
 
     // Probes are independent files — run them concurrently (serial probing
     // cost ~1.5-2 s per shard x 59 shards on CulturaX).
@@ -272,6 +273,7 @@ bool ParquetGlobSource::next(Chunk& out) {
             pcfg.batch_size = config_.batch_size;
             pcfg.num_threads = config_.num_threads;
             pcfg.use_mmap = config_.use_mmap;
+    pcfg.vector_fp16 = config_.vector_fp16;
             cur_src_ = std::make_unique<ParquetSource>(
                 shard_paths_[cur_shard_], pcfg);
         }
@@ -332,6 +334,7 @@ bool ParquetGlobSource::parallel_for_each_chunk(
             pcfg.batch_size = config_.batch_size;
             pcfg.num_threads = config_.num_threads;
             pcfg.use_mmap = config_.use_mmap;
+    pcfg.vector_fp16 = config_.vector_fp16;
             for (;;) {
                 const uint32_t s = next_shard.fetch_add(1);
                 if (s >= shard_paths_.size()) break;

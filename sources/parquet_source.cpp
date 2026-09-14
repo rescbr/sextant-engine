@@ -2,6 +2,7 @@
 
 #include <sextant/error.hpp>
 #include "../src/simd_kernels.hpp"
+#include "../src/util/fp16.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -128,14 +129,16 @@ ParquetSource::ParquetSource(const std::string& path,
         const carquet_schema_node_t* vec_node =
             carquet_schema_get_element(file_schema, vec_elem_idx);
         vec_type_len_ = carquet_schema_node_type_length(vec_node);
-        if (vec_type_len_ % sizeof(float) != 0 || vec_type_len_ == 0) {
+        const int32_t unit = config_.vector_fp16 ? 2 : 4;
+        if (vec_type_len_ % unit != 0 || vec_type_len_ == 0) {
             throw Error(ErrorCode::InvalidParam,
                         "ParquetSource: vector column FIXED_LEN_BYTE_ARRAY "
                         "length " +
                             std::to_string(vec_type_len_) +
-                            " is not a multiple of 4");
+                            " is not a multiple of " +
+                            std::to_string(unit));
         }
-        dim_ = static_cast<Dim>(vec_type_len_ / sizeof(float));
+        dim_ = static_cast<Dim>(vec_type_len_ / unit);
     } else if (vec_phys == CARQUET_PHYSICAL_DOUBLE) {
         dim_ = 1;
     } else if (vec_phys == CARQUET_PHYSICAL_INT64 ||
@@ -524,7 +527,7 @@ void ParquetSource::materialize_batch_(carquet_row_batch_t* batch) {
                 carquet_reader_schema(reader_.get()), vec_col_idx_);
 
         const bool can_zero_copy =
-            config_.use_mmap && nulls == nullptr &&
+            config_.use_mmap && nulls == nullptr && !config_.vector_fp16 &&
             (vec_phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY ||
              vec_phys == CARQUET_PHYSICAL_FLOAT);
 
@@ -549,8 +552,15 @@ void ParquetSource::materialize_batch_(carquet_row_batch_t* batch) {
             }
         } else {
             vec_buf_.resize(static_cast<size_t>(n) * dim_);
-            std::memcpy(vec_buf_.data(), data,
-                        static_cast<size_t>(n) * vec_type_len_);
+            if (config_.vector_fp16 &&
+                vec_phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY) {
+                cast_fp16_to_fp32(static_cast<const float16_t*>(data),
+                                  vec_buf_.data(),
+                                  static_cast<size_t>(n) * dim_);
+            } else {
+                std::memcpy(vec_buf_.data(), data,
+                            static_cast<size_t>(n) * vec_type_len_);
+            }
             vec_ptr_ = vec_buf_.data();
             if (nulls) {
                 for (uint32_t i = 0; i < n; ++i) {

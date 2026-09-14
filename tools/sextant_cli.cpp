@@ -446,6 +446,9 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     cmdline::parser p;
     p.add<std::string>("input", 0, "Base vectors (.fbin/.parquet)", true);
     p.add<std::string>("vector-col", 0, "Vector column name in parquet (default: embedding)", false, "embedding");
+    p.add("vector-fp16", 0,
+          "FLBA vector column holds fp16 halves (dim*2 bytes per row;"
+          " converted to fp32 on read)");
     p.add<std::string>("index", 0, "Output tree file path", true);
     p.add<uint32_t>("k-root", 0, "Root branching factor (0=auto)", false, 0);
     p.add<uint32_t>("leaf-capacity", 0, "Max vectors per leaf", false, 5000);
@@ -663,6 +666,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
             // When --filter-data is provided, suppress shard-local filter columns
             // (the builder uses the global cfg.filter_column_data from the fdat).
             gcfg.vectors_only = !fdat_path.empty();
+            gcfg.vector_fp16 = p.exist("vector-fp16");
             ParquetGlobSource source(shard_paths, gcfg);
             if (fdat_path.empty()) {
                 cfg.filter_schema = source.schema();
@@ -674,6 +678,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
             pcfg.vector_col = vector_col;
             pcfg.payload_col = payload_col;
             pcfg.normalize = need_normalize;
+            pcfg.vector_fp16 = p.exist("vector-fp16");
             ParquetSource source(shard_paths[0], pcfg);
             if (fdat_path.empty()) {
                 cfg.filter_schema = source.schema();

@@ -112,6 +112,7 @@ meson test -C build                             # run the test suite (31 files)
 |---|---|---|
 | `--input` | (required) | Base vectors, `.fbin` or `.parquet` (glob source supports patterns) |
 | `--vector-col` | `embedding` | Vector column name in parquet |
+| `--vector-fp16` | off | Vector column is a FIXED_LEN_BYTE_ARRAY of fp16 halves (`dim`×2 bytes/row); converted to fp32 on read |
 | `--index` | (required) | Output tree file path |
 | `--k-root` | 0 (auto) | Root branching factor |
 | `--leaf-capacity` | 5000 | Max vectors per leaf |
@@ -224,6 +225,26 @@ local quantizer when data drifts or appends are expected.
   converts the other way. `--vector-col` names the embedding column;
   `--payload-col` streams an opaque payload column into leaf extents;
   `--label-file` joins filter columns by row position.
+
+  **Vector column layout matters for build speed.** The build re-reads the
+  corpus ~12× (sample, ~10 Lloyd passes, emission). Layout cost per pass on
+  the CulturaX 1M corpus (2.9M×768, warm page cache, 16 threads):
+
+  | layout | per-pass Lloyd | full build | corpus size |
+  |---|---|---|---|
+  | `list<float>` (fp32, zstd) | 2.9 s | 53 s | 9.5 GB |
+  | FIXED_LEN_BYTE_ARRAY fp32, zstd | 1.9 s | 40 s | 9.5 GB |
+  | FIXED_LEN_BYTE_ARRAY fp32, uncompressed | 1.1 s | 29 s | 12 GB |
+  | FIXED_LEN_BYTE_ARRAY fp16, zstd (`--vector-fp16`) | 1.1 s | 29 s | 5.5 GB |
+  | FIXED_LEN_BYTE_ARRAY fp16, uncompressed (`--vector-fp16`) | **0.7 s** | **24 s** | 7.9 GB |
+
+  `list<float>` is fully supported (you don't control customer input) but
+  pays zstd decode + def/rep level assembly on every pass — ~2.2× slower than
+  fp16 FLBA and ~4.5 GB larger on disk. Recommended layout: a fixed-size
+  binary (`dim`×2) fp16 column, uncompressed for the mmap zero-copy path.
+  Recall is unaffected: fp16 storage measured recall@10 0.857 vs 0.855 fp32
+  on the tie-saturated CulturaX corpus. `scripts/emb_to_flba.py` converts
+  a `list<float>` corpus to any of the FLBA layouts.
 
 Use `tools/fvecs_to_fbin` to convert `.fvecs`/`.ivecs` corpora.
 

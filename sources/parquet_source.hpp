@@ -33,6 +33,9 @@ struct ParquetSourceConfig {
     bool verify_checksums = false;  // off by default — CRC is pure waste for builds
     int32_t num_threads = 0;
     bool normalize = false;         // L2-normalize each vector row (for cosine/IP)
+    bool vector_fp16 = false;       // FLBA vector col holds fp16 halves
+                                    // (type_len = dim*2; converted to fp32
+                                    // at chunk materialization)
 };
 
 /// RAII wrappers for carquet C handles.

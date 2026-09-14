@@ -36,6 +36,7 @@ public:
         int32_t num_threads = 0;
         bool use_mmap = true;
         bool vectors_only = false;  // project only vector col (filter data from sidecar)
+        bool vector_fp16 = false;  // FLBA vector col holds fp16 halves
     };
 
     ParquetGlobSource(const std::vector<std::string>& shard_paths,

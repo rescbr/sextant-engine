@@ -79,5 +79,42 @@ inline void cast_fp32_to_fp16(const float* src, float16_t* dst, size_t n) {
 #endif
 }
 
+/// Cast `n` FP16 values at `src` to `dst` (FP32). SIMD paths mirror
+/// cast_fp32_to_fp16 above (F16C VCVTPH2PS / NEON FCVT).
+inline void cast_fp16_to_fp32(const float16_t* src, float* dst, size_t n) {
+#if defined(SEXTANT_FP16_HAS_NEON)
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vcvt_f32_f16(vld1_f16(src + i));
+        vst1q_f32(dst + i, v);
+    }
+    for (; i < n; i++) {
+        dst[i] = static_cast<float>(src[i]);
+    }
+#elif defined(SEXTANT_FP16_HAS_F16C)
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i h = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(src + i));
+        __m256 v = _mm256_cvtph_ps(h);
+        _mm256_storeu_ps(dst + i, v);
+    }
+    if (i + 4 <= n) {
+        __m128i h = _mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(src + i));
+        __m128 v = _mm_cvtph_ps(h);
+        _mm_storeu_ps(dst + i, v);
+        i += 4;
+    }
+    for (; i < n; i++) {
+        dst[i] = static_cast<float>(src[i]);
+    }
+#else
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = static_cast<float>(src[i]);
+    }
+#endif
+}
+
 }  // namespace sextant
 
