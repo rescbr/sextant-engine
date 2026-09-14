@@ -51,7 +51,9 @@ private:
     void consume_labels_(uint32_t n, Chunk& out);
 
     Config config_;
-    std::vector<std::unique_ptr<ParquetSource>> shards_;
+    std::vector<std::string> shard_paths_;
+    std::unique_ptr<ParquetSource> cur_src_;  // one shard open at a time
+    uint64_t payload_total_bytes_ = 0;        // cached sum (footer metadata)
     std::vector<uint64_t> shard_base_;  // global row-id base per shard
     size_t cur_shard_ = 0;
     std::vector<RowId> rid_buf_;  // re-based ids handed to the consumer

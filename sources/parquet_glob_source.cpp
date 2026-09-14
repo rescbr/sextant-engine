@@ -82,7 +82,12 @@ ParquetGlobSource::ParquetGlobSource(
                     "ParquetGlobSource: no shard paths provided");
     }
 
-    // Create vector shard sources
+    // Probe each shard with a TEMPORARY ParquetSource (footer + schema work
+    // only, no page reads) to validate dim/count, capture the merged schema
+    // and the payload byte estimate — then CLOSE it. Keeping all shard
+    // readers open pins one mmap per shard for the whole build: measured
+    // 9.6 GB of resident page cache on the 60-shard CulturaX corpus.
+    // Readers are opened lazily, one at a time, in next().
     ParquetSourceConfig pcfg;
     pcfg.vector_col = config_.vector_col;
     pcfg.payload_col = config_.payload_col;
@@ -92,19 +97,21 @@ ParquetGlobSource::ParquetGlobSource(
     pcfg.use_mmap = config_.use_mmap;
 
     for (const auto& path : shard_paths) {
-        auto src = std::make_unique<ParquetSource>(path, pcfg);
-        if (shards_.empty()) {
-            dim_ = src->dim();
+        ParquetSource probe(path, pcfg);
+        if (shard_paths_.empty()) {
+            dim_ = probe.dim();
+            schema_ = probe.schema();
         } else {
-            if (src->dim() != dim_) {
+            if (probe.dim() != dim_) {
                 throw Error(ErrorCode::InvalidParam,
                             "ParquetGlobSource: dimension mismatch across shards");
             }
         }
-        total_count_ += src->count();
-        shard_base_.push_back(total_count_ - src->count());
-        shards_.push_back(std::move(src));
-    }
+        total_count_ += probe.count();
+        shard_base_.push_back(total_count_ - probe.count());
+        payload_total_bytes_ += probe.payload_total_bytes();
+        shard_paths_.push_back(path);
+    }  // `probe` destroyed here: reader + mmap closed
 
     // Set up label reader if specified
     if (!config_.label_file.empty()) {
@@ -158,14 +165,14 @@ ParquetGlobSource::ParquetGlobSource(
 
     // Also include filter columns from the vector shards (if any)
     if (n_label_cols_ == 0) {
-        // No label file — use shard schema
-        schema_ = shards_[0]->schema();
+        // No label file — use shard schema (captured by the constructor's
+        // first probe).
     }
 
     chunk_filter_ptrs_.resize(schema_.columns.size(), nullptr);
 
     spdlog::debug("ParquetGlobSource: {} shards, N={}, dim={}, label_cols={}",
-                  shards_.size(), total_count_, dim_, n_label_cols_);
+                  shard_paths_.size(), total_count_, dim_, n_label_cols_);
 }
 
 Dim ParquetGlobSource::dim() const { return dim_; }
@@ -175,16 +182,14 @@ uint64_t ParquetGlobSource::count() const { return total_count_; }
 Schema ParquetGlobSource::schema() const { return schema_; }
 
 uint64_t ParquetGlobSource::payload_total_bytes() const {
-    // Sum across shards only — the label reader carries filter columns, not
-    // payload. Estimates compose exactly since each shard's ParquetSource
-    // derives its own upper bound from column-chunk metadata.
-    uint64_t total = 0;
-    for (const auto& s : shards_) total += s->payload_total_bytes();
-    return total;
+    // Sum of per-shard column-chunk metadata estimates, cached at
+    // construction (each probe read footers only, no data pages).
+    return payload_total_bytes_;
 }
 
 void ParquetGlobSource::reset() {
-    for (auto& s : shards_) s->reset();
+    // Close the open shard reader (drops its mmap) — reopened lazily.
+    cur_src_.reset();
     cur_shard_ = 0;
     if (label_reader_) {
         label_reader_->reset();
@@ -224,9 +229,22 @@ void ParquetGlobSource::consume_labels_(uint32_t n, Chunk& out) {
 }
 
 bool ParquetGlobSource::next(Chunk& out) {
-    // Advance to next shard if current is exhausted
-    while (cur_shard_ < shards_.size()) {
-        if (shards_[cur_shard_]->next(out)) {
+    // Advance to next shard if current is exhausted. One reader is open at
+    // a time (lazily constructed); advancing closes the previous shard's
+    // reader and its mmap.
+    while (cur_shard_ < shard_paths_.size()) {
+        if (!cur_src_) {
+            ParquetSourceConfig pcfg;
+            pcfg.vector_col = config_.vector_col;
+            pcfg.payload_col = config_.payload_col;
+            pcfg.normalize = config_.normalize;
+            pcfg.batch_size = config_.batch_size;
+            pcfg.num_threads = config_.num_threads;
+            pcfg.use_mmap = config_.use_mmap;
+            cur_src_ = std::make_unique<ParquetSource>(
+                shard_paths_[cur_shard_], pcfg);
+        }
+        if (cur_src_->next(out)) {
             // ParquetSource assigns row ids from a per-file cursor, so each
             // shard emits ids 0..n_shard-1. Re-base them to GLOBAL ids here:
             // the build treats source-assigned ids as corpus-wide row ids
@@ -257,6 +275,8 @@ bool ParquetGlobSource::next(Chunk& out) {
             }
             return true;
         }
+        // Shard exhausted: close its reader (drops the mmap) and advance.
+        cur_src_.reset();
         ++cur_shard_;
     }
     out.count = 0;
