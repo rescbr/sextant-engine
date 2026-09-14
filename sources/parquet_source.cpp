@@ -313,6 +313,28 @@ void ParquetSource::init_schema_() {
         }
     }
 
+    // Map leaf column index -> schema element node. carquet_schema_get_element
+    // indexes ALL elements (root, groups, leaves), NOT leaf columns — calling
+    // it with a column index misclassifies columns whenever a nested (list)
+    // column shifts the element numbering (e.g. `language` resolved to the
+    // emb.list group with max_rep=1 → typed Set → "read set column" errors).
+    // Same leaf-walk the payload block above uses.
+    std::vector<const carquet_schema_node_t*> leaf_nodes(
+        static_cast<size_t>(n), nullptr);
+    {
+        const int32_t n_elem = carquet_schema_num_elements(file_schema);
+        int32_t leaf_seen = 0;
+        for (int32_t e = 1; e < n_elem; ++e) {
+            const carquet_schema_node_t* node =
+                carquet_schema_get_element(file_schema, e);
+            if (carquet_schema_node_is_leaf(node)) {
+                if (leaf_seen < n)
+                    leaf_nodes[static_cast<size_t>(leaf_seen)] = node;
+                ++leaf_seen;
+            }
+        }
+    }
+
     for (int32_t i = 0; i < n; ++i) {
         if (i == vec_col_idx_) continue;
         if (i == payload_col_idx_) continue;
@@ -321,9 +343,9 @@ void ParquetSource::init_schema_() {
         carquet_physical_type_t phys =
             carquet_schema_column_type(file_schema, i);
         const carquet_schema_node_t* node =
-            carquet_schema_get_element(file_schema, i);
+            leaf_nodes[static_cast<size_t>(i)];
         const carquet_logical_type_t* lt =
-            carquet_schema_node_logical_type(node);
+            node ? carquet_schema_node_logical_type(node) : nullptr;
         carquet_logical_type_id_t logical_id =
             lt ? lt->id : CARQUET_LOGICAL_UNKNOWN;
         int16_t max_rep = carquet_schema_node_max_rep_level(node);
