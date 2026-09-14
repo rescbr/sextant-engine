@@ -35,6 +35,7 @@ test_sources = [
     'test_simd_x86.cpp',
     'test_leaf_cache.cpp',
     'test_batch_search.cpp',
+    'test_cluster_stage.cpp',
 
 ]
 

@@ -285,6 +285,7 @@ engine_sources = [
     'src/tree/cardinality.cpp',
     'src/tree/plane.cpp',
     'src/tree/filter_data_io.cpp',
+    'src/tree/cluster_stage.cpp',
     'src/tree/fsck.cpp',
     'src/util/engine_trace.cpp',
     'src/logging.cpp',

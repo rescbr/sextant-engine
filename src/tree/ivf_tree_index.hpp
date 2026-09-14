@@ -85,6 +85,11 @@ public:
     struct BuildConfig {
         uint32_t k_root = 0;           // root branching factor (0 = auto)
         uint32_t leaf_capacity = 5000; // max vectors per leaf
+        uint64_t stage_budget_mb = 512;  // RAM budget for emission-pass
+                                          // cluster staging arenas (0 = pure
+                                          // disk staging). Bounds build RAM
+                                          // at scale: in-flight leaf data
+                                          // spills to disk beyond this.
         uint16_t n_probe_l0 = 0;       // probe count at level 0 (0 = auto)
         uint16_t n_probe_ln = 0;       // probe count at deeper levels (0 = auto)
         float probe_fraction = 0.0f;   // corpus-fraction probe budget to bake

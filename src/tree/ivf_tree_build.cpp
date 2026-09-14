@@ -8,6 +8,7 @@
 #include "tree/filter_column_write.hpp"  // filter column write path
 #include "tree/filter_column_read.hpp"   // filter column read path (mutable ops)
 #include "tree/filter_scan.hpp"         // filter predicate evaluation
+#include "tree/cluster_stage.hpp"       // per-cluster disk staging
 #include "tree/coders/coder_factory.hpp"
 #include "tree/coders/global_pq_coder.hpp"
 #include "sextant/error.hpp"
@@ -1022,7 +1023,7 @@ void run_lloyd_refinement(TreeBuildContext& ctx) {
 
 // ---------------------------------------------------------------------------
 // Phase 4: the streaming emission pass. Initializes per-cluster leaf buffers,
-// defines the append_filter_row + flush_buffer lambdas, projects root centroids
+// defines the serialize_filter_row + flush_buffer lambdas, projects root centroids
 // back to FP16 original space, streams all vectors (project → route → encode →
 // buffer → flush on overflow), populates the cardinality table, and final-
 // flushes all buffers. Writes leaf extents directly to the file via the
@@ -1072,6 +1073,14 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     ctx.n_schema_cols = n_schema_cols;
 
     struct LeafBuffer {
+        // Per-cluster ACCUMULATORS (stay in RAM for the whole build): the
+        // incremental centroid sum and the staged row count (drives the
+        // leaf_cap flush trigger). Everything row-shaped (codes, row ids,
+        // ip biases, fp16 vecs, payload bytes, filter values) is streamed to
+        // the ClusterStage temp file instead; the vectors below are
+        // TRANSIENT per-leaf buffers rebuilt by flush_buffer from the stage
+        // (leaf_cap-sized, cleared after each flush).
+        uint32_t staged_rows = 0;
         std::vector<uint8_t> codes;
         std::vector<RowId> row_ids;
         // Per-vector IP bias (||x||/||x_hat||, fp16) for scalar + InnerProduct.
@@ -1107,27 +1116,26 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     }
 
     // Per-chunk filter data state. Updated at the top of each chunk iteration
-    // in the streaming loop below; read by append_filter_row and the
+    // in the streaming loop below; read by serialize_filter_row and the
     // cardinality/payload dual-path logic.
     bool chunk_has_filter = false;
     const void* const* chunk_fcols = nullptr;
 
-    /// Append the filter column values for a row into a leaf's per-column
-    /// ColumnData (Phase C). `local_idx` is the row index within the current
-    /// chunk; `row_id` is the global row id. When the chunk provides per-chunk
-    /// filter data (chunk_has_filter), values are read from chunk_fcols by
-    /// local_idx; otherwise the global cfg.filter_column_data fallback is used
-    /// (indexed by the global row_id).
-    auto append_filter_row = [&](std::vector<ColumnData>& dst, RowId row_id, uint32_t local_idx) {
+    // Serialize the filter column values for one row into staged-record
+    // filter-row format (same dual-path value extraction the old in-RAM
+    // ColumnData append used: chunk_fcols by local_idx when present, else
+    // cfg.filter_column_data by global row id).
+    auto serialize_filter_row = [&](std::vector<uint8_t>& out, RowId row_id,
+                                     uint32_t local_idx) {
         const uint32_t r = static_cast<uint32_t>(row_id);
         for (uint32_t c = 0; c < n_schema_cols; ++c) {
-            auto& d = dst[c];
-            switch (d.type) {
+            const ColumnType t = cfg.filter_schema.columns[c].type;
+            switch (t) {
                 case ColumnType::Int32:
                 case ColumnType::Int64:
                 case ColumnType::Float:
                 case ColumnType::Bool: {
-                    const uint8_t w = column_type_width(d.type);
+                    const uint8_t w = column_type_width(t);
                     const uint8_t* sp;
                     if (chunk_has_filter) {
                         sp = static_cast<const uint8_t*>(chunk_fcols[c]) +
@@ -1136,38 +1144,33 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                         const auto& src = cfg.filter_column_data[c];
                         sp = src.fixed_data.data() + static_cast<size_t>(r) * w;
                     }
-                    d.fixed_data.insert(d.fixed_data.end(), sp, sp + w);
+                    out.insert(out.end(), sp, sp + w);
                     break;
                 }
                 case ColumnType::String: {
-                    // Validation happens in MemSourceBuilder (before uint16 truncation).
                     const FilterStringColumn* sc;
                     uint32_t off; uint16_t len;
+                    const char* data;
                     if (chunk_has_filter) {
                         sc = static_cast<const FilterStringColumn*>(chunk_fcols[c]);
                         off = sc->offsets[local_idx]; len = sc->lengths[local_idx];
+                        data = sc->data;
                     } else {
                         const auto& src = cfg.filter_column_data[c];
                         off = src.str_offsets[r]; len = src.str_lengths[r];
-                        sc = nullptr;  // not used for data ptr
+                        data = src.str_data.data();
                     }
-                    d.str_offsets.push_back(static_cast<uint32_t>(d.str_data.size()));
-                    d.str_lengths.push_back(len);
-                    if (chunk_has_filter) {
-                        d.str_data.insert(d.str_data.end(),
-                                          sc->data + off, sc->data + off + len);
-                    } else {
-                        const auto& src = cfg.filter_column_data[c];
-                        d.str_data.insert(d.str_data.end(),
-                                          src.str_data.data() + off,
-                                          src.str_data.data() + off + len);
-                    }
+                    uint8_t lb[2];
+                    uint8_t* lp = lb;
+                    staged_put_u16(lp, len);
+                    out.insert(out.end(), lb, lb + 2);
+                    out.insert(out.end(), data + off, data + off + len);
                     break;
                 }
                 case ColumnType::Set: {
-                    // Validation happens in MemSourceBuilder (before uint8/uint16 truncation).
                     const FilterSetColumn* fsc;
-                    uint8_t ec; uint32_t off; const uint16_t* elem_lens; const char* elem_data;
+                    uint8_t ec; uint32_t off;
+                    const uint16_t* elem_lens; const char* elem_data;
                     if (chunk_has_filter) {
                         fsc = static_cast<const FilterSetColumn*>(chunk_fcols[c]);
                         ec = fsc->counts[local_idx];
@@ -1182,18 +1185,18 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                         elem_lens = src.set_elem_lengths.data();
                         elem_data = src.set_elem_data.data();
                     }
-                    d.set_counts.push_back(ec);
-                    d.set_offsets.push_back(static_cast<uint32_t>(d.set_elem_lengths.size()));
-                    // Cumulative byte offset into elem_data for element `off`.
+                    out.push_back(ec);
                     uint32_t byte_off = 0;
                     for (uint32_t k = 0; k < off; ++k)
                         byte_off += elem_lens[k];
                     for (uint32_t e = 0; e < ec; ++e) {
                         const uint16_t elen = elem_lens[off + e];
-                        d.set_elem_lengths.push_back(elen);
-                        d.set_elem_data.insert(d.set_elem_data.end(),
-                            elem_data + byte_off,
-                            elem_data + byte_off + elen);
+                        uint8_t lb[2];
+                        uint8_t* lp = lb;
+                        staged_put_u16(lp, elen);
+                        out.insert(out.end(), lb, lb + 2);
+                        out.insert(out.end(), elem_data + byte_off,
+                                   elem_data + byte_off + elen);
                         byte_off += elen;
                     }
                     break;
@@ -1209,13 +1212,75 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     std::vector<LeafMeta>& leaf_metas = ctx.leaf_metas;  // grows as leaves are flushed
     std::vector<std::vector<uint8_t>>& leaf_summaries = ctx.leaf_summaries;
 
+    // Per-cluster DISK staging: row payloads (codes / raw fp16 / biases /
+    // row ids / filter values / payload bytes) go to `<output>.stage` instead
+    // of accumulating in RAM. finish() (and the destructor, on exception)
+    // unlinks the temp file.
+    ClusterStage stage(ctx.output_path + ".stage", k_root,
+                       cfg.stage_budget_mb << 20);
+
     const uint32_t cpb = (scan_bits == 4) ? 32 : 16;
     const uint32_t bb = m4 * 16;
 
     auto flush_buffer = [&](uint32_t c) {
         auto& buf = buffers[c];
-        if (buf.row_ids.empty()) return;
-        const uint32_t count = static_cast<uint32_t>(buf.row_ids.size());
+        if (buf.staged_rows == 0) return;
+
+        // Rebuild the transient per-leaf buffers from the disk stage. The
+        // vectors below are leaf-sized only (cleared again at the bottom of
+        // this flush); the row data itself never accumulates in RAM.
+        buf.codes.clear();
+        buf.row_ids.clear();
+        buf.ip_biases.clear();
+        buf.fp16_vecs.clear();
+        buf.payload_lens.clear();
+        buf.payload_offs.clear();
+        buf.payload_store.clear();
+        if (has_filter) {
+            buf.filter_cols.assign(n_schema_cols, ColumnData{});
+            for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
+                buf.filter_cols[cc].type = cfg.filter_schema.columns[cc].type;
+        }
+        stage.for_each(c, [&](const uint8_t* rec, uint32_t rec_len) {
+            StagedRow row;
+            std::string perr;
+            if (!staged_parse(rec, rec_len, row, perr))
+                throw Error(ErrorCode::CorruptIndex,
+                            "run_emission_pass: corrupt staged record: " +
+                                perr);
+            if (row.code)
+                buf.codes.insert(buf.codes.end(), row.code,
+                                 row.code + row.code_len);
+            if (row.fp16_vec)
+                buf.fp16_vecs.insert(buf.fp16_vecs.end(), row.fp16_vec,
+                                     row.fp16_vec + row.fp16_vec_bytes / 2);
+            if (row.has_ip_bias)
+                buf.ip_biases.push_back(row.ip_bias);
+            buf.row_ids.push_back(row.row_id);
+            if (row.filter_row) {
+                std::string ferr;
+                if (!staged_append_filter_row(row.filter_row,
+                                              row.filter_row_len,
+                                              cfg.filter_schema,
+                                              buf.filter_cols, ferr))
+                    throw Error(ErrorCode::CorruptIndex,
+                                "run_emission_pass: corrupt staged filter "
+                                "row: " + ferr);
+            }
+            if (row.payload) {
+                buf.payload_offs.push_back(static_cast<uint32_t>(
+                    buf.payload_store.size()));
+                buf.payload_store.insert(buf.payload_store.end(),
+                                         row.payload,
+                                         row.payload + row.payload_len);
+                buf.payload_lens.push_back(row.payload_len);
+            }
+        });
+        const uint32_t count = buf.staged_rows;
+        // Sanity: the rebuilt buffers must match the staged row count.
+        if (buf.row_ids.size() != count)
+            throw Error(ErrorCode::CorruptIndex,
+                        "run_emission_pass: staged record count mismatch");
 
         // Compute the leaf centroid from the incremental accumulator.
         std::vector<float> centroid_f32(dim);
@@ -1408,6 +1473,8 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         buf.payload_lens.clear();
         buf.payload_offs.clear();
         buf.payload_store.clear();
+        buf.staged_rows = 0;
+        stage.drop(c);
         if (has_filter) {
             buf.filter_cols.assign(n_schema_cols, ColumnData{});
             for (uint32_t cc = 0; cc < n_schema_cols; ++cc)
@@ -1511,6 +1578,11 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         // index, same order the codes get flushed in).
         std::vector<float> plane_proj;
         const uint32_t plane_rank = ctx.plane ? ctx.plane_writer.meta().rank : 0;
+        // Serial-merge staging scratch: full staged record (with its u32
+        // rec_len prefix) and the serialized filter row. Capacity is reused
+        // across rows.
+        std::vector<uint8_t> rec_buf;
+        std::vector<uint8_t> fr_buf;
         // NOTE: no preallocation here. An earlier 1M-row preallocation
         // (1<<20 × rank floats = 512 MB at rank 128) was the single largest
         // standing allocation of the build; the adaptive resize in the loop
@@ -1817,46 +1889,70 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                         if (ctx.plane) {
                             ctx.plane_writer.encode_staged(
                                 c,
-                                static_cast<uint32_t>(buf.row_ids.size()),
+                                buf.staged_rows,
                                 &plane_proj[static_cast<size_t>(
                                     tb.local_indices[j]) * plane_rank]);
                         }
-                        if (keep_raw_vecs) {
-                            // local families: keep raw FP16 for
-                            // per-leaf fitting at flush time.
-                            buf.fp16_vecs.insert(buf.fp16_vecs.end(),
-                                tb.fp16_vecs.data() + static_cast<size_t>(j) * dim,
-                                tb.fp16_vecs.data() + static_cast<size_t>(j + 1) * dim);
-                        } else {
-                            buf.codes.insert(buf.codes.end(),
-                                tb.codes.data() + static_cast<size_t>(j) * code_size,
-                                tb.codes.data() + static_cast<size_t>(j + 1) * code_size);
-                        }
-                        if (ctx.has_ip_bias)
-                            buf.ip_biases.push_back(tb.ip_biases[j]);
-                        buf.row_ids.push_back(tb.row_ids[j]);
                         // Incremental centroid accumulator (from raw FP16).
                         const float16_t* fv = tb.fp16_vecs.data()
                             + static_cast<size_t>(j) * dim;
                         for (uint16_t d = 0; d < dim; ++d)
                             buf.centroid_sum[d] += static_cast<float>(fv[d]);
-                        ++buf.centroid_count;
-                        if (has_filter)
-                            append_filter_row(buf.filter_cols, tb.row_ids[j],
-                                              tb.local_indices[j]);
+                        // Serialize the row into a staged record (see
+                        // cluster_stage.hpp for the layout) and append it to
+                        // the cluster's disk stage. Appends happen in the
+                        // same global row order the old in-RAM buffers saw,
+                        // so per-cluster leaf contents are identical.
+                        const RowId rid = tb.row_ids[j];
+                        uint16_t flags = keep_raw_vecs ? kStagedHasFp16
+                                                       : kStagedHasCode;
+                        if (ctx.has_ip_bias) flags |= kStagedHasIpBias;
+                        if (has_filter) flags |= kStagedHasFilter;
+                        if (has_payload) flags |= kStagedHasPayload;
+                        uint32_t plen = 0;
+                        const uint8_t* pdata = nullptr;
                         if (has_payload) {
-                            const uint32_t plen = tb.payload_lens[j];
-                            buf.payload_offs.push_back(
-                                static_cast<uint32_t>(
-                                    buf.payload_store.size()));
-                            buf.payload_store.insert(
-                                buf.payload_store.end(),
-                                tb.payload_store.data() + tb.payload_offs[j],
-                                tb.payload_store.data() + tb.payload_offs[j]
-                                    + plen);
-                            buf.payload_lens.push_back(plen);
+                            plen = tb.payload_lens[j];
+                            pdata = tb.payload_store.data() + tb.payload_offs[j];
                         }
-                        if (buf.row_ids.size() >= leaf_cap)
+                        rec_buf.assign(4, 0);  // room for rec_len (patched last)
+                        auto put = [&](const void* q, size_t n) {
+                            const auto* b = static_cast<const uint8_t*>(q);
+                            rec_buf.insert(rec_buf.end(), b, b + n);
+                        };
+                        const uint64_t rid64 = static_cast<uint64_t>(rid);
+                        put(&rid64, 8);
+                        put(&flags, 2);
+                        if (keep_raw_vecs) {
+                            const uint32_t nb = static_cast<uint32_t>(dim) * 2;
+                            put(&nb, 4);
+                            put(fv, nb);
+                        } else {
+                            const uint32_t nb = code_size;
+                            put(&nb, 4);
+                            put(tb.codes.data() +
+                                    static_cast<size_t>(j) * code_size,
+                                code_size);
+                        }
+                        if (ctx.has_ip_bias)
+                            put(&tb.ip_biases[j], sizeof(float16_t));
+                        if (has_filter) {
+                            fr_buf.clear();
+                            serialize_filter_row(fr_buf, rid,
+                                                 tb.local_indices[j]);
+                            const uint32_t nb =
+                                static_cast<uint32_t>(fr_buf.size());
+                            put(&nb, 4);
+                            put(fr_buf.data(), nb);
+                        }
+                        if (has_payload) put(pdata, plen);
+                        const uint32_t rlen =
+                            static_cast<uint32_t>(rec_buf.size() - 4);
+                        std::memcpy(rec_buf.data(), &rlen, 4);
+                        stage.append(c, rec_buf.data() + 4, rlen);
+                        ++buf.centroid_count;
+                        ++buf.staged_rows;
+                        if (buf.staged_rows >= leaf_cap)
                             flush_buffer(c);
                     }
                 }
@@ -1880,6 +1976,10 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         }
     }
     for (uint32_t c = 0; c < k_root; ++c) flush_buffer(c);
+    // All leaves are flushed — reclaim the stage file now (the destructor
+    // would also unlink it, but doing it here frees the space immediately
+    // and makes the success path explicit).
+    stage.finish();
 
     ctx.n_leaves_total = static_cast<uint32_t>(leaf_metas.size());
     // Depth-1 short-circuit: when the actual leaf count fits within k_root,
