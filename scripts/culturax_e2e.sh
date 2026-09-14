@@ -44,20 +44,11 @@ fi
 SHARDS=("$EMB"/chunk_*.parquet)
 [[ ${#SHARDS[@]} -ge 1 ]] || { echo "no chunk_*.parquet in $EMB"; exit 1; }
 if [[ $MINI -eq 1 ]]; then INPUT_GLOB="${SHARDS[0]}"; else INPUT_GLOB="$EMB/chunk_*.parquet"; fi
-# Build input = slim parquet (emb + payload text only): every extra column in
-# the corpus parquet becomes an auto filter column, and long-string set reads
-# hit a known carquet bug at >=50K rows ("read set column N: Invalid argument")
-# — tracked separately; not a release-flow blocker.
-SLIM="$OUT/slim"; mkdir -p "$SLIM"
-$PY - "$INPUT_GLOB" "$SLIM" <<'EOF'
-import sys, glob, os
-import pyarrow.parquet as pq
-paths = sorted(glob.glob(sys.argv[1]))
-for p in paths:
-    t = pq.read_table(p, columns=["emb", "text"])
-    pq.write_table(t, os.path.join(sys.argv[2], os.path.basename(p)), compression="zstd")
-print(f"slim: {len(paths)} files -> {sys.argv[2]}")
-EOF
+# Build input = the corpus parquets directly (emb + text payload + language/
+# url/source/doc_idx/... auto filter columns). An earlier carquet 'set
+# column' failure that forced a slim (emb+text) workaround turned out to be
+# an engine-side schema element/leaf index bug — fixed; full schemas build
+# and filtered search is a release gate (step 5b).
 echo "input: $INPUT_GLOB (${#SHARDS[@]} shard files present)"
 
 if [[ $SKIP_BUILD -eq 0 ]]; then
@@ -96,11 +87,11 @@ EOF
         --prefix "$OUT/cx" --n-queries 1000 --k 10
     gate "ground truth generated" $?
 
-    echo "== 3. build-tree (defaults + payload) =="
+    echo "== 3. build-tree (defaults + payload + filter columns) =="
     /usr/bin/time -f "build_wall=%es peak_rss=%MKB" \
-    "$SEXTANT" build-tree --input "$SLIM/$(basename "$INPUT_GLOB")" --vector-col emb \
+    "$SEXTANT" build-tree --input "$INPUT_GLOB" --vector-col emb \
         --payload-col text --index "$OUT/cx.tree" 2>&1 | tail -5
-    gate "default tree built (plane+payload)" $?
+    gate "default tree built (plane+payload+filters)" $?
 
     echo "== 3b. build plane-less mutation tree (head subset) =="
     # delete_batch requires a global-PQ-family codebook; the default
@@ -126,7 +117,7 @@ if [[ $MINI -eq 1 ]]; then
         --ground-truth "$OUT/cx_gt.gtmm" --threads 16 --batch-window 256 \
         --probe-fraction 1.0 2>&1 | grep -E "recall@10|time:"
     RECALL=$(./build-x86/tools/sextant tree-search --index "$OUT/cx.tree" --query "$OUT/cx_query.fbin" \
-        --ground-truth "$OUT/cx_gt.gtmm" --threads 16 --probe-fraction 1.0 2>/dev/null | grep -oE "recall@10: [0-9.]+" | grep -oE "[0-9.]+")
+        --ground-truth "$OUT/cx_gt.gtmm" --threads 16 --probe-fraction 1.0 2>&1 | grep -oE "recall@10: [0-9.]+" | grep -oE "[0-9.]+$")
     MIN_RECALL=0.55
     awk -v r="${RECALL:-0}" -v m="0.55" 'BEGIN{exit !(r>=m)}'
     gate "mini sanity: f=1.0 recall ${RECALL:-?} >= 0.55" $?
@@ -138,6 +129,13 @@ else
     awk -v r="${RECALL:-0}" -v m="$MIN_RECALL" 'BEGIN{exit !(r>=m)}'
     gate "warm recall ${RECALL:-?} >= $MIN_RECALL (f=.1, full corpus)" $?
 fi
+
+echo "== 5b. filtered search (is_first_chunk:eq:1) =="
+FR=$("$SEXTANT" tree-search --index "$OUT/cx.tree" --query "$OUT/q5.fbin" \
+    --threads 16 --probe-fraction 1.0 --filter 'is_first_chunk:eq:1' 2>&1 \
+    | grep -oE 'mean results/query: [0-9.]+' | grep -oE '[0-9.]+$')
+awk -v r="${FR:-0}" 'BEGIN{exit !(r >= 9)}'
+gate "filtered search returns full result set (${FR:-0}/query, is_first_chunk=1)" $?
 
 echo "== 6. payload roundtrip =="
 head -c 400000 "$OUT/cx_query.fbin" > "$OUT/q5.fbin"  # ~130 queries x 768 x f32
