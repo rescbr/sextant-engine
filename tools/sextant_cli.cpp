@@ -1544,6 +1544,20 @@ int cmd_tree_search(int argc, char* argv[]) {
 
     for (uint32_t pass = 0; pass < (passes > 1 ? passes - 1 : passes); ++pass)
         run_pass();
+    // True pass wall (the engine's window accounting sums per-window
+    // internals that overlap under the depth-3 pipeline and does not
+    // include the serialized sweep stream's lock waits — it can report
+    // a third of the real wall). Capture rusage for CPU here too.
+    const auto t_search = std::chrono::steady_clock::now();
+    const double search_wall =
+        std::chrono::duration<double>(t_search - t0).count();
+    struct rusage ru_s{};
+    getrusage(RUSAGE_SELF, &ru_s);
+    const double search_cpu =
+        static_cast<double>(ru_s.ru_utime.tv_sec) +
+        1e-6 * static_cast<double>(ru_s.ru_utime.tv_usec) +
+        static_cast<double>(ru_s.ru_stime.tv_sec) +
+        1e-6 * static_cast<double>(ru_s.ru_stime.tv_usec) - cpu0;
 
     // Tally recall + emit results (serial — I/O bound).
     // Recall metric: fraction of search top-k results that appear in the
@@ -1721,6 +1735,19 @@ int cmd_tree_search(int argc, char* argv[]) {
             w.timestamp = std::chrono::duration<double>(
                 t0.time_since_epoch()).count();
             sink.emit(w);
+            // True wall/cpu of the timed search passes — the authoritative
+            // number; the "window" record above carries engine-internal
+            // per-window accounting (overlapping, sweep-lock waits
+            // excluded).
+            metrics::PhaseMetrics sp;
+            sp.phase = "search";
+            sp.source = "tree-search-passes";
+            sp.wall_seconds = search_wall;
+            sp.cpu_seconds = search_cpu;
+            sp.wait_count = qcount;
+            sp.timestamp = std::chrono::duration<double>(
+                t0.time_since_epoch()).count();
+            sink.emit(sp);
         }
     }
 
