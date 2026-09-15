@@ -561,6 +561,12 @@ struct FilteredFixture {
         cfg.closure_multiplier = 0.0f;
         cfg.filter_schema = schema;
         cfg.filter_column_data = std::move(cols);
+        // Tracked cardinality keeps Eq selectivity exact (1/50 for year);
+        // with the default off-policy the uniform prior 1/n drives the
+        // brute-force fallback and the batch/single parity tests below
+        // would compare different (both correct) scan strategies.
+        cfg.cardinality_spec =
+            sextant::tree::CardinalitySpec::all_on();
         sextant::tree::IVFTreeIndex::build_streaming_pca(s, tree_path, cfg);
     }
     ~FilteredFixture() { std::filesystem::remove_all(dir); }

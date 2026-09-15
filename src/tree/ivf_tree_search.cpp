@@ -644,8 +644,29 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             scratch.route_gap = 0.0f;
             scratch.root_dists.clear();
             rstatus = RouteStatus::Ok;
-            plane_route_(query, config, scratch.candidates);
+            // Plane routing normally skips the descent-side selectivity
+            // logic — but the extreme-low-selectivity brute-force fallback
+            // (<1%, e.g. an Eq on an untracked/identifier-like column)
+            // must still trigger: a W-shortlist scan would almost never
+            // surface a handful of matching rows out of millions.
             if (!config.predicates.empty() &&
+                resolve_pred_columns_(config, scratch.pred_col_indices,
+                                      scratch.geo_lng_col_indices)) {
+                scratch.selectivity = card_table_.empty()
+                    ? 1.0f
+                    : card_table_.selectivity_combined(
+                          manifest_.schema, config.predicates,
+                          scratch.pred_col_indices,
+                          scratch.geo_lng_col_indices);
+                if (scratch.selectivity > 0.0f &&
+                    scratch.selectivity < 0.01f) {
+                    rstatus = RouteStatus::FallbackFiltered;
+                }
+            }
+            if (rstatus != RouteStatus::FallbackFiltered)
+                plane_route_(query, config, scratch.candidates);
+            if (!config.predicates.empty() &&
+                rstatus == RouteStatus::Ok &&
                 !scratch.candidates.empty()) {
                 (void)resolve_pred_columns_(config,
                                             scratch.pred_col_indices,
@@ -670,7 +691,11 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 }
                 scratch.candidates = std::move(pruned);
             }
-            if (scratch.candidates.empty()) rstatus = RouteStatus::Empty;
+            // (FallbackFiltered survives even though candidates is empty —
+            // the brute-force path below does its own full-leaf walk.)
+            if (scratch.candidates.empty() &&
+                rstatus != RouteStatus::FallbackFiltered)
+                rstatus = RouteStatus::Empty;
         } else {
             rstatus = route_query_(query, config, scratch, scratch.candidates);
         }
@@ -2400,14 +2425,13 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
     const std::vector<uint32_t>& geo_lng_col_indices,
     std::vector<std::pair<const uint8_t*, uint32_t>>* /*payload_locs*/) const {
 
-    // Brute-force filtered search for the local / scalar families is not
-    // yet implemented. This path is only triggered at extreme low
-    // selectivity (<1%) with filter columns.
+    // The brute-force body below is coder-generic (per-row rerank decode +
+    // filter evaluation), but was originally implemented and validated only
+    // for the global-PQ family; keep a debug log for the others.
     if (coder_->family() != CoderFamily::GlobalPq) {
-        spdlog::warn("[sextant] brute-force filtered search not yet supported "
-                     "for {}; returning empty results",
-                     coder_->family_name());
-        return {};
+        spdlog::debug("[sextant] brute-force filtered search on {} "
+                      "(originally validated for global pq only)",
+                      coder_->family_name());
     }
     const uint32_t summary_size = manifest_.summary_size;
 
@@ -2472,7 +2496,7 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
                                        config.predicates, pred_col_indices, geo_lng_col_indices))
                 continue;
 
-            // Exact match — decode PQ code and compute distance.
+            // Exact match — decode the row and compute the exact distance.
             const float dist = coder_->rerank(query, leaf_ptr, i, nullptr);
             results.push_back({layout.row_ids[i], dist});
         }

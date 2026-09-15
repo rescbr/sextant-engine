@@ -1,5 +1,7 @@
 #include "cardinality.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -58,10 +60,15 @@ void CardinalityTable::hll_add(std::vector<uint8_t>& hll, uint32_t finalized_has
     const uint32_t idx = finalized_hash >> ColumnCardinality::kHllPadding;
     const uint32_t rest = finalized_hash & ((1u << ColumnCardinality::kHllPadding) - 1);
     // rank = 1 + leading zeros of the (32-kHllBits) remaining bits.
+    // NOTE: 32 - clz(rest) = bit length of rest, so the rank is
+    // (kHllPadding - bitlen) + 1. (An earlier version computed bitlen -
+    // kHllBits + 1 — an inverted rank — which inflated the estimate ~8x
+    // once the estimator left the linear-counting range.)
     const uint8_t rank = rest == 0
         ? static_cast<uint8_t>(ColumnCardinality::kHllPadding + 1)
-        : static_cast<uint8_t>(32 - static_cast<uint32_t>(__builtin_clz(rest)) -
-                               ColumnCardinality::kHllBits + 1);
+        : static_cast<uint8_t>(ColumnCardinality::kHllPadding -
+                               (32 - static_cast<uint32_t>(
+                                          __builtin_clz(rest))) + 1);
     if (rank > hll_get(hll, idx)) hll_set(hll, idx, rank);
 }
 
@@ -93,11 +100,13 @@ double ColumnCardinality::distinct_estimate() const {
 // Table
 // ===========================================================================
 
-void CardinalityTable::init(const Schema& schema, uint64_t n_vectors, uint32_t cap) {
+void CardinalityTable::init(const Schema& schema, uint64_t n_vectors, uint32_t cap,
+                            const CardinalitySpec* spec) {
     n_vectors_ = n_vectors;
     cap_ = cap;
     col_to_idx_.assign(schema.columns.size(), UINT32_MAX);
     columns_.clear();
+    col_names_.clear();
 
     for (uint32_t c = 0; c < schema.columns.size(); ++c) {
         const auto type = schema.columns[c].type;
@@ -108,6 +117,25 @@ void CardinalityTable::init(const Schema& schema, uint64_t n_vectors, uint32_t c
             auto& col = columns_.emplace_back();
             col.is_numeric = (type == ColumnType::Int32 || type == ColumnType::Int64 ||
                               type == ColumnType::Float);
+            col.mode = spec ? spec->default_mode : CardinalityMode::Off;
+            col_names_.emplace_back(schema.columns[c].name);
+        }
+    }
+
+    if (!spec) return;
+    for (const auto& [name, mode] : spec->per_column) {
+        bool found = false;
+        for (uint32_t c = 0; c < schema.columns.size(); ++c) {
+            if (schema.columns[c].name != name) continue;
+            const uint32_t ci = col_to_idx_[c];
+            if (ci != UINT32_MAX) columns_[ci].mode = mode;
+            found = true;
+            break;
+        }
+        if (!found) {
+            throw Error(ErrorCode::InvalidParam,
+                        "cardinality-col: unknown filter column '" + name +
+                            "' (not in the filter schema)");
         }
     }
 }
@@ -132,6 +160,9 @@ void CardinalityTable::add_string(uint32_t col_idx, std::string_view val) {
     const uint32_t ci = col_to_idx_[col_idx];
     if (ci == UINT32_MAX) return;
     auto& col = columns_[ci];
+    if (col.mode == CardinalityMode::Off || col.mode == CardinalityMode::Rejected)
+        return;
+    ++col.adds;
     const uint32_t h = filter_hash(val);
     hll_add(col.hll, hll_finalize(h));  // always: distinct estimate is uncapped
     freq_add_(col, h);
@@ -145,6 +176,9 @@ void CardinalityTable::add_set(uint32_t col_idx,
     const uint32_t ci = col_to_idx_[col_idx];
     if (ci == UINT32_MAX) return;
     auto& col = columns_[ci];
+    if (col.mode == CardinalityMode::Off || col.mode == CardinalityMode::Rejected)
+        return;
+    ++col.adds;
 
     const uint8_t ec = counts[row_idx];
     const uint32_t off = offsets[row_idx];
@@ -226,6 +260,9 @@ void CardinalityTable::add_numeric(uint32_t col_idx, double val) {
     const uint32_t ci = col_to_idx_[col_idx];
     if (ci == UINT32_MAX) return;
     auto& col = columns_[ci];
+    if (col.mode == CardinalityMode::Off || col.mode == CardinalityMode::Rejected)
+        return;
+    ++col.adds;
     if (col.binned) {
         bin_add_(col, val, 1);
         return;
@@ -271,6 +308,16 @@ void CardinalityTable::merge_from(const CardinalityTable& other) {
     for (uint32_t ci = 0; ci < m; ++ci) {
         auto& dst = columns_[ci];
         const auto& src = other.columns_[ci];
+
+        // The global table decides what it wants: Off/Rejected columns
+        // discard shard contributions entirely (shards normally stop
+        // producing them after propagate_modes_to, but the first merge of
+        // a chunk decided mid-chunk can still carry a tail).
+        if (dst.mode == CardinalityMode::Off ||
+            dst.mode == CardinalityMode::Rejected)
+            continue;
+
+        dst.adds += src.adds;
 
         if (src.overflowed) dst.overflowed = true;
 
@@ -328,19 +375,126 @@ void CardinalityTable::merge_from(const CardinalityTable& other) {
         if (cap_ != 0 && dst.numeric_hist.size() > cap_)
             numeric_to_binned_(dst);
     }
+
+    // Merge point = sample checkpoint for `auto` columns.
+    evaluate_auto();
+}
+
+void CardinalityTable::evaluate_auto() {
+    for (uint32_t ci = 0; ci < columns_.size(); ++ci) {
+        auto& col = columns_[ci];
+        if (col.mode != CardinalityMode::Auto || col.adds < kCardinalitySample)
+            continue;
+        // Distinct estimate from whatever structure the column keeps:
+        // HLL for strings/sets, exact-map size for numerics (a numeric
+        // column binned before the sample point is by construction near
+        // the cap → distinct ≈ adds → identity-like → reject).
+        const double distinct = col.is_numeric
+            ? static_cast<double>(col.binned
+                     ? std::min<uint64_t>(col.bin_total, col.adds)
+                     : col.numeric_hist.size())
+            : col.distinct_estimate();
+        const double ratio = distinct / static_cast<double>(col.adds);
+        const std::string name =
+            ci < col_names_.size() ? col_names_[ci] : "col_" + std::to_string(ci);
+        if (ratio > kCardinalityIdentityRatio) {
+            // Identifier-like (url/uuid): the freq map carries no information
+            // (all counts ≈ 1). Freeze the distinct estimate and free the rest.
+            col.est_distinct_stored =
+                static_cast<uint64_t>(std::max<double>(1.0, static_cast<double>(std::llround(distinct))));
+            free_data_(col);
+            col.mode = CardinalityMode::Rejected;
+            spdlog::info("[sextant] cardinality: auto column '{}' rejected "
+                         "(distinct/adds = {:.3f} after {} adds; frozen "
+                         "est_distinct = {})",
+                         name, ratio, col.adds, col.est_distinct_stored);
+        } else {
+            col.mode = CardinalityMode::On;  // keep everything accumulated
+        }
+    }
+}
+
+void CardinalityTable::propagate_modes_to(CardinalityTable& shard) const {
+    const uint32_t m = std::min<uint32_t>(columns_.size(), shard.columns_.size());
+    for (uint32_t ci = 0; ci < m; ++ci) {
+        const CardinalityMode mode = columns_[ci].mode;
+        auto& scol = shard.columns_[ci];
+        scol.mode = mode;
+        if (mode == CardinalityMode::Off || mode == CardinalityMode::Rejected) {
+            free_data_(scol);
+            scol.overflowed = false;
+            scol.binned = false;
+            scol.adds = 0;
+            scol.est_distinct_stored = 0;
+        }
+    }
+}
+
+void CardinalityTable::copy_modes_from(const CardinalityTable& src) {
+    if (col_to_idx_.empty() || src.col_to_idx_.empty()) return;
+    for (uint32_t c = 0; c < col_to_idx_.size() && c < src.col_to_idx_.size();
+         ++c) {
+        const uint32_t ci = col_to_idx_[c];
+        const uint32_t si = src.col_to_idx_[c];
+        if (ci == UINT32_MAX || si == UINT32_MAX) continue;
+        columns_[ci].mode = src.columns_[si].mode;
+        if (src.columns_[si].mode == CardinalityMode::Rejected)
+            columns_[ci].est_distinct_stored =
+                src.columns_[si].est_distinct_stored;
+    }
 }
 
 void CardinalityTable::clear_stats() {
     for (auto& col : columns_) {
-        col.freq.clear();
-        col.numeric_hist.clear();
-        col.bins.clear();
+        free_data_(col);
         col.binned = false;
         col.overflowed = false;
         col.bin_total = 0;
-        col.est_distinct_stored = 0;
-        col.hll.clear();
+        col.adds = 0;
+        // A rejected column's frozen estimate survives the clear (only
+        // meaningful on the global table, but harmless on shards).
+        if (col.mode != CardinalityMode::Rejected) col.est_distinct_stored = 0;
     }
+}
+
+void CardinalityTable::free_data_(ColumnCardinality& col) {
+    col.freq.clear();
+    col.numeric_hist.clear();
+    col.bins.clear();
+    col.hll.clear();
+}
+
+CardinalityMode CardinalityTable::column_mode(uint32_t schema_col) const {
+    if (schema_col >= col_to_idx_.size()) return CardinalityMode::Off;
+    const uint32_t ci = col_to_idx_[schema_col];
+    if (ci == UINT32_MAX) return CardinalityMode::Off;
+    return columns_[ci].mode;
+}
+
+std::string CardinalityTable::mode_report() const {
+    std::string per_col;
+    uint32_t n_on = 0, n_off = 0, n_rejected = 0;
+    for (uint32_t ci = 0; ci < columns_.size(); ++ci) {
+        const auto& col = columns_[ci];
+        switch (col.mode) {
+            case CardinalityMode::Off:      ++n_off; break;
+            case CardinalityMode::Rejected: ++n_rejected; break;
+            default:                        ++n_on; break;  // On + undecided Auto
+        }
+        if (ci < col_names_.size()) {
+            if (!per_col.empty()) per_col += ", ";
+            per_col += col_names_[ci] + ":";
+            per_col += col.mode == CardinalityMode::Off      ? "off"
+                     : col.mode == CardinalityMode::Rejected ? "rejected"
+                     : col.mode == CardinalityMode::Auto      ? "auto"
+                                                              : "tracked";
+        }
+    }
+    std::string out = "tracked=" + std::to_string(n_on) +
+                       ", rejected=" + std::to_string(n_rejected) +
+                       ", off=" + std::to_string(n_off);
+    if (!per_col.empty()) out += " (" + per_col + ")";
+    return out;
 }
 
 bool CardinalityTable::any_overflowed() const {
@@ -356,12 +510,31 @@ size_t CardinalityTable::total_entries() const {
     return total;
 }
 
+float CardinalityTable::untracked_prior_(const ColumnCardinality& col) const {
+    // Eq prior for a column with no exact data: the frozen sample-phase
+    // distinct estimate if it exists (rejected `auto` columns), else the
+    // uniform 1/n_vectors. NEVER 0 — a zero selectivity would spuriously
+    // trigger the brute-force fallback for every query on the column.
+    if (col.est_distinct_stored > 0)
+        return static_cast<float>(std::min(1.0, 1.0 / static_cast<double>(
+                                                      col.est_distinct_stored)));
+    if (n_vectors_ > 0) return 1.0f / static_cast<float>(n_vectors_);
+    return 1.0f;
+}
+
 float CardinalityTable::selectivity_string(uint32_t col_idx,
                                              std::string_view val) const {
-    if (col_idx >= col_to_idx_.size() || n_vectors_ == 0) return 0.0f;
-    const uint32_t ci = col_to_idx_[col_idx];
-    if (ci == UINT32_MAX) return 0.0f;
+    if (n_vectors_ == 0) return 1.0f;
+    const uint32_t ci =
+        col_idx < col_to_idx_.size() ? col_to_idx_[col_idx] : UINT32_MAX;
+    if (ci == UINT32_MAX) {
+        // Column not in the table at all (absent from the blob = off).
+        ColumnCardinality absent;
+        return untracked_prior_(absent);
+    }
     const auto& col = columns_[ci];
+    if (col.mode == CardinalityMode::Off || col.mode == CardinalityMode::Rejected)
+        return untracked_prior_(col);
     const uint32_t h = filter_hash(val);
     auto it = col.freq.find(h);
     if (it == col.freq.end()) {
@@ -439,8 +612,21 @@ float CardinalityTable::selectivity_binned_(const ColumnCardinality& col,
 
 float CardinalityTable::selectivity_numeric(uint32_t col_idx,
                                               const Predicate& pred) const {
-    if (col_idx >= col_to_idx_.size() || n_vectors_ == 0) return 1.0f;
-    const uint32_t ci = col_to_idx_[col_idx];
+    if (n_vectors_ == 0) return 1.0f;
+    const uint32_t ci =
+        col_idx < col_to_idx_.size() ? col_to_idx_[col_idx] : UINT32_MAX;
+
+    // Eq on an untracked column: uniform prior (1/frozen distinct estimate,
+    // else 1/n). Range ops keep the conservative no-data behavior below.
+    if (ci != UINT32_MAX &&
+        (columns_[ci].mode == CardinalityMode::Off ||
+         columns_[ci].mode == CardinalityMode::Rejected) &&
+        pred.op == PredicateOp::Eq)
+        return untracked_prior_(columns_[ci]);
+    if (ci == UINT32_MAX && pred.op == PredicateOp::Eq) {
+        ColumnCardinality absent;
+        return untracked_prior_(absent);
+    }
     if (ci == UINT32_MAX) return 1.0f;
 
     const auto& col = columns_[ci];
@@ -591,8 +777,15 @@ namespace {
 // Versioned-blob magic. Bit 31 set: a legacy blob's first 4 bytes are the
 // low half of n_vectors (u64), which cannot have bit 31 set for realistic
 // row counts, so the two formats are unambiguously distinguishable.
-constexpr uint32_t kCardMagic = 0xC4DA0002u;
-constexpr uint8_t kCardVersion = 2;
+constexpr uint32_t kCardMagic = 0xC4DA0003u;
+constexpr uint8_t kCardVersion = 3;
+// Per-column mode lives in the flags byte (bits 3-4).
+inline uint8_t mode_flag_bits(CardinalityMode m) {
+    return static_cast<uint8_t>(m) << 3;
+}
+inline CardinalityMode mode_from_flags(uint8_t flags) {
+    return static_cast<CardinalityMode>((flags >> 3) & 3);
+}
 }  // namespace
 
 std::vector<uint8_t> CardinalityTable::serialize() const {
@@ -618,20 +811,27 @@ std::vector<uint8_t> CardinalityTable::serialize() const {
     write_u8(kCardVersion);
     write_u64(n_vectors_);
 
-    // Count columns with data.
-    uint32_t n_cols = 0;
-    for (const auto& col : columns_)
-        if (!col.freq.empty() || !col.numeric_hist.empty() || col.binned) ++n_cols;
-
-    write_u32(n_cols);
+    // v3 writes EVERY column (an Off column is just a mode flag with zero
+    // entries) so the search side knows the policy without the schema.
+    write_u32(static_cast<uint32_t>(columns_.size()));
     for (uint32_t c = 0; c < col_to_idx_.size(); ++c) {
         const uint32_t ci = col_to_idx_[c];
         if (ci == UINT32_MAX) continue;
         const auto& col = columns_[ci];
-        if (col.freq.empty() && col.numeric_hist.empty() && !col.binned) continue;
+        // Auto columns serialize as On (they were tracked like On); the
+        // pending decision only matters at build time.
+        const CardinalityMode mode = col.mode == CardinalityMode::Auto
+            ? CardinalityMode::On : col.mode;
         write_u32(c);
         write_u8((col.is_numeric ? 1 : 0) | (col.binned ? 2 : 0) |
-                 (col.overflowed ? 4 : 0));
+                 (col.overflowed ? 4 : 0) | mode_flag_bits(mode));
+        if (mode == CardinalityMode::Off) continue;  // mode flag, zero entries
+        if (mode == CardinalityMode::Rejected) {
+            // Rejected: nothing but the distinct estimate frozen at rejection
+            // time (the whole 3 KB HLL collapses to one number).
+            write_u64(std::max<uint64_t>(col.est_distinct_stored, 1));
+            continue;
+        }
         if (col.is_numeric) {
             if (col.binned) {
                 write_f64(col.bin_min);
@@ -670,12 +870,15 @@ void CardinalityTable::deserialize(const uint8_t* data, size_t len) {
 
     uint32_t first = 0;
     std::memcpy(&first, data, 4);
-    const bool versioned = (first == kCardMagic);
+    const bool versioned =
+        (first == kCardMagic || first == (kCardMagic - 1u));  // v3 or v2
+    // v3 carries the per-column mode; v2/legacy columns are implicitly On.
+    const bool has_mode = versioned && (first == kCardMagic);
 
     size_t off = 0;
     if (versioned) {
         off = 4;  // magic
-        ++off;    // version (validated by the magic; only one version exists)
+        ++off;    // version (validated by the magic)
     }
 
     auto read_u32 = [&]() -> uint32_t {
@@ -718,6 +921,16 @@ void CardinalityTable::deserialize(const uint8_t* data, size_t len) {
             uint8_t flags = data[peek]; peek += 1;
             const bool is_num = flags & 1;
             const bool binned = versioned && (flags & 2);
+            const auto mode = has_mode ? mode_from_flags(flags) : CardinalityMode::On;
+            if (mode == CardinalityMode::Off) {
+                max_col = std::max(max_col, cid);  // mode flag only, no entries
+                continue;
+            }
+            if (mode == CardinalityMode::Rejected) {
+                peek += 8;  // frozen est_distinct
+                max_col = std::max(max_col, cid);
+                continue;
+            }
             if (binned) {
                 peek += 8 + 8 + 8 + 8 + 8;  // min/max, frame, bin_total
                 peek += static_cast<size_t>(kCardinalityNumBins) * 4;
@@ -739,12 +952,21 @@ void CardinalityTable::deserialize(const uint8_t* data, size_t len) {
         const bool is_numeric = flags & 1;
         const bool binned = versioned && (flags & 2);
         const bool overflowed = versioned && (flags & 4);
+        const auto mode = has_mode ? mode_from_flags(flags) : CardinalityMode::On;
         const uint32_t ci = static_cast<uint32_t>(columns_.size());
         columns_.emplace_back();
         col_to_idx_[col_id] = ci;
         auto& col = columns_[ci];
         col.is_numeric = is_numeric;
         col.overflowed = overflowed;
+        col.mode = mode;
+        if (mode == CardinalityMode::Off) {
+            continue;  // tracked-policy marker only
+        }
+        if (mode == CardinalityMode::Rejected) {
+            col.est_distinct_stored = read_u64();
+            continue;
+        }
         if (binned) {
             col.binned = true;
             col.bin_min = read_f64();

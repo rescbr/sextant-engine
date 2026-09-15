@@ -1531,6 +1531,9 @@ IVFTreeIndex::VacuumResult IVFTreeIndex::vacuum(const VacuumConfig& config) {
 
         CardinalityTable new_card;
         new_card.init(manifest_.schema, total_live);
+        // Preserve the built blob's per-column tracking policy; columns the
+        // old blob never knew default to Off.
+        new_card.copy_modes_from(card_table_);
 
         for (uint32_t lid = 0; lid < leaf_table_.size(); ++lid) {
             if (leaf_table_[lid].page == kInvalidPage) continue;
@@ -1588,6 +1591,9 @@ IVFTreeIndex::VacuumResult IVFTreeIndex::vacuum(const VacuumConfig& config) {
                 }
             }
         }
+
+        // Serial-add path (no shards): decide pending `auto` columns now.
+        new_card.evaluate_auto();
 
         // Serialize + write the new cardinality blob, then commit. The old blob
         // is freed as part of commit_mutable_ (which rewrites the leaf table +

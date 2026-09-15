@@ -32,11 +32,60 @@
 #include <unordered_map>
 #include <vector>
 
+#include "sextant/error.hpp"
+
 namespace sextant::tree {
 
 /// Default per-column cap on exact cardinality entries (freq map keys or
 /// numeric histogram nodes). 0 = unlimited (legacy behavior).
 inline constexpr uint32_t kDefaultCardinalityCap = 1u << 20;
+
+/// `auto` columns are tracked exactly like `on` until this many values have
+/// been merged into the global table, then a keep/reject decision is made.
+/// 100k is enough for the HLL distinct estimate to converge well within its
+/// ~1.6% standard error while bounding the wasted work on identity columns.
+inline constexpr uint64_t kCardinalitySample = 100'000;
+
+/// `auto` rejection threshold: if distinct_estimate / adds exceeds this,
+/// the column is treated as identifier-like (url/uuid: ratio ≈ 1.0 at any
+/// sample size; categorical columns: ratio ≈ distinct/n, tiny) and flipped
+/// to untracked with a frozen distinct estimate. 0.5 splits the two regimes
+/// with a wide margin on both sides.
+inline constexpr double kCardinalityIdentityRatio = 0.5;
+
+/// Per-column cardinality tracking policy.
+///   Off       — not tracked at all (DEFAULT): add_* are no-ops; search-time
+///               Eq uses the uniform prior 1/n_vectors (never 0).
+///   On        — tracked exactly (capped exact maps + HLL / binned numerics;
+///               today's behavior).
+///   Auto      — tracked like `on` during the sampling phase; decided into
+///               `on` or `rejected` at a merge point once kCardinalitySample
+///               values have been merged (see CardinalityTable::evaluate_auto).
+///   Rejected  — internal terminal state of a rejected `auto` column: no
+///               exact data, only the distinct estimate frozen at rejection
+///               time (Eq → min(1, 1/est_distinct)).
+enum class CardinalityMode : uint8_t {
+    Off = 0,
+    On = 1,
+    Auto = 2,
+    Rejected = 3,
+};
+
+/// User-facing cardinality tracking configuration (`--cardinality-col`).
+/// `default_mode` applies to every filter column not named in `per_column`:
+/// the bare keyword "auto" sets it to Auto; the CLI default leaves it Off.
+/// `per_column` entries override per name (name, name=on, name=off, name=auto).
+struct CardinalitySpec {
+    CardinalityMode default_mode = CardinalityMode::Off;
+    std::map<std::string, CardinalityMode> per_column;
+
+    /// Legacy behavior: every column tracked (`on`). Used by tests.
+    static CardinalitySpec all_on() {
+        CardinalitySpec s;
+        s.default_mode = CardinalityMode::On;
+        return s;
+    }
+};
 
 /// Number of linear bins used when a numeric histogram overflows its cap.
 inline constexpr uint32_t kCardinalityNumBins = 4096;
@@ -72,10 +121,19 @@ struct ColumnCardinality {
     bool overflowed = false;
 
     // Distinct-value estimate after deserialize (search side never adds, so
-    // the HLL registers are not serialized — only the estimate is).
+    // the HLL registers are not serialized — only the estimate is). Also
+    // carries the frozen estimate of a Rejected `auto` column (see mode).
     uint64_t est_distinct_stored = 0;
 
     bool is_numeric = false;
+
+    // Tracking policy for this column (see CardinalityMode). Off by default.
+    CardinalityMode mode = CardinalityMode::Off;
+
+    // Values added to this column since tracking started (merge-cumulative
+    // on the global table; per-chunk on shard tables). Drives the `auto`
+    // sample-phase decision.
+    uint64_t adds = 0;
 
     // --- HyperLogLog distinct estimator (2^12 registers, 6 bits each) ---
     // Fed on every string/set add (before the cap check) so the estimate
@@ -95,9 +153,13 @@ class CardinalityTable {
 public:
     /// Initialize for the given schema. Allocates per-column maps for
     /// all filter column types (numeric, string, set). `cap` bounds the
-    /// exact per-column entries (0 = unlimited).
+    /// exact per-column entries (0 = unlimited). `spec` (optional) sets
+    /// per-column tracking modes; null = every column Off (the default
+    /// policy). Throws Error(InvalidParam) if `spec` names a column that
+    /// is not in the schema (typo protection).
     void init(const Schema& schema, uint64_t n_vectors,
-              uint32_t cap = kDefaultCardinalityCap);
+              uint32_t cap = kDefaultCardinalityCap,
+              const CardinalitySpec* spec = nullptr);
 
     /// Record a string value for a column during the build emission pass.
     void add_string(uint32_t col_idx, std::string_view val);
@@ -120,9 +182,28 @@ public:
     void merge_from(const CardinalityTable& other);
 
     /// Reset all per-column statistics to empty, keeping the schema layout
-    /// (col_to_idx_ / is_numeric flags). Used to reuse a sharded table across
-    /// chunks without reallocating its column structure.
+    /// (col_to_idx_ / is_numeric flags / tracking modes). Used to reuse a
+    /// sharded table across chunks without reallocating its column structure.
     void clear_stats();
+
+    /// Run the `auto` keep/reject decision for every Auto column that has
+    /// reached the sample size (kCardinalitySample merged adds). Called at
+    /// shard merge points and after a vacuum rebuild. Rejected columns are
+    /// freed (freq/HLL/numeric data) and keep only their frozen distinct
+    /// estimate; accepted columns are promoted to On and keep what they
+    /// accumulated. Logs each rejection.
+    void evaluate_auto();
+
+    /// Copy this table's per-column tracking modes onto `shard` (matched by
+    /// schema column index) and free any accumulated shard data for
+    /// Off/Rejected columns, so shards stop hashing values the global table
+    /// no longer wants. Called by the build loop after each merge.
+    void propagate_modes_to(CardinalityTable& shard) const;
+
+    /// Copy per-column modes from `src` (matched by schema column index).
+    /// Used by the vacuum rebuild to preserve the existing blob's policy.
+    /// Columns absent from `src` keep their current mode.
+    void copy_modes_from(const CardinalityTable& src);
 
     /// Estimate selectivity for a string equality predicate.
     float selectivity_string(uint32_t col_idx, std::string_view val) const;
@@ -152,6 +233,14 @@ public:
     uint64_t n_vectors() const { return n_vectors_; }
     uint32_t cap() const { return cap_; }
 
+    /// Tracking mode of a schema column (Off if the column is unknown or
+    /// absent from the table).
+    CardinalityMode column_mode(uint32_t schema_col) const;
+
+    /// Diagnostics: per-column tracking modes as "name=mode" pairs plus a
+    /// per-mode count summary for the build log.
+    std::string mode_report() const;
+
     /// True if any column overflowed its exact-entry cap (diagnostics).
     bool any_overflowed() const;
 
@@ -161,11 +250,14 @@ public:
     /// Serialize to a binary blob. Versioned: starts with a magic u32 with
     /// the high bit set (legacy blobs start with n_vectors:u64, which cannot
     /// have bit 31 of its low word set for realistic row counts).
-    /// Format:
-    ///   [magic: u32 = 0xC4DA0002][version: u8 = 2]
+    /// Format (v3):
+    ///   [magic: u32 = 0xC4DA0003][version: u8 = 3]
     ///   [n_vectors: u64][n_columns: u32]
-    ///   for each column with data:
-    ///     [col_id: u32][flags: u8]   bit0 is_numeric, bit1 binned, bit2 overflowed
+    ///   for each column:
+    ///     [col_id: u32][flags: u8]   bit0 is_numeric, bit1 binned,
+    ///                                bit2 overflowed, bits3-4 mode
+    ///     (Off: nothing further)
+    ///     (Rejected: [est_distinct: u64])
     ///     if string/set: [n_entries: u32][est_distinct: u64]
     ///                     [n_entries × (hash: u32, count: u32)]
     ///     elif numeric exact: [n_entries: u32][n_entries × (value: f64, count: u32)]
@@ -174,8 +266,9 @@ public:
     ///                     [4096 × (count: u32)]
     std::vector<uint8_t> serialize() const;
 
-    /// Deserialize from a binary blob. Accepts both the versioned format
-    /// above and the legacy layout ([n_vectors: u64][n_columns: u32] ...).
+    /// Deserialize from a binary blob. Accepts the versioned format above
+    /// (v3: per-column mode; v2: pre-mode) and the legacy layout
+    /// ([n_vectors: u64][n_columns: u32] ...).
     void deserialize(const uint8_t* data, size_t len);
 
     // --- HLL helpers (exposed for testing) ---
@@ -188,8 +281,17 @@ public:
 private:
     std::vector<ColumnCardinality> columns_;
     std::vector<uint32_t> col_to_idx_;  // schema col index → columns_ index
+    std::vector<std::string> col_names_;  // schema col name per columns_ index
     uint64_t n_vectors_ = 0;
     uint32_t cap_ = kDefaultCardinalityCap;  // 0 = unlimited
+
+    /// Uniform Eq prior for an untracked column: 1/est_distinct when a
+    /// frozen sample-phase estimate exists, else 1/n_vectors. NEVER 0 —
+    /// selectivity 0 would spuriously trigger the brute-force fallback.
+    float untracked_prior_(const ColumnCardinality& col) const;
+
+    /// Free all per-column data (exact maps, HLL, bins). Keeps mode.
+    static void free_data_(ColumnCardinality& col);
 
     /// Exact-map insert for a hashed string/set value, honoring the cap.
     void freq_add_(ColumnCardinality& col, uint32_t h);

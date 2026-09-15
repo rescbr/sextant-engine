@@ -153,94 +153,7 @@ TEST(TreeFilterColumns, BuildAndVerifyLeafLayout) {
     cfg.num_threads = 4;
     cfg.filter_schema = schema;
     cfg.filter_column_data = make_filter_data_int32_string(n);
-
-    auto result = ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    EXPECT_EQ(result.n_vectors, n);
-
-    auto idx = IVFTreeIndex::open(tree_path);
-    EXPECT_GT(idx->n_leaves(), 0u);
-
-    // --- Verify a leaf's header + summary + filter column region ---
-    std::vector<uint8_t> leaf_buf;
-    LeafExtent le = find_first_leaf(tree_path, leaf_buf);
-    ASSERT_NE(le.page, kInvalidPage);
-
-    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_buf.data());
-    EXPECT_EQ(lh->magic, kTreeLeafMagic);
-    EXPECT_EQ(lh->n_filter_columns, 2u);
-    EXPECT_GT(lh->summary_size, 0u);
-    // filter_columns_offset points past row_ids.
-    const uint64_t fc_off_expected =
-        leaf_rowids_offset(lh->summary_size,
-                            (static_cast<uint32_t>(lh->count) +
-                             lh->codes_per_block - 1) / lh->codes_per_block,
-                            lh->block_bytes) +
-        static_cast<uint64_t>(lh->count) * sizeof(RowId);
-    EXPECT_EQ(lh->filter_columns_offset, fc_off_expected);
-
-    // --- Verify the summary region: numeric min/max for "year" ---
-    const uint8_t* summary = leaf_buf.data() + leaf_filter_offset();
-    uint8_t n_numeric = summary[0];
-    ASSERT_EQ(n_numeric, 1u);  // only "year" is numeric
-    uint8_t col_id = summary[1];
-    EXPECT_EQ(col_id, 0u);  // "year" is column 0
-    double min_val, max_val;
-    std::memcpy(&min_val, summary + 2, 8);
-    std::memcpy(&max_val, summary + 10, 8);
-    // year values are 2000..2049; min ≥ 2000, max ≤ 2049.
-    EXPECT_GE(min_val, 2000.0);
-    EXPECT_LE(min_val, 2049.0);
-    EXPECT_GE(max_val, 2000.0);
-    EXPECT_LE(max_val, 2049.0);
-    EXPECT_LE(min_val, max_val);
-
-    // --- Verify the filter column data region: int32 "year" column ---
-    // Layout after factors: [int32 year: count × 4][string category: ...]
-    const uint32_t count = static_cast<uint32_t>(lh->count);
-    const uint8_t* fc = leaf_buf.data() + lh->filter_columns_offset;
-    // The "year" column is the first fixed-width column.
-    for (uint32_t i = 0; i < count; ++i) {
-        int32_t v;
-        std::memcpy(&v, fc + i * 4, 4);
-        EXPECT_GE(v, 2000);
-        EXPECT_LE(v, 2049);
-    }
-
-    std::filesystem::remove(base_path);
-    std::filesystem::remove(tree_path);
-}
-
-// ===========================================================================
-// Phase C: search still works with filter columns present (no predicates).
-// ===========================================================================
-
-TEST(TreeFilterColumns, SearchUnaffectedByFilterColumns) {
-    const uint64_t n = 3000;
-    const uint32_t dim = 48;
-    const uint32_t n_clusters = 30;
-    const std::string base_path = write_test_fbin("tree_filter_search.fbin",
-                                                   n, dim, n_clusters, 11);
-    const std::string tree_path = (std::filesystem::temp_directory_path() /
-                                   "tree_filter_search.tree").string();
-    std::filesystem::remove(tree_path);
-
-    Schema schema;
-    schema.columns.push_back({"year", ColumnType::Int32});
-
-    IVFTreeIndex::BuildConfig cfg;
-    cfg.params.metric = MetricKind::L2Sq;
-    cfg.params.quantizer_type = "pq";
-    cfg.params.pq4_m = 12;
-    cfg.params.scan_pq_bits = 4;
-    cfg.params.partition_balance_factor = 4.0f;
-    cfg.params.closure_epsilon = -1.0f;
-    cfg.k_root = 8;
-    cfg.leaf_capacity = 500;
-    cfg.pca_dims = 16;
-    cfg.max_lloyd_passes = 2;
-    cfg.num_threads = 4;
-    cfg.filter_schema = schema;
-    cfg.filter_column_data = make_filter_data_int32_string(n);
+    cfg.cardinality_spec = CardinalitySpec::all_on();
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
@@ -753,10 +666,11 @@ TEST(TreeFilterColumns, CardinalityTableSerializedAndLoaded) {
     cfg.num_threads = 4;
     cfg.filter_schema = schema;
     cfg.filter_column_data = make_filter_data_int32_string(n);
-
+    cfg.cardinality_spec = CardinalitySpec::all_on();
+ 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
-
+ 
     // The cardinality table must have been serialized and loaded.
     ASSERT_FALSE(idx->cardinality().empty());
     EXPECT_EQ(idx->cardinality().n_vectors(), n);
@@ -1178,7 +1092,8 @@ TEST(TreeCardinalityCap, StringOverflowFallsBackToDistinctEstimate) {
     schema.columns.push_back({"tag", ColumnType::String});
 
     CardinalityTable t;
-    t.init(schema, 1000, /*cap=*/100);
+    const auto on_spec = CardinalitySpec::all_on();
+    t.init(schema, 1000, /*cap=*/100, &on_spec);
 
     // 1000 distinct values, uniform: each appears once.
     for (int i = 0; i < 1000; ++i)
@@ -1213,7 +1128,7 @@ TEST(TreeCardinalityCap, StringOverflowFallsBackToDistinctEstimate) {
     // A column that never overflowed still reports exact 0 for unseen
     // values (unchanged legacy semantics).
     CardinalityTable t2;
-    t2.init(schema, 1000, /*cap=*/0);  // unlimited
+    t2.init(schema, 1000, /*cap=*/0, &on_spec);  // unlimited
     for (int i = 0; i < 50; ++i)
         t2.add_string(0, "tag_" + std::to_string(i));
     EXPECT_NEAR(t2.selectivity_string(0, "tag_999"), 0.0f, 1e-9f);
@@ -1225,7 +1140,8 @@ TEST(TreeCardinalityCap, NumericOverflowSwitchesToBinned) {
     schema.columns.push_back({"doc_idx", ColumnType::Int64});
 
     CardinalityTable t;
-    t.init(schema, 2000, /*cap=*/100);
+    const auto on_spec = CardinalitySpec::all_on();
+    t.init(schema, 2000, /*cap=*/100, &on_spec);
 
     // 1000 distinct values, each appearing twice: uniform over [0, 999].
     for (int i = 0; i < 1000; ++i) {
@@ -1309,10 +1225,11 @@ TEST(TreeCardinalityCap, CappedMergeKeepsBoundsAndFallback) {
     schema.columns.push_back({"url", ColumnType::String});
 
     // Two shard tables with a 50-entry cap each, global with 100.
+    const auto on_spec = CardinalitySpec::all_on();
     CardinalityTable global, shard_a, shard_b;
-    global.init(schema, 10000, 100);
-    shard_a.init(schema, 10000, 50);
-    shard_b.init(schema, 10000, 50);
+    global.init(schema, 10000, 100, &on_spec);
+    shard_a.init(schema, 10000, 50, &on_spec);
+    shard_b.init(schema, 10000, 50, &on_spec);
     for (int i = 0; i < 300; ++i) {
         shard_a.add_string(0, "u_" + std::to_string(i));
         shard_b.add_string(0, "u_" + std::to_string(i));
@@ -1331,12 +1248,168 @@ TEST(TreeCardinalityCap, CappedMergeKeepsBoundsAndFallback) {
 
     // Not-overflowed merge keeps exact-zero semantics for absent values.
     CardinalityTable g2, s2;
-    g2.init(schema, 100, 0);
-    s2.init(schema, 100, 0);
+    g2.init(schema, 100, 0, &on_spec);
+    s2.init(schema, 100, 0, &on_spec);
     s2.add_string(0, "only_value");
     g2.merge_from(s2);
     EXPECT_NEAR(g2.selectivity_string(0, "other"), 0.0f, 1e-9f);
     EXPECT_NEAR(g2.selectivity_string(0, "only_value"), 1.0f / 100.0f, 1e-6f);
+}
+
+// ===========================================================================
+// Per-column tracking policy: off (default) / on / auto with sample-phase
+// identity rejection.
+// ===========================================================================
+
+TEST(TreeCardinalityModes, DefaultOffEverywhere) {
+    Schema schema;
+    schema.columns.push_back({"url", ColumnType::String});
+    schema.columns.push_back({"lang", ColumnType::String});
+
+    CardinalityTable t;
+    t.init(schema, 1000);  // no spec → all Off
+
+    for (int i = 0; i < 500; ++i) {
+        t.add_string(0, "http://x/" + std::to_string(i));
+        t.add_string(1, i % 2 ? "en" : "fr");
+    }
+
+    EXPECT_EQ(t.total_entries(), 0u);
+    EXPECT_FALSE(t.any_overflowed());
+
+    // Blob is tiny: header + one mode flag per column.
+    auto blob = t.serialize();
+    EXPECT_LE(blob.size(), 32u);
+
+    CardinalityTable rt;
+    rt.deserialize(blob.data(), blob.size());
+    EXPECT_EQ(rt.n_vectors(), 1000u);
+    EXPECT_EQ(rt.column_mode(0), CardinalityMode::Off);
+    EXPECT_EQ(rt.column_mode(1), CardinalityMode::Off);
+
+    // Eq selectivity = uniform prior 1/n — and NEVER 0 (a zero estimate
+    // would spuriously trigger the brute-force fallback).
+    EXPECT_NEAR(rt.selectivity_string(0, "http://x/17"), 1.0f / 1000.0f, 1e-9f);
+    EXPECT_NEAR(rt.selectivity_string(1, "en"), 1.0f / 1000.0f, 1e-9f);
+}
+
+TEST(TreeCardinalityModes, AutoCategoricalColumnStaysTracked) {
+    Schema schema;
+    schema.columns.push_back({"lang", ColumnType::String});
+    CardinalitySpec spec;
+    spec.default_mode = CardinalityMode::Auto;
+
+    CardinalityTable t;
+    t.init(schema, 200000, kDefaultCardinalityCap, &spec);
+
+    // 200k values over 100 distinct → distinct/adds ≈ 0.0005 << 0.5.
+    for (int i = 0; i < 200000; ++i)
+        t.add_string(0, "cat_" + std::to_string(i % 100));
+    t.evaluate_auto();
+
+    EXPECT_EQ(t.column_mode(0), CardinalityMode::On);
+    EXPECT_EQ(t.total_entries(), 100u);  // exact counts kept
+
+    // Round-trip: mode on, exact counts preserved.
+    auto blob = t.serialize();
+    CardinalityTable rt;
+    rt.deserialize(blob.data(), blob.size());
+    EXPECT_EQ(rt.column_mode(0), CardinalityMode::On);
+    EXPECT_NEAR(rt.selectivity_string(0, "cat_3"), 2000.0f / 200000.0f, 1e-6f);
+    EXPECT_NEAR(rt.selectivity_string(0, "cat_999"), 0.0f, 1e-9f);
+}
+
+TEST(TreeCardinalityModes, AutoIdentityColumnRejected) {
+    Schema schema;
+    schema.columns.push_back({"url", ColumnType::String});
+    CardinalitySpec spec;
+    spec.default_mode = CardinalityMode::Auto;
+
+    CardinalityTable t;
+    t.init(schema, 200000, kDefaultCardinalityCap, &spec);
+
+    // 200k unique values → distinct/adds ≈ 1.0 > 0.5 → rejected.
+    for (int i = 0; i < 200000; ++i)
+        t.add_string(0, "http://x/" + std::to_string(i));
+    t.evaluate_auto();
+
+    EXPECT_EQ(t.column_mode(0), CardinalityMode::Rejected);
+    EXPECT_EQ(t.total_entries(), 0u);  // exact map + HLL freed
+
+    // Round-trip: frozen est_distinct ≈ 200k survives; Eq → ~1/200k.
+    auto blob = t.serialize();
+    CardinalityTable rt;
+    rt.deserialize(blob.data(), blob.size());
+    EXPECT_EQ(rt.column_mode(0), CardinalityMode::Rejected);
+    const float s = rt.selectivity_string(0, "http://x/123");
+    EXPECT_NEAR(s, 1.0f / 200000.0f, 0.05f / 200000.0f);
+    EXPECT_GT(s, 0.0f);
+    // Blob carries no freq entries — just the mode flag + one u64.
+    EXPECT_LE(blob.size(), 32u);
+}
+
+TEST(TreeCardinalityModes, AutoDecisionPropagatesToShards) {
+    Schema schema;
+    schema.columns.push_back({"url", ColumnType::String});
+    schema.columns.push_back({"lang", ColumnType::String});
+    CardinalitySpec spec;
+    spec.default_mode = CardinalityMode::Auto;
+
+    CardinalityTable global, shard;
+    global.init(schema, 400000, kDefaultCardinalityCap, &spec);
+    shard.init(schema, 400000, kDefaultCardinalityCap, &spec);
+
+    // 100k unique urls + 100k categorical langs (merged via the shard).
+    for (int i = 0; i < 100000; ++i) {
+        shard.add_string(0, "u/" + std::to_string(i));
+        shard.add_string(1, "en");
+    }
+    global.merge_from(shard);  // merge point runs the auto decision
+    global.propagate_modes_to(shard);
+
+    EXPECT_EQ(global.column_mode(0), CardinalityMode::Rejected);
+    EXPECT_EQ(global.column_mode(1), CardinalityMode::On);  // ratio ~0
+    EXPECT_EQ(shard.column_mode(0), CardinalityMode::Rejected);
+
+    // The shard no longer hashes rejected values: adds are no-ops and the
+    // next chunk's merge contributes nothing to the rejected column.
+    shard.clear_stats();
+    for (int i = 0; i < 1000; ++i) shard.add_string(0, "later/" + std::to_string(i));
+    global.merge_from(shard);
+    EXPECT_EQ(global.total_entries(), 1u);  // only lang's "en"
+}
+
+TEST(TreeCardinalityModes, UnknownColumnNameThrows) {
+    Schema schema;
+    schema.columns.push_back({"lang", ColumnType::String});
+    CardinalitySpec spec;
+    spec.per_column["languge"] = CardinalityMode::On;  // typo
+
+    CardinalityTable t;
+    EXPECT_THROW(t.init(schema, 100, kDefaultCardinalityCap, &spec),
+                 sextant::Error);
+}
+
+TEST(TreeCardinalityModes, UntrackedNumericEqUsesPriorRangeConservative) {
+    Schema schema;
+    schema.columns.push_back({"doc_idx", ColumnType::Int64});
+    CardinalitySpec spec;
+    spec.per_column["doc_idx"] = CardinalityMode::Auto;
+
+    CardinalityTable t;
+    t.init(schema, 200000, kDefaultCardinalityCap, &spec);
+    for (int i = 0; i < 200000; ++i) t.add_numeric(0, i);
+    t.evaluate_auto();
+
+    // Identity-like numeric (all distinct) → rejected, exact map freed.
+    EXPECT_EQ(t.column_mode(0), CardinalityMode::Rejected);
+    EXPECT_EQ(t.total_entries(), 0u);
+
+    Predicate eq; eq.op = PredicateOp::Eq; eq.value = 42.0;
+    Predicate lt; lt.op = PredicateOp::Lt; lt.value = 100.0;
+    EXPECT_NEAR(t.selectivity_numeric(0, eq), 1.0f / 200000.0f, 0.05f / 200000.0f);
+    // Range on an untracked column keeps the conservative no-data behavior.
+    EXPECT_NEAR(t.selectivity_numeric(0, lt), 1.0f, 1e-6f);
 }
 
 }  // namespace

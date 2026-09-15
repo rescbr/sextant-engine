@@ -460,6 +460,12 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
         "Max exact cardinality entries per filter column (heavy hitters stay "
         "exact; overflow falls back to HLL distinct estimates / 4096-bin "
         "histograms). 0 = unlimited", false, 1u << 20);
+    p.add<std::string>("cardinality-col", 0,
+        "Per-column cardinality tracking policy, comma-separated specs: "
+        "name | name=on | name=off | name=auto, or the bare keyword 'auto' "
+        "(all filter columns default to auto sampling). Columns not named "
+        "default to off. Example: --cardinality-col language,source,url=auto",
+        false, "");
     p.add<uint32_t>("chunk-vectors", 0,
         "Source chunk size in vectors (fbin builds; larger = fewer "
         "thread-spawn boundaries in the streaming passes)", false, 2048);
@@ -533,6 +539,55 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     cfg.leaf_capacity = p.get<uint32_t>("leaf-capacity");
     cfg.stage_budget_mb = p.get<uint64_t>("stage-budget-mb");
     cfg.cardinality_cap = p.get<uint32_t>("cardinality-cap");
+    {
+        // Parse --cardinality-col specs. The cmdline library keeps only the
+        // last value of a repeated option, so specs are comma-separated.
+        const std::string spec_str = p.get<std::string>("cardinality-col");
+        const auto parse_fail = [&spec_str](const std::string& why) {
+            std::cerr << "build-tree: invalid --cardinality-col spec '"
+                      << spec_str << "': " << why << "\n";
+        };
+        auto split = [](const std::string& s) {
+            std::vector<std::string> out;
+            std::string cur;
+            for (char ch : s) {
+                if (ch == ',') { out.push_back(cur); cur.clear(); }
+                else cur += ch;
+            }
+            out.push_back(cur);
+            return out;
+        };
+        bool ok = true;
+        for (auto& tok : split(spec_str)) {
+            // Trim whitespace.
+            const size_t b = tok.find_first_not_of(" \t");
+            const size_t e = tok.find_last_not_of(" \t");
+            if (b == std::string::npos) continue;
+            tok = tok.substr(b, e - b + 1);
+            if (tok == "auto") {
+                cfg.cardinality_spec.default_mode = tree::CardinalityMode::Auto;
+                continue;
+            }
+            const size_t eq = tok.find('=');
+            const std::string name = eq == std::string::npos
+                ? tok : tok.substr(0, eq);
+            const std::string mode_s = eq == std::string::npos
+                ? "on" : tok.substr(eq + 1);
+            if (name.empty()) { parse_fail("empty column name"); ok = false; continue; }
+            tree::CardinalityMode mode;
+            if (mode_s == "on") mode = tree::CardinalityMode::On;
+            else if (mode_s == "off") mode = tree::CardinalityMode::Off;
+            else if (mode_s == "auto") mode = tree::CardinalityMode::Auto;
+            else {
+                parse_fail("unknown mode '" + mode_s + "' for column '" +
+                           name + "' (expected on|off|auto)");
+                ok = false;
+                continue;
+            }
+            cfg.cardinality_spec.per_column[name] = mode;
+        }
+        if (!ok) return 1;
+    }
     cfg.num_threads = p.get<uint32_t>("threads");
     cfg.pca_dims = p.get<uint32_t>("pca-dims");
     cfg.max_lloyd_passes = p.get<uint32_t>("max-lloyd-passes");
@@ -748,7 +803,16 @@ bool parse_filter_predicate(const std::string& filter_str, sextant::Predicate& p
     pred = sextant::Predicate{};
     pred.column = parts[0];
     const std::string& op_str = parts[1];
-    const std::string& val_str = parts[2];
+    // String values may themselves contain ':' (e.g. url:eq:https://...),
+    // so for the string-valued ops below the value is everything after the
+    // second colon, rejoined.
+    std::string val_str = parts[2];
+    const auto join_tail = [&]() {
+        for (size_t i = 3; i < parts.size(); ++i) {
+            val_str += ':';
+            val_str += parts[i];
+        }
+    };
 
     if      (op_str == "eq")            pred.op = PredicateOp::Eq;
     else if (op_str == "ne")            pred.op = PredicateOp::NotEq;
@@ -812,9 +876,11 @@ bool parse_filter_predicate(const std::string& filter_str, sextant::Predicate& p
             break;
         case PredicateOp::In:
         case PredicateOp::NotIn:
+            join_tail();
             pred.values = split_on(',', val_str);
             break;
         case PredicateOp::Contains:
+            join_tail();
             pred.str_value = val_str;
             break;
         case PredicateOp::ContainsAny:
@@ -834,7 +900,11 @@ bool parse_filter_predicate(const std::string& filter_str, sextant::Predicate& p
         case PredicateOp::Prefix:
         case PredicateOp::Eq:
         case PredicateOp::NotEq:
-            // Could be string or numeric. Try numeric first; fall back to string.
+            // Could be string or numeric. Try numeric first; fall back to
+            // string. Rejoin ':'-bearing tails first (urls, timestamps);
+            // std::stod rejects any string with interior colons anyway, so
+            // numeric specs (which never contain ':') are unaffected.
+            join_tail();
             try { pred.value = std::stod(val_str); }
             catch (...) { pred.str_value = val_str; }
             break;

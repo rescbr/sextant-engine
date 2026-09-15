@@ -100,6 +100,12 @@ public:
                                           // estimate, numeric columns to
                                           // fixed 4096-bin histograms on
                                           // overflow.
+        CardinalitySpec cardinality_spec;  // per-column tracking policy
+                                          // (off/on/auto). Default: every
+                                          // column Off (identifier-like
+                                          // columns carry no information in
+                                          // their freq maps). Populate from
+                                          // --cardinality-col.
         uint16_t n_probe_l0 = 0;       // probe count at level 0 (0 = auto)
         uint16_t n_probe_ln = 0;       // probe count at deeper levels (0 = auto)
         float probe_fraction = 0.0f;   // corpus-fraction probe budget to bake
