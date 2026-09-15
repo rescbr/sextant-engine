@@ -18,6 +18,11 @@ CD=$(dirname "$0")/..
 SEXTANT="$CD/build-x86/tools/sextant"
 PY=~/venvs/corpus/bin/python
 EMB=/mnt/sextant/culturax1m/emb
+# Canonical build input: fp16 FLBA (fixed_len_byte_array, dim*2) — the
+# fast path (zero list assembly, ~0.7s/Lloyd-pass vs 2.9s for list<float>).
+# --vector-fp16 tells the reader the FLBA holds fp16 halves. The list<float>
+# path remains supported (see README vector-layout table).
+FP16=/mnt/sextant/culturax1m/emb_flba16_raw
 OUT=/mnt/sextant/culturax_e2e
 MINI=0; SKIP_BUILD=0
 for a in "$@"; do
@@ -43,7 +48,7 @@ if [[ $MINI -eq 0 && $SKIP_BUILD -eq 0 ]] && ! grep -q "ALL DONE" "$EMB/progress
 fi
 SHARDS=("$EMB"/chunk_*.parquet)
 [[ ${#SHARDS[@]} -ge 1 ]] || { echo "no chunk_*.parquet in $EMB"; exit 1; }
-if [[ $MINI -eq 1 ]]; then INPUT_GLOB="${SHARDS[0]}"; else INPUT_GLOB="$EMB/chunk_*.parquet"; fi
+if [[ $MINI -eq 1 ]]; then INPUT_GLOB="${SHARDS[0]}"; VEC_FLAGS=""; else INPUT_GLOB="$FP16/chunk_*.parquet"; VEC_FLAGS="--vector-fp16"; fi
 # Build input = the corpus parquets directly (emb + text payload + language/
 # url/source/doc_idx/... auto filter columns). An earlier carquet 'set
 # column' failure that forced a slim (emb+text) workaround turned out to be
@@ -52,8 +57,8 @@ if [[ $MINI -eq 1 ]]; then INPUT_GLOB="${SHARDS[0]}"; else INPUT_GLOB="$EMB/chun
 echo "input: $INPUT_GLOB (${#SHARDS[@]} shard files present)"
 
 if [[ $SKIP_BUILD -eq 0 ]]; then
-    echo "== 1. materialize base fbin + mutation fixtures =="
-    $PY - "$INPUT_GLOB" "$OUT" <<'EOF'
+    echo "== 1. materialize base fbin + mutation fixtures (fp32 from $EMB) =="
+    $PY - "$EMB/chunk_*.parquet" "$OUT" <<'EOF'
 import sys, glob, struct
 import numpy as np
 import pyarrow.parquet as pq
@@ -89,8 +94,8 @@ EOF
 
     echo "== 3. build-tree (defaults + payload + filter columns) =="
     /usr/bin/time -f "build_wall=%es peak_rss=%MKB" \
-    "$SEXTANT" build-tree --input "$INPUT_GLOB" --vector-col emb \
-        --payload-col text --index "$OUT/cx.tree" 2>&1 | tail -5
+    "$SEXTANT" build-tree --input "$INPUT_GLOB" $VEC_FLAGS --vector-col emb \
+        --payload-col text --index "$OUT/cx.tree" 2>&1 | tee "$OUT/build.log" | tail -5
     gate "default tree built (plane+payload+filters)" $?
 
     echo "== 3b. build plane-less mutation tree (head subset) =="
@@ -171,3 +176,10 @@ gate "post-mutation search runs" $?
 
 echo
 if [[ "${FAILED:-0}" -eq 0 ]]; then echo "E2E RESULT: ALL GATES PASS"; else echo "E2E RESULT: FAILURES PRESENT"; exit 1; fi
+
+# --- Canonical metrics digest (scrape from the logs written above) ---
+BW=$(grep -oE "build_wall=[0-9.m]+" "$OUT/build.log" 2>/dev/null | tail -1 | cut -d= -f2)
+WQ=$(grep -oE "\([0-9.]+ QPS\)" "$OUT/warm.log" 2>/dev/null | tail -1 | tr -d '()' | awk '{print $1}')
+CQ=$(grep -oE "\([0-9.]+ QPS\)" "$OUT/cold.log" 2>/dev/null | tail -1 | tr -d '()' | awk '{print $1}')
+WR=$(grep -oE "recall@10: [0-9.]+" "$OUT/warm.log" 2>/dev/null | tail -1 | cut -d' ' -f2)
+echo "METRICS build_wall=${BW:-?} warm_qps=${WQ:-?} cold_qps=${CQ:-?} warm_recall=${WR:-?} (n=2919988, fp16-flba-raw)"
