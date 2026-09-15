@@ -293,6 +293,19 @@ public:
     /// the TreeLeafHeader. Must be thread-safe given per-worker setups.
     virtual void scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
                            RawScanHeap& heap) = 0;
+    /// True when scan_leaf_batch() exploits multi-query decoding (one
+    /// pass over the leaf's code rows shared by up to 4 queries).
+    virtual bool supports_batch_scan() const { return false; }
+    /// Scan one leaf for up to 4 queries (`n` <= 4): `setups`/`heaps`
+    /// are parallel per-query arrays, all already bound to this leaf
+    /// (bind_leaf called per setup by the caller). The default loops
+    /// scan_leaf per query — identical results, no decode sharing.
+    virtual void scan_leaf_batch(const ScanSetup* const setups[4],
+                                 const uint8_t* leaf,
+                                 RawScanHeap* const heaps[4], uint32_t n) {
+        for (uint32_t q = 0; q < n; ++q)
+            scan_leaf(*setups[q], leaf, *heaps[q]);
+    }
     /// Exact(ish) rerank of one candidate: returns the refined distance.
     /// When `scratch_decoded` != nullptr it receives the decoded vector
     /// (dim floats); families whose rerank never materializes a decode may

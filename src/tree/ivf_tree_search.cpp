@@ -2202,8 +2202,17 @@ void IVFTreeIndex::search_batch(
                     const uint32_t ref_end =
                         li + 1 < n_unique ? uleaves[li + 1].ref_begin
                                           : static_cast<uint32_t>(refs.size());
-                    for (uint32_t ri = ul.ref_begin; ri < ref_end; ++ri) {
-                        const auto& fr = refs[ri];
+                    // Resolve/ensure this leaf's Partials FIRST, by index —
+                    // my_partials.push_back may reallocate, so pointers
+                    // collected now would dangle. bind_leaf is per
+                    // (query,leaf): setups are per-query objects, so each
+                    // query's setup gets bound once per leaf, exactly as
+                    // the per-ref loop did.
+                    const uint32_t nrefs = ref_end - ul.ref_begin;
+                    static thread_local std::vector<uint32_t> pidx;
+                    pidx.resize(nrefs);
+                    for (uint32_t k = 0; k < nrefs; ++k) {
+                        const auto& fr = refs[ul.ref_begin + k];
                         QueryState& s = qs[fr.qidx];
                         Partial* p;
                         auto it = pmap.find(fr.qidx);
@@ -2219,51 +2228,91 @@ void IVFTreeIndex::search_batch(
                         } else {
                             p = &my_partials[it->second];
                         }
+                        pidx[k] = static_cast<uint32_t>(
+                            p - my_partials.data());
                         if (per_leaf) coder_->bind_leaf(*p->setup, leaf_ptr);
-                        RawScanHeap rh{&p->heap, s.W, fr.slot};
-                        coder_->scan_leaf(*p->setup, leaf_ptr, rh);
-                        // Harvest: resolve everything finalize needs from
-                        // THIS leaf while the buffer is valid. Entries are
-                        // admitted to the W-bounded pool only if they beat
-                        // its worst slot (cheap pq-dist compare first;
-                        // row-id/rerank/predicate work only on admission).
-                        {
-                            const auto* lh = reinterpret_cast<
-                                const TreeLeafHeader*>(leaf_ptr);
-                            const RowId* rids =
-                                reinterpret_cast<const RowId*>(
-                                    leaf_ptr +
-                                    coder_->geometry(lh).rowids_offset);
-                            const bool has_preds = !s.predicates->empty();
-                            for (const auto& e : p->heap) {
-                                if (e.leaf_slot != fr.slot) continue;
-                                if (!pool_should_replace(
-                                        p->pool, e.pq_dist, e.leaf_slot,
-                                        e.local_idx))
-                                    continue;
-                                PoolEntry pe;
-                                pe.pq_dist = e.pq_dist;
-                                pe.leaf_slot = e.leaf_slot;
-                                pe.local_idx = e.local_idx;
-                                pe.row_id = rids[e.local_idx];
-                                pe.dist = 0.0f;
-                                pe.reranked = false;
-                                pe.pred_ok = true;
-                                if (eager_rerank) {
-                                    pe.dist = coder_->rerank(
-                                        s.query, *p->setup, leaf_ptr,
-                                        e.local_idx, nullptr);
-                                    pe.reranked = true;
-                                }
-                                if (has_preds) {
-                                    pe.pred_ok = eval_all_predicates(
-                                        leaf_cols, manifest_.schema,
-                                        e.local_idx, *s.predicates,
-                                        s.pred_col_indices,
-                                        s.geo_lng_col_indices);
-                                }
-                                pool_replace(p->pool, std::move(pe));
+                    }
+                    // Harvest: resolve everything finalize needs from
+                    // THIS leaf while the buffer is valid. Entries are
+                    // admitted to the W-bounded pool only if they beat
+                    // its worst slot (cheap pq-dist compare first;
+                    // row-id/rerank/predicate work only on admission).
+                    auto harvest = [&](QueryState& s, Partial* p,
+                                       const ProbeRef& fr) {
+                        const auto* lh = reinterpret_cast<
+                            const TreeLeafHeader*>(leaf_ptr);
+                        const RowId* rids =
+                            reinterpret_cast<const RowId*>(
+                                leaf_ptr +
+                                coder_->geometry(lh).rowids_offset);
+                        const bool has_preds = !s.predicates->empty();
+                        for (const auto& e : p->heap) {
+                            if (e.leaf_slot != fr.slot) continue;
+                            if (!pool_should_replace(
+                                    p->pool, e.pq_dist, e.leaf_slot,
+                                    e.local_idx))
+                                continue;
+                            PoolEntry pe;
+                            pe.pq_dist = e.pq_dist;
+                            pe.leaf_slot = e.leaf_slot;
+                            pe.local_idx = e.local_idx;
+                            pe.row_id = rids[e.local_idx];
+                            pe.dist = 0.0f;
+                            pe.reranked = false;
+                            pe.pred_ok = true;
+                            if (eager_rerank) {
+                                pe.dist = coder_->rerank(
+                                    s.query, *p->setup, leaf_ptr,
+                                    e.local_idx, nullptr);
+                                pe.reranked = true;
                             }
+                            if (has_preds) {
+                                pe.pred_ok = eval_all_predicates(
+                                    leaf_cols, manifest_.schema,
+                                    e.local_idx, *s.predicates,
+                                    s.pred_col_indices,
+                                    s.geo_lng_col_indices);
+                            }
+                            pool_replace(p->pool, std::move(pe));
+                        }
+                    };
+                    // Scan: group this leaf's refs into batches of 4 when
+                    // the coder shares the row decode across queries (one
+                    // pass over the code rows per group instead of per
+                    // ref); otherwise per-query as before.
+                    if (coder_->supports_batch_scan()) {
+                        for (uint32_t k = 0; k < nrefs;) {
+                            const uint32_t bn = std::min(4u, nrefs - k);
+                            const ScanSetup* st[4];
+                            RawScanHeap rhs[4];
+                            RawScanHeap* rhs_p[4];
+                            for (uint32_t b = 0; b < bn; ++b) {
+                                const auto& fr =
+                                    refs[ul.ref_begin + k + b];
+                                QueryState& s = qs[fr.qidx];
+                                Partial* p = &my_partials[pidx[k + b]];
+                                st[b] = p->setup.get();
+                                rhs[b] = RawScanHeap{&p->heap, s.W,
+                                                     fr.slot};
+                                rhs_p[b] = &rhs[b];
+                            }
+                            coder_->scan_leaf_batch(st, leaf_ptr, rhs_p, bn);
+                            for (uint32_t b = 0; b < bn; ++b) {
+                                const auto& fr =
+                                    refs[ul.ref_begin + k + b];
+                                harvest(qs[fr.qidx],
+                                        &my_partials[pidx[k + b]], fr);
+                            }
+                            k += bn;
+                        }
+                    } else {
+                        for (uint32_t k = 0; k < nrefs; ++k) {
+                            const auto& fr = refs[ul.ref_begin + k];
+                            QueryState& s = qs[fr.qidx];
+                            Partial* p = &my_partials[pidx[k]];
+                            RawScanHeap rh{&p->heap, s.W, fr.slot};
+                            coder_->scan_leaf(*p->setup, leaf_ptr, rh);
+                            harvest(s, p, fr);
                         }
                     }
                     // Hot-set: the leaf's harvest is complete — nothing

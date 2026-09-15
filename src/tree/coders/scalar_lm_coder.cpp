@@ -13,6 +13,7 @@ namespace sextant::tree {
 
 using coders::lloyd_split_f32;
 using coders::scalar_scan_leaf;
+using coders::scalar_scan_leaf_batch;
 using coders::ScalarScanCtx;
 
 struct ScalarLmCoder::Setup : public ScanSetup {
@@ -263,13 +264,11 @@ std::unique_ptr<ScanSetup> ScalarLmCoder::scan_setup(const float* query) {
 
 void ScalarLmCoder::bind_leaf(ScanSetup&, const uint8_t*) const {}
 
-void ScalarLmCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
-                              RawScanHeap& heap) {
+ScalarScanCtx ScalarLmCoder::make_scan_ctx(const ScanSetup& setup,
+                                            const uint8_t* leaf) const {
     const auto& s = static_cast<const Setup&>(setup);
     const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
     const uint32_t count = lh->count;
-    if (count == 0) return;
-
     ScalarScanCtx c;
     c.codes = leaf + leaf_codes_offset(lh->summary_size);
     c.count = count;
@@ -294,7 +293,31 @@ void ScalarLmCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
     c.K = quantizer_->K();
     c.shape_u8 = quantizer_->shape_u8();
     c.shape_f32 = quantizer_->shape();
-    scalar_scan_leaf(c, heap);
+    return c;
+}
+
+void ScalarLmCoder::scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
+                              RawScanHeap& heap) {
+    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
+    if (lh->count == 0) return;
+    scalar_scan_leaf(make_scan_ctx(setup, leaf), heap);
+}
+
+void ScalarLmCoder::scan_leaf_batch(const ScanSetup* const setups[4],
+                                    const uint8_t* leaf,
+                                    RawScanHeap* const heaps[4], uint32_t n) {
+    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
+    if (lh->count == 0) return;
+    ScalarScanCtx ctxs[4];
+    const ScalarScanCtx* c4[4];
+    for (uint32_t q = 0; q < n; ++q) {
+        ctxs[q] = make_scan_ctx(*setups[q], leaf);
+        c4[q] = &ctxs[q];
+    }
+    // The kernel touches all 4 ctx slots: pad with the last valid one
+    // (its pad-row dots are computed but never pushed).
+    for (uint32_t q = n; q < 4; ++q) c4[q] = c4[n - 1];
+    scalar_scan_leaf_batch(c4, n, heaps);
 }
 
 float ScalarLmCoder::rerank(const float* query, const ScanSetup& setup,

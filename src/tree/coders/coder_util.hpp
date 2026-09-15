@@ -509,6 +509,154 @@ inline void scalar_i8_dots4(const ScalarScanCtx& c,
     scalar_i8_dots4_ref(c, cp, dots);
 }
 
+/// 4-QUERY batched i8 kernel: one nibble unpack per 16-dim chunk shared by
+/// 4 query contexts (same leaf → same dim/cs), one dpbusd chain per query
+/// against its own a8 broadcast. Per query, the accumulator sequence is
+/// IDENTICAL to scalar_i8_dots4 (same nibs values, same dpbusd order), so
+/// dots[q][v] is bit-identical to a per-query scalar_i8_dots4 call.
+inline void scalar_i8_dots4_q4(const ScalarScanCtx* const c4[4],
+                               const uint8_t* const* cp,
+                               float dots[4][4]) {
+#if defined(SEXTANT_HAS_AVX512_SCAN)
+    const ScalarScanCtx& c0 = *c4[0];
+    const uint32_t dim = c0.dim;
+    const uint32_t cs = c0.cs;
+    const uint32_t padded = (dim + 15) / 16 * 16;
+    const bool fully_padded = padded / 2 <= cs;
+    const uint32_t d16i = fully_padded ? padded : dim / 16 * 16;
+    const __m512i g_tbl = c0.slm_shaped
+        ? _mm512_broadcast_i32x4(_mm_loadu_si128(
+              reinterpret_cast<const __m128i*>(c0.shape_u8)))
+        : _mm512_setzero_si512();
+    __m512i acc[4] = {_mm512_setzero_si512(), _mm512_setzero_si512(),
+                      _mm512_setzero_si512(), _mm512_setzero_si512()};
+    __m512i acclo[4] = {_mm512_setzero_si512(), _mm512_setzero_si512(),
+                        _mm512_setzero_si512(), _mm512_setzero_si512()};
+    for (uint32_t d = 0; d < d16i; d += 16) {
+        __m512i nibs = avx512_nibbles4(cp, d);  // unpack ONCE, shared
+        if (c0.slm_shaped) nibs = _mm512_shuffle_epi8(g_tbl, nibs);
+        for (uint32_t q = 0; q < 4; ++q) {
+            const ScalarScanCtx& cq = *c4[q];
+            const __m128i a128 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(cq.a8 + d));
+            acc[q] = _mm512_dpbusd_epi32(
+                acc[q], nibs, _mm512_broadcast_i32x4(a128));
+            if (cq.i8_mode >= 2 && cq.a8_lo) {
+                const __m128i alo128 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(cq.a8_lo + d));
+                acclo[q] = _mm512_dpbusd_epi32(
+                    acclo[q], nibs, _mm512_broadcast_i32x4(alo128));
+            }
+        }
+    }
+    // Epilogue: fold each 128-bit lane's four dwords into the row-v total
+    // with SIMD shuffles only (row v lives in lane v). Single store; the
+    // four row totals are read from the folded lanes.
+    alignas(64) int32_t sums[16];
+    alignas(64) int32_t sums_lo[16];
+    for (uint32_t q = 0; q < 4; ++q) {
+        const ScalarScanCtx& cq = *c4[q];
+        const bool lo = cq.i8_mode >= 2 && cq.a8_lo;
+        __m512i t = _mm512_add_epi32(acc[q], _mm512_shuffle_epi32(
+                                         acc[q], _MM_SHUFFLE(2, 3, 0, 1)));
+        t = _mm512_add_epi32(t, _mm512_shuffle_epi32(
+                                 t, _MM_SHUFFLE(1, 0, 3, 2)));
+        __m512i u = t;
+        if (lo) {
+            u = _mm512_add_epi32(
+                acclo[q], _mm512_shuffle_epi32(acclo[q],
+                                               _MM_SHUFFLE(2, 3, 0, 1)));
+            u = _mm512_add_epi32(u, _mm512_shuffle_epi32(
+                                     u, _MM_SHUFFLE(1, 0, 3, 2)));
+            _mm512_store_si512(reinterpret_cast<__m512i*>(sums_lo), u);
+        }
+        _mm512_store_si512(reinterpret_cast<__m512i*>(sums), t);
+        if (lo) {
+            const __m128 f = _mm_add_ps(
+                _mm_cvtepi32_ps(_mm_setr_epi32(sums[0], sums[4], sums[8],
+                                               sums[12])),
+                _mm_mul_ps(_mm_cvtepi32_ps(_mm_setr_epi32(
+                              sums_lo[0], sums_lo[4], sums_lo[8],
+                              sums_lo[12])),
+                           _mm_set1_ps(1.0f / 127.0f)));
+            _mm_storeu_ps(&dots[q][0], _mm_mul_ps(f, _mm_set1_ps(cq.i8_inv)));
+        } else {
+            const __m128 f = _mm_mul_ps(
+                _mm_cvtepi32_ps(_mm_setr_epi32(sums[0], sums[4], sums[8],
+                                               sums[12])),
+                _mm_set1_ps(cq.i8_inv));
+            _mm_storeu_ps(&dots[q][0], f);
+        }
+    }
+    if (!fully_padded) {
+        // SIMD tail: masked loads build zero-padded rows; zero nibbles
+        // contribute nothing to dpbusd, so the padded chunk is exact.
+        const uint32_t rem = dim - d16i;           // 1..15 dims
+        const uint32_t nbytes = (rem + 1) / 2;     // 1..8 bytes
+        auto row_masked = [&](const uint8_t* row) {
+            const __m128i b = _mm_maskz_loadu_epi8(
+                static_cast<__mmask16>((1u << nbytes) - 1u),
+                row + d16i / 2);
+            const __m128i m = _mm_set1_epi8(0x0F);
+            const __m128i l = _mm_and_si128(b, m);
+            const __m128i h = _mm_and_si128(_mm_srli_epi16(b, 4), m);
+            const __m128i l4 = _mm_srli_si128(l, 4);
+            const __m128i h4 = _mm_srli_si128(h, 4);
+            return _mm_unpacklo_epi64(_mm_unpacklo_epi8(l, h),
+                                      _mm_unpacklo_epi8(l4, h4));
+        };
+        const __m512i nibs = _mm512_inserti32x4(
+            _mm512_inserti32x4(
+                _mm512_inserti32x4(
+                    _mm512_castsi128_si512(row_masked(cp[0])),
+                    row_masked(cp[1]), 1),
+                row_masked(cp[2]), 2),
+            row_masked(cp[3]), 3);
+        const __m512i nibs_g =
+            c0.slm_shaped ? _mm512_shuffle_epi8(g_tbl, nibs) : nibs;
+        const __mmask8 ma = static_cast<__mmask8>((1u << rem) - 1u);
+        auto fold = [](__m512i v) {
+            __m512i t = _mm512_add_epi32(
+                v, _mm512_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
+            return _mm512_add_epi32(
+                t, _mm512_shuffle_epi32(t, _MM_SHUFFLE(1, 0, 3, 2)));
+        };
+        for (uint32_t q = 0; q < 4; ++q) {
+            const ScalarScanCtx& cq = *c4[q];
+            const bool lo = cq.i8_mode >= 2 && cq.a8_lo;
+            const __m128i a128 = _mm_maskz_loadu_epi8(ma, cq.a8 + d16i);
+            __m512i tq = _mm512_dpbusd_epi32(
+                _mm512_setzero_si512(), nibs_g,
+                _mm512_broadcast_i32x4(a128));
+            __m512i ulo = tq;
+            if (lo) {
+                const __m128i alo = _mm_maskz_loadu_epi8(ma,
+                                                         cq.a8_lo + d16i);
+                ulo = _mm512_dpbusd_epi32(_mm512_setzero_si512(), nibs_g,
+                                          _mm512_broadcast_i32x4(alo));
+            }
+            _mm512_store_si512(reinterpret_cast<__m512i*>(sums), fold(tq));
+            if (lo) _mm512_store_si512(reinterpret_cast<__m512i*>(sums_lo),
+                                       fold(ulo));
+            const __m128 f0 = _mm_cvtepi32_ps(
+                _mm_setr_epi32(sums[0], sums[4], sums[8], sums[12]));
+            const __m128 f = lo
+                ? _mm_add_ps(f0, _mm_mul_ps(
+                    _mm_cvtepi32_ps(_mm_setr_epi32(
+                        sums_lo[0], sums_lo[4], sums_lo[8], sums_lo[12])),
+                    _mm_set1_ps(1.0f / 127.0f)))
+                : f0;
+            _mm_storeu_ps(&dots[q][0], _mm_add_ps(
+                _mm_loadu_ps(&dots[q][0]),
+                _mm_mul_ps(f, _mm_set1_ps(cq.i8_inv))));
+        }
+    }
+    return;
+#endif
+    for (uint32_t q = 0; q < 4; ++q)
+        scalar_i8_dots4_ref(*c4[q], cp, dots[q]);
+}
+
 inline void scalar_arith_dots4(const ScalarScanCtx& c,
                                const uint8_t* const* cp, float dots[4]) {
 #if defined(SEXTANT_HAS_AVX512_SCAN)
@@ -620,6 +768,51 @@ inline void scalar_scan_leaf(const ScalarScanCtx& c, RawScanHeap& heap) {
     if (c.i8_mode) scalar_scan_i8(c, heap);
     else if (c.slm_arith) scalar_scan_arith(c, heap);
     else scalar_scan_gather(c, heap);
+}
+
+/// Multi-query i8 scan: ONE pass over the leaf's code rows serving up to 4
+/// query contexts (same leaf → same codes/count/cs). Per query the
+/// candidate push/flush sequence is identical to scalar_scan_i8 (all rows
+/// pushed, one flush), and the buffered admission is arrival-order
+/// independent anyway — heaps end up bit-identical to per-query scans.
+inline void scalar_scan_i8_batch(const ScalarScanCtx* const c4[4],
+                                 uint32_t qn, RawScanHeap* const heaps[4]) {
+    const ScalarScanCtx& c0 = *c4[0];
+    static thread_local std::vector<uint8_t> pad_row_buf;
+    if (pad_row_buf.size() < c0.cs) pad_row_buf.assign(c0.cs, 0);
+    // Reused per-worker buffers (capacity persists across leaves, like the
+    // single-query kernel's thread-local cbuf).
+    static thread_local detail::ScalarCandBuf cbufs[4];
+    for (uint32_t q = 0; q < qn; ++q) cbufs[q].reset();
+    for (uint32_t i = 0; i < c0.count; i += 4) {
+        const auto r = detail::scalar_rows(c0, i, pad_row_buf.data());
+        float dots[4][4];
+        scalar_i8_dots4_q4(c4, r.cp, dots);
+        for (uint32_t q = 0; q < qn; ++q)
+            detail::scalar_cand_push4(cbufs[q], *c4[q], i, r.nv, dots[q]);
+    }
+    for (uint32_t q = 0; q < qn; ++q)
+        detail::scalar_cand_flush(cbufs[q], *heaps[q]);
+}
+
+/// Batched dispatch for up to 4 query contexts on one leaf. Uses the
+/// shared-unpack i8 kernel when every context agrees on i8_mode and
+/// slm_shaped (the normal case — one coder, one leaf); otherwise falls
+/// back to per-query scalar_scan_leaf (zero behavior change either way).
+inline void scalar_scan_leaf_batch(const ScalarScanCtx* const c4[4],
+                                   uint32_t qn, RawScanHeap* const heaps[4]) {
+    if (qn > 0 && c4[0]->i8_mode) {
+        bool uniform = true;
+        for (uint32_t q = 0; q < qn; ++q)
+            if (!c4[q]->i8_mode ||
+                c4[q]->slm_shaped != c4[0]->slm_shaped) uniform = false;
+        if (uniform) {
+            scalar_scan_i8_batch(c4, qn, heaps);
+            return;
+        }
+    }
+    for (uint32_t q = 0; q < qn; ++q)
+        scalar_scan_leaf(*c4[q], *heaps[q]);
 }
 
 /// Fused decode+L2² rerank for arithmetic (uniform / shared-shape) 4-bit

@@ -10,6 +10,10 @@
 
 #include <vector>
 
+namespace sextant::tree::coders {
+struct ScalarScanCtx;  // defined in coder_util.hpp
+}
+
 namespace sextant::tree {
 
 class LocalScalarCoder final : public LeafCoder {
@@ -44,6 +48,10 @@ public:
     void bind_leaf(ScanSetup& setup, const uint8_t* leaf) const override;
     void scan_leaf(const ScanSetup& setup, const uint8_t* leaf,
                    RawScanHeap& heap) override;
+    bool supports_batch_scan() const override { return true; }
+    void scan_leaf_batch(const ScanSetup* const setups[4],
+                         const uint8_t* leaf, RawScanHeap* const heaps[4],
+                         uint32_t n) override;
     float rerank(const float* query, const uint8_t* leaf, uint32_t local_idx,
                  float* scratch_decoded) override;
 
@@ -81,6 +89,9 @@ public:
 
 private:
     struct Setup;
+    /// Per-(query,leaf) kernel context (shared by scan_leaf / batch path).
+    coders::ScalarScanCtx make_scan_ctx(const ScanSetup& setup,
+                                        const uint8_t* leaf) const;
     CoderParams params_;
 };
 
