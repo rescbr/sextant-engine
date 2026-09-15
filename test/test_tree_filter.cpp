@@ -5,6 +5,7 @@
 #include "tree/page_file.hpp"
 #include "tree/superblock.hpp"
 #include "tree/filter_scan.hpp"  // eval_predicate_geo, haversine_km, summary_may_match
+#include "tree/filter_hash.hpp"  // filter_hash (legacy cardinality blob test)
 #include <sextant/column_data.hpp>
 #include <sextant/error.hpp>
 #include "sextant/config.hpp"
@@ -1167,5 +1168,177 @@ TEST(GeoPredicate, SummaryMayMatchGeoRadius) {
                                     {far}, {0}, {1}));
 }
 
+// ===========================================================================
+// Phase D memory bounds: capped string freq maps, HLL distinct estimate,
+// binned numeric histograms, and versioned/legacy serialization compat.
+// ===========================================================================
+
+TEST(TreeCardinalityCap, StringOverflowFallsBackToDistinctEstimate) {
+    Schema schema;
+    schema.columns.push_back({"tag", ColumnType::String});
+
+    CardinalityTable t;
+    t.init(schema, 1000, /*cap=*/100);
+
+    // 1000 distinct values, uniform: each appears once.
+    for (int i = 0; i < 1000; ++i)
+        t.add_string(0, "tag_" + std::to_string(i));
+
+    // Capped: at most 100 exact entries, column flagged overflowed.
+    // (Exact count depends on which keys won races, but never exceeds cap.)
+    const auto* col = &t;
+    (void)col;
+    EXPECT_TRUE(t.any_overflowed());
+    EXPECT_LE(t.total_entries(), 100u);
+
+    // Values present in the exact map report exact counts (1/1000).
+    // Values absent from the map report ~1/est_distinct (NOT 0: the column
+    // overflowed, so absence from the map doesn't mean absence in the data).
+    float s_seen = 0.0f;
+    float s_unseen = 0.0f;
+    for (int i = 0; i < 1000; ++i) {
+        const float s = t.selectivity_string(0, "tag_" + std::to_string(i));
+        if (i < 100)
+            s_seen = std::max(s_seen, s);
+        else
+            s_unseen = std::max(s_unseen, s);
+    }
+    // tag_0..tag_99 may or may not all be retained, but every query returns
+    // a positive estimate bounded by 1/est_distinct ≈ 1/1000-ish. HLL on
+    // 1000 distinct values of a 2^12 register set is accurate to ~2%.
+    EXPECT_GT(s_unseen, 0.0f);
+    EXPECT_LT(s_unseen, 0.01f);
+    EXPECT_GT(s_seen, 0.0f);
+
+    // A column that never overflowed still reports exact 0 for unseen
+    // values (unchanged legacy semantics).
+    CardinalityTable t2;
+    t2.init(schema, 1000, /*cap=*/0);  // unlimited
+    for (int i = 0; i < 50; ++i)
+        t2.add_string(0, "tag_" + std::to_string(i));
+    EXPECT_NEAR(t2.selectivity_string(0, "tag_999"), 0.0f, 1e-9f);
+    EXPECT_NEAR(t2.selectivity_string(0, "tag_7"), 1.0f / 1000.0f, 1e-6f);
+}
+
+TEST(TreeCardinalityCap, NumericOverflowSwitchesToBinned) {
+    Schema schema;
+    schema.columns.push_back({"doc_idx", ColumnType::Int64});
+
+    CardinalityTable t;
+    t.init(schema, 2000, /*cap=*/100);
+
+    // 1000 distinct values, each appearing twice: uniform over [0, 999].
+    for (int i = 0; i < 1000; ++i) {
+        t.add_numeric(0, i);
+        t.add_numeric(0, i);
+    }
+
+    EXPECT_TRUE(t.any_overflowed());
+    EXPECT_EQ(t.total_entries(), 0u);  // exact map replaced by bins
+
+    // Range selectivity via bins: half the mass below 500.
+    Predicate lt;
+    lt.op = PredicateOp::Lt;
+    lt.value = 500;
+    EXPECT_NEAR(t.selectivity_numeric(0, lt), 0.5f, 0.05f);
+
+    Predicate ge;
+    ge.op = PredicateOp::Ge;
+    ge.value = 750;
+    EXPECT_NEAR(t.selectivity_numeric(0, ge), 0.25f, 0.05f);
+
+    Predicate bt;
+    bt.op = PredicateOp::Between;
+    bt.value = 100;
+    bt.value2 = 300;
+    EXPECT_NEAR(t.selectivity_numeric(0, bt), 0.2f, 0.05f);
+
+    Predicate outside;
+    outside.op = PredicateOp::Lt;
+    outside.value = -1;
+    EXPECT_NEAR(t.selectivity_numeric(0, outside), 0.0f, 1e-6f);
+
+    // Round-trip through the versioned serializer preserves binned mode and
+    // the overflow fallback.
+    auto blob = t.serialize();
+    CardinalityTable rt;
+    rt.deserialize(blob.data(), blob.size());
+    EXPECT_EQ(rt.n_vectors(), 2000u);
+    EXPECT_NEAR(rt.selectivity_numeric(0, lt), t.selectivity_numeric(0, lt),
+                1e-6f);
+}
+
+TEST(TreeCardinalityCap, LegacyBlobStillDeserializes) {
+    // Hand-craft a LEGACY cardinality blob (pre-cap format):
+    //   [n_vectors: u64][n_columns: u32]
+    //   per column: [col_id: u32][is_numeric: u8][n_entries: u32]
+    //               [n_entries × (hash: u32, count: u32)]
+    const uint64_t n = 100;
+    const uint32_t h1 = filter_hash(std::string_view("alpha"));
+    const uint32_t h2 = filter_hash(std::string_view("beta"));
+
+    std::vector<uint8_t> blob;
+    auto push_u32 = [&](uint32_t v) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        blob.insert(blob.end(), p, p + 4);
+    };
+    auto push_u64 = [&](uint64_t v) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        blob.insert(blob.end(), p, p + 8);
+    };
+    push_u64(n);      // n_vectors
+    push_u32(1);      // n_columns
+    push_u32(3);      // col_id
+    blob.push_back(0);  // is_numeric = false
+    push_u32(2);      // n_entries
+    push_u32(h1); push_u32(90);
+    push_u32(h2); push_u32(10);
+
+    CardinalityTable t;
+    t.deserialize(blob.data(), blob.size());
+    EXPECT_EQ(t.n_vectors(), n);
+    EXPECT_FALSE(t.empty());
+    EXPECT_NEAR(t.selectivity_string(3, "alpha"), 0.9f, 1e-6f);
+    EXPECT_NEAR(t.selectivity_string(3, "beta"), 0.1f, 1e-6f);
+    // Not overflowed (legacy blobs never are) → unseen value reports 0.
+    EXPECT_NEAR(t.selectivity_string(3, "gamma"), 0.0f, 1e-9f);
+}
+
+TEST(TreeCardinalityCap, CappedMergeKeepsBoundsAndFallback) {
+    Schema schema;
+    schema.columns.push_back({"url", ColumnType::String});
+
+    // Two shard tables with a 50-entry cap each, global with 100.
+    CardinalityTable global, shard_a, shard_b;
+    global.init(schema, 10000, 100);
+    shard_a.init(schema, 10000, 50);
+    shard_b.init(schema, 10000, 50);
+    for (int i = 0; i < 300; ++i) {
+        shard_a.add_string(0, "u_" + std::to_string(i));
+        shard_b.add_string(0, "u_" + std::to_string(i));
+    }
+    global.merge_from(shard_a);
+    global.merge_from(shard_b);
+
+    EXPECT_LE(global.total_entries(), 100u);
+    EXPECT_TRUE(global.any_overflowed());
+
+    // Merged fallback estimate: ~300 distinct (each value appears twice in
+    // the merged data) — 1/300 ± HLL error, comfortably far from 0.
+    const float s = global.selectivity_string(0, "definitely_not_there");
+    EXPECT_GT(s, 1.0f / 600.0f);
+    EXPECT_LT(s, 1.0f / 100.0f);
+
+    // Not-overflowed merge keeps exact-zero semantics for absent values.
+    CardinalityTable g2, s2;
+    g2.init(schema, 100, 0);
+    s2.init(schema, 100, 0);
+    s2.add_string(0, "only_value");
+    g2.merge_from(s2);
+    EXPECT_NEAR(g2.selectivity_string(0, "other"), 0.0f, 1e-9f);
+    EXPECT_NEAR(g2.selectivity_string(0, "only_value"), 1.0f / 100.0f, 1e-6f);
+}
+
 }  // namespace
 }  // namespace sextant::tree
+

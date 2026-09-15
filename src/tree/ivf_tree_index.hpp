@@ -90,6 +90,16 @@ public:
                                           // disk staging). Bounds build RAM
                                           // at scale: in-flight leaf data
                                           // spills to disk beyond this.
+        uint32_t cardinality_cap = kDefaultCardinalityCap;  // max exact
+                                          // per-column cardinality entries
+                                          // (freq map keys / numeric
+                                          // histogram nodes; 0 = unlimited).
+                                          // Bounds Phase D table RAM:
+                                          // string columns switch to insert-
+                                          // if-present + HLL distinct
+                                          // estimate, numeric columns to
+                                          // fixed 4096-bin histograms on
+                                          // overflow.
         uint16_t n_probe_l0 = 0;       // probe count at level 0 (0 = auto)
         uint16_t n_probe_ln = 0;       // probe count at deeper levels (0 = auto)
         float probe_fraction = 0.0f;   // corpus-fraction probe budget to bake

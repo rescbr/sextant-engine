@@ -456,6 +456,10 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     p.add<uint64_t>("stage-budget-mb", 0,
         "RAM budget (MiB) for emission-pass cluster staging arenas. Clusters "
         "spill to a temp file beyond it (0 = pure disk staging)", false, 1024);
+    p.add<uint32_t>("cardinality-cap", 0,
+        "Max exact cardinality entries per filter column (heavy hitters stay "
+        "exact; overflow falls back to HLL distinct estimates / 4096-bin "
+        "histograms). 0 = unlimited", false, 1u << 20);
     p.add<uint32_t>("chunk-vectors", 0,
         "Source chunk size in vectors (fbin builds; larger = fewer "
         "thread-spawn boundaries in the streaming passes)", false, 2048);
@@ -528,6 +532,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
     cfg.k_root = p.get<uint32_t>("k-root");
     cfg.leaf_capacity = p.get<uint32_t>("leaf-capacity");
     cfg.stage_budget_mb = p.get<uint64_t>("stage-budget-mb");
+    cfg.cardinality_cap = p.get<uint32_t>("cardinality-cap");
     cfg.num_threads = p.get<uint32_t>("threads");
     cfg.pca_dims = p.get<uint32_t>("pca-dims");
     cfg.max_lloyd_passes = p.get<uint32_t>("max-lloyd-passes");

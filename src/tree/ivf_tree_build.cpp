@@ -271,7 +271,7 @@ void resolve_build_params(TreeBuildContext& ctx) {
     // estimation. Populated during the emission pass and serialized after all
     // tree nodes are written. No-op when there are no filter columns.
     if (!cfg.filter_schema.empty()) {
-        ctx.card_table.init(cfg.filter_schema, ctx.n);
+        ctx.card_table.init(cfg.filter_schema, ctx.n, cfg.cardinality_cap);
     }
 
     const auto& params = cfg.params;
@@ -1557,10 +1557,15 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         // Hoisted outside the chunk loop so capacity is reused across chunks.
         std::vector<std::vector<ThreadLeafBuffer>> thread_buffers(hw);
         std::vector<CardinalityTable> thread_cards(hw);
+        // Per-thread shards get cap / hw so the aggregate stays within the
+        // global cap after the merge (0 = unlimited on both sides).
+        const uint32_t card_thread_cap = cfg.cardinality_cap == 0
+            ? 0u
+            : std::max(1u, cfg.cardinality_cap / std::max(1u, hw));
         for (uint32_t t = 0; t < hw; ++t) {
             thread_buffers[t].resize(k_root);
             if (has_filter)
-                thread_cards[t].init(cfg.filter_schema, ctx.n);
+                thread_cards[t].init(cfg.filter_schema, ctx.n, card_thread_cap);
         }
 
         uint64_t offset = 0;
@@ -2377,6 +2382,12 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     if (!cfg.filter_schema.empty() && !card_table.empty()) {
         auto card_blob = card_table.serialize();
         const uint64_t card_bytes = card_blob.size();
+        spdlog::info("[sextant] cardinality: {} exact entries{}, blob {} "
+                     "bytes",
+                     card_table.total_entries(),
+                     card_table.any_overflowed() ? " (some columns capped/binned)"
+                                                 : "",
+                     card_bytes);
         card_npg = static_cast<uint32_t>((card_bytes + kPageSize - 1) / kPageSize);
         if (card_npg > 0) {
             card_page = alloc.alloc_extent(file, card_npg);
