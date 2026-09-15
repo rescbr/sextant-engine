@@ -12,6 +12,10 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace sextant::tree {
 
@@ -230,6 +234,31 @@ float PlaneWriter::decode_dim_(uint32_t code, uint32_t e) const {
 void PlaneWriter::prepare(uint32_t n_leaves) { leaves_.resize(n_leaves); }
 
 void PlaneWriter::transfer_leaf(uint32_t cluster, uint32_t leaf_id) {
+    if (spill_fd_ >= 0) {
+        // Spill mode (layout-v1 streaming build): append the flushed leaf's
+        // blocks (+ pv alphas) to the temp file and free the staging state
+        // immediately — RAM stays O(one in-flight cluster) instead of
+        // Θ(n_leaves) blocks until finalize. Records arrive in strictly
+        // increasing leaf_id order (flush order), so finalize reads them
+        // back in one sequential pass.
+        if (cluster >= stage_.size())
+            throw std::runtime_error(
+                "plane: spill transfer of unstaged cluster");
+        LeafState& ls = stage_[cluster];
+        const uint32_t n_blocks = ls.n_blocks;
+        const uint32_t n_alphas =
+            static_cast<uint32_t>(ls.alphas.size());
+        spill_put(&leaf_id, sizeof(leaf_id));
+        spill_put(&n_blocks, sizeof(n_blocks));
+        spill_put(&n_alphas, sizeof(n_alphas));
+        spill_put(ls.blocks.data(),
+                  static_cast<size_t>(n_blocks) * block_bytes_);
+        spill_put(ls.alphas.data(),
+                  static_cast<size_t>(n_alphas) * sizeof(float16_t));
+        ++spill_n_recs_;
+        ls = LeafState{};  // free the RAM now
+        return;
+    }
     if (leaf_id >= leaves_.size()) leaves_.resize(leaf_id + 1);
     // Swap the cluster's accumulated blocks into the global leaf slot;
     // the cluster staging slot receives the fresh (empty) state that was
@@ -271,10 +300,6 @@ void PlaneWriter::encode_into_(PlaneWriter::LeafState& ls, uint32_t slot,
         ls.n_blocks = block + 1;
         ls.blocks.resize(static_cast<size_t>(ls.n_blocks) * block_bytes_, 0);
     }
-    if (ls.proj.size() < static_cast<size_t>(slot + 1) * meta_.rank)
-        ls.proj.resize(static_cast<size_t>(slot + 1) * meta_.rank);
-    std::memcpy(&ls.proj[static_cast<size_t>(slot) * meta_.rank], pr,
-                meta_.rank * sizeof(float));
 
     uint8_t* blk = &ls.blocks[static_cast<size_t>(block) * block_bytes_];
     const uint8_t nbi = static_cast<uint8_t>(lane % 16);
@@ -305,6 +330,31 @@ void PlaneWriter::encode_into_(PlaneWriter::LeafState& ls, uint32_t slot,
                 (blk[s * 16 + nbi] & 0xF0u) | nib);
         }
     }
+
+    if (meta_.encoding == PlaneEncoding::U4LM_PV) {
+        // Least-squares renorm alpha, computed NOW by decoding back this
+        // slot's just-written nibbles — the same accumulation order over s
+        // and the same doubles as the old finalize()-time proj pass, so
+        // the stored fp16 bytes are identical, without retaining the
+        // rank-float projection (512 B/vec) per staged row.
+        const uint8_t* blkr =
+            &ls.blocks[static_cast<size_t>(block) * block_bytes_];
+        const uint8_t nbi2 = static_cast<uint8_t>(lane % 16);
+        double dvc = 0, dcc = 0;
+        for (uint32_t s = 0; s < meta_.rank; ++s) {
+            const uint32_t code = (lane >= 16)
+                ? static_cast<uint32_t>(blkr[s * 16 + nbi2] >> 4)
+                : static_cast<uint32_t>(blkr[s * 16 + nbi2] & 0xFu);
+            const float dc = decode_dim_(code, s);
+            dvc += static_cast<double>(pr[s]) * dc;
+            dcc += static_cast<double>(dc) * dc;
+        }
+        const float a = dcc > 1e-12
+            ? static_cast<float>(dvc / dcc) : 1.0f;
+        if (ls.alphas.size() < static_cast<size_t>(slot + 1))
+            ls.alphas.resize(static_cast<size_t>(slot + 1));
+        ls.alphas[slot] = static_cast<float16_t>(a);
+    }
 }
 
 void PlaneWriter::encode_member(uint32_t leaf_id, uint32_t slot,
@@ -319,7 +369,7 @@ void PlaneWriter::encode_member(uint32_t leaf_id, uint32_t slot,
 
 std::vector<uint8_t> PlaneWriter::finalize(
     const std::vector<uint32_t>& leaf_counts) {
-    if (leaves_.size() != leaf_counts.size())
+    if (spill_fd_ < 0 && leaves_.size() != leaf_counts.size())
         throw std::runtime_error("plane: leaf_counts != prepared leaves");
     const uint32_t R = meta_.rank;
     const bool pv = meta_.encoding == PlaneEncoding::U4LM_PV;
@@ -360,27 +410,15 @@ std::vector<uint8_t> PlaneWriter::finalize(
     std::memcpy(blob.data() + h->mean_off, mean_.data(), mean_bytes);
     std::memcpy(blob.data() + h->codebook_off, codebook_.data(), cb_bytes);
 
-    // Per-dim code decode for the alpha pass (reads the encoded blocks).
-    auto decode_slot = [&](const LeafState& ls, uint32_t slot,
-                           uint32_t s) -> float {
-        const uint32_t block = slot / kVecsPerBlock;
-        const uint32_t lane = slot % kVecsPerBlock;
-        const uint8_t* blk =
-            &ls.blocks[static_cast<size_t>(block) * block_bytes_];
-        if (meta_.encoding == PlaneEncoding::B1G) {
-            const uint32_t g = s / 4, t = s % 4;
-            const uint8_t nbi2 = static_cast<uint8_t>(lane % 16);
-            const uint8_t byte2 = blk[g * 16 + nbi2];
-            const uint32_t nib = (lane >= 16) ? (byte2 >> 4) & 0xFu
-                                              : byte2 & 0xFu;
-            return decode_dim_((nib >> t) & 1u, s);
-        }
-        const uint8_t nbi = static_cast<uint8_t>(lane % 16);
-        const uint32_t code = (lane >= 16)
-            ? static_cast<uint32_t>(blk[s * 16 + nbi] >> 4)
-            : static_cast<uint32_t>(blk[s * 16 + nbi] & 0xFu);
-        return decode_dim_(code, s);
-    };
+    if (spill_fd_ >= 0) {
+        // Layout-v1 spill mode: fill the blocks/alpha regions by replaying
+        // the spill records (leaf_id order == blob order, one sequential
+        // pass), then retire the temp file.
+        finalize_from_spill(blob.data(), leaf_counts, h->blocks_off,
+                           h->alpha_off);
+        spill_close();
+        return blob;
+    }
 
     uint8_t* alpha_cur = blob.data() + h->alpha_off;
     uint8_t* blocks_cur = blob.data() + h->blocks_off;
@@ -394,20 +432,13 @@ std::vector<uint8_t> PlaneWriter::finalize(
         }
         blocks_cur += static_cast<size_t>(nb) * block_bytes_;
         if (!pv) continue;
-        for (uint32_t i = 0; i < leaf_counts[l]; ++i) {
-            const float* v = &ls.proj[static_cast<size_t>(i) * R];
-            double dvc = 0, dcc = 0;
-            for (uint32_t s = 0; s < R; ++s) {
-                const float dc = decode_slot(ls, i, s);
-                dvc += static_cast<double>(v[s]) * dc;
-                dcc += static_cast<double>(dc) * dc;
-            }
-            const float a = dcc > 1e-12
-                ? static_cast<float>(dvc / dcc) : 1.0f;
-            const float16_t h16 = static_cast<float16_t>(a);
-            std::memcpy(alpha_cur, &h16, 2);
-            alpha_cur += 2;
-        }
+        // Alphas were computed at encode time (decode-back of the slot's
+        // nibbles — identical math to the old finalize proj pass).
+        if (ls.alphas.size() < leaf_counts[l])
+            throw std::runtime_error("plane: alphas shorter than leaf count");
+        std::memcpy(alpha_cur, ls.alphas.data(),
+                    static_cast<size_t>(leaf_counts[l]) * 2);
+        alpha_cur += static_cast<size_t>(leaf_counts[l]) * 2;
     }
     return blob;
 }
@@ -458,41 +489,158 @@ std::vector<uint8_t> PlaneWriter::detach_leaf_blocks(uint32_t cluster,
                 static_cast<size_t>(nb) * block_bytes_);
 
     if (pv) {
-        // Same per-member alpha as finalize(): the least-squares scalar
-        // that best reconstructs the projected row from its own decoded
-        // code. Mirrors finalize's decode_slot against the detached
-        // bytes (byte-identical to ls.blocks).
-        const uint32_t R = meta_.rank;
-        auto decode_slot = [&](uint32_t slot, uint32_t s) -> float {
-            const uint32_t block = slot / kVecsPerBlock;
-            const uint32_t lane = slot % kVecsPerBlock;
-            const uint8_t* blk =
-                out.data() + static_cast<size_t>(block) * block_bytes_;
-            const uint8_t nbi = static_cast<uint8_t>(lane % 16);
-            const uint32_t code = (lane >= 16)
-                ? static_cast<uint32_t>(blk[s * 16 + nbi] >> 4)
-                : static_cast<uint32_t>(blk[s * 16 + nbi] & 0xFu);
-            return decode_dim_(code, s);
-        };
-        uint8_t* alpha_cur = out.data() +
-            static_cast<size_t>(nb) * block_bytes_;
-        for (uint32_t i = 0; i < count; ++i) {
-            const float* v = &ls.proj[static_cast<size_t>(i) * R];
-            double dvc = 0, dcc = 0;
-            for (uint32_t s = 0; s < R; ++s) {
-                const float dc = decode_slot(i, s);
-                dvc += static_cast<double>(v[s]) * dc;
-                dcc += static_cast<double>(dc) * dc;
-            }
-            const float a = dcc > 1e-12
-                ? static_cast<float>(dvc / dcc) : 1.0f;
-            const float16_t h16 = static_cast<float16_t>(a);
-            std::memcpy(alpha_cur, &h16, 2);
-            alpha_cur += 2;
-        }
+        // Alphas were computed at encode time (decode-back of the slot's
+        // nibbles — identical math to the previous recompute against the
+        // detached bytes, which are byte-identical to ls.blocks).
+        if (ls.alphas.size() < count)
+            throw std::runtime_error(
+                "plane: staging alphas shorter than leaf count");
+        std::memcpy(out.data() + static_cast<size_t>(nb) * block_bytes_,
+                    ls.alphas.data(), static_cast<size_t>(count) * 2);
     }
     ls = LeafState{};  // staging resets: slots are leaf-local
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// PlaneWriter leaf-block spill (layout v1)
+// ---------------------------------------------------------------------------
+
+PlaneWriter::~PlaneWriter() { spill_close(); }
+
+void PlaneWriter::enable_spill(const std::string& temp_path) {
+    spill_close();
+    spill_fd_ = ::open(temp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (spill_fd_ < 0)
+        throw std::runtime_error("plane: cannot open spill file " +
+                                 temp_path);
+    // Unlink while open: the stage can never outlive the writer, even on
+    // exception or crash (POSIX semantics).
+    ::unlink(temp_path.c_str());
+    spill_wbuf_.resize(1u << 20);
+    spill_wpos_ = 0;
+    spill_wused_ = 0;
+    spill_n_recs_ = 0;
+}
+
+void PlaneWriter::spill_put(const void* p, size_t n) {
+    if (spill_fd_ < 0)
+        throw std::runtime_error("plane: spill write without a spill file");
+    const uint8_t* src = static_cast<const uint8_t*>(p);
+    while (n) {
+        const size_t room = spill_wbuf_.size() - spill_wused_;
+        if (room == 0) {
+            spill_flush();
+            continue;
+        }
+        const size_t c = std::min(room, n);
+        std::memcpy(spill_wbuf_.data() + spill_wused_, src, c);
+        spill_wused_ += c;
+        src += c;
+        n -= c;
+    }
+}
+
+void PlaneWriter::spill_flush() {
+    if (spill_fd_ < 0 || spill_wused_ == 0) return;
+    size_t off = 0;
+    while (off < spill_wused_) {
+        const ssize_t w = ::pwrite(spill_fd_, spill_wbuf_.data() + off,
+                                   spill_wused_ - off,
+                                   static_cast<off_t>(spill_wpos_ + off));
+        if (w <= 0)
+            throw std::runtime_error("plane: short spill write");
+        off += static_cast<size_t>(w);
+    }
+    spill_wpos_ += spill_wused_;
+    spill_wused_ = 0;
+}
+
+void PlaneWriter::spill_close() {
+    if (spill_fd_ < 0) return;
+    try {
+        spill_flush();
+    } catch (...) {
+        // Destructor path: best effort.
+    }
+    ::close(spill_fd_);
+    spill_fd_ = -1;
+    spill_wbuf_.clear();
+    spill_wbuf_.shrink_to_fit();
+    spill_wused_ = 0;
+}
+
+void PlaneWriter::finalize_from_spill(
+    uint8_t* blob, const std::vector<uint32_t>& leaf_counts,
+    uint64_t blocks_off, uint64_t alpha_off) {
+    const bool pv = meta_.encoding == PlaneEncoding::U4LM_PV;
+    spill_flush();
+
+    // Per-leaf blob run offsets (records are in increasing leaf_id order
+    // and the blob's runs are in leaf order, so replay is one sequential
+    // pass).
+    std::vector<uint64_t> blocks_prefix(leaf_counts.size() + 1, 0);
+    std::vector<uint64_t> alpha_prefix(leaf_counts.size() + 1, 0);
+    for (size_t l = 0; l < leaf_counts.size(); ++l) {
+        blocks_prefix[l + 1] = blocks_prefix[l] +
+            ((leaf_counts[l] + kVecsPerBlock - 1) / kVecsPerBlock) *
+            block_bytes_;
+        alpha_prefix[l + 1] = alpha_prefix[l] +
+            (pv ? static_cast<uint64_t>(leaf_counts[l]) * 2 : 0);
+    }
+
+    std::vector<uint8_t> rec;
+    auto pread_all = [&](void* dst, size_t n, uint64_t at) {
+        auto* d = static_cast<uint8_t*>(dst);
+        size_t got = 0;
+        while (got < n) {
+            const ssize_t r = ::pread(spill_fd_, d + got, n - got,
+                                      static_cast<off_t>(at + got));
+            if (r <= 0)
+                throw std::runtime_error(
+                    "plane: short spill read at offset " +
+                    std::to_string(at));
+            got += static_cast<size_t>(r);
+        }
+    };
+
+    uint64_t pos = 0;
+    uint32_t expected = 0;
+    for (uint32_t r = 0; r < spill_n_recs_; ++r) {
+        uint8_t hdr[12];
+        pread_all(hdr, sizeof(hdr), pos);
+        pos += sizeof(hdr);
+        uint32_t leaf_id, n_blocks, n_alphas;
+        std::memcpy(&leaf_id, hdr, 4);
+        std::memcpy(&n_blocks, hdr + 4, 4);
+        std::memcpy(&n_alphas, hdr + 8, 4);
+        if (leaf_id != expected)
+            throw std::runtime_error(
+                "plane: spill records out of leaf order");
+        if (leaf_id >= leaf_counts.size())
+            throw std::runtime_error("plane: spill leaf beyond leaf_counts");
+        const size_t bb = static_cast<size_t>(n_blocks) * block_bytes_;
+        const size_t ab = static_cast<size_t>(n_alphas) * 2;
+        const uint32_t nb =
+            (leaf_counts[leaf_id] + kVecsPerBlock - 1) / kVecsPerBlock;
+        if (n_blocks < nb || (!pv && n_alphas != 0) ||
+            (pv && n_alphas < leaf_counts[leaf_id]))
+            throw std::runtime_error(
+                "plane: spill record shorter than leaf count");
+        if (rec.size() < bb + ab) rec.resize(bb + ab);
+        pread_all(rec.data(), bb + ab, pos);
+        pos += bb + ab;
+        std::memcpy(blob + blocks_off + blocks_prefix[leaf_id],
+                    rec.data(), bb);
+        if (pv)
+            std::memcpy(blob + alpha_off + alpha_prefix[leaf_id],
+                        rec.data() + bb,
+                        static_cast<size_t>(leaf_counts[leaf_id]) * 2);
+        ++expected;
+    }
+    if (expected != leaf_counts.size())
+        throw std::runtime_error(
+            "plane: spill holds fewer leaves than leaf_counts");
 }
 
 // ---------------------------------------------------------------------------

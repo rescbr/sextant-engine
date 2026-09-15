@@ -642,6 +642,9 @@ void train_quantizer_and_pca(TreeBuildContext& ctx) {
         pcfg.train_rows = train_n;
         ctx.plane_writer.train(plane_sample.data(), train_n, dim, pcfg);
         ctx.plane_writer.prepare(0);  // leaves grow on demand
+        if (cfg.plane_layout == 0)
+            ctx.plane_writer.enable_spill(ctx.output_path +
+                                          ".plane.stage");
         ctx.plane = true;
         spdlog::info("[sextant] plane: basis+codebooks trained in {:.2}s "
                      "(in-build, {} sample rows)",

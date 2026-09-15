@@ -25,6 +25,7 @@
 /// IMMUTABLE (mutable ops throw, like scalar_lloydmax) — v1 semantics.
 
 #include "page_file.hpp"
+#include "sextant/types.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -80,6 +81,13 @@ public:
     void encode_staged(uint32_t cluster, uint32_t slot, const float* pr);
     void transfer_leaf(uint32_t cluster, uint32_t leaf_id);
 
+    /// Layout-v1 RAM bound: with the spill enabled, transfer_leaf appends
+    /// each flushed leaf's blocks (+ pv alphas) to a temp file instead of
+    /// retaining every leaf's blocks in RAM until finalize. The file is
+    /// unlinked at open (POSIX unlink-while-open: it can never outlive the
+    /// writer) and closed by finalize/the destructor.
+    void enable_spill(const std::string& temp_path);
+
     /// Projects one vector (rank floats into `pr`).
     void project(const float* vec, float* pr) const;
 
@@ -112,6 +120,8 @@ public:
     std::vector<uint8_t> detach_leaf_blocks(uint32_t cluster,
                                             uint32_t count);
 
+    ~PlaneWriter();
+
     const PlaneMeta& meta() const { return meta_; }
 
 private:
@@ -123,7 +133,8 @@ private:
     // Pending per-leaf encoding state (build-side only).
     struct LeafState {
         std::vector<uint8_t> blocks;  // ceil(count/32) × block_bytes
-        std::vector<float> proj;      // count × rank (alpha pass)
+        std::vector<float16_t> alphas;  // count fp16 alphas (u4lm_pv only;
+                                        // computed at encode time, 2 B/vec)
         uint32_t n_blocks = 0;
     };
     std::vector<LeafState> leaves_;
@@ -134,6 +145,25 @@ private:
 
     uint32_t encode_dim_(float v, uint32_t e) const;
     float decode_dim_(uint32_t code, uint32_t e) const;
+
+    // Leaf-block spill (layout v1 streaming build). Append-only temp file,
+    // unlink-at-open, sequential records in increasing leaf_id order:
+    //   [u32 leaf_id][u32 n_blocks][u32 n_alphas]
+    //   [n_blocks × block_bytes blocks][n_alphas × 2 alpha bytes]
+    std::string spill_path_;
+    int spill_fd_ = -1;
+    std::vector<uint8_t> spill_wbuf_;  // 1 MiB append buffer
+    size_t spill_wpos_ = 0;            // next file byte for the buffer
+    size_t spill_wused_ = 0;           // bytes pending in spill_wbuf_
+    uint32_t spill_n_recs_ = 0;
+    void spill_put(const void* p, size_t n);
+    void spill_flush();
+    void spill_close();
+    // Fills the blob's blocks/alpha regions from the spill (one sequential
+    // pass). `blocks_prefix`/`alpha_prefix` are per-leaf blob offsets.
+    void finalize_from_spill(uint8_t* blob,
+                             const std::vector<uint32_t>& leaf_counts,
+                             uint64_t blocks_off, uint64_t alpha_off);
 };
 
 /// Search side: read-only view over an attached plane extent.
