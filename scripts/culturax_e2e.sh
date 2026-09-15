@@ -142,6 +142,34 @@ FR=$("$SEXTANT" tree-search --index "$OUT/cx.tree" --query "$OUT/q5.fbin" \
 awk -v r="${FR:-0}" 'BEGIN{exit !(r >= 9)}'
 gate "filtered search returns full result set (${FR:-0}/query, is_first_chunk=1)" $?
 
+# == 5c. synthetic-query recall (LLM-generated RAG queries; alongside the
+# self-query gate). Fixtures: cx_synth1k{,_16}_gt.gtmm from
+# corpora/gen_synth_queries.py + embed_queries.py + gen_ground_truth.py.
+# Two gates: (a) default config recall >= 0.75; (b) INVARIANT: f=1.0 +
+# exact rerank == 1.0 — synthetic queries have no duplicate-vector ties,
+# so the exact path must be perfect (self-queries saturate at ~0.86
+# from sibling ties and cannot gate this).
+if [[ -f "$OUT/cx_synth1k16_gt.gtmm" && -f "$OUT/cx_base16.fbin" ]]; then
+    SR=$("$SEXTANT" tree-search --index "$OUT/cx.tree" \
+        --query "$OUT/cx_synth1k16_query.fbin" \
+        --ground-truth "$OUT/cx_synth1k16_gt.gtmm" \
+        --threads 16 --batch-window 256 --probe-fraction 0.1 2>&1 \
+        | grep -oE "recall@10: [0-9.]+" | grep -oE "[0-9.]+$")
+    awk -v r="${SR:-0}" 'BEGIN{exit !(r >= 0.75)}'
+    gate "synthetic-query recall ${SR:-0} >= 0.75 (f=.1, 1k RAG queries)" $?
+    ER=$("$SEXTANT" tree-search --index "$OUT/cx.tree" \
+        --query "$OUT/cx_synth1k16_query.fbin" \
+        --ground-truth "$OUT/cx_synth1k16_gt.gtmm" \
+        --threads 16 --batch-window 256 --probe-fraction 1.0 \
+        --exact-rerank-base "$OUT/cx_base16.fbin" 2>&1 \
+        | grep -oE "recall@10: [0-9.]+" | grep -oE "[0-9.]+$")
+    awk -v r="${ER:-0}" 'BEGIN{exit !(r >= 0.999)}'
+    gate "synthetic exact-rerank invariant ${ER:-0} == 1.0 (f=1.0)" $?
+else
+    echo "synthetic-query fixtures absent — skipping 5c (generate via"
+    echo "corpora/gen_synth_queries.py + embed_queries.py + gen_ground_truth.py)"
+fi
+
 echo "== 6. payload roundtrip =="
 head -c 400000 "$OUT/cx_query.fbin" > "$OUT/q5.fbin"  # ~130 queries x 768 x f32
 "$SEXTANT" tree-search --index "$OUT/cx.tree" --query "$OUT/q5.fbin" \

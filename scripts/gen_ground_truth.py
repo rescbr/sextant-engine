@@ -25,25 +25,38 @@ def main():
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--chunk-size", type=int, default=50000)
+    ap.add_argument("--queries", default=None,
+                    help="external query fbin (overrides --n-queries "
+                         "sampling; GT ids index the base)")
     args = ap.parse_args()
 
     with open(args.base, 'rb') as f:
         n, dim = struct.unpack('<II', f.read(8))
     print(f"Base: {n} vectors, dim={dim}")
 
-    nq = min(args.n_queries, n)
+    if args.queries:
+        with open(args.queries, 'rb') as f:
+            nq, qdim = struct.unpack('<II', f.read(8))
+            assert qdim == dim, f"query dim {qdim} != base dim {dim}"
+            qv = np.frombuffer(f.read(nq * qdim * 4), dtype=np.float32)
+            qv = qv.reshape(nq, qdim)
+    else:
+        nq = min(args.n_queries, n)
     k = min(args.k, n - 1)
     rng = np.random.default_rng(args.seed)
 
     # Pick query indices.
-    query_idx = np.sort(rng.choice(n, size=nq, replace=False))
-    query_set = set(query_idx.tolist())
+    query_idx = (np.sort(rng.choice(n, size=nq, replace=False))
+                 if args.queries is None else None)
+    query_set = set(query_idx.tolist()) if query_idx is not None else set()
 
     # Pass 1: read query vectors and all norms (streaming).
     print("Pass 1: collecting query vectors + norms...")
-    queries = np.empty((nq, dim), dtype=np.float32)
+    queries = (np.empty((nq, dim), dtype=np.float32)
+               if args.queries is None else qv.astype(np.float32))
     norms = np.empty(n, dtype=np.float32)
-    qi_map = {idx: i for i, idx in enumerate(query_idx)}
+    qi_map = ({idx: i for i, idx in enumerate(query_idx)}
+              if query_idx is not None else {})
     vec_bytes = dim * 4
     with open(args.base, 'rb') as f:
         f.read(8)
@@ -52,7 +65,8 @@ def main():
             norms[i] = np.dot(vec, vec)
             if i in qi_map:
                 queries[qi_map[i]] = vec
-    query_norms = norms[query_idx]
+    query_norms = (norms[query_idx] if args.queries is None
+                   else np.linalg.norm(queries, axis=1))
     print(f"  {nq} queries loaded.")
 
     # Pass 2: streaming brute-force KNN with chunked dot-product matrix.
@@ -102,8 +116,10 @@ def main():
                 # Merge with existing top-k.
                 all_d = np.concatenate([top_dists[q], cand_dists])
                 all_i = np.concatenate([top_ids[q], cand_ids])
-                # Exclude self.
-                mask = all_i != query_idx[q]
+                # Exclude self (sampled-from-base queries only; external
+                # queries keep their generating chunk as a GT target).
+                self_id = query_idx[q] if query_idx is not None else -1
+                mask = all_i != self_id
                 all_d = all_d[mask]
                 all_i = all_i[mask]
                 if len(all_d) <= k:
