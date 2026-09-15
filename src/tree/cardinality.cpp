@@ -774,9 +774,8 @@ float CardinalityTable::selectivity_combined(
 // ===========================================================================
 
 namespace {
-// Versioned-blob magic. Bit 31 set: a legacy blob's first 4 bytes are the
-// low half of n_vectors (u64), which cannot have bit 31 set for realistic
-// row counts, so the two formats are unambiguously distinguishable.
+// Versioned-blob magic. Deserialize accepts ONLY this version — the
+// on-disk format is pre-release and no legacy trees need to load.
 constexpr uint32_t kCardMagic = 0xC4DA0003u;
 constexpr uint8_t kCardVersion = 3;
 // Per-column mode lives in the flags byte (bits 3-4).
@@ -870,15 +869,19 @@ void CardinalityTable::deserialize(const uint8_t* data, size_t len) {
 
     uint32_t first = 0;
     std::memcpy(&first, data, 4);
-    const bool versioned =
-        (first == kCardMagic || first == (kCardMagic - 1u));  // v3 or v2
-    // v3 carries the per-column mode; v2/legacy columns are implicitly On.
-    const bool has_mode = versioned && (first == kCardMagic);
-
-    size_t off = 0;
-    if (versioned) {
-        off = 4;  // magic
-        ++off;    // version (validated by the magic)
+    if (first != kCardMagic) {
+        spdlog::warn("cardinality: blob has unknown format (magic {:#x}, "
+                     "expected {:#x}) — ignoring; filters fall back to "
+                     "default selectivity",
+                     first, kCardMagic);
+        return;
+    }
+    size_t off = 4;  // magic
+    uint8_t version = data[off++];
+    if (version != kCardVersion) {
+        spdlog::warn("cardinality: blob version {} unsupported (expected "
+                     "{}) — ignoring", version, kCardVersion);
+        return;
     }
 
     auto read_u32 = [&]() -> uint32_t {
@@ -920,8 +923,8 @@ void CardinalityTable::deserialize(const uint8_t* data, size_t len) {
             std::memcpy(&cid, data + peek, 4); peek += 4;
             uint8_t flags = data[peek]; peek += 1;
             const bool is_num = flags & 1;
-            const bool binned = versioned && (flags & 2);
-            const auto mode = has_mode ? mode_from_flags(flags) : CardinalityMode::On;
+            const bool binned = (flags & 2);
+            const auto mode = mode_from_flags(flags);
             if (mode == CardinalityMode::Off) {
                 max_col = std::max(max_col, cid);  // mode flag only, no entries
                 continue;
@@ -938,7 +941,7 @@ void CardinalityTable::deserialize(const uint8_t* data, size_t len) {
                 uint32_t n_entries = 0;
                 if (peek + 4 > len) return;
                 std::memcpy(&n_entries, data + peek, 4); peek += 4;
-                if (versioned && !is_num) peek += 8;  // est_distinct
+                if (!is_num) peek += 8;  // est_distinct
                 peek += static_cast<size_t>(n_entries) * (is_num ? 12 : 8);
             }
             max_col = std::max(max_col, cid);
@@ -950,9 +953,9 @@ void CardinalityTable::deserialize(const uint8_t* data, size_t len) {
         const uint32_t col_id = read_u32();
         const uint8_t flags = read_u8();
         const bool is_numeric = flags & 1;
-        const bool binned = versioned && (flags & 2);
-        const bool overflowed = versioned && (flags & 4);
-        const auto mode = has_mode ? mode_from_flags(flags) : CardinalityMode::On;
+        const bool binned = (flags & 2);
+        const bool overflowed = (flags & 4);
+        const auto mode = mode_from_flags(flags);
         const uint32_t ci = static_cast<uint32_t>(columns_.size());
         columns_.emplace_back();
         col_to_idx_[col_id] = ci;
@@ -986,7 +989,7 @@ void CardinalityTable::deserialize(const uint8_t* data, size_t len) {
             }
         } else {
             const uint32_t n_entries = read_u32();
-            if (versioned) col.est_distinct_stored = read_u64();
+            col.est_distinct_stored = read_u64();
             col.freq.reserve(n_entries);
             for (uint32_t j = 0; j < n_entries; ++j) {
                 const uint32_t hash = read_u32();

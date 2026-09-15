@@ -247,9 +247,9 @@ public:
     /// Total entries currently held across all exact maps (diagnostics).
     size_t total_entries() const;
 
-    /// Serialize to a binary blob. Versioned: starts with a magic u32 with
-    /// the high bit set (legacy blobs start with n_vectors:u64, which cannot
-    /// have bit 31 of its low word set for realistic row counts).
+    /// Serialize to a binary blob. Versioned: starts with a magic u32.
+    /// No pre-release compat: the on-disk format is not finalized and no
+    /// released trees exist — deserialize accepts ONLY this version.
     /// Format (v3):
     ///   [magic: u32 = 0xC4DA0003][version: u8 = 3]
     ///   [n_vectors: u64][n_columns: u32]
@@ -266,9 +266,10 @@ public:
     ///                     [4096 × (count: u32)]
     std::vector<uint8_t> serialize() const;
 
-    /// Deserialize from a binary blob. Accepts the versioned format above
-    /// (v3: per-column mode; v2: pre-mode) and the legacy layout
-    /// ([n_vectors: u64][n_columns: u32] ...).
+    /// Deserialize from a binary blob. Accepts only the versioned format
+    /// above (magic 0xC4DA0003); any other blob is rejected (logs a
+    /// warning and leaves the table empty — the search path treats an
+    /// empty table as "no estimates" and uses its default selectivity).
     void deserialize(const uint8_t* data, size_t len);
 
     // --- HLL helpers (exposed for testing) ---

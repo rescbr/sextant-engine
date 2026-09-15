@@ -5,7 +5,7 @@
 #include "tree/page_file.hpp"
 #include "tree/superblock.hpp"
 #include "tree/filter_scan.hpp"  // eval_predicate_geo, haversine_km, summary_may_match
-#include "tree/filter_hash.hpp"  // filter_hash (legacy cardinality blob test)
+
 #include <sextant/column_data.hpp>
 #include <sextant/error.hpp>
 #include "sextant/config.hpp"
@@ -1184,40 +1184,23 @@ TEST(TreeCardinalityCap, NumericOverflowSwitchesToBinned) {
                 1e-6f);
 }
 
-TEST(TreeCardinalityCap, LegacyBlobStillDeserializes) {
-    // Hand-craft a LEGACY cardinality blob (pre-cap format):
-    //   [n_vectors: u64][n_columns: u32]
-    //   per column: [col_id: u32][is_numeric: u8][n_entries: u32]
-    //               [n_entries × (hash: u32, count: u32)]
+TEST(TreeCardinalityCap, UnknownBlobMagicIsRejected) {
+    // A blob with an unrecognized magic (e.g. a pre-versioning layout)
+    // must be rejected gracefully: empty table, no crash. The search
+    // path treats an empty table as "no estimates".
     const uint64_t n = 100;
-    const uint32_t h1 = filter_hash(std::string_view("alpha"));
-    const uint32_t h2 = filter_hash(std::string_view("beta"));
-
     std::vector<uint8_t> blob;
-    auto push_u32 = [&](uint32_t v) {
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
-        blob.insert(blob.end(), p, p + 4);
-    };
     auto push_u64 = [&](uint64_t v) {
         const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
         blob.insert(blob.end(), p, p + 8);
     };
-    push_u64(n);      // n_vectors
-    push_u32(1);      // n_columns
-    push_u32(3);      // col_id
-    blob.push_back(0);  // is_numeric = false
-    push_u32(2);      // n_entries
-    push_u32(h1); push_u32(90);
-    push_u32(h2); push_u32(10);
+    push_u64(n);  // legacy layout started with n_vectors — no magic
+    blob.insert(blob.end(), 20, 0);
 
     CardinalityTable t;
     t.deserialize(blob.data(), blob.size());
-    EXPECT_EQ(t.n_vectors(), n);
-    EXPECT_FALSE(t.empty());
-    EXPECT_NEAR(t.selectivity_string(3, "alpha"), 0.9f, 1e-6f);
-    EXPECT_NEAR(t.selectivity_string(3, "beta"), 0.1f, 1e-6f);
-    // Not overflowed (legacy blobs never are) → unseen value reports 0.
-    EXPECT_NEAR(t.selectivity_string(3, "gamma"), 0.0f, 1e-9f);
+    EXPECT_TRUE(t.empty());
+    EXPECT_EQ(t.n_vectors(), 0u);
 }
 
 TEST(TreeCardinalityCap, CappedMergeKeepsBoundsAndFallback) {
