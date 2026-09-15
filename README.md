@@ -144,7 +144,7 @@ meson test -C build                             # run the test suite (31 files)
 | `--plane-pre-prune` | 0.25 | Two-stage routing: fraction of leaves surviving to the plane sweep (measured best; 0 = off) |
 | `--no-rerank` | off | Use raw PQ distances (skip FP32 rerank) |
 | `--exact-rerank-base` | — | Original base `.fbin`; rerank against true vectors (implies rerank) |
-| `--adaptive-probe-gap` / `--adaptive-w-gap` | manifest / off | Geometric gap pruning / adaptive shortlist cut |
+| `--adaptive-probe-gap` / `--adaptive-w-gap` | manifest / **auto (2.5 @ 384B codes)** | Geometric gap pruning / adaptive shortlist cut: results become a variable-length list cut at the first reranked distance gap past k — the caller re-scores. Auto tau is per scan-code size (2.5 ≥ 288B, 5.0 below). `0` = fixed top-k. Measured CulturaX synth queries: +4pp recall@10 at iso-QPS, 2.5x fewer caller rescans |
 | `--threads` / `--search-threads` | auto / serial | Query-parallel / within-query leaf-parallel scan threads |
 | `--scan-i8` | −1 (auto) | Scalar scan kernel i8 SDOT/VNNI mode (0 float FMA, 1 int8, 2 int8+dual residual) |
 | `--batch-window` | 0 (per-query) | Subtree-major batch mode window size |

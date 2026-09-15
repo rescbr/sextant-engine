@@ -1025,7 +1025,11 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<float>("adaptive-probe-gap", 0, "Geometric gap pruning (0=manifest)", false, 0.0f);
     p.add<float>("adaptive-w-gap", 0,
         "Adaptive shortlist cut: truncate results at the first reranked "
-        "distance gap past k (0=off)", false, 0.0f);
+        "distance gap past k. Default -1 = AUTO: tau per scan-code size "
+        "(2.5 at 384B codes, validated CulturaX +4pp recall@10 iso-QPS; "
+        "5.0 below 192B — shallow codes need a deeper cut). 0 = off "
+        "(fixed top-k). Results become a variable-length shortlist the "
+        "caller re-scores.", false, -1.0f);
     p.add<uint32_t>("threads", 0, "Search threads (0=auto)", false, 0);
     p.add<int>("scan-i8", 0,
         "Scalar scan kernel i8 SDOT/VNNI mode (-1=auto: int8 on AVX512/VNNI, "
@@ -1186,6 +1190,14 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.fastscan_W = p.get<uint32_t>("fastscan-w");
     scfg.rerank = !p.exist("no-rerank");
     scfg.adaptive_w_gap = p.get<float>("adaptive-w-gap");
+    if (scfg.adaptive_w_gap < 0) {
+        // AUTO: tau calibrated per scan-code size (billion-scale doc:
+        // tau 2-3 for 384B codes; 5-10 for the low-byte tiers).
+        const uint32_t cs = idx->coder().code_size();
+        scfg.adaptive_w_gap = cs >= 288 ? 2.5f : 5.0f;
+        std::cerr << "adaptive-w-gap: auto -> " << scfg.adaptive_w_gap
+                  << " (code_size " << cs << "B)\n";
+    }
     scfg.use_plane = !p.exist("no-plane");
     scfg.plane_pre_prune = p.get<float>("plane-pre-prune");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
