@@ -163,15 +163,44 @@ bool IVFTreeIndex::resolve_pred_columns_(
     for (uint32_t pi = 0; pi < config.predicates.size(); ++pi) {
         const auto& pred = config.predicates[pi];
         const auto* col = manifest_.schema.find(pred.column);
-        if (!col) return false;  // Predicate references unknown column.
+        // Loud failures for malformed predicates. The historical behaviors
+        // were silent and wrong: an unknown column name mapped to
+        // RouteStatus::Empty (zero results for a typo), and an op/type
+        // mismatch (e.g. Contains on a String column) fell through
+        // eval_predicate's default-true (pass-all). Both now throw.
+        if (!col) {
+            throw Error(ErrorCode::InvalidParam,
+                        "predicate references unknown filter column '" +
+                            pred.column + "'");
+        }
+        if (!predicate_applies_to(pred.op, col->type)) {
+            throw Error(ErrorCode::InvalidParam,
+                        "predicate op does not apply to column '" +
+                            pred.column + "' of type " +
+                            std::string(column_type_name(col->type)));
+        }
         pred_col_indices.push_back(
             static_cast<uint32_t>(col - manifest_.schema.columns.data()));
         // Geo predicates need a second column (longitude).
         if (pred.op == PredicateOp::GeoRadius ||
             pred.op == PredicateOp::GeoBox) {
-            if (pred.geo_lng_column.empty()) return false;
+            if (pred.geo_lng_column.empty()) {
+                throw Error(ErrorCode::InvalidParam,
+                            "geo predicate on '" + pred.column +
+                                "' requires geo_lng_column");
+            }
             const auto* lng_col = manifest_.schema.find(pred.geo_lng_column);
-            if (!lng_col) return false;
+            if (!lng_col) {
+                throw Error(ErrorCode::InvalidParam,
+                    "geo predicate references unknown longitude column '" +
+                        pred.geo_lng_column + "'");
+            }
+            if (!predicate_applies_to(pred.op, lng_col->type)) {
+                throw Error(ErrorCode::InvalidParam,
+                    "geo longitude column '" + pred.geo_lng_column +
+                        "' must be numeric (got " +
+                        std::string(column_type_name(lng_col->type)) + ")");
+            }
             geo_lng_col_indices[pi] = static_cast<uint32_t>(
                 lng_col - manifest_.schema.columns.data());
         }

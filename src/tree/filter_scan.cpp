@@ -240,9 +240,10 @@ bool eval_predicate(const ColumnView& col, uint32_t idx, const Predicate& pred) 
                 case PredicateOp::Ge:       return val >= pred.value;
                 case PredicateOp::Between:  return val >= pred.value && val <= pred.value2;
                 case PredicateOp::In: {
-                    if (val == pred.value || val == pred.value2 ||
-                        val == pred.value3 || val == pred.value4)
-                        return true;
+                    // `values` is the operand. The legacy scalar fast-path
+                    // (value..value4) consulted slots shared with Eq/Between/
+                    // geo — callers building In via values left them zeroed,
+                    // silently matching every row holding 0. Removed.
                     for (const auto& s : pred.values) {
                         try { if (val == std::stod(s)) return true; }
                         catch (...) { continue; }
@@ -250,9 +251,6 @@ bool eval_predicate(const ColumnView& col, uint32_t idx, const Predicate& pred) 
                     return false;
                 }
                 case PredicateOp::NotIn: {
-                    if (val == pred.value || val == pred.value2 ||
-                        val == pred.value3 || val == pred.value4)
-                        return false;
                     for (const auto& s : pred.values) {
                         try { if (val == std::stod(s)) return false; }
                         catch (...) { continue; }

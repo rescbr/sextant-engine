@@ -352,8 +352,142 @@ TEST(TreeFilterColumns, ValidationRejectsOversizeSetElement) {
 // Phase D: filtered search — predicates are applied during the scan.
 // ===========================================================================
 
-TEST(TreeFilterColumns, FilteredSearchInt32Equality) {
-    const uint64_t n = 3000;
+// Phase C2: predicate resolution must fail LOUDLY for malformed predicates.
+// Historical behaviors (both silent, both wrong): unknown column name →
+// RouteStatus::Empty (zero results for a typo); op/type mismatch →
+// eval_predicate default-true (pass-all). Both now throw InvalidParam.
+// ===========================================================================
+
+TEST(TreeFilterColumns, PredicateValidationThrows) {
+    const uint64_t n = 2000;
+    const uint32_t dim = 32;
+    const uint32_t n_clusters = 20;
+    const std::string base_path = write_test_fbin("tree_pred_val.fbin",
+                                                   n, dim, n_clusters, 31);
+    const std::string tree_path = (std::filesystem::temp_directory_path() /
+                                   "tree_pred_val.tree").string();
+    std::filesystem::remove(tree_path);
+
+    Schema schema;
+    schema.columns.push_back({"year", ColumnType::Int32});
+    schema.columns.push_back({"category", ColumnType::String});
+
+    // year = i % 10 (deliberately includes rows holding 0 — see the
+    // In-no-zero-match regression at the bottom of this test).
+    std::vector<ColumnData> cols(2);
+    cols[0].type = ColumnType::Int32;
+    cols[1].type = ColumnType::String;
+    cols[0].fixed_data.resize(n * 4);
+    for (uint64_t i = 0; i < n; ++i) {
+        const int32_t year = static_cast<int32_t>(i % 10);
+        std::memcpy(&cols[0].fixed_data[i * 4], &year, 4);
+    }
+    for (uint64_t i = 0; i < n; ++i) {
+        std::string val = "cat_" + std::to_string(i % 10);
+        cols[1].str_offsets.push_back(
+            static_cast<uint32_t>(cols[1].str_data.size()));
+        cols[1].str_lengths.push_back(static_cast<uint16_t>(val.size()));
+        cols[1].str_data.insert(cols[1].str_data.end(),
+                                val.data(), val.data() + val.size());
+    }
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "pq";
+    cfg.params.pq4_m = 8;
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 500;
+    cfg.pca_dims = 16;
+    cfg.max_lloyd_passes = 2;
+    cfg.num_threads = 4;
+    cfg.filter_schema = schema;
+    cfg.filter_column_data = std::move(cols);
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    auto idx = IVFTreeIndex::open(tree_path);
+
+    std::vector<float> query(dim, 0.5f);
+    SearchConfig sconfig;
+    sconfig.k = 10;
+    sconfig.n_probe = 8;
+    sconfig.n_probe_ln = 8;
+
+    auto expect_throws = [&](const char* what, const Predicate& pred) {
+        SearchConfig c = sconfig;
+        c.predicates.push_back(pred);
+        try {
+            (void)idx->search(query.data(), 10, c);
+            FAIL() << what << ": expected InvalidParam throw";
+        } catch (const sextant::Error& e) {
+            EXPECT_EQ(e.code(), sextant::ErrorCode::InvalidParam)
+                << what << ": " << e.what();
+        }
+    };
+
+    // Unknown column name.
+    Predicate unknown;
+    unknown.column = "nope";
+    unknown.op = PredicateOp::Eq;
+    unknown.value = 1.0;
+    expect_throws("unknown column", unknown);
+
+    // Op/type mismatches (formerly silent pass-all).
+    Predicate contains_on_string;
+    contains_on_string.column = "category";
+    contains_on_string.op = PredicateOp::Contains;
+    contains_on_string.str_value = "cat_1";
+    expect_throws("Contains on String column", contains_on_string);
+
+    Predicate lt_on_string;
+    lt_on_string.column = "category";
+    lt_on_string.op = PredicateOp::Lt;
+    lt_on_string.value = 5.0;
+    expect_throws("Lt on String column", lt_on_string);
+
+    Predicate prefix_on_int;
+    prefix_on_int.column = "year";
+    prefix_on_int.op = PredicateOp::Prefix;
+    prefix_on_int.str_value = "2";
+    expect_throws("Prefix on Int32 column", prefix_on_int);
+
+    Predicate geo_bad_lng;
+    geo_bad_lng.column = "year";
+    geo_bad_lng.op = PredicateOp::GeoRadius;
+    geo_bad_lng.geo_lng_column = "category";  // longitude must be numeric
+    geo_bad_lng.value = 0.0;
+    geo_bad_lng.value2 = 0.0;
+    geo_bad_lng.radius_km = 10.0;
+    expect_throws("geo with String longitude column", geo_bad_lng);
+
+    // REGRESSION (numeric In): membership is defined by `values` ONLY.
+    // The legacy value..value4 fast-path matched rows holding 0 against a
+    // zero-defaulted slot — IN("5") used to also return every year==0 row.
+    {
+        SearchConfig c = sconfig;
+        c.n_probe = UINT32_MAX;   // exhaustive
+        c.n_probe_ln = UINT32_MAX;
+        Predicate in5;
+        in5.column = "year";
+        in5.op = PredicateOp::In;
+        in5.values = {"5"};
+        c.predicates.push_back(in5);
+        auto results = idx->search(query.data(), 10, c);
+        ASSERT_EQ(results.size(), 10u);
+        for (const auto& r : results) {
+            EXPECT_EQ(static_cast<int64_t>(r.row_id) % 10, 5)
+                << "IN(\"5\") matched row " << r.row_id
+                << " with year " << (r.row_id % 10) << " (zero-slot match?)";
+        }
+    }
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
+TEST(TreeFilterColumns, FilteredSearchInt32Equality) {    const uint64_t n = 3000;
     const uint32_t dim = 48;
     const uint32_t n_clusters = 30;
     const std::string base_path = write_test_fbin("tree_filter_eq.fbin",

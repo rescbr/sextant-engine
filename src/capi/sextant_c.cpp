@@ -107,12 +107,9 @@ int translate_one(const sextant_predicate& p, sextant::Predicate& ep,
         case SEXTANT_PRED_NOT_IN:
             ep.op = (p.op == SEXTANT_PRED_IN) ? sextant::PredicateOp::In
                                               : sextant::PredicateOp::NotIn;
-            // Membership is defined solely by the values list; NaN-poison
-            // value..value4 so the engine's extra numeric comparand checks
-            // (filter_scan's In/NotIn fast path) can never spuriously match
-            // (e.g. a row value of 0 against a zero-defaulted field).
-            ep.value = ep.value2 = ep.value3 = ep.value4 =
-                std::numeric_limits<double>::quiet_NaN();
+            // Membership is defined solely by the values list (the engine's
+            // legacy numeric value..value4 comparand fast-path was removed;
+            // scalar slots are not consulted for In/NotIn).
             if (!append_values(/*allow_empty=*/p.op == SEXTANT_PRED_NOT_IN))
                 return -1;
             break;

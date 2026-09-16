@@ -44,6 +44,19 @@ inline bool is_fixed_width(ColumnType t) {
     return column_type_width(t) != 0;
 }
 
+/// Lowercase name of a column type (error messages / diagnostics).
+inline std::string_view column_type_name(ColumnType t) {
+    switch (t) {
+        case ColumnType::Int32:  return "int32";
+        case ColumnType::Int64:  return "int64";
+        case ColumnType::Float:  return "float";
+        case ColumnType::Bool:   return "bool";
+        case ColumnType::String: return "string";
+        case ColumnType::Set:    return "set";
+    }
+    return "?";
+}
+
 /// A declared filter column.
 struct FilterColumn {
     std::string name;
@@ -170,5 +183,41 @@ struct Predicate {
     std::string str_value;             // for Eq/NotEq/Prefix on string columns
     std::vector<std::string> values;   // for In/NotIn (string or numeric-as-string)
 };
+
+/// Is `op` evaluable against a column of type `type`? Search-time predicate
+/// resolution rejects combinations this returns false for (loud InvalidParam
+/// instead of the historical silent pass-all / zero-result behaviors).
+/// Geo ops (GeoRadius/GeoBox) apply to the lat/lng column pair and require
+/// numeric columns.
+inline bool predicate_applies_to(PredicateOp op, ColumnType type) {
+    const bool numeric = type == ColumnType::Int32 ||
+                         type == ColumnType::Int64 ||
+                         type == ColumnType::Float;
+    switch (op) {
+        case PredicateOp::Eq:
+        case PredicateOp::NotEq:
+            return numeric || type == ColumnType::String ||
+                   type == ColumnType::Bool;
+        case PredicateOp::In:
+        case PredicateOp::NotIn:
+            return numeric || type == ColumnType::String;
+        case PredicateOp::Lt:
+        case PredicateOp::Le:
+        case PredicateOp::Gt:
+        case PredicateOp::Ge:
+        case PredicateOp::Between:
+            return numeric;
+        case PredicateOp::Prefix:
+            return type == ColumnType::String;
+        case PredicateOp::Contains:
+        case PredicateOp::ContainsAny:
+        case PredicateOp::ContainsAll:
+            return type == ColumnType::Set;
+        case PredicateOp::GeoRadius:
+        case PredicateOp::GeoBox:
+            return numeric;  // lat + lng columns
+    }
+    return false;
+}
 
 }  // namespace sextant
