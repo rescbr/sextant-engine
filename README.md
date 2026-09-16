@@ -272,10 +272,46 @@ Use `tools/fvecs_to_fbin` to convert `.fvecs`/`.ivecs` corpora.
 ## C API
 
 `include/sextant/sextant_c.h` (implemented in `src/capi/sextant_c.cpp`) is a
-minimal C ABI over the tree index for external benchmark harnesses: build
-from an `.fbin` corpus, open, concurrent `sextant_search()` on a shared
-handle. No filtering, no payloads — bench surface only. Smoke/QPS harnesses:
-`scripts/capi_smoke.cpp`, `scripts/capi_qps.cpp`.
+plain-C99 ABI over the tree index — the sole seam the (post-release) DuckDB
+extension will use. The v1 surface covers: `.fbin`/in-memory/streaming-push
+builds (the push API accepts typed filter columns — Int32/Int64/Float/String —
+and per-row payload blobs), open/close, single-query search with an optional
+conjunct list of predicates (EQ/NEQ/PREFIX on strings; EQ/NEQ/LT/LE/GT/GE/
+BETWEEN on numerics; set/geo ops are reserved and return NotImplemented),
+shared-predicate batch search with row-major output, opaque leaf-location
+output plus `sextant_fetch_payload()` / `sextant_fetch_vector()` for O(1)
+result blob/decoded-vector fetch (locations stay valid until close on the
+default read-only handles), and `sextant_index_count()`.
+
+**Exception-safety contract:** every entry point catches all exceptions
+internally — no exception ever crosses the C boundary (DuckDB TUs are
+`-fno-exceptions`). Failures surface as negative returns with a message
+written into the caller's `char* err` buffer. Enum values and struct layouts
+are ABI-fixed; structs evolve by tail-append only.
+
+```c
+sextant_build_opts bo = sextant_default_build_opts();
+sextant_filter_col_def cols[1] = {{"year", SEXTANT_COL_INT32}};
+char err[256];
+void* b = sextant_build_begin(&bo, dim, cols, 1, /*has_payload=*/1, err, sizeof err);
+sextant_build_push(b, vecs, n_rows, col_ptrs, payload_offs, payload_bytes,
+                   err, sizeof err);
+sextant_build_finish(b, "/tmp/t.tree", err, sizeof err);   /* frees b */
+
+void* idx = sextant_open_index("/tmp/t.tree", err, sizeof err);
+sextant_predicate p = {.column = "year", .op = SEXTANT_PRED_EQ, .value = 2024};
+void* leaf[10]; uint32_t slot[10]; uint64_t ids[10]; float d[10];
+int32_t n = sextant_search2(idx, query, &sopts, &p, 1, ids, d, leaf, slot,
+                            10, err, sizeof err);
+if (n > 0) {
+    uint8_t buf[64];
+    uint32_t size = sextant_fetch_payload(idx, leaf[0], slot[0],
+                                          buf, sizeof buf);  /* full size */
+}
+```
+
+Smoke/QPS harnesses: `scripts/capi_smoke.cpp`, `scripts/capi_qps.cpp`; the
+v1 surface is covered by `test/test_capi.cpp`.
 
 ## Parameter advisor (`analyze` / `autobuild`)
 

@@ -1,14 +1,20 @@
 #pragma once
 
 /// @file sextant_c.h
-/// Minimal C ABI over the IVF tree index for external benchmark harnesses
-/// (task 5: retrievalbench head-to-head). Build from an .fbin corpus, open,
-/// search single queries. No filtering, no payloads — bench surface only.
+/// C ABI over the IVF tree index. Originally the external benchmark-harness
+/// surface (task 5: retrievalbench head-to-head: build from .fbin, open,
+/// single-query search); extended for the DuckDB-ready v1 ABI: filtered
+/// search, batch search, payload/vector fetch, and a streaming push build
+/// with filter columns + payloads.
 ///
 /// All functions are thread-safe for concurrent sextant_search() on the same
 /// index handle (search is const); build/open/close are single-threaded.
 /// Errors: functions returning int report 0 on success and a negative value
 /// on failure, writing a message into `err` when non-null.
+///
+/// EXCEPTION-SAFETY CONTRACT: every entry point catches all exceptions
+/// internally. No exception ever escapes the C boundary (DuckDB extension
+/// TUs are -fno-exceptions). Failures surface as negative returns + `err`.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -108,6 +114,161 @@ int32_t sextant_search(void* index, const float* query,
                        const sextant_search_opts* opts,
                        uint64_t* out_row_ids, float* out_dists,
                        uint32_t out_capacity, char* err, size_t err_len);
+
+// ===========================================================================
+// DuckDB-ready v1 extension: predicates, filtered/batch search, payload and
+// vector fetch, streaming push build. ABI: enum values below are FIXED
+// forever; structs evolve by tail-append only.
+// ===========================================================================
+
+/// Predicate operators. Values are part of the ABI — never renumber.
+/// v1 implements: EQ/NEQ/PREFIX on string columns, and
+/// EQ/NEQ/LT/LE/GT/GE/BETWEEN on Int32/Int64/Float columns.
+enum {
+    SEXTANT_PRED_EQ = 0,       ///< value == x (numeric) or str_value == s
+    SEXTANT_PRED_NEQ = 1,      ///< value != x / str_value != s
+    SEXTANT_PRED_LT = 2,       ///< x <  value           (numeric only)
+    SEXTANT_PRED_LE = 3,       ///< x <= value
+    SEXTANT_PRED_GT = 4,       ///< x >  value
+    SEXTANT_PRED_GE = 5,       ///< x >= value
+    SEXTANT_PRED_BETWEEN = 6,  ///< value <= x <= value2 (numeric only)
+    SEXTANT_PRED_PREFIX = 7,   ///< str_value is a prefix of s (string only)
+    // Reserved — NOT implemented in v1; using these returns a negative
+    // "not implemented" error. Values fixed for future v1.x additions:
+    SEXTANT_PRED_IN = 8,         ///< x in values set
+    SEXTANT_PRED_NOT_IN = 9,     ///< x not in values set
+    SEXTANT_PRED_CONTAINS = 10,        ///< set column contains value
+    SEXTANT_PRED_CONTAINS_ANY = 11,    ///< set intersects values
+    SEXTANT_PRED_CONTAINS_ALL = 12,    ///< values subset of set
+    SEXTANT_PRED_GEO_RADIUS = 13,      ///< haversine(x, center) <= radius_km
+    SEXTANT_PRED_GEO_BOX = 14,         ///< lat/lng inside [min,max] box
+};
+
+typedef struct sextant_predicate {
+    const char* column;    ///< filter column name (required, non-NULL)
+    int op;                ///< SEXTANT_PRED_* (required)
+    double value;          ///< numeric comparand; BETWEEN low bound
+    double value2;         ///< BETWEEN high bound (inclusive)
+    const char* str_value; ///< string comparand (EQ/NEQ/PREFIX); NULL = ""
+} sextant_predicate;
+
+/// Filter column types for sextant_build_begin. Values are ABI-fixed.
+/// Note: the engine stores Float as IEEE binary32; predicate `value` doubles
+/// are narrowed at evaluation. SEXTANT_COL_SET is reserved (v1 rejects it).
+enum {
+    SEXTANT_COL_INT32 = 0,
+    SEXTANT_COL_INT64 = 1,
+    SEXTANT_COL_FLOAT = 2,  ///< engine-internal binary32
+    SEXTANT_COL_STRING = 3,
+    SEXTANT_COL_SET = 4,    ///< reserved — rejected in v1
+};
+
+typedef struct sextant_filter_col_def {
+    const char* name;  ///< column name (required, non-NULL)
+    int type;          ///< SEXTANT_COL_*
+} sextant_filter_col_def;
+
+/// Per-column string values for one sextant_build_push() call. The
+/// filter_values entry for a String column points at one of these.
+typedef struct sextant_str_values {
+    const char* const* data;   ///< n_rows pointers to (not NUL-terminated) data
+    const uint32_t* lengths;   ///< n_rows byte lengths (each <= 65535)
+} sextant_str_values;
+
+/// Single-query filtered search. Same contract as sextant_search(), plus a
+/// conjunct list of `n_preds` predicates (all must hold). `preds` may be
+/// NULL/0 for unfiltered. Returns the number of results written, or negative.
+int32_t sextant_search_filtered(void* index, const float* query,
+                                const sextant_search_opts* opts,
+                                const sextant_predicate* preds,
+                                uint32_t n_preds,
+                                uint64_t* out_row_ids, float* out_dists,
+                                uint32_t out_capacity,
+                                char* err, size_t err_len);
+
+/// Single-query filtered search with payload locations. In addition to the
+/// sextant_search_filtered contract, writes the leaf location of every
+/// result: out_leaf_ptrs[i] is an OPAQUE pointer into the index mmap,
+/// out_slots[i] its slot; both are consumed by sextant_fetch_payload() /
+/// sextant_fetch_vector(). Locations stay valid until sextant_close_index()
+/// (read-only handles never mutate). Arrays are caller-allocated
+/// (out_capacity entries); pass NULL for either to skip them.
+int32_t sextant_search2(void* index, const float* query,
+                        const sextant_search_opts* opts,
+                        const sextant_predicate* preds, uint32_t n_preds,
+                        uint64_t* out_row_ids, float* out_dists,
+                        void** out_leaf_ptrs, uint32_t* out_slots,
+                        uint32_t out_capacity, char* err, size_t err_len);
+
+/// Batch search with shared predicates: all `n_queries` queries (row-major,
+/// dim from the index) are searched under the same conjunct list (may be
+/// NULL/0). Output is row-major with per-query capacity: query i's results
+/// live at out_row_ids[i*out_capacity_per_query .. + out_n_per_query[i])
+/// (same for out_dists). out_n_per_query must have n_queries entries.
+/// Returns 0 on success, negative on failure.
+int sextant_search_batch(void* index, const float* queries,
+                         uint32_t n_queries,
+                         const sextant_search_opts* opts,
+                         const sextant_predicate* preds, uint32_t n_preds,
+                         uint64_t* out_row_ids, float* out_dists,
+                         uint32_t out_capacity_per_query,
+                         uint32_t* out_n_per_query,
+                         char* err, size_t err_len);
+
+/// Fetch the payload blob for one search result. Returns the FULL blob size
+/// in bytes and copies min(size, buf_capacity) bytes into out_buf. 0 = no
+/// payload for this row (or null arguments). Call again with a larger buffer
+/// when the returned size exceeds buf_capacity. leaf_ptr/slot come from
+/// sextant_search2 output and stay valid until sextant_close_index().
+uint32_t sextant_fetch_payload(const void* index, const void* leaf_ptr,
+                               uint32_t slot, void* out_buf,
+                               uint32_t buf_capacity);
+
+/// Decode the stored vector for one search result into `out` (dim() floats,
+/// caller-allocated). Stored codes are lossy (fp16/quantized): compare with
+/// ~1e-2 relative tolerance. Returns 0 on success, negative on failure.
+int sextant_fetch_vector(const void* index, const void* leaf_ptr,
+                         uint32_t slot, float* out);
+
+/// Total indexed rows (sum over leaves). Read-only-handle safe. On indexes
+/// built with closure replication a row stored in several leaves is counted
+/// once per copy (the manifest carries no logical row count).
+uint64_t sextant_index_count(const void* index);
+
+// --- Streaming push build ------------------------------------------------
+
+/// Begin a push build of `dim`-dimensional vectors. `cols` declares the
+/// filter columns (may be NULL when n_cols == 0); `has_payload` enables
+/// per-row payload blobs via sextant_build_push. Row ids are assigned 0..n-1
+/// in push order. Returns an opaque builder handle, or NULL on failure.
+/// SEXTANT_COL_SET is rejected.
+void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
+                          const sextant_filter_col_def* cols, uint32_t n_cols,
+                          int has_payload, char* err, size_t err_len);
+
+/// Push n_rows vectors (row-major, dim from sextant_build_begin). May be called
+/// any number of times; row ids continue across calls. `filter_values`, when
+/// non-NULL, holds one entry per declared column, each covering n_rows rows
+/// in push order: for Int32/Int64/Float a pointer to a contiguous array of
+/// that C type; for String a pointer to a sextant_str_values. A NULL entry
+/// (or NULL filter_values with declared columns) fills the rows with the
+/// type's default (0 / empty string). Payload: payload_offsets has n_rows+1
+/// entries delimiting n_rows blobs in payload_data (both required when the
+/// build has payloads; pass NULL to give all rows empty payloads).
+/// Returns 0 on success, negative on failure (builder stays usable).
+int sextant_build_push(void* builder, const float* vectors, uint32_t n_rows,
+                       const void* const* filter_values,
+                       const uint64_t* payload_offsets,
+                       const uint8_t* payload_data,
+                       char* err, size_t err_len);
+
+/// Finish: run the (blocking) build and write the index to out_path. Frees
+/// the builder on BOTH success and failure. Returns 0 on success.
+int sextant_build_finish(void* builder, const char* out_path,
+                         char* err, size_t err_len);
+
+/// Abort a push build and free the builder. No file is written.
+void sextant_build_abort(void* builder);
 
 #ifdef __cplusplus
 }  // extern "C"

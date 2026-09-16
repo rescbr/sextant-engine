@@ -355,6 +355,11 @@ sextant_c_lib = static_library('sextant_c',
     install: false,
 )
 
+sextant_c_dep = declare_dependency(
+    link_with: sextant_c_lib,
+    include_directories: [engine_inc],
+)
+
 # Shared variant for external harnesses (task 5: Rust FFI links one .so
 # instead of a thin-archive merge). -Dcapi_shared=true.
 if get_option('capi_shared')

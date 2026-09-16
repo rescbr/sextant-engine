@@ -51,5 +51,15 @@ foreach src : test_sources
                       'SEXTANT_DATASETS=' + meson.current_source_dir() / '../datasets'])
 endforeach
 
+# test_capi links the C ABI shim library (sextant_c) on top of the engine.
+test_capi_exe = executable('test_capi', 'test_capi.cpp',
+    dependencies: [sextant_c_dep, sextant_sources_dep, gtest_dep, gtest_main_dep],
+    include_directories: [test_inc, sources_inc],
+    cpp_args: ['-DSEXTANT_SOURCE_DIR="' + meson.source_root() + '"'],
+)
+test('test_capi', test_capi_exe,
+     env: ['SEXTANT_TEST_DATA=' + meson.current_source_dir() / 'data',
+           'SEXTANT_DATASETS=' + meson.current_source_dir() / '../datasets'])
+
 # Install test data files (SIFTsmall etc.) so tests find them at runtime.
 install_data('data/siftsmall_base.fbin', install_dir: 'sextant-test')

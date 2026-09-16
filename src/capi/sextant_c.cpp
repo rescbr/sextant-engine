@@ -12,6 +12,17 @@
 #include "mem_source.hpp"
 #include "tree/ivf_tree_index.hpp"
 
+#include <sextant/column_data.hpp>
+#include <sextant/schema.hpp>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <string>
+#include <vector>
+
 namespace {
 
 /// Copy an exception message into the caller's error buffer.
@@ -20,6 +31,116 @@ void set_err(char* err, size_t err_len, const char* msg) {
         std::snprintf(err, err_len, "%s", msg);
     }
 }
+
+using sextant::tree::IVFTreeIndex;
+
+/// Translate sextant_search_opts into the engine SearchConfig (shared by
+/// sextant_search / _filtered / search2 / search_batch).
+void fill_search_config(const sextant_search_opts* opts,
+                         sextant::SearchConfig& cfg) {
+    cfg.k = opts->k;
+    if (opts->exhaustive) {
+        // Probe-all: every root child, every internal child, no gap
+        // pruning, no code budget. The clamp `min(n_probe, k_root)` makes
+        // UINT32_MAX mean "all leaves" (see search()'s level-0/ln paths).
+        cfg.n_probe = UINT32_MAX;
+        cfg.n_probe_ln = UINT32_MAX;
+        cfg.adaptive_probe_gap = -1.0f;  // <0 = off
+    } else {
+        cfg.n_probe = opts->n_probe;
+        cfg.n_probe_ln = opts->n_probe_ln;
+        cfg.probe_fraction = opts->probe_fraction;
+        cfg.adaptive_probe_gap = opts->adaptive_probe_gap;
+    }
+    cfg.fastscan_W = opts->fastscan_W;
+    cfg.rerank = opts->rerank != 0;
+    cfg.exact_rerank_base = opts->exact_rerank_base;
+    cfg.adaptive_w_gap = opts->adaptive_w_gap;
+    cfg.search_threads = opts->search_threads;
+    // The scan kernel mode is a process-wide setting with a per-thread
+    // override the scan reads (set below).
+    sextant::tree::set_scan_i8_override(opts->int8_scan);
+}
+
+/// Translate a C predicate conjunct list into engine Predicates.
+/// Returns 0 on success, negative on failure (message set).
+int translate_predicates(const sextant_predicate* preds, uint32_t n_preds,
+                          std::vector<sextant::Predicate>& out,
+                          char* err, size_t err_len) {
+    out.clear();
+    for (uint32_t i = 0; i < n_preds; ++i) {
+        const sextant_predicate& p = preds[i];
+        if (!p.column) {
+            set_err(err, err_len, "predicate: null column name");
+            return -1;
+        }
+        sextant::Predicate ep;
+        ep.column = p.column;
+        ep.value = p.value;
+        ep.value2 = p.value2;
+        if (p.str_value) ep.str_value = p.str_value;
+        switch (p.op) {
+            case SEXTANT_PRED_EQ:      ep.op = sextant::PredicateOp::Eq; break;
+            case SEXTANT_PRED_NEQ:     ep.op = sextant::PredicateOp::NotEq; break;
+            case SEXTANT_PRED_LT:      ep.op = sextant::PredicateOp::Lt; break;
+            case SEXTANT_PRED_LE:      ep.op = sextant::PredicateOp::Le; break;
+            case SEXTANT_PRED_GT:      ep.op = sextant::PredicateOp::Gt; break;
+            case SEXTANT_PRED_GE:      ep.op = sextant::PredicateOp::Ge; break;
+            case SEXTANT_PRED_BETWEEN: ep.op = sextant::PredicateOp::Between; break;
+            case SEXTANT_PRED_PREFIX:  ep.op = sextant::PredicateOp::Prefix; break;
+            case SEXTANT_PRED_IN:
+            case SEXTANT_PRED_NOT_IN:
+            case SEXTANT_PRED_CONTAINS:
+            case SEXTANT_PRED_CONTAINS_ANY:
+            case SEXTANT_PRED_CONTAINS_ALL:
+            case SEXTANT_PRED_GEO_RADIUS:
+            case SEXTANT_PRED_GEO_BOX:
+                set_err(err, err_len,
+                        "predicate op not implemented in C API v1");
+                return -4;  // NotImplemented
+            default:
+                set_err(err, err_len, "predicate: unknown op value");
+                return -1;
+        }
+        out.push_back(std::move(ep));
+    }
+    return 0;
+}
+
+/// Common argument validation for the single-query search entry points.
+bool validate_search_args(const IVFTreeIndex* idx, const float* query,
+                           const sextant_search_opts* opts,
+                           const uint64_t* out_row_ids, const float* out_dists,
+                           char* err, size_t err_len, const char* who) {
+    if (!idx || !query || !opts || !out_row_ids || !out_dists || opts->k == 0) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "%s: null argument or k==0", who);
+        set_err(err, err_len, buf);
+        return false;
+    }
+    return true;
+}
+
+/// Streaming push-build state. Buffers vectors (via MemSourceBuilder),
+/// filter columns (ColumnData, indexed by global row id) and payload blobs,
+/// then feeds build_streaming_pca at finish — mirroring the FbinSource +
+/// BuildConfig sidecar path used by the filter-column tests.
+struct PushBuilder {
+    uint32_t dim = 0;
+    sextant_build_opts opts = {};
+    sextant::MemSourceBuilder vecs;
+    sextant::Schema schema;                  // declared filter columns
+    std::vector<sextant::ColumnData> cols;   // one per schema column
+    std::vector<uint8_t> payload_data;
+    std::vector<uint32_t> payload_offsets;   // row_count + 1 entries
+    bool has_payload = false;
+    uint64_t rows = 0;
+
+    explicit PushBuilder(uint32_t d) : dim(d), vecs(d) {
+        // Row 0's start; the invariant is rows+1 entries, last == total.
+        payload_offsets.push_back(0);
+    }
+};
 
 }  // namespace
 
@@ -161,44 +282,23 @@ int32_t sextant_search(void* index, const float* query,
                        const sextant_search_opts* opts,
                        uint64_t* out_row_ids, float* out_dists,
                        uint32_t out_capacity, char* err, size_t err_len) {
-    auto* idx = reinterpret_cast<sextant::tree::IVFTreeIndex*>(index);
-    if (!idx || !query || !opts || !out_row_ids || !out_dists || opts->k == 0
-        || out_capacity < opts->k) {
-        set_err(err, err_len, "sextant_search: null argument or k==0");
+    auto* idx = reinterpret_cast<IVFTreeIndex*>(index);
+    if (!validate_search_args(idx, query, opts, out_row_ids, out_dists,
+                             err, err_len, "sextant_search"))
+        return -1;
+    if (out_capacity < opts->k) {
+        set_err(err, err_len, "sextant_search: out_capacity < k");
         return -1;
     }
     try {
-        int scan_i8_override = -1;
         sextant::SearchConfig cfg;
-        cfg.k = opts->k;
-        if (opts->exhaustive) {
-            // Probe-all: every root child, every internal child, no gap
-            // pruning, no code budget. The clamp `min(n_probe, k_root)` makes
-            // UINT32_MAX mean "all leaves" (see search()'s level-0/ln paths).
-            cfg.n_probe = UINT32_MAX;
-            cfg.n_probe_ln = UINT32_MAX;
-            cfg.adaptive_probe_gap = -1.0f;  // <0 = off
-        } else {
-            cfg.n_probe = opts->n_probe;
-            cfg.n_probe_ln = opts->n_probe_ln;
-            cfg.probe_fraction = opts->probe_fraction;
-            cfg.adaptive_probe_gap = opts->adaptive_probe_gap;
-        }
-        cfg.fastscan_W = opts->fastscan_W;
-        cfg.rerank = opts->rerank != 0;
-        cfg.exact_rerank_base = opts->exact_rerank_base;
-        cfg.adaptive_w_gap = opts->adaptive_w_gap;
-        scan_i8_override = opts->int8_scan;
-        cfg.search_threads = opts->search_threads;
-        // The scan kernel mode is a process-wide setting with a per-thread
-        // override the scan reads (set below).
-        sextant::tree::set_scan_i8_override(scan_i8_override);
+        fill_search_config(opts, cfg);
         auto results = idx->search(query, opts->k, cfg);
         // Under the adaptive-W contract (adaptive_w_gap > 0) the engine may
         // return more than k ids. The caller's arrays are sized k, so clamp;
         // a harness wanting the full shortlist passes k = fastscan_W.
         const int32_t n = std::min<int32_t>(static_cast<int32_t>(results.size()),
-                                            static_cast<int32_t>(out_capacity));
+                                           static_cast<int32_t>(out_capacity));
         for (int32_t i = 0; i < n; ++i) {
             out_row_ids[i] = static_cast<uint64_t>(results[i].row_id);
             out_dists[i] = results[i].dist;
@@ -211,6 +311,386 @@ int32_t sextant_search(void* index, const float* query,
         set_err(err, err_len, "sextant_search: unknown exception");
         return -3;
     }
+}
+
+int32_t sextant_search_filtered(void* index, const float* query,
+                                const sextant_search_opts* opts,
+                                const sextant_predicate* preds,
+                                uint32_t n_preds,
+                                uint64_t* out_row_ids, float* out_dists,
+                                uint32_t out_capacity,
+                                char* err, size_t err_len) {
+    return sextant_search2(index, query, opts, preds, n_preds,
+                          out_row_ids, out_dists, nullptr, nullptr,
+                          out_capacity, err, err_len);
+}
+
+int32_t sextant_search2(void* index, const float* query,
+                        const sextant_search_opts* opts,
+                        const sextant_predicate* preds, uint32_t n_preds,
+                        uint64_t* out_row_ids, float* out_dists,
+                        void** out_leaf_ptrs, uint32_t* out_slots,
+                        uint32_t out_capacity, char* err, size_t err_len) {
+    auto* idx = reinterpret_cast<IVFTreeIndex*>(index);
+    if (!validate_search_args(idx, query, opts, out_row_ids, out_dists,
+                             err, err_len, "sextant_search2"))
+        return -1;
+    if (out_capacity < opts->k) {
+        set_err(err, err_len, "sextant_search2: out_capacity < k");
+        return -1;
+    }
+    try {
+        sextant::SearchConfig cfg;
+        fill_search_config(opts, cfg);
+        if (n_preds) {
+            if (int rc = translate_predicates(preds, n_preds,
+                                             cfg.predicates, err, err_len))
+                return rc;
+        }
+        std::vector<std::pair<const uint8_t*, uint32_t>> locs;
+        std::vector<std::pair<const uint8_t*, uint32_t>>* locs_ptr =
+            (out_leaf_ptrs && out_slots) ? &locs : nullptr;
+        auto results = idx->search(query, opts->k, cfg, locs_ptr);
+        const int32_t n = std::min<int32_t>(static_cast<int32_t>(results.size()),
+                                           static_cast<int32_t>(out_capacity));
+        for (int32_t i = 0; i < n; ++i) {
+            out_row_ids[i] = static_cast<uint64_t>(results[i].row_id);
+            out_dists[i] = results[i].dist;
+            if (locs_ptr) {
+                out_leaf_ptrs[i] = const_cast<void*>(
+                    static_cast<const void*>(locs[i].first));
+                out_slots[i] = locs[i].second;
+            }
+        }
+        return n;
+    } catch (const std::exception& e) {
+        set_err(err, err_len, e.what());
+        return -2;
+    } catch (...) {
+        set_err(err, err_len, "sextant_search2: unknown exception");
+        return -3;
+    }
+}
+
+int sextant_search_batch(void* index, const float* queries,
+                         uint32_t n_queries,
+                         const sextant_search_opts* opts,
+                         const sextant_predicate* preds, uint32_t n_preds,
+                         uint64_t* out_row_ids, float* out_dists,
+                         uint32_t out_capacity_per_query,
+                         uint32_t* out_n_per_query,
+                         char* err, size_t err_len) {
+    auto* idx = reinterpret_cast<IVFTreeIndex*>(index);
+    if (!idx || !queries || !opts || !out_row_ids || !out_dists
+        || !out_n_per_query || n_queries == 0 || opts->k == 0
+        || out_capacity_per_query < opts->k) {
+        set_err(err, err_len,
+                "sextant_search_batch: null argument, n_queries==0 or k==0");
+        return -1;
+    }
+    try {
+        sextant::SearchConfig cfg;
+        fill_search_config(opts, cfg);
+        if (n_preds) {
+            if (int rc = translate_predicates(preds, n_preds,
+                                             cfg.predicates, err, err_len))
+                return rc;
+        }
+        std::vector<std::vector<sextant::Candidate>> results;
+        idx->search_batch(queries, n_queries, opts->k, cfg, results);
+        for (uint32_t q = 0; q < n_queries; ++q) {
+            const uint32_t n = std::min<uint32_t>(
+                static_cast<uint32_t>(results[q].size()),
+                out_capacity_per_query);
+            uint64_t* rid = out_row_ids + static_cast<size_t>(q)
+                           * out_capacity_per_query;
+            float* ds = out_dists + static_cast<size_t>(q)
+                       * out_capacity_per_query;
+            for (uint32_t i = 0; i < n; ++i) {
+                rid[i] = static_cast<uint64_t>(results[q][i].row_id);
+                ds[i] = results[q][i].dist;
+            }
+            out_n_per_query[q] = n;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_err(err, err_len, e.what());
+        return -2;
+    } catch (...) {
+        set_err(err, err_len, "sextant_search_batch: unknown exception");
+        return -3;
+    }
+}
+
+uint32_t sextant_fetch_payload(const void* index, const void* leaf_ptr,
+                               uint32_t slot, void* out_buf,
+                               uint32_t buf_capacity) {
+    auto* idx = reinterpret_cast<const IVFTreeIndex*>(index);
+    if (!idx || !leaf_ptr) return 0;
+    try {
+        auto blob = idx->fetch_payload(
+            static_cast<const uint8_t*>(leaf_ptr), slot);
+        const uint32_t size = static_cast<uint32_t>(blob.size());
+        if (out_buf && buf_capacity > 0)
+            std::memcpy(out_buf, blob.data(),
+                       std::min<size_t>(size, buf_capacity));
+        return size;
+    } catch (...) {
+        return 0;  // never throw across the C boundary
+    }
+}
+
+int sextant_fetch_vector(const void* index, const void* leaf_ptr,
+                         uint32_t slot, float* out) {
+    auto* idx = reinterpret_cast<const IVFTreeIndex*>(index);
+    if (!idx || !leaf_ptr || !out) return -1;
+    try {
+        return idx->fetch_vector(static_cast<const uint8_t*>(leaf_ptr),
+                                slot, out)
+                   ? 0 : -2;
+    } catch (const std::exception& e) {
+        // No err buffer in this signature; the negative return is the
+        // failure signal (kept minimal per the ABI contract).
+        (void)e;
+        return -3;
+    } catch (...) {
+        return -3;
+    }
+}
+
+uint64_t sextant_index_count(const void* index) {
+    auto* idx = reinterpret_cast<const IVFTreeIndex*>(index);
+    if (!idx) return 0;
+    try {
+        // Exact logical row count when the cardinality table was written
+        // (any filter-column index); otherwise sum leaf extent counts.
+        const uint64_t n = idx->cardinality().n_vectors();
+        if (n > 0) return n;
+        uint64_t total = 0;
+        for (const auto& l : idx->debug_leaf_info()) total += l.count;
+        return total;
+    } catch (...) {
+        return 0;
+    }
+}
+
+void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
+                          const sextant_filter_col_def* cols, uint32_t n_cols,
+                          int has_payload, char* err, size_t err_len) {
+    if (!opts || !opts->quantizer || dim == 0
+        || (!cols && n_cols > 0)) {
+        set_err(err, err_len, "sextant_build_begin: null/zero argument");
+        return nullptr;
+    }
+    try {
+        auto* b = new PushBuilder(dim);
+        b->opts = *opts;
+        b->has_payload = has_payload != 0;
+        for (uint32_t c = 0; c < n_cols; ++c) {
+            if (!cols[c].name) {
+                delete b;
+                set_err(err, err_len,
+                       "sextant_build_begin: filter column with null name");
+                return nullptr;
+            }
+            sextant::ColumnType t;
+            switch (cols[c].type) {
+                case SEXTANT_COL_INT32:  t = sextant::ColumnType::Int32; break;
+                case SEXTANT_COL_INT64:  t = sextant::ColumnType::Int64; break;
+                case SEXTANT_COL_FLOAT:  t = sextant::ColumnType::Float; break;
+                case SEXTANT_COL_STRING: t = sextant::ColumnType::String; break;
+                case SEXTANT_COL_SET:
+                    delete b;
+                    set_err(err, err_len,
+                           "sextant_build_begin: SET columns not supported "
+                           "in C API v1");
+                    return nullptr;
+                default:
+                    delete b;
+                    set_err(err, err_len,
+                           "sextant_build_begin: unknown column type");
+                    return nullptr;
+            }
+            b->schema.columns.push_back({cols[c].name, t});
+            b->cols.emplace_back().type = t;
+        }
+        b->schema.has_payload = b->has_payload;
+        // MemSource carries vectors ONLY (empty schema) — filter columns and
+        // payloads ride BuildConfig sidecars (cfg.filter_column_data indexed
+        // by global row id), mirroring the FbinSource filter tests. Giving
+        // MemSource the schema would route the build down the per-chunk
+        // filter path against empty chunk data.
+        return b;
+    } catch (const std::exception& e) {
+        set_err(err, err_len, e.what());
+        return nullptr;
+    } catch (...) {
+        set_err(err, err_len, "sextant_build_begin: unknown exception");
+        return nullptr;
+    }
+}
+
+int sextant_build_push(void* builder, const float* vectors, uint32_t n_rows,
+                       const void* const* filter_values,
+                       const uint64_t* payload_offsets,
+                       const uint8_t* payload_data,
+                       char* err, size_t err_len) {
+    auto* b = reinterpret_cast<PushBuilder*>(builder);
+    if (!b || !vectors || n_rows == 0) {
+        set_err(err, err_len, "sextant_build_push: null/zero argument");
+        return -1;
+    }
+    if (b->has_payload && !payload_offsets) {
+        set_err(err, err_len,
+                "sextant_build_push: payload_offsets required (has_payload)");
+        return -1;
+    }
+    try {
+        const uint32_t n_cols = static_cast<uint32_t>(b->cols.size());
+        for (uint32_t r = 0; r < n_rows; ++r) {
+            b->vecs.add_vector(vectors + static_cast<size_t>(r) * b->dim,
+                              static_cast<sextant::RowId>(b->rows + r));
+            for (uint32_t c = 0; c < n_cols; ++c) {
+                const void* fv = filter_values ? filter_values[c] : nullptr;
+                auto& col = b->cols[c];
+                switch (col.type) {
+                    case sextant::ColumnType::Int32: {
+                       int32_t v = 0;
+                       if (fv) v = static_cast<const int32_t*>(fv)[r];
+                       col.fixed_data.insert(
+                           col.fixed_data.end(),
+                           reinterpret_cast<const uint8_t*>(&v),
+                           reinterpret_cast<const uint8_t*>(&v) + 4);
+                       break;
+                    }
+                    case sextant::ColumnType::Int64: {
+                       int64_t v = 0;
+                       if (fv) v = static_cast<const int64_t*>(fv)[r];
+                       col.fixed_data.insert(
+                           col.fixed_data.end(),
+                           reinterpret_cast<const uint8_t*>(&v),
+                           reinterpret_cast<const uint8_t*>(&v) + 8);
+                       break;
+                    }
+                    case sextant::ColumnType::Float: {
+                       float v = 0.0f;
+                       if (fv) v = static_cast<const float*>(fv)[r];
+                       col.fixed_data.insert(
+                           col.fixed_data.end(),
+                           reinterpret_cast<const uint8_t*>(&v),
+                           reinterpret_cast<const uint8_t*>(&v) + 4);
+                       break;
+                    }
+                    case sextant::ColumnType::String: {
+                       const char* data = nullptr;
+                       uint32_t len = 0;
+                       if (fv) {
+                           const auto* sv =
+                               static_cast<const sextant_str_values*>(fv);
+                           if (sv->data && sv->lengths) {
+                               data = sv->data[r];
+                               len = sv->lengths[r];
+                           }
+                       }
+                       if (len > 65535) {
+                           set_err(err, err_len,
+                                   "sextant_build_push: string length "
+                                   "exceeds 65535");
+                           return -1;
+                       }
+                       col.str_offsets.push_back(
+                           static_cast<uint32_t>(col.str_data.size()));
+                       col.str_lengths.push_back(static_cast<uint16_t>(len));
+                       if (data && len)
+                           col.str_data.insert(col.str_data.end(), data,
+                                               data + len);
+                       break;
+                    }
+                    case sextant::ColumnType::Bool:
+                    case sextant::ColumnType::Set:
+                       set_err(err, err_len,
+                               "sextant_build_push: Bool/Set columns "
+                               "unsupported in v1");
+                       return -4;
+                }
+            }
+            // Payload row: append the blob, then record the new total.
+            // Invariant: payload_offsets has rows+1 entries, last == total.
+            if (b->has_payload) {
+                const uint64_t start = payload_offsets[r];
+                const uint64_t end = payload_offsets[r + 1];
+                if (end < start) {
+                    set_err(err, err_len,
+                           "sextant_build_push: payload_offsets not "
+                           "monotone");
+                    return -1;
+                }
+                if (payload_data && end > start)
+                    b->payload_data.insert(
+                       b->payload_data.end(), payload_data + start,
+                       payload_data + end);
+                b->payload_offsets.push_back(
+                    static_cast<uint32_t>(b->payload_data.size()));
+            }
+        }
+        b->rows += n_rows;
+        return 0;
+    } catch (const std::exception& e) {
+        set_err(err, err_len, e.what());
+        return -2;
+    } catch (...) {
+        set_err(err, err_len, "sextant_build_push: unknown exception");
+        return -3;
+    }
+}
+
+int sextant_build_finish(void* builder, const char* out_path,
+                         char* err, size_t err_len) {
+    auto* b = reinterpret_cast<PushBuilder*>(builder);
+    if (!b || !out_path) {
+        delete b;
+        set_err(err, err_len, "sextant_build_finish: null argument");
+        return -1;
+    }
+    try {
+        auto source = b->vecs.build();
+        const sextant_build_opts& opts = b->opts;
+        sextant::tree::IVFTreeIndex::BuildConfig cfg;
+        cfg.k_root = opts.k_root;
+        cfg.leaf_capacity = opts.leaf_capacity ? opts.leaf_capacity : 5000;
+        cfg.pca_dims = opts.pca_dims ? opts.pca_dims : 32;
+        cfg.num_threads = opts.num_threads;
+        cfg.max_lloyd_passes =
+            opts.max_lloyd_passes ? opts.max_lloyd_passes : 10;
+        cfg.adaptive_probe_gap = opts.adaptive_probe_gap;
+        cfg.params.quantizer_type = opts.quantizer;
+        cfg.params.pq4_m = static_cast<uint16_t>(opts.pq_m);
+        cfg.params.metric = opts.metric == SEXTANT_METRIC_IP
+            ? sextant::MetricKind::InnerProduct
+            : sextant::MetricKind::L2Sq;
+        cfg.filter_schema = b->schema;
+        if (!b->cols.empty()) cfg.filter_column_data = b->cols;
+        if (b->has_payload) {
+            cfg.payload_data = b->payload_data.data();
+            cfg.payload_offsets = b->payload_offsets.data();
+        }
+        sextant::tree::IVFTreeIndex::build_streaming_pca(*source, out_path,
+                                                         cfg);
+        delete b;
+        return 0;
+    } catch (const std::exception& e) {
+        delete b;
+        set_err(err, err_len, e.what());
+        return -2;
+    } catch (...) {
+        delete b;
+        set_err(err, err_len, "sextant_build_finish: unknown exception");
+        return -3;
+    }
+}
+
+void sextant_build_abort(void* builder) {
+    delete reinterpret_cast<PushBuilder*>(builder);
 }
 
 }  // extern "C"
