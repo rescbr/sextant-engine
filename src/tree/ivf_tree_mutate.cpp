@@ -1286,6 +1286,16 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
             "delete_batch not supported while a routing plane is attached "
             "(v1 planes are immutable)");
     }
+    // Payload guard: compaction below rewrites codes/row_ids/filter columns
+    // but never rewrites the payload offset/len arrays, so any delete on a
+    // payload-bearing index would silently desync fetch_payload. Loudly
+    // refuse instead (REAL BUG found in the v1 release audit — e2e's
+    // mutation tree is payload-less, which is why this was never hit).
+    if (manifest_.schema.has_payload) {
+        throw Error(ErrorCode::NotImplemented,
+            "delete_batch not supported on payload-bearing indexes "
+            "(payload extent remapping not implemented)");
+    }
     const auto t0 = std::chrono::steady_clock::now();
 
     if (coder_->family() != CoderFamily::GlobalPq) {

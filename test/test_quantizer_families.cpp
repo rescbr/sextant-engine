@@ -159,7 +159,7 @@ void run_family(const FamilySpec& spec) {
         auto br = IVFTreeIndex::build_streaming_pca(s, tree, cfg);
         (void)br;
     }
-    auto idx = IVFTreeIndex::open(tree);
+    auto idx = IVFTreeIndex::open(tree, 0, 1, 0, /*writable=*/true);
     ASSERT_TRUE(idx);
     // Closure replication stores a bounded fraction of vectors in more
     // than one leaf (none on the synthetic clustered fixtures, ~9% here),
@@ -313,7 +313,7 @@ TEST(QuantizerFamilies, LocalScalarInnerProductBias) {
         FbinSource s(datasets_dir() + "/mini10k_base.fbin");
         IVFTreeIndex::build_streaming_pca(s, tree, cfg);
     }
-    auto idx = IVFTreeIndex::open(tree);
+    auto idx = IVFTreeIndex::open(tree, 0, 1, 0, /*writable=*/true);
     ASSERT_TRUE(idx);
     EXPECT_GE(idx->live_count(), m.n);
     SearchConfig sc;
@@ -358,7 +358,7 @@ TEST(QuantizerFamilies, PcaDisabledBuild) {
         FbinSource s(datasets_dir() + "/mini10k_base.fbin");
         IVFTreeIndex::build_streaming_pca(s, tree, cfg);
     }
-    auto idx = IVFTreeIndex::open(tree);
+    auto idx = IVFTreeIndex::open(tree, 0, 1, 0, /*writable=*/true);
     ASSERT_TRUE(idx);
     EXPECT_EQ(idx->pca_dims_default(), 0u);
     SearchConfig sc;
@@ -400,7 +400,7 @@ TEST(QuantizerFamilies, ProbeFractionRouting) {
         FbinSource s(datasets_dir() + "/mini10k_base.fbin");
         IVFTreeIndex::build_streaming_pca(s, tree, cfg);
     }
-    auto idx = IVFTreeIndex::open(tree);
+    auto idx = IVFTreeIndex::open(tree, 0, 1, 0, /*writable=*/true);
     ASSERT_TRUE(idx);
     EXPECT_FLOAT_EQ(idx->probe_fraction_default(), 0.5f);
 
@@ -454,7 +454,7 @@ TEST(QuantizerFamilies, FeedbackProbing) {
         FbinSource s(datasets_dir() + "/mini10k_base.fbin");
         IVFTreeIndex::build_streaming_pca(s, tree, cfg);
     }
-    auto idx = IVFTreeIndex::open(tree);
+    auto idx = IVFTreeIndex::open(tree, 0, 1, 0, /*writable=*/true);
     ASSERT_TRUE(idx);
 
     auto result_ids = [&](SearchConfig sc) {
@@ -576,7 +576,7 @@ TEST(QuantizerFamilies, ProbeLnAutoSizing) {
         FbinSource s(datasets_dir() + "/mini10k_base.fbin");
         IVFTreeIndex::build_streaming_pca(s, tree, cfg);
     }
-    auto idx = IVFTreeIndex::open(tree);
+    auto idx = IVFTreeIndex::open(tree, 0, 1, 0, /*writable=*/true);
     ASSERT_TRUE(idx);
     ASSERT_GT(idx->n_leaves(), 4u * 4u)
         << "fixture should force more than 4 leaves per root child";

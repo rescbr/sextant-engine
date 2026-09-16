@@ -100,7 +100,7 @@ std::vector<ColumnData> make_filter_data_int32_string(uint64_t n) {
 struct LeafExtent { PageId page; uint64_t pages; };
 LeafExtent find_first_leaf(const std::string& tree_path,
                            std::vector<uint8_t>& out_buf) {
-    PageFile file(tree_path);
+    PageFile file(tree_path, PageFileMode::ReadOnly);
     Superblock sb;
     sb.load(file);
 
@@ -549,7 +549,7 @@ TEST(TreeFilterColumns, InternalNodeSummariesPopulated) {
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
 
     // Open the file directly to inspect the root node extent.
-    PageFile file(tree_path);
+    PageFile file(tree_path, PageFileMode::ReadOnly);
     Superblock sb;
     sb.load(file);
     const PageId root_page = sb.root_node_page();
@@ -876,6 +876,67 @@ TEST(TreeFilterColumns, PayloadRoundTrip) {
         }
     }
     EXPECT_GT(verified, 0u);
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
+// Phase E2: delete_batch must loudly refuse on payload-bearing indexes.
+// Before the v1 release audit this silently compacted codes/row_ids/filters
+// without rewriting payload offset/len arrays, desyncing fetch_payload.
+// ===========================================================================
+
+TEST(TreeFilterColumns, DeleteBatchThrowsOnPayload) {
+    const uint64_t n = 1000;
+    const uint32_t dim = 32;
+    const uint32_t n_clusters = 10;
+    const std::string base_path = write_test_fbin(
+        "tree_payload_guard.fbin", n, dim, n_clusters, 42);
+    const std::string tree_path = (std::filesystem::temp_directory_path() /
+                                   "tree_payload_guard.tree").string();
+    std::filesystem::remove(tree_path);
+
+    Schema schema;
+    schema.has_payload = true;
+    std::vector<uint8_t> payload_data;
+    std::vector<uint32_t> payload_offsets(n + 1);
+    for (uint64_t i = 0; i < n; ++i) {
+        payload_offsets[i] = static_cast<uint32_t>(payload_data.size());
+        const std::string blob = "blob_" + std::to_string(i);
+        payload_data.insert(payload_data.end(), blob.begin(), blob.end());
+    }
+    payload_offsets[n] = static_cast<uint32_t>(payload_data.size());
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "pq";
+    cfg.params.pq4_m = 8;
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 4;
+    cfg.leaf_capacity = 250;
+    cfg.pca_dims = 16;
+    cfg.max_lloyd_passes = 2;
+    cfg.num_threads = 2;
+    cfg.filter_schema = schema;
+    cfg.filter_column_data = make_filter_data_int32_string(n);
+    cfg.payload_data = payload_data.data();
+    cfg.payload_offsets = payload_offsets.data();
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
+    bool threw = false;
+    try {
+        idx->delete_batch({0, 1, 2});
+    } catch (const sextant::Error& e) {
+        threw = true;
+        EXPECT_EQ(e.code(), sextant::ErrorCode::NotImplemented);
+        EXPECT_NE(std::string(e.what()).find("payload"), std::string::npos)
+            << "error should mention payload: " << e.what();
+    }
+    EXPECT_TRUE(threw) << "delete_batch must throw on payload-bearing indexes";
 
     std::filesystem::remove(base_path);
     std::filesystem::remove(tree_path);

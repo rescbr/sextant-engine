@@ -29,6 +29,13 @@ using PageId = uint64_t;
 /// Sentinel for "no page" (invalid / nil).
 inline constexpr PageId kInvalidPage = 0xFFFFFFFFFFFFFFFFull;
 
+/// Open mode for PageFile.
+/// - ReadOnly: search/scan handles. O_RDONLY, no O_CREAT — the index is an
+///   immutable materialized view; search never writes, and read-only
+///   deployments (read-only mounts, other-user files) must work.
+/// - ReadWrite: build/vacuum/fsck-repair/mutation. O_RDWR | O_CREAT.
+enum class PageFileMode : uint8_t { ReadOnly, ReadWrite };
+
 /// Buffered, page-aligned file for the IVF tree.
 ///
 /// One FD. All I/O is at page granularity (multiples of kPageSize). The file
@@ -37,9 +44,8 @@ class PageFile {
 public:
     PageFile() = default;
 
-    /// Open `path` for read/write (create if it doesn't exist).
-    /// Throws on failure.
-    explicit PageFile(const std::string& path);
+    /// Open `path` in `mode`. Throws on failure.
+    explicit PageFile(const std::string& path, PageFileMode mode);
     ~PageFile();
 
     PageFile(const PageFile&) = delete;

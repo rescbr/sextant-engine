@@ -978,7 +978,7 @@ int cmd_plane_attach(int argc, char* argv[]) {
     const auto* base = reinterpret_cast<const float*>(
         static_cast<const uint8_t*>(m) + 8);
 
-    auto idx = tree::IVFTreeIndex::open(index_path);
+    auto idx = tree::IVFTreeIndex::open(index_path, 0, 1, 0, /*writable=*/true);
     idx->attach_plane(base, hdr.n, hdr.dim, enc,
                       static_cast<uint16_t>(p.get<uint32_t>("rank")),
                       p.get<uint32_t>("train-rows"));
@@ -2331,7 +2331,7 @@ int cmd_tree_insert(int argc, char* argv[]) {
         return 1;
     }
 
-    auto idx = tree::IVFTreeIndex::open(index_path);
+    auto idx = tree::IVFTreeIndex::open(index_path, 0, 1, 0, /*writable=*/true);
     if (vh.dim != idx->dim()) {
         std::cerr << "tree-insert: dim mismatch (file=" << vh.dim
                   << ", index=" << idx->dim() << ")\n";
@@ -2433,7 +2433,7 @@ int cmd_tree_delete(int argc, char* argv[]) {
         }
     }
 
-    auto idx = tree::IVFTreeIndex::open(index_path);
+    auto idx = tree::IVFTreeIndex::open(index_path, 0, 1, 0, /*writable=*/true);
     const uint64_t before = idx->live_count();
     idx->delete_batch(row_ids);
     const uint64_t after = idx->live_count();
@@ -2468,7 +2468,7 @@ int cmd_tree_vacuum(int argc, char* argv[]) {
 
     const std::string index_path = p.get<std::string>("index");
 
-    auto idx = tree::IVFTreeIndex::open(index_path);
+    auto idx = tree::IVFTreeIndex::open(index_path, 0, 1, 0, /*writable=*/true);
     tree::IVFTreeIndex::VacuumConfig cfg;
     cfg.rebuild_cardinality = p.exist("rebuild-cardinality");
     cfg.batch_size = p.get<uint32_t>("batch-size");
@@ -2508,7 +2508,7 @@ int cmd_tree_defrag(int argc, char* argv[]) {
 
     const std::string index_path = p.get<std::string>("index");
 
-    auto idx = tree::IVFTreeIndex::open(index_path);
+    auto idx = tree::IVFTreeIndex::open(index_path, 0, 1, 0, /*writable=*/true);
     tree::IVFTreeIndex::DefragConfig cfg;
     cfg.shrink_file = !p.exist("no-shrink");
     cfg.batch_size = p.get<uint32_t>("batch-size");

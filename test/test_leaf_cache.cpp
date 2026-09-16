@@ -440,7 +440,7 @@ TEST(LeafExtentCacheIntegration, SearchParityAndHitAccounting) {
     // Cache ON: first query = misses; identical query again = hits; results
     // must match the cache-off baseline exactly.
     auto idx = sextant::tree::IVFTreeIndex::open(
-        tree_path, 8ull << 20);  // 8 MiB — fits all leaves of this fixture
+        tree_path, 8ull << 20, 1, 0, /*writable=*/true);  // 8 MiB — fits all leaves of this fixture
     std::vector<float> q(dim, 0.3f);
     (void)idx->search(q.data(), 10, sc);  // warm
     auto s1 = idx->search_stats().snapshot_and_reset();

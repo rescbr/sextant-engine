@@ -127,7 +127,7 @@ TEST(TreeFsck, RepairsCorruptBitmap) {
     PageId leaked = 0;   // a free page we'll falsely mark allocated
     PageId orphan = 0;   // an allocated page we'll falsely mark free
     {
-        PageFile file(tree_path);
+        PageFile file(tree_path, PageFileMode::ReadWrite);
         Superblock sb;
         sb.load(file);
 
@@ -180,11 +180,20 @@ TEST(TreeFsck, RepairsCorruptBitmap) {
 // ===========================================================================
 
 TEST(TreeFsck, EmptyFileFailsGracefully) {
-    // PageFile creates the file if absent; fsck should then report a bad
-    // superblock rather than throwing.
     const std::string tree_path =
         (std::filesystem::temp_directory_path() / "fsck_empty.tree").string();
     std::filesystem::remove(tree_path);
+
+    // Missing file: fsck (read-only open) throws a clean error and never
+    // creates a zero-byte file.
+    EXPECT_THROW(fsck(tree_path), sextant::Error);
+    EXPECT_FALSE(std::filesystem::exists(tree_path));
+
+    // Existing but empty (0-byte) file: open succeeds, superblock load
+    // fails — reported in the result, not thrown.
+    FILE* f = std::fopen(tree_path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    std::fclose(f);
 
     auto result = fsck(tree_path);
     EXPECT_FALSE(result.superblock_ok);

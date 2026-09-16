@@ -121,7 +121,7 @@ TestTree build_test_tree(uint64_t n, uint32_t dim, uint32_t n_clusters,
 TEST(VacuumDefrag, VacuumRepairsDirtySummaries) {
     auto tt = build_test_tree(/*n=*/1000, /*dim=*/32, /*n_clusters=*/10,
                                /*leaf_cap=*/200, /*k_root=*/4);
-    auto idx = IVFTreeIndex::open(tt.tree_path);
+    auto idx = IVFTreeIndex::open(tt.tree_path, 0, 1, 0, /*writable=*/true);
 
     // Delete all vectors with category == 0 (100 vectors).
     std::vector<RowId> to_delete;
@@ -167,7 +167,7 @@ TEST(VacuumDefrag, VacuumPreservesSearchRecall) {
     const uint32_t dim = 32;
     auto tt = build_test_tree(/*n=*/1000, dim, /*n_clusters=*/10,
                                /*leaf_cap=*/200, /*k_root=*/4);
-    auto idx = IVFTreeIndex::open(tt.tree_path);
+    auto idx = IVFTreeIndex::open(tt.tree_path, 0, 1, 0, /*writable=*/true);
 
     // Baseline recall: search for 20 random queries (no filter).
     auto measure_recall = [&](IVFTreeIndex& index) -> float {
@@ -210,7 +210,7 @@ TEST(VacuumDefrag, VacuumPreservesSearchRecall) {
 TEST(VacuumDefrag, VacuumRebuildCardinality) {
     auto tt = build_test_tree(/*n=*/500, /*dim=*/32, /*n_clusters=*/10,
                                /*leaf_cap=*/200, /*k_root=*/4);
-    auto idx = IVFTreeIndex::open(tt.tree_path);
+    auto idx = IVFTreeIndex::open(tt.tree_path, 0, 1, 0, /*writable=*/true);
 
     // Delete 50 vectors.
     std::vector<RowId> to_delete;
@@ -227,7 +227,7 @@ TEST(VacuumDefrag, VacuumRebuildCardinality) {
         << "Cardinality table should have been rebuilt";
 
     // Reopen and verify search still works.
-    idx = IVFTreeIndex::open(tt.tree_path);
+    idx = IVFTreeIndex::open(tt.tree_path, 0, 1, 0, /*writable=*/true);
     SearchConfig scfg;
     scfg.k = 10;
     scfg.n_probe = 4;
@@ -242,7 +242,7 @@ TEST(VacuumDefrag, VacuumRebuildCardinality) {
 TEST(VacuumDefrag, VacuumOnCleanIndexIsNoOp) {
     auto tt = build_test_tree(/*n=*/500, /*dim=*/32, /*n_clusters=*/10,
                                /*leaf_cap=*/200, /*k_root=*/4);
-    auto idx = IVFTreeIndex::open(tt.tree_path);
+    auto idx = IVFTreeIndex::open(tt.tree_path, 0, 1, 0, /*writable=*/true);
 
     // No deletes → no dirty leaves → vacuum should repair 0 summaries.
     auto result = idx->vacuum();
@@ -259,7 +259,7 @@ TEST(VacuumDefrag, VacuumOnCleanIndexIsNoOp) {
 TEST(VacuumDefrag, DefragRelocatesLeaves) {
     auto tt = build_test_tree(/*n=*/1000, /*dim=*/32, /*n_clusters=*/10,
                                /*leaf_cap=*/200, /*k_root=*/4);
-    auto idx = IVFTreeIndex::open(tt.tree_path);
+    auto idx = IVFTreeIndex::open(tt.tree_path, 0, 1, 0, /*writable=*/true);
 
     const uint64_t pages_before = idx->n_pages();
 
@@ -288,7 +288,7 @@ TEST(VacuumDefrag, DefragPreservesSearchResults) {
     const uint32_t dim = 32;
     auto tt = build_test_tree(/*n=*/1000, dim, /*n_clusters=*/10,
                                /*leaf_cap=*/200, /*k_root=*/4);
-    auto idx = IVFTreeIndex::open(tt.tree_path);
+    auto idx = IVFTreeIndex::open(tt.tree_path, 0, 1, 0, /*writable=*/true);
 
     // Baseline: search for 20 queries, record distance profiles.
     SearchConfig scfg;
@@ -337,7 +337,7 @@ TEST(VacuumDefrag, DefragPreservesSearchResults) {
 TEST(VacuumDefrag, DefragShrinksFile) {
     auto tt = build_test_tree(/*n=*/1000, /*dim=*/32, /*n_clusters=*/10,
                                /*leaf_cap=*/200, /*k_root=*/4);
-    auto idx = IVFTreeIndex::open(tt.tree_path);
+    auto idx = IVFTreeIndex::open(tt.tree_path, 0, 1, 0, /*writable=*/true);
     const uint64_t pages_after_build = idx->n_pages();
 
     // Delete a large chunk to create free pages.
@@ -364,7 +364,7 @@ TEST(VacuumDefrag, VacuumThenDefrag) {
     const uint32_t dim = 32;
     auto tt = build_test_tree(/*n=*/800, dim, /*n_clusters=*/10,
                                /*leaf_cap=*/200, /*k_root=*/4);
-    auto idx = IVFTreeIndex::open(tt.tree_path);
+    auto idx = IVFTreeIndex::open(tt.tree_path, 0, 1, 0, /*writable=*/true);
 
     // Delete 200 vectors.
     std::vector<RowId> to_delete;

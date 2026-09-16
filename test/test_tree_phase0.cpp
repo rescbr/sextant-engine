@@ -40,7 +40,7 @@ TEST(TreePageFile, WriteReadRoundTrip) {
     constexpr uint32_t kNPg = 4;
 
     {
-        PageFile f(path);
+        PageFile f(path, PageFileMode::ReadWrite);
         f.truncate(kNPg);
         EXPECT_EQ(f.num_pages(), kNPg);
 
@@ -53,7 +53,7 @@ TEST(TreePageFile, WriteReadRoundTrip) {
         f.sync();
     }
     {
-        PageFile f(path);
+        PageFile f(path, PageFileMode::ReadOnly);
         std::vector<uint8_t> buf(kPageSize);
         for (uint32_t p = 0; p < kNPg; ++p) {
             f.read_page(p, buf.data());
@@ -68,7 +68,7 @@ TEST(TreePageFile, MultiPageExtent) {
     std::string path = temp_path(".tree");
     constexpr uint32_t kNPg = 8;
 
-    PageFile f(path);
+    PageFile f(path, PageFileMode::ReadWrite);
     f.truncate(kNPg);
 
     // Write 4 pages at once starting at page 2.
@@ -88,11 +88,42 @@ TEST(TreePageFile, MultiPageExtent) {
 
 TEST(TreePageFile, TruncateGrowsAndShrinks) {
     std::string path = temp_path(".tree");
-    PageFile f(path);
+    PageFile f(path, PageFileMode::ReadWrite);
     f.truncate(10);
     EXPECT_EQ(f.num_pages(), 10);
     f.truncate(3);
     EXPECT_EQ(f.num_pages(), 3);
+    std::filesystem::remove(path);
+}
+
+TEST(TreePageFile, ReadOnlyIsWriteProof) {
+    // Read-only opens must never create the file: opening a missing path
+    // throws instead of leaving a zero-byte file behind.
+    std::string missing = temp_path(".tree");
+    EXPECT_THROW(PageFile f(missing, PageFileMode::ReadOnly), sextant::Error);
+    EXPECT_FALSE(std::filesystem::exists(missing));
+
+    // Build a file, reopen read-only: reads work, writes throw, and the
+    // file is untouched afterwards.
+    std::string path = temp_path(".tree");
+    {
+        PageFile f(path, PageFileMode::ReadWrite);
+        f.truncate(2);
+        std::vector<uint8_t> buf(kPageSize, 0x5A);
+        f.write_page(0, buf.data());
+    }
+    {
+        PageFile f(path, PageFileMode::ReadOnly);
+        std::vector<uint8_t> buf(kPageSize);
+        f.read_page(0, buf.data());
+        EXPECT_EQ(buf[0], 0x5A);
+        EXPECT_THROW(f.write_page(1, buf.data()), sextant::Error);
+        EXPECT_THROW(f.truncate(4), sextant::Error);
+    }
+    {
+        PageFile f(path, PageFileMode::ReadWrite);
+        EXPECT_EQ(f.num_pages(), 2u);  // no growth happened
+    }
     std::filesystem::remove(path);
 }
 
@@ -108,7 +139,7 @@ protected:
     static constexpr PageId kBitmapPage = 2;
     static constexpr uint32_t kBitmapPages = 1;  // 1 page = 32768 bits
 
-    PageFile file{path};
+    PageFile file{path, PageFileMode::ReadWrite};
     PageAllocator alloc;
 
     void SetUp() override {
@@ -214,7 +245,7 @@ TEST(TreeSuperblock, InitFreshAndLoad) {
     std::string path = temp_path(".tree");
 
     {
-        PageFile f(path);
+        PageFile f(path, PageFileMode::ReadWrite);
         f.truncate(3);  // superblock + shadow + bitmap
 
         Superblock sb;
@@ -225,7 +256,7 @@ TEST(TreeSuperblock, InitFreshAndLoad) {
         EXPECT_EQ(sb.commit_seq(), 1u);
     }
     {
-        PageFile f(path);
+        PageFile f(path, PageFileMode::ReadOnly);
         Superblock sb;
         sb.load(f);
         EXPECT_EQ(sb.commit_seq(), 1u);
@@ -238,7 +269,7 @@ TEST(TreeSuperblock, InitFreshAndLoad) {
 
 TEST(TreeSuperblock, MultipleCommits) {
     std::string path = temp_path(".tree");
-    PageFile f(path);
+    PageFile f(path, PageFileMode::ReadWrite);
     f.truncate(3);
 
     Superblock sb;
@@ -268,7 +299,7 @@ TEST(TreeSuperblock, ShadowSurvivesPartialWrite) {
     // should still be valid and loadable.
     std::string path = temp_path(".tree");
 
-    PageFile f(path);
+    PageFile f(path, PageFileMode::ReadWrite);
     f.truncate(3);
 
     Superblock sb;
@@ -290,7 +321,7 @@ TEST(TreeSuperblock, ShadowSurvivesPartialWrite) {
 
 TEST(TreeSuperblock, BadMagicThrows) {
     std::string path = temp_path(".tree");
-    PageFile f(path);
+    PageFile f(path, PageFileMode::ReadWrite);
     f.truncate(3);
 
     // Both pages are zero (no valid magic).

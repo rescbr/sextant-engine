@@ -203,10 +203,16 @@ public:
     /// internal/routing nodes always use the mmap (they are part of the
     /// routing DRAM budget). Mutations (insert/delete/split/vacuum/defrag)
     /// invalidate the cache wholesale via remap_().
+    ///
+    /// `writable=false` (default): open the file read-only — the search/
+    /// serving contract (immutable index; works on read-only mounts).
+    /// `writable=true`: internal mutation path (insert/delete/vacuum/defrag/
+    /// plane attach) — opens O_RDWR.
     static std::unique_ptr<IVFTreeIndex> open(const std::string& path,
                                               uint64_t leaf_cache_bytes = 0,
                                               uint32_t cache_window_pct = 1,
-                                              uint64_t plane_cache_bytes = 0);
+                                              uint64_t plane_cache_bytes = 0,
+                                              bool writable = false);
 
     // --- Search ---
 

@@ -2604,7 +2604,7 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
         vec_bytes >> 20, leaf_overhead >> 20, payload_bytes >> 20,
         upper_pages, bitmap_pages,
         (bitmap_pages * kPagesPerBitmapPage * kPageSize) >> 30);
-    PageFile file(output_path);
+    PageFile file(output_path, PageFileMode::ReadWrite);
     // Formatting fresh: wipe any superblock copies left over from a previous
     // tree in this file. Superblock::load picks the copy with the higher
     // commit_seq, and this build's first commit is seq 1 — a stale copy from

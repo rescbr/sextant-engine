@@ -68,17 +68,20 @@ void IVFTreeIndex::close() {
 std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
                                               uint64_t leaf_cache_bytes,
                                               uint32_t cache_window_pct,
-                                              uint64_t plane_cache_bytes) {
+                                              uint64_t plane_cache_bytes,
+                                              bool writable) {
     auto idx = std::unique_ptr<IVFTreeIndex>(new IVFTreeIndex());
-    // Fail fast on a missing path: PageFile opens O_RDWR|O_CREAT (the
-    // build/vacuum write path needs creation), so opening a typo'd name
-    // would silently leave a zero-byte file behind.
+    // Fail fast on a missing path in every mode: read-only opens would
+    // otherwise surface a raw ENOENT (fine, but we want the path in the
+    // message), and writable opens must never silently create an empty
+    // tree where the caller expected an existing one.
     if (!std::filesystem::exists(path)) {
         throw Error(ErrorCode::InvalidParam,
                     "IVFTreeIndex::open: no such file: " + path);
     }
     idx->path_ = path;
-    idx->file_ = PageFile(path);
+    idx->file_ = PageFile(path, writable ? PageFileMode::ReadWrite
+                                         : PageFileMode::ReadOnly);
     // fd for the search path's posix_fadvise prefetch calls (open-issued
     // read-ahead). Historically this was never wired — every fadvise64
     // silently returned EBADF, so all pre-2026-09 cold-search numbers ran

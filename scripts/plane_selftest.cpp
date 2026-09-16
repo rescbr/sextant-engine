@@ -43,7 +43,7 @@ int main() {
         std::remove(path);
         MemorySource src2(base.data(), N, D);
         (void)IVFTreeIndex::build_streaming_pca(src2, path, bc);
-        idx = IVFTreeIndex::open(path);
+        idx = IVFTreeIndex::open(path, 0, 1, 0, /*writable=*/true);
         idx->attach_plane(base.data(), N, D, enc, 96, 4000);
         const auto* pl = idx->plane();
         const uint32_t R = pl->meta().rank;

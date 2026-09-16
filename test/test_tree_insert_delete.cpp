@@ -103,7 +103,7 @@ TEST(TreeInsertDelete, InsertIncreasesLiveCount) {
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
     // Insert 100 new vectors with row_ids n..n+99.
@@ -145,7 +145,7 @@ TEST(TreeInsertDelete, InsertedVectorsAreSearchable) {
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
 
     // Read the fbin data for query vectors.
     uint64_t fbin_n;
@@ -223,7 +223,7 @@ TEST(TreeInsertDelete, DeleteDecreasesLiveCount) {
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
     // Delete row_ids 0..99.
@@ -259,7 +259,7 @@ TEST(TreeInsertDelete, DeletedVectorsAreNotSearchable) {
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
 
     // Delete row_id 42.
     idx->delete_batch({static_cast<RowId>(42)});
@@ -309,7 +309,7 @@ TEST(TreeInsertDelete, InsertThenDeleteRestoresCount) {
     cfg.adaptive_probe_gap = 0.0f;  // disable gap pruning for deterministic probing
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
     // Insert 50 vectors.
@@ -365,7 +365,7 @@ TEST(TreeInsertDelete, MutationsPersistAfterReopen) {
 
     // Insert, then close.
     {
-        auto idx = IVFTreeIndex::open(tree_path);
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
         IVFTreeIndex::InsertPoint point;
         std::vector<float> vec(dim, 0.5f);
         point.vector = vec.data();
@@ -376,7 +376,7 @@ TEST(TreeInsertDelete, MutationsPersistAfterReopen) {
 
     // Reopen — the insert should persist.
     {
-        auto idx = IVFTreeIndex::open(tree_path);
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
         EXPECT_GE(idx->live_count(), n + 1);  // closure replication may exceed this
 
         // Search for the inserted vector.
@@ -424,7 +424,7 @@ TEST(TreeInsertDelete, InsertTriggersLeafSplit) {
     cfg.adaptive_probe_gap = 0.0f;
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     const uint32_t n_leaves_before = idx->n_leaves();
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
@@ -649,7 +649,7 @@ TEST(TreeInsertDelete, SiftSmallSplitDrift) {
     cfg.adaptive_probe_gap = 0.0f;
 
     ([&]{ FbinSource s(test::siftsmall_base()); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
 
     SearchConfig scfg;
     scfg.k = 10;
@@ -770,7 +770,7 @@ TEST(TreeInsertDelete, InsertWithFilterColumns) {
     cfg.filter_column_data = filter_data;
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
     // Read base data for queries.
@@ -877,7 +877,7 @@ TEST(TreeInsertDelete, Depth3SplitIncreasesLeafCount) {
     cfg.pca_dims = 0;               // FP16 routing
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
 
     EXPECT_EQ(idx->depth(), 3)
         << "Tree should be depth=3 with k_root=16 > k_root_max_depth2=4";
@@ -997,7 +997,7 @@ TEST(TreeInsertDelete, ScalarInsertIncreasesLiveCount) {
     cfg.adaptive_probe_gap = 0.0f;
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
     const uint32_t n_insert = 100;
@@ -1037,7 +1037,7 @@ TEST(TreeInsertDelete, ScalarInsertedVectorsAreSearchable) {
     cfg.adaptive_probe_gap = 0.0f;
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
 
     uint64_t fbin_n;
     uint32_t fbin_dim;
@@ -1102,7 +1102,7 @@ TEST(TreeInsertDelete, ScalarInsertTriggersLeafSplit) {
     cfg.adaptive_probe_gap = 0.0f;
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     const uint32_t n_leaves_before = idx->n_leaves();
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
@@ -1176,7 +1176,7 @@ TEST(TreeInsertDelete, ScalarIPBiasRecallAndInsert) {
     cfg.adaptive_probe_gap = 0.0f;
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
     uint64_t fbin_n;
@@ -1276,7 +1276,7 @@ TEST(TreeInsertDelete, LocalPqInsertAndSplit) {
     cfg.adaptive_probe_gap = 0.0f;
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     const uint32_t n_leaves_before = idx->n_leaves();
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
@@ -1384,7 +1384,7 @@ TEST(TreeInsertDelete, LocalScalarInsertAndSplit) {
     cfg.adaptive_probe_gap = 0.0f;
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
-    auto idx = IVFTreeIndex::open(tree_path);
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
     const uint32_t n_leaves_before = idx->n_leaves();
     EXPECT_GE(idx->live_count(), n);  // closure replication may exceed this
 
@@ -1489,7 +1489,7 @@ TEST(TreeInsertDelete, LargeTreeBitmapCoversFileAndMutates) {
     ([&]{ FbinSource s(base_path);
           return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     {
-        auto idx = IVFTreeIndex::open(tree_path);
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
         EXPECT_GT(idx->live_count(), n - 1);
     }
 
@@ -1504,7 +1504,7 @@ TEST(TreeInsertDelete, LargeTreeBitmapCoversFileAndMutates) {
 
     // Mutation at scale: insert, reopen, delete, reopen, fsck clean.
     {
-        auto idx = IVFTreeIndex::open(tree_path);
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
         std::vector<float> vec(dim, 0.5f);
         std::vector<IVFTreeIndex::InsertPoint> points;
         points.push_back({vec.data(), static_cast<RowId>(n + 1), {}, {}});
@@ -1512,7 +1512,7 @@ TEST(TreeInsertDelete, LargeTreeBitmapCoversFileAndMutates) {
         EXPECT_GE(idx->live_count(), n);
     }
     {
-        auto idx = IVFTreeIndex::open(tree_path);
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
         idx->delete_batch({static_cast<RowId>(n + 1)});
     }
     const auto res2 = fsck(tree_path);
@@ -1556,7 +1556,7 @@ TEST(TreeInsertDelete, SplitWithWidePqMNoStackSmash) {
     ([&]{ FbinSource s(base_path);
           return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     {
-        auto idx = IVFTreeIndex::open(tree_path);
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
         // Insert enough to force at least one split (kmeans_pq m=384 runs
         // inside split_leaf_ — the exact path that smashed the stack).
         const uint32_t n_insert = 4000;
@@ -1574,7 +1574,7 @@ TEST(TreeInsertDelete, SplitWithWidePqMNoStackSmash) {
         EXPECT_GT(idx->n_leaves(), 4u);  // splits happened
     }
     {
-        auto idx = IVFTreeIndex::open(tree_path);
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
         EXPECT_GE(idx->live_count(), n + 4000 - 1);
     }
     const auto res = fsck(tree_path);
@@ -1624,13 +1624,13 @@ TEST(TreeInsertDelete, ChurnSplitWavesKeepAccounting) {
     // leaf capacity per remaining leaf so the split loop cascades (leaves
     // created by splits get split again).
     {
-        auto idx = IVFTreeIndex::open(tree_path);
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
         std::vector<RowId> del;
         for (uint64_t i = 0; i < n / 4; ++i) del.push_back(static_cast<RowId>(i));
         idx->delete_batch(del);
     }
     {
-        auto idx = IVFTreeIndex::open(tree_path);
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
         const uint32_t n_insert = 24000;
         std::vector<float> vec_storage(
             static_cast<size_t>(n_insert) * dim);

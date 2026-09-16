@@ -243,7 +243,8 @@ std::string FsckResult::summary() const {
 FsckResult fsck(const std::string& path, bool repair) {
     FsckResult result;
 
-    PageFile file(path);
+    PageFile file(path, repair ? PageFileMode::ReadWrite
+                               : PageFileMode::ReadOnly);
 
     // -----------------------------------------------------------------------
     // Level 0: Superblock.

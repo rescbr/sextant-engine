@@ -142,6 +142,37 @@ FR=$("$SEXTANT" tree-search --index "$OUT/cx.tree" --query "$OUT/q5.fbin" \
 awk -v r="${FR:-0}" 'BEGIN{exit !(r >= 9)}'
 gate "filtered search returns full result set (${FR:-0}/query, is_first_chunk=1)" $?
 
+# == 5b2. rare-value Eq gate (url:eq:<globally-unique url>) ==
+# Guards the rare-string brute-force fallback path that was once broken
+# invisibly (fixed in 8803abc): a predicate matching exactly one row must
+# return exactly that row (mean results/query == 1), not 0.
+RARE_URL_FILE="$OUT/rare_url.txt"
+if [[ ! -s "$RARE_URL_FILE" ]]; then
+    "$PY" - "$INPUT_GLOB" "$RARE_URL_FILE" <<'PYEOF'
+import sys, glob, collections, pyarrow.parquet as pq
+pattern, out = sys.argv[1], sys.argv[2]
+counts = collections.Counter()
+files = sorted(glob.glob(pattern))
+assert files, pattern
+for f in files:
+    urls = pq.read_table(f, columns=['url']).column('url').to_pylist()
+    counts.update(urls)
+for u, n in counts.items():
+    if n == 1:
+        with open(out, 'w') as fh:
+            fh.write(u)
+        print(f"rare url (1 of {sum(counts.values())} rows): {u[:80]}")
+        sys.exit(0)
+raise SystemExit("no singleton url found")
+PYEOF
+fi
+RARE_URL=$(cat "$RARE_URL_FILE")
+RR=$("$SEXTANT" tree-search --index "$OUT/cx.tree" --query "$OUT/q5.fbin" \
+    --threads 16 --probe-fraction 1.0 --filter "url:eq:$RARE_URL" 2>&1 \
+    | grep -oE 'mean results/query: [0-9.]+' | grep -oE '[0-9.]+$' || true)
+awk -v r="${RR:--1}" 'BEGIN{exit !(r > 0.99 && r < 1.01)}'
+gate "rare-value Eq returns exactly 1 result (${RR:-0}/query, url singleton)" $?
+
 # == 5c. synthetic-query recall (LLM-generated RAG queries; alongside the
 # self-query gate). Fixtures: cx_synth1k{,_16}_gt.gtmm from
 # corpora/gen_synth_queries.py + embed_queries.py + gen_ground_truth.py.

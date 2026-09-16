@@ -13,11 +13,18 @@
 
 namespace sextant::tree {
 
-PageFile::PageFile(const std::string& path)
+PageFile::PageFile(const std::string& path, PageFileMode mode)
     : path_(path) {
-    // O_RDWR | O_CREAT: the tree file is read/write during build and vacuum.
-    // No O_DIRECT — buffered I/O with explicit fdatasync at commit points.
-    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+    // ReadWrite: O_RDWR | O_CREAT — the tree file is read/write during build,
+    // vacuum, fsck repair and (internal) mutation. No O_DIRECT — buffered I/O
+    // with explicit fdatasync at commit points.
+    // ReadOnly: O_RDONLY, no O_CREAT — pure search handles. Also works on
+    // read-only mounts / files we lack write permission for, and makes any
+    // stray write on the search path structurally impossible.
+    const int flags = mode == PageFileMode::ReadWrite
+                          ? (O_RDWR | O_CREAT)
+                          : O_RDONLY;
+    fd_ = ::open(path.c_str(), flags, 0644);
     if (fd_ < 0) {
         throw Error(ErrorCode::IoError,
                     "PageFile: failed to open '" + path + "': " +
