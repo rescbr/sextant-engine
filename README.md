@@ -274,10 +274,14 @@ Use `tools/fvecs_to_fbin` to convert `.fvecs`/`.ivecs` corpora.
 `include/sextant/sextant_c.h` (implemented in `src/capi/sextant_c.cpp`) is a
 plain-C99 ABI over the tree index — the sole seam the (post-release) DuckDB
 extension will use. The v1 surface covers: `.fbin`/in-memory/streaming-push
-builds (the push API accepts typed filter columns — Int32/Int64/Float/String —
-and per-row payload blobs), open/close, single-query search with an optional
-conjunct list of predicates (EQ/NEQ/PREFIX on strings; EQ/NEQ/LT/LE/GT/GE/
-BETWEEN on numerics; set/geo ops are reserved and return NotImplemented),
+builds (the push API accepts typed filter columns — Int32/Int64/Float/
+String/Set — and per-row payload blobs), open/close, single-query search
+with an optional conjunct list of predicates covering the full engine
+surface: EQ/NEQ/LT/LE/GT/GE/BETWEEN on numerics, EQ/NEQ/PREFIX/IN/NOT_IN on
+strings (IN/NOT_IN also on numerics, values passed as strings),
+CONTAINS/CONTAINS_ANY/CONTAINS_ALL on Set columns, and GEO_RADIUS/GEO_BOX
+(`column` = latitude column, `geo_lng_column` = longitude column, both
+numeric),
 shared-predicate batch search with row-major output, opaque leaf-location
 output plus `sextant_fetch_payload()` / `sextant_fetch_vector()` for O(1)
 result blob/decoded-vector fetch (locations stay valid until close on the
@@ -291,15 +295,22 @@ are ABI-fixed; structs evolve by tail-append only.
 
 ```c
 sextant_build_opts bo = sextant_default_build_opts();
-sextant_filter_col_def cols[1] = {{"year", SEXTANT_COL_INT32}};
+sextant_filter_col_def cols[2] = {{"year", SEXTANT_COL_INT32},
+                                  {"tags", SEXTANT_COL_SET}};
 char err[256];
-void* b = sextant_build_begin(&bo, dim, cols, 1, /*has_payload=*/1, err, sizeof err);
+void* b = sextant_build_begin(&bo, dim, cols, 2, /*has_payload=*/1, err, sizeof err);
+/* per-chunk Set input: row r's elements are indices offsets[r]..offsets[r+1]
+   into elem_data/elem_lengths (strings are length + pointer, not NUL-terminated) */
+sextant_set_values tags = {counts, offsets, elem_data, elem_lengths};
+const void* col_ptrs[2] = {years, &tags};
 sextant_build_push(b, vecs, n_rows, col_ptrs, payload_offs, payload_bytes,
                    err, sizeof err);
 sextant_build_finish(b, "/tmp/t.tree", err, sizeof err);   /* frees b */
 
 void* idx = sextant_open_index("/tmp/t.tree", err, sizeof err);
-sextant_predicate p = {.column = "year", .op = SEXTANT_PRED_EQ, .value = 2024};
+sextant_predicate p = {.column = "tags", .op = SEXTANT_PRED_CONTAINS,
+                       .str_value = "sports"};   /* designated init zero-fills
+                                                    the tail-appended fields */
 void* leaf[10]; uint32_t slot[10]; uint64_t ids[10]; float d[10];
 int32_t n = sextant_search2(idx, query, &sopts, &p, 1, ids, d, leaf, slot,
                             10, err, sizeof err);

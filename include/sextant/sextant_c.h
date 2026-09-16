@@ -122,8 +122,27 @@ int32_t sextant_search(void* index, const float* query,
 // ===========================================================================
 
 /// Predicate operators. Values are part of the ABI — never renumber.
-/// v1 implements: EQ/NEQ/PREFIX on string columns, and
-/// EQ/NEQ/LT/LE/GT/GE/BETWEEN on Int32/Int64/Float columns.
+/// All ops implemented. Per-op field usage (fields beyond those listed are
+/// ignored; zero-init / designated-init zero-fills unused tail fields):
+///
+/// op              | column type | fields used
+/// ----------------|-------------|------------------------------------------
+/// EQ/NEQ          | any         | value (numeric) or str_value (string)
+/// LT/LE/GT/GE     | numeric     | value
+/// BETWEEN         | numeric     | value (low), value2 (high, inclusive)
+/// PREFIX          | string      | str_value
+/// IN / NOT_IN     | any         | values/value_lengths/n_values (strings;
+///                 |             | numeric columns compare via the strings)
+/// CONTAINS        | set         | str_value (the element)
+/// CONTAINS_ANY    | set         | str_value (optional) + values (folds both)
+/// CONTAINS_ALL    | set         | str_value (optional) + values (folds both)
+/// GEO_RADIUS      | lat column  | geo_lng_column, value/value2 = center
+///                 | (numeric)   | lat/lng, radius_km
+/// GEO_BOX         | lat column  | geo_lng_column, value/value2/value3/
+///                 | (numeric)   | value4 = min_lat/min_lng/max_lat/max_lng
+///
+/// Geo predicates name the latitude column in `column` and the longitude
+/// column in `geo_lng_column` (both must be numeric filter columns).
 enum {
     SEXTANT_PRED_EQ = 0,       ///< value == x (numeric) or str_value == s
     SEXTANT_PRED_NEQ = 1,      ///< value != x / str_value != s
@@ -133,34 +152,47 @@ enum {
     SEXTANT_PRED_GE = 5,       ///< x >= value
     SEXTANT_PRED_BETWEEN = 6,  ///< value <= x <= value2 (numeric only)
     SEXTANT_PRED_PREFIX = 7,   ///< str_value is a prefix of s (string only)
-    // Reserved — NOT implemented in v1; using these returns a negative
-    // "not implemented" error. Values fixed for future v1.x additions:
-    SEXTANT_PRED_IN = 8,         ///< x in values set
+    SEXTANT_PRED_IN = 8,         ///< x in values set (n_values must be > 0)
     SEXTANT_PRED_NOT_IN = 9,     ///< x not in values set
-    SEXTANT_PRED_CONTAINS = 10,        ///< set column contains value
-    SEXTANT_PRED_CONTAINS_ANY = 11,    ///< set intersects values
-    SEXTANT_PRED_CONTAINS_ALL = 12,    ///< values subset of set
-    SEXTANT_PRED_GEO_RADIUS = 13,      ///< haversine(x, center) <= radius_km
+    SEXTANT_PRED_CONTAINS = 10,        ///< set column contains str_value
+    SEXTANT_PRED_CONTAINS_ANY = 11,    ///< set intersects str_value+values
+    SEXTANT_PRED_CONTAINS_ALL = 12,    ///< str_value+values subset of set
+    SEXTANT_PRED_GEO_RADIUS = 13,      ///< haversine((lat,lng),(value,value2))
+                                      ///< <= radius_km
     SEXTANT_PRED_GEO_BOX = 14,         ///< lat/lng inside [min,max] box
 };
 
 typedef struct sextant_predicate {
     const char* column;    ///< filter column name (required, non-NULL)
     int op;                ///< SEXTANT_PRED_* (required)
-    double value;          ///< numeric comparand; BETWEEN low bound
-    double value2;         ///< BETWEEN high bound (inclusive)
-    const char* str_value; ///< string comparand (EQ/NEQ/PREFIX); NULL = ""
+    double value;          ///< numeric comparand; BETWEEN low bound;
+                           ///< GEO_RADIUS center lat; GEO_BOX min_lat
+    double value2;         ///< BETWEEN high bound (inclusive);
+                           ///< GEO_RADIUS center lng; GEO_BOX min_lng
+    const char* str_value; ///< string comparand (EQ/NEQ/PREFIX), set element
+                           ///< (CONTAINS family); NULL = ""
+    // --- tail-appended fields (ABI: old callers read them as zeroed) ---
+    const char* const* values;    ///< IN/NOT_IN/CONTAINS_ANY/CONTAINS_ALL
+                                  ///< list: n_values pointers to (not
+                                  ///< NUL-terminated) data
+    const uint32_t* value_lengths;///< n_values byte lengths
+    uint32_t n_values;            ///< list length (0 = empty list)
+    const char* geo_lng_column;   ///< GEO_RADIUS/GEO_BOX longitude column
+                                  ///< name (required for geo ops)
+    double radius_km;             ///< GEO_RADIUS radius in kilometers
+    double value3;                ///< GEO_BOX max_lat
+    double value4;                ///< GEO_BOX max_lng
 } sextant_predicate;
 
 /// Filter column types for sextant_build_begin. Values are ABI-fixed.
 /// Note: the engine stores Float as IEEE binary32; predicate `value` doubles
-/// are narrowed at evaluation. SEXTANT_COL_SET is reserved (v1 rejects it).
+/// are narrowed at evaluation.
 enum {
     SEXTANT_COL_INT32 = 0,
     SEXTANT_COL_INT64 = 1,
     SEXTANT_COL_FLOAT = 2,  ///< engine-internal binary32
     SEXTANT_COL_STRING = 3,
-    SEXTANT_COL_SET = 4,    ///< reserved — rejected in v1
+    SEXTANT_COL_SET = 4,    ///< set of strings (via sextant_set_values)
 };
 
 typedef struct sextant_filter_col_def {
@@ -174,6 +206,19 @@ typedef struct sextant_str_values {
     const char* const* data;   ///< n_rows pointers to (not NUL-terminated) data
     const uint32_t* lengths;   ///< n_rows byte lengths (each <= 65535)
 } sextant_str_values;
+
+/// Per-column set values for one sextant_build_push() call. The
+/// filter_values entry for a Set column points at one of these. Row r's
+/// elements are the indices offsets[r] .. offsets[r+1] (exclusive); element
+/// j's bytes live at elem_data[j] with byte length elem_lengths[j]
+/// (each length <= 65535; at most 255 elements per row). A NULL entry (or
+/// NULL offsets) fills the rows with empty sets.
+typedef struct sextant_set_values {
+    const uint32_t* counts;         ///< n_rows element counts (may be NULL)
+    const uint32_t* offsets;        ///< n_rows+1 element-run bounds
+    const char* const* elem_data;   ///< element pointers (indexed by run)
+    const uint32_t* elem_lengths;   ///< element byte lengths
+} sextant_set_values;
 
 /// Single-query filtered search. Same contract as sextant_search(), plus a
 /// conjunct list of `n_preds` predicates (all must hold). `preds` may be
@@ -243,7 +288,6 @@ uint64_t sextant_index_count(const void* index);
 /// filter columns (may be NULL when n_cols == 0); `has_payload` enables
 /// per-row payload blobs via sextant_build_push. Row ids are assigned 0..n-1
 /// in push order. Returns an opaque builder handle, or NULL on failure.
-/// SEXTANT_COL_SET is rejected.
 void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
                           const sextant_filter_col_def* cols, uint32_t n_cols,
                           int has_payload, char* err, size_t err_len);
@@ -252,9 +296,10 @@ void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
 /// any number of times; row ids continue across calls. `filter_values`, when
 /// non-NULL, holds one entry per declared column, each covering n_rows rows
 /// in push order: for Int32/Int64/Float a pointer to a contiguous array of
-/// that C type; for String a pointer to a sextant_str_values. A NULL entry
+/// that C type; for String a pointer to a sextant_str_values; for Set a
+/// pointer to a sextant_set_values. A NULL entry
 /// (or NULL filter_values with declared columns) fills the rows with the
-/// type's default (0 / empty string). Payload: payload_offsets has n_rows+1
+/// type's default (0 / empty string / empty set). Payload: payload_offsets has n_rows+1
 /// entries delimiting n_rows blobs in payload_data (both required when the
 /// build has payloads; pass NULL to give all rows empty payloads).
 /// Returns 0 on success, negative on failure (builder stays usable).

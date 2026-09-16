@@ -64,6 +64,21 @@ std::string category_of(uint32_t i) {
 }
 std::string payload_of(uint32_t i) { return "payload_" + std::to_string(i); }
 
+/// Set column: row i always has "tag_<i%3>"; multiples of 5 also have
+/// "x5"; row 777 additionally has the unique "rare_tag".
+std::vector<std::string> tags_of(uint32_t i) {
+    std::vector<std::string> t{"tag_" + std::to_string(i % 3)};
+    if (i % 5 == 0) t.push_back("x5");
+    if (i == 777) t.push_back("rare_tag");
+    return t;
+}
+
+/// Geo columns (Float): a deterministic lat/lng grid around the Bay Area.
+float lat_of(uint32_t i) { return static_cast<float>(37.0 + (i % 90) * 0.1); }
+float lng_of(uint32_t i) {
+    return static_cast<float>(-122.0 + (i / 90 % 90) * 0.1);
+}
+
 /// Build the shared test index via the push API in 3 chunks.
 /// Returns the tree path; the index must be opened by the caller.
 std::string build_test_index(const Corpus& c, const std::string& name) {
@@ -80,9 +95,12 @@ std::string build_test_index(const Corpus& c, const std::string& name) {
     bopts.max_lloyd_passes = 2;
     bopts.num_threads = 4;
 
-    sextant_filter_col_def cols[2] = {{"year", SEXTANT_COL_INT32},
-                                      {"category", SEXTANT_COL_STRING}};
-    void* b = sextant_build_begin(&bopts, kDim, cols, 2, 1, err, sizeof(err));
+    sextant_filter_col_def cols[5] = {{"year", SEXTANT_COL_INT32},
+                                      {"category", SEXTANT_COL_STRING},
+                                      {"tags", SEXTANT_COL_SET},
+                                      {"lat", SEXTANT_COL_FLOAT},
+                                      {"lng", SEXTANT_COL_FLOAT}};
+    void* b = sextant_build_begin(&bopts, kDim, cols, 5, 1, err, sizeof(err));
     EXPECT_NE(b, nullptr) << err;
     if (!b) return path;
 
@@ -95,6 +113,11 @@ std::string build_test_index(const Corpus& c, const std::string& name) {
         std::vector<const char*> strs(n);
         std::vector<uint32_t> lens(n);
         std::vector<std::string> keep(n);
+        std::vector<float> lats(n), lngs(n);
+        std::vector<const char*> eptr;
+        std::vector<uint32_t> elen;
+        std::vector<uint32_t> scnt(n), soff(n + 1);
+        std::vector<std::string> keep_elems;
         std::vector<uint64_t> offs(n + 1);
         std::vector<uint8_t> pdata;
         for (uint32_t r = 0; r < n; ++r) {
@@ -103,13 +126,30 @@ std::string build_test_index(const Corpus& c, const std::string& name) {
             keep[r] = category_of(i);
             strs[r] = keep[r].data();
             lens[r] = static_cast<uint32_t>(keep[r].size());
+            lats[r] = lat_of(i);
+            lngs[r] = lng_of(i);
+            scnt[r] = static_cast<uint32_t>(tags_of(i).size());
+            soff[r] = static_cast<uint32_t>(elen.size());
+            for (const auto& t : tags_of(i)) {
+                keep_elems.push_back(t);
+                elen.push_back(static_cast<uint32_t>(t.size()));
+            }
             offs[r] = pdata.size();
             const std::string blob = payload_of(i);
             pdata.insert(pdata.end(), blob.begin(), blob.end());
         }
         offs[n] = pdata.size();
+        soff[n] = static_cast<uint32_t>(elen.size());
+        // Fill element pointers only after keep_elems is fully grown —
+        // push_back reallocations would dangle them otherwise.
+        eptr.resize(elen.size());
+        for (size_t e = 0; e < elen.size(); ++e)
+            eptr[e] = keep_elems[e].data();
         sextant_str_values sv{strs.data(), lens.data()};
-        const void* fvals[2] = {years.data(), &sv};
+        sextant_set_values setv{scnt.data(), soff.data(), eptr.data(),
+                                elen.data()};
+        const void* fvals[5] = {years.data(), &sv, &setv, lats.data(),
+                                lngs.data()};
         const int rc = sextant_build_push(b, c.row(row), n, fvals,
                                           offs.data(), pdata.data(),
                                           err, sizeof(err));
@@ -164,6 +204,44 @@ struct CApiTest : public ::testing::Test {
         if (index) sextant_close_index(index);
         std::error_code ec;
         std::filesystem::remove(path, ec);
+    }
+
+    /// Exhaustive filtered search under `pred`, asserting every returned row
+    /// lies in `allowed`, the count matches brute force, and top-k recall vs
+    /// the exact ranking over `allowed` is at least k/2 (decoded-distance
+    /// ranking is lossy at 4-bit codes).
+    void run_filtered_parity(const sextant_predicate& pred,
+                             const std::set<uint64_t>& allowed) {
+        ASSERT_FALSE(allowed.empty());
+        sextant_search_opts opts = sextant_default_search_opts();
+        opts.k = 10;
+        opts.exhaustive = 1;
+        opts.rerank = 1;
+        opts.int8_scan = 0;  // float kernel (score-exact scan)
+        // Exact rerank against the pushed corpus: removes the quantized
+        // ranking error, so the result set must equal brute force exactly.
+        opts.exact_rerank_base = corpus.data.data();
+        for (uint32_t trial = 0; trial < 3; ++trial) {
+            const float* query = corpus.centers[trial % kClusters].data();
+            uint64_t ids[10];
+            float dists[10];
+            char err[512] = {0};
+            const int32_t n = sextant_search_filtered(
+                index, query, &opts, &pred, 1, ids, dists, 10,
+                err, sizeof(err));
+            ASSERT_GE(n, 0) << err;
+            ASSERT_GT(n, 0);
+            for (int32_t i = 0; i < n; ++i) {
+                EXPECT_NE(allowed.count(ids[i]), 0u)
+                    << "row " << ids[i] << " failed predicate";
+            }
+            const auto truth =
+                brute_force_topk(corpus, query, opts.k, allowed);
+            ASSERT_EQ(static_cast<size_t>(n), truth.size());
+            std::set<uint64_t> got(ids, ids + n);
+            std::set<uint64_t> want(truth.begin(), truth.end());
+            EXPECT_EQ(got, want) << "exact-rerank top-k mismatch";
+        }
     }
 };
 
@@ -383,7 +461,8 @@ TEST_F(CApiTest, PayloadAndVectorFetchRoundTrip) {
     }
 }
 
-// (g) Error paths: nulls, unknown op, reserved (NotImplemented) ops.
+// (g) Error paths: nulls, unknown op, IN with empty list, geo without
+// longitude column, CONTAINS without an element.
 TEST_F(CApiTest, ErrorPaths) {
     char err[512] = {0};
     sextant_search_opts opts = sextant_default_search_opts();
@@ -424,22 +503,41 @@ TEST_F(CApiTest, ErrorPaths) {
                                       ids, dists, 10, err, sizeof(err)), 0);
     EXPECT_NE(err[0], '\0');
 
-    // Reserved op (IN) → NotImplemented.
+    // IN with an empty values list → clear error.
     pred.op = SEXTANT_PRED_IN;
+    pred.n_values = 0;
     std::memset(err, 0, sizeof(err));
-    const int32_t rc = sextant_search_filtered(
-        index, q, &opts, &pred, 1, ids, dists, 10, err, sizeof(err));
-    EXPECT_EQ(rc, -4);
-    EXPECT_NE(err[0], '\0');
-    EXPECT_NE(std::string(err).find("not implemented"), std::string::npos);
+    EXPECT_LT(sextant_search_filtered(index, q, &opts, &pred, 1,
+                                      ids, dists, 10, err, sizeof(err)), 0);
+    EXPECT_NE(std::string(err).find("n_values"), std::string::npos) << err;
 
-    // Reserved op via batch path as well.
+    // Geo op without geo_lng_column → clear error (the engine would
+    // otherwise silently yield no results).
     pred.op = SEXTANT_PRED_GEO_RADIUS;
+    pred.value = 40.0;
+    pred.value2 = -121.0;
+    pred.radius_km = 10.0;
+    std::memset(err, 0, sizeof(err));
+    EXPECT_LT(sextant_search_filtered(index, q, &opts, &pred, 1,
+                                      ids, dists, 10, err, sizeof(err)), 0);
+    EXPECT_NE(err[0], '\0');
+
+    // CONTAINS without an element → clear error.
+    pred.op = SEXTANT_PRED_CONTAINS;
+    pred.str_value = nullptr;
+    std::memset(err, 0, sizeof(err));
+    EXPECT_LT(sextant_search_filtered(index, q, &opts, &pred, 1,
+                                      ids, dists, 10, err, sizeof(err)), 0);
+    EXPECT_NE(err[0], '\0');
+
+    // Same validation on the batch path.
+    pred.op = SEXTANT_PRED_IN;
+    pred.n_values = 0;
     uint32_t per_q = 0;
     std::memset(err, 0, sizeof(err));
-    EXPECT_EQ(sextant_search_batch(index, q, 1, &opts, &pred, 1,
-                                   ids, dists, 10, &per_q,
-                                   err, sizeof(err)), -4);
+    EXPECT_LT(sextant_search_batch(index, q, 1, &opts, &pred, 1,
+                                    ids, dists, 10, &per_q,
+                                    err, sizeof(err)), 0);
     EXPECT_NE(err[0], '\0');
 }
 
@@ -465,10 +563,233 @@ TEST(CApiBuild, AbortLeavesNoFile) {
     sextant_build_abort(b);
     EXPECT_FALSE(std::filesystem::exists(path));
 
-    // SET columns are rejected at build_begin (v1 NotImplemented).
+    // SET columns are accepted since v1.1 (empty-set NULL fill): build a
+    // tiny index with a set column whose filter_values entry is NULL —
+    // every row gets the empty set, so CONTAINS matches nothing.
+    const std::string setpath =
+        (std::filesystem::temp_directory_path() / "capi_setnull.tree")
+            .string();
+    std::filesystem::remove(setpath);
     sextant_filter_col_def setcol[1] = {{"tags", SEXTANT_COL_SET}};
     std::memset(err, 0, sizeof(err));
-    EXPECT_EQ(sextant_build_begin(&bopts, kDim, setcol, 1, 0,
-                                  err, sizeof(err)), nullptr);
-    EXPECT_NE(err[0], '\0');
+    void* sb = sextant_build_begin(&bopts, kDim, setcol, 1, 0,
+                                   err, sizeof(err));
+    ASSERT_NE(sb, nullptr) << err;
+    EXPECT_EQ(sextant_build_push(sb, vecs.data(), 64, nullptr, nullptr,
+                                 nullptr, err, sizeof(err)), 0)
+        << err;  // NULL filter_values → all rows get empty sets
+    EXPECT_EQ(sextant_build_finish(sb, setpath.c_str(), err, sizeof(err)), 0)
+        << err;
+
+    void* sidx = sextant_open_index(setpath.c_str(), err, sizeof(err));
+    ASSERT_NE(sidx, nullptr) << err;
+    {
+        sextant_search_opts sopts = sextant_default_search_opts();
+        sopts.k = 4;
+        sopts.exhaustive = 1;
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = "tags";
+        p.op = SEXTANT_PRED_CONTAINS;
+        p.str_value = "anything";
+        uint64_t ids4[4];
+        float d4[4];
+        char e2[256] = {0};
+        EXPECT_EQ(sextant_search_filtered(sidx, vecs.data(), &sopts, &p, 1,
+                                          ids4, d4, 4, e2, sizeof(e2)), 0)
+            << e2;
+    }
+    sextant_close_index(sidx);
+    std::filesystem::remove(setpath);
+}
+
+// ===========================================================================
+// v1.1 predicate ops: In/NotIn, Contains family, geo. Every assertion is
+// checked against ground truth computed in-test over the pushed data.
+// ===========================================================================
+
+// (i) IN / NOT_IN: string membership, numeric-as-string membership, exclusion.
+TEST_F(CApiTest, InAndNotIn) {
+    // String IN: category in {"cat_3", "cat_7"}.
+    {
+        const char* vals[2] = {"cat_3", "cat_7"};
+        const uint32_t lens[2] = {5, 5};
+        sextant_predicate pred;
+        std::memset(&pred, 0, sizeof(pred));
+        pred.column = "category";
+        pred.op = SEXTANT_PRED_IN;
+        pred.values = vals;
+        pred.value_lengths = lens;
+        pred.n_values = 2;
+        std::set<uint64_t> allowed;
+        for (uint32_t i = 0; i < kN; ++i) {
+            const auto c = category_of(i);
+            if (c == "cat_3" || c == "cat_7") allowed.insert(i);
+        }
+        ASSERT_GE(allowed.size(), 10u);
+        run_filtered_parity(pred, allowed);
+    }
+    // Numeric IN via strings: year in {"2010", "2011", "2012"}.
+    {
+        const char* vals[3] = {"2010", "2011", "2012"};
+        const uint32_t lens[3] = {4, 4, 4};
+        sextant_predicate pred;
+        std::memset(&pred, 0, sizeof(pred));
+        pred.column = "year";
+        pred.op = SEXTANT_PRED_IN;
+        pred.values = vals;
+        pred.value_lengths = lens;
+        pred.n_values = 3;
+        std::set<uint64_t> allowed;
+        for (uint32_t i = 0; i < kN; ++i)
+            if (year_of(i) == 2010 || year_of(i) == 2011 || year_of(i) == 2012)
+                allowed.insert(i);
+        ASSERT_GE(allowed.size(), 10u);
+        run_filtered_parity(pred, allowed);
+    }
+    // NOT_IN: exclude "cat_0".
+    {
+        const char* vals[1] = {"cat_0"};
+        const uint32_t lens[1] = {5};
+        sextant_predicate pred;
+        std::memset(&pred, 0, sizeof(pred));
+        pred.column = "category";
+        pred.op = SEXTANT_PRED_NOT_IN;
+        pred.values = vals;
+        pred.value_lengths = lens;
+        pred.n_values = 1;
+        std::set<uint64_t> allowed;
+        for (uint32_t i = 0; i < kN; ++i)
+            if (category_of(i) != "cat_0") allowed.insert(i);
+        run_filtered_parity(pred, allowed);
+    }
+}
+
+// (j) CONTAINS family: positive + negative against tags_of ground truth.
+TEST_F(CApiTest, SetContainsOps) {
+    // CONTAINS "tag_1" -> i % 3 == 1.
+    {
+        sextant_predicate pred;
+        std::memset(&pred, 0, sizeof(pred));
+        pred.column = "tags";
+        pred.op = SEXTANT_PRED_CONTAINS;
+        pred.str_value = "tag_1";
+        std::set<uint64_t> allowed;
+        for (uint32_t i = 0; i < kN; ++i)
+            if (i % 3 == 1) allowed.insert(i);
+        run_filtered_parity(pred, allowed);
+    }
+    // CONTAINS_ANY {"x5", "rare_tag"} -> i % 5 == 0 || i == 777.
+    {
+        const char* vals[2] = {"x5", "rare_tag"};
+        const uint32_t lens[2] = {2, 8};
+        sextant_predicate pred;
+        std::memset(&pred, 0, sizeof(pred));
+        pred.column = "tags";
+        pred.op = SEXTANT_PRED_CONTAINS_ANY;
+        pred.values = vals;
+        pred.value_lengths = lens;
+        pred.n_values = 2;
+        std::set<uint64_t> allowed;
+        for (uint32_t i = 0; i < kN; ++i)
+            if (i % 5 == 0 || i == 777) allowed.insert(i);
+        ASSERT_GE(allowed.size(), 10u);
+        run_filtered_parity(pred, allowed);
+    }
+    // CONTAINS_ALL {"tag_2", "x5"} -> i % 3 == 2 && i % 5 == 0.
+    {
+        const char* vals[2] = {"tag_2", "x5"};
+        const uint32_t lens[2] = {5, 2};
+        sextant_predicate pred;
+        std::memset(&pred, 0, sizeof(pred));
+        pred.column = "tags";
+        pred.op = SEXTANT_PRED_CONTAINS_ALL;
+        pred.values = vals;
+        pred.value_lengths = lens;
+        pred.n_values = 2;
+        std::set<uint64_t> allowed;
+        for (uint32_t i = 0; i < kN; ++i)
+            if (i % 3 == 2 && i % 5 == 0) allowed.insert(i);
+        ASSERT_GE(allowed.size(), 10u);
+        run_filtered_parity(pred, allowed);
+    }
+    // Negative: no row contains "missing_tag" -> zero results.
+    {
+        sextant_predicate pred;
+        std::memset(&pred, 0, sizeof(pred));
+        pred.column = "tags";
+        pred.op = SEXTANT_PRED_CONTAINS;
+        pred.str_value = "missing_tag";
+        sextant_search_opts opts = sextant_default_search_opts();
+        opts.k = 10;
+        opts.exhaustive = 1;
+        uint64_t ids[10];
+        float dists[10];
+        char err[512] = {0};
+        const int32_t n = sextant_search_filtered(
+            index, corpus.centers[0].data(), &opts, &pred, 1,
+            ids, dists, 10, err, sizeof(err));
+        ASSERT_GE(n, 0) << err;
+        EXPECT_EQ(n, 0);
+    }
+}
+
+// (k) GEO_RADIUS / GEO_BOX over the synthetic lat/lng grid.
+namespace {
+double haversine_km_test(double lat1, double lng1, double lat2, double lng2) {
+    constexpr double kR = 6371.0;
+    constexpr double kD2R = 3.14159265358979323846 / 180.0;
+    const double dlat = (lat2 - lat1) * kD2R;
+    const double dlng = (lng2 - lng1) * kD2R;
+    const double a = std::sin(dlat / 2) * std::sin(dlat / 2) +
+                     std::cos(lat1 * kD2R) * std::cos(lat2 * kD2R) *
+                     std::sin(dlng / 2) * std::sin(dlng / 2);
+    return 2 * kR * std::asin(std::sqrt(a));
+}
+}  // namespace
+
+TEST_F(CApiTest, GeoPredicates) {
+    const double clat = 40.5, clng = -121.4, radius = 55.0;
+    std::set<uint64_t> allowed;
+    double min_gap = 1e9;  // closest row distance to the radius boundary
+    for (uint32_t i = 0; i < kN; ++i) {
+        const double d = haversine_km_test(clat, clng, lat_of(i), lng_of(i));
+        min_gap = std::min(min_gap, std::fabs(d - radius));
+        if (d <= radius) allowed.insert(i);
+    }
+    // No float32 storage rounding may flip a row across the boundary.
+    ASSERT_GT(min_gap, 0.2) << "fixture too close to the radius boundary";
+    ASSERT_GE(allowed.size(), 10u);
+
+    {
+        sextant_predicate pred;
+        std::memset(&pred, 0, sizeof(pred));
+        pred.column = "lat";           // latitude column
+        pred.op = SEXTANT_PRED_GEO_RADIUS;
+        pred.geo_lng_column = "lng";   // longitude column
+        pred.value = clat;             // center lat
+        pred.value2 = clng;            // center lng
+        pred.radius_km = radius;
+        run_filtered_parity(pred, allowed);
+    }
+    {
+        // GEO_BOX [40, 41] lat x [-121.5, -120.5] lng (inclusive).
+        sextant_predicate pred;
+        std::memset(&pred, 0, sizeof(pred));
+        pred.column = "lat";
+        pred.op = SEXTANT_PRED_GEO_BOX;
+        pred.geo_lng_column = "lng";
+        pred.value = 40.0;     // min_lat
+        pred.value2 = -121.5;  // min_lng
+        pred.value3 = 41.0;    // max_lat
+        pred.value4 = -120.5;  // max_lng
+        std::set<uint64_t> boxed;
+        for (uint32_t i = 0; i < kN; ++i) {
+            const double la = lat_of(i), ln = lng_of(i);
+            if (la >= 40.0 && la <= 41.0 && ln >= -121.5 && ln <= -120.5)
+                boxed.insert(i);
+        }
+        ASSERT_GE(boxed.size(), 10u);
+        run_filtered_parity(pred, boxed);
+    }
 }

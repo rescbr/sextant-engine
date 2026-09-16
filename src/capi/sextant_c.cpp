@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -62,46 +63,124 @@ void fill_search_config(const sextant_search_opts* opts,
     sextant::tree::set_scan_i8_override(opts->int8_scan);
 }
 
-/// Translate a C predicate conjunct list into engine Predicates.
+/// Translate one C predicate into the engine Predicate. `who` prefixes
+/// error messages. Returns 0 on success, negative on failure (msg set).
+int translate_one(const sextant_predicate& p, sextant::Predicate& ep,
+                  const char* who, char* err, size_t err_len) {
+    if (!p.column) {
+        set_err(err, err_len, "predicate: null column name");
+        return -1;
+    }
+    ep.column = p.column;
+    ep.value = p.value;
+    ep.value2 = p.value2;
+    if (p.str_value) ep.str_value = p.str_value;
+
+    const auto append_values = [&](bool allow_empty) {
+        if (p.n_values == 0) {
+            if (allow_empty) return true;
+            set_err(err, err_len,
+                    "predicate: values list required (n_values == 0)");
+            return false;
+        }
+        if (!p.values || !p.value_lengths) {
+            set_err(err, err_len,
+                    "predicate: values/value_lengths required with n_values");
+            return false;
+        }
+        ep.values.reserve(ep.values.size() + p.n_values);
+        for (uint32_t i = 0; i < p.n_values; ++i)
+            ep.values.emplace_back(p.values[i], p.value_lengths[i]);
+        return true;
+    };
+
+    switch (p.op) {
+        case SEXTANT_PRED_EQ:      ep.op = sextant::PredicateOp::Eq; break;
+        case SEXTANT_PRED_NEQ:     ep.op = sextant::PredicateOp::NotEq; break;
+        case SEXTANT_PRED_LT:      ep.op = sextant::PredicateOp::Lt; break;
+        case SEXTANT_PRED_LE:      ep.op = sextant::PredicateOp::Le; break;
+        case SEXTANT_PRED_GT:      ep.op = sextant::PredicateOp::Gt; break;
+        case SEXTANT_PRED_GE:      ep.op = sextant::PredicateOp::Ge; break;
+        case SEXTANT_PRED_BETWEEN: ep.op = sextant::PredicateOp::Between; break;
+        case SEXTANT_PRED_PREFIX:  ep.op = sextant::PredicateOp::Prefix; break;
+        case SEXTANT_PRED_IN:
+        case SEXTANT_PRED_NOT_IN:
+            ep.op = (p.op == SEXTANT_PRED_IN) ? sextant::PredicateOp::In
+                                              : sextant::PredicateOp::NotIn;
+            // Membership is defined solely by the values list; NaN-poison
+            // value..value4 so the engine's extra numeric comparand checks
+            // (filter_scan's In/NotIn fast path) can never spuriously match
+            // (e.g. a row value of 0 against a zero-defaulted field).
+            ep.value = ep.value2 = ep.value3 = ep.value4 =
+                std::numeric_limits<double>::quiet_NaN();
+            if (!append_values(/*allow_empty=*/p.op == SEXTANT_PRED_NOT_IN))
+                return -1;
+            break;
+        case SEXTANT_PRED_CONTAINS:
+            // Engine convention (CLI): the sought element lives in str_value.
+            if (!p.str_value) {
+                set_err(err, err_len,
+                        "predicate: CONTAINS requires str_value");
+                return -1;
+            }
+            ep.op = sextant::PredicateOp::Contains;
+            break;
+        case SEXTANT_PRED_CONTAINS_ANY:
+        case SEXTANT_PRED_CONTAINS_ALL:
+            // Engine convention: str_value (optional) + values are folded
+            // into one query set.
+            if (p.n_values == 0 && !p.str_value) {
+                set_err(err, err_len,
+                        "predicate: CONTAINS_ANY/CONTAINS_ALL require "
+                        "str_value or a non-empty values list");
+                return -1;
+            }
+            ep.op = (p.op == SEXTANT_PRED_CONTAINS_ANY)
+                        ? sextant::PredicateOp::ContainsAny
+                        : sextant::PredicateOp::ContainsAll;
+            if (!append_values(/*allow_empty=*/true)) return -1;
+            break;
+        case SEXTANT_PRED_GEO_RADIUS:
+            if (!p.geo_lng_column) {
+                set_err(err, err_len,
+                        "predicate: GEO_RADIUS requires geo_lng_column");
+                return -1;
+            }
+            ep.op = sextant::PredicateOp::GeoRadius;
+            ep.geo_lng_column = p.geo_lng_column;
+            ep.radius_km = p.radius_km;  // value/value2 = center lat/lng
+            break;
+        case SEXTANT_PRED_GEO_BOX:
+            if (!p.geo_lng_column) {
+                set_err(err, err_len,
+                        "predicate: GEO_BOX requires geo_lng_column");
+                return -1;
+            }
+            ep.op = sextant::PredicateOp::GeoBox;
+            ep.geo_lng_column = p.geo_lng_column;
+            ep.value3 = p.value3;  // max_lat
+            ep.value4 = p.value4;  // max_lng
+            break;
+        default:
+            set_err(err, err_len, "predicate: unknown op value");
+            return -1;
+    }
+    (void)who;
+    return 0;
+}
+
+/// Translate a C predicate conjunct list into engine Predicates (shared by
+/// sextant_search_filtered / search2 / search_batch).
 /// Returns 0 on success, negative on failure (message set).
 int translate_predicates(const sextant_predicate* preds, uint32_t n_preds,
                           std::vector<sextant::Predicate>& out,
                           char* err, size_t err_len) {
     out.clear();
+    out.reserve(n_preds);
     for (uint32_t i = 0; i < n_preds; ++i) {
-        const sextant_predicate& p = preds[i];
-        if (!p.column) {
-            set_err(err, err_len, "predicate: null column name");
-            return -1;
-        }
         sextant::Predicate ep;
-        ep.column = p.column;
-        ep.value = p.value;
-        ep.value2 = p.value2;
-        if (p.str_value) ep.str_value = p.str_value;
-        switch (p.op) {
-            case SEXTANT_PRED_EQ:      ep.op = sextant::PredicateOp::Eq; break;
-            case SEXTANT_PRED_NEQ:     ep.op = sextant::PredicateOp::NotEq; break;
-            case SEXTANT_PRED_LT:      ep.op = sextant::PredicateOp::Lt; break;
-            case SEXTANT_PRED_LE:      ep.op = sextant::PredicateOp::Le; break;
-            case SEXTANT_PRED_GT:      ep.op = sextant::PredicateOp::Gt; break;
-            case SEXTANT_PRED_GE:      ep.op = sextant::PredicateOp::Ge; break;
-            case SEXTANT_PRED_BETWEEN: ep.op = sextant::PredicateOp::Between; break;
-            case SEXTANT_PRED_PREFIX:  ep.op = sextant::PredicateOp::Prefix; break;
-            case SEXTANT_PRED_IN:
-            case SEXTANT_PRED_NOT_IN:
-            case SEXTANT_PRED_CONTAINS:
-            case SEXTANT_PRED_CONTAINS_ANY:
-            case SEXTANT_PRED_CONTAINS_ALL:
-            case SEXTANT_PRED_GEO_RADIUS:
-            case SEXTANT_PRED_GEO_BOX:
-                set_err(err, err_len,
-                        "predicate op not implemented in C API v1");
-                return -4;  // NotImplemented
-            default:
-                set_err(err, err_len, "predicate: unknown op value");
-                return -1;
-        }
+        if (int rc = translate_one(preds[i], ep, "predicate", err, err_len))
+            return rc;
         out.push_back(std::move(ep));
     }
     return 0;
@@ -503,12 +582,7 @@ void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
                 case SEXTANT_COL_INT64:  t = sextant::ColumnType::Int64; break;
                 case SEXTANT_COL_FLOAT:  t = sextant::ColumnType::Float; break;
                 case SEXTANT_COL_STRING: t = sextant::ColumnType::String; break;
-                case SEXTANT_COL_SET:
-                    delete b;
-                    set_err(err, err_len,
-                           "sextant_build_begin: SET columns not supported "
-                           "in C API v1");
-                    return nullptr;
+                case SEXTANT_COL_SET:    t = sextant::ColumnType::Set; break;
                 default:
                     delete b;
                     set_err(err, err_len,
@@ -610,10 +684,76 @@ int sextant_build_push(void* builder, const float* vectors, uint32_t n_rows,
                                                data + len);
                        break;
                     }
+                    case sextant::ColumnType::Set: {
+                       // Row r's elements are the offset run [o_r, o_r+1)
+                       // of indices into elem_data/elem_lengths.
+                       uint32_t begin = 0, end = 0;
+                       const sextant_set_values* sv = nullptr;
+                       if (fv) {
+                           sv = static_cast<const sextant_set_values*>(fv);
+                           if (sv->counts && !sv->offsets) {
+                               set_err(err, err_len,
+                                       "sextant_build_push: set counts "
+                                       "require offsets");
+                               return -1;
+                           }
+                           if (sv->offsets) {
+                               begin = sv->offsets[r];
+                               end = sv->offsets[r + 1];
+                               if (end < begin) {
+                                   set_err(err, err_len,
+                                           "sextant_build_push: set offsets "
+                                           "not monotone");
+                                   return -1;
+                               }
+                               if (sv->counts && sv->counts[r] != end - begin) {
+                                   set_err(err, err_len,
+                                           "sextant_build_push: set count "
+                                           "mismatches offset run");
+                                   return -1;
+                               }
+                           }
+                       }
+                       const uint32_t count = end - begin;
+                       if (count > 255) {
+                           set_err(err, err_len,
+                                   "sextant_build_push: set element count "
+                                   "exceeds 255");
+                           return -1;
+                       }
+                       col.set_offsets.push_back(
+                           static_cast<uint32_t>(
+                               col.set_elem_lengths.size()));
+                       col.set_counts.push_back(
+                           static_cast<uint8_t>(count));
+                       if (count) {
+                           if (!sv->elem_data || !sv->elem_lengths) {
+                               set_err(err, err_len,
+                                       "sextant_build_push: set elements "
+                                       "require elem_data/elem_lengths");
+                               return -1;
+                           }
+                           for (uint32_t e = begin; e < end; ++e) {
+                               const uint32_t len = sv->elem_lengths[e];
+                               if (len > 65535) {
+                                   set_err(err, err_len,
+                                           "sextant_build_push: set element "
+                                           "length exceeds 65535");
+                                   return -1;
+                               }
+                               col.set_elem_lengths.push_back(
+                                   static_cast<uint16_t>(len));
+                               const char* d = sv->elem_data[e];
+                               if (d && len)
+                                   col.set_elem_data.insert(
+                                       col.set_elem_data.end(), d, d + len);
+                           }
+                       }
+                       break;
+                    }
                     case sextant::ColumnType::Bool:
-                    case sextant::ColumnType::Set:
                        set_err(err, err_len,
-                               "sextant_build_push: Bool/Set columns "
+                               "sextant_build_push: Bool columns "
                                "unsupported in v1");
                        return -4;
                 }
