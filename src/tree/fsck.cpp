@@ -314,6 +314,21 @@ FsckResult fsck(const std::string& path, bool repair) {
     result.leaf_internals_ok =
         (walk.magic_failures == 0 && walk.crc_failures == 0);
 
+    // Informational (NOT a failure): the manifest's n_vectors is the
+    // LOGICAL row count (input rows, pre-closure-replication), while
+    // total_leaf_count sums physical leaf slots. A positive delta is the
+    // expected closure-replication copies; a negative delta or a delta on
+    // a payload-less no-closure build would warrant a closer look.
+    if (manifest.n_vectors > 0) {
+        const int64_t delta =
+            static_cast<int64_t>(walk.total_leaf_count) -
+            static_cast<int64_t>(manifest.n_vectors);
+        spdlog::info(
+            "fsck: manifest n_vectors={} vs sum of leaf counts={} "
+            "(delta {:+}; positive delta = closure replication, expected)",
+            manifest.n_vectors, walk.total_leaf_count, delta);
+    }
+
     // -----------------------------------------------------------------------
     // Level 4: Payload (simplified — count extents, no orphan detection).
     // -----------------------------------------------------------------------

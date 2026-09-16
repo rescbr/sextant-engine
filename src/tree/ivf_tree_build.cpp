@@ -264,6 +264,51 @@ void resolve_build_params(TreeBuildContext& ctx) {
     }
     ctx.summary_size = cfg.filter_schema.summary_size();
 
+    // --- Validate the payload sidecar (BuildConfig.payload_offsets).
+    // A wrong array (N instead of N+1 entries, non-monotonic, or last !=
+    // total payload bytes) mis-sizes the allocation bitmap or walks off
+    // the payload buffer — fail fast before any file is created.
+    if (cfg.payload_offsets) {
+        if (cfg.payload_offsets_count != ctx.n + 1) {
+            throw Error(ErrorCode::InvalidParam,
+                "build_streaming_pca: payload_offsets has " +
+                std::to_string(cfg.payload_offsets_count) +
+                " entries, expected n+1 = " + std::to_string(ctx.n + 1));
+        }
+        if (cfg.payload_offsets[0] != 0) {
+            throw Error(ErrorCode::InvalidParam,
+                "build_streaming_pca: payload_offsets[0] must be 0 (got " +
+                std::to_string(cfg.payload_offsets[0]) + ")");
+        }
+        for (uint64_t i = 0; i < ctx.n; ++i) {
+            if (cfg.payload_offsets[i + 1] < cfg.payload_offsets[i]) {
+                throw Error(ErrorCode::InvalidParam,
+                    "build_streaming_pca: payload_offsets not monotonic "
+                    "at row " + std::to_string(i) + " (" +
+                    std::to_string(cfg.payload_offsets[i]) + " > " +
+                    std::to_string(cfg.payload_offsets[i + 1]) + ")");
+            }
+        }
+        if (cfg.filter_schema.has_payload) {
+            // Payloads reach the build through two channels: the source's
+            // per-chunk blobs (payload_total_bytes()) or the cfg sidecar
+            // (payload_data/payload_offsets, total = offsets[n]). Require
+            // at least one, and never a bare offsets array without data.
+            if (!cfg.payload_data) {
+                throw Error(ErrorCode::InvalidParam,
+                    "build_streaming_pca: payload_offsets set without "
+                    "payload_data (both must come from the same sidecar)");
+            }
+            if (ctx.source.payload_total_bytes() == 0 &&
+                cfg.payload_offsets[ctx.n] == 0) {
+                throw Error(ErrorCode::InvalidParam,
+                    "build_streaming_pca: payloads enabled but no payload "
+                    "bytes (source payload_total_bytes() = 0 and the "
+                    "sidecar's last offset is 0)");
+            }
+        }
+    }
+
     spdlog::info("[sextant] build_streaming_pca: N={} dim={} → '{}'",
                  ctx.n, ctx.dim, ctx.output_path);
 
@@ -2309,6 +2354,9 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     manifest.metric = static_cast<uint8_t>(params.metric);
     manifest.depth = depth; manifest.k_root = k_root; manifest.k_l1 = k_l1;
     manifest.leaf_capacity = leaf_cap; manifest.n_leaves = n_leaves_total;
+    // Logical row count: input rows indexed (ctx.n), NOT the post-closure
+    // replicated slot count that leaves may hold.
+    manifest.n_vectors = ctx.n;
     manifest.n_probe_l0 = cfg.n_probe_l0 > 0 ? cfg.n_probe_l0
         : static_cast<uint32_t>(std::max(1.0, 2.0*std::sqrt(double(k_root))));
     // n_probe_ln default: cover ALL leaves of a probed root child (max

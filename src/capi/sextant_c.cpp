@@ -462,10 +462,14 @@ uint64_t sextant_index_count(const void* index) {
     auto* idx = reinterpret_cast<const IVFTreeIndex*>(index);
     if (!idx) return 0;
     try {
-        // Exact logical row count when the cardinality table was written
-        // (any filter-column index); otherwise sum leaf extent counts.
-        const uint64_t n = idx->cardinality().n_vectors();
+        // Logical row count from the manifest — O(1), counts each input
+        // row once (closure-replicated leaf slots are not counted) and
+        // reflects the last committed build/mutation. 0 = legacy manifest
+        // (pre-n_vectors); fall back to leaf-header sums / cardinality.
+        const uint64_t n = idx->n_vectors();
         if (n > 0) return n;
+        const uint64_t cn = idx->cardinality().n_vectors();
+        if (cn > 0) return cn;
         uint64_t total = 0;
         for (const auto& l : idx->debug_leaf_info()) total += l.count;
         return total;
@@ -673,6 +677,7 @@ int sextant_build_finish(void* builder, const char* out_path,
         if (b->has_payload) {
             cfg.payload_data = b->payload_data.data();
             cfg.payload_offsets = b->payload_offsets.data();
+            cfg.payload_offsets_count = b->payload_offsets.size();
         }
         sextant::tree::IVFTreeIndex::build_streaming_pca(*source, out_path,
                                                          cfg);

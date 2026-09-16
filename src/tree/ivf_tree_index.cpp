@@ -104,6 +104,7 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
     const size_t nul = cfg_buf.find('\0');
     if (nul != std::string::npos) cfg_buf.resize(nul);
     idx->manifest_ = manifest_from_toml(cfg_buf);
+    idx->n_vectors_disk_ = idx->manifest_.n_vectors;
 
     // Construct the per-family leaf coder (the only quantizer_type
     // interpretation besides the build resolve). Local families carry no

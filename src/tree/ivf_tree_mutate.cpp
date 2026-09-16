@@ -10,6 +10,7 @@
 #include "tree/filter_scan.hpp"         // filter predicate evaluation
 #include "tree/coders/coder_factory.hpp"
 #include "tree/coders/global_pq_coder.hpp"
+#include "tree/tree_manifest.hpp"   // manifest_to_toml (n_vectors rewrite)
 #include "sextant/error.hpp"
 #include "sextant/logging.hpp"
 #include "sextant/engine_trace.hpp"
@@ -394,6 +395,30 @@ void IVFTreeIndex::commit_mutable_(PageAllocator& alloc) {
     }
     if (old_lt_page != kInvalidPage)
         alloc.free_extent(file_, old_lt_page, old_lt_pages);
+
+    // Rewrite the manifest blob when the logical row count changed
+    // (insert_batch / delete_batch update manifest_.n_vectors in memory;
+    // the on-disk TOML must follow so a reopen sees the new count).
+    // Must run BEFORE alloc.flush_bitmap — a post-flush allocation would
+    // never reach the on-disk bitmap and a later commit would hand the
+    // same pages out twice (silent leaf-table corruption).
+    if (manifest_.n_vectors != n_vectors_disk_) {
+        std::string cfg_toml = manifest_to_toml(manifest_);
+        const uint32_t cfg_npg = static_cast<uint32_t>(
+            (cfg_toml.size() + kPageSize - 1) / kPageSize);
+        const PageId cfg_page = alloc.alloc_extent(file_, cfg_npg);
+        {
+            std::vector<uint8_t> b(cfg_npg * kPageSize, 0);
+            std::memcpy(b.data(), cfg_toml.data(), cfg_toml.size());
+            file_.write_pages(cfg_page, cfg_npg, b.data());
+        }
+        const PageId old_cfg = superblock_.config_page();
+        const uint32_t old_cfg_pg = superblock_.config_pages();
+        if (old_cfg != kInvalidPage)
+            alloc.free_extent(file_, old_cfg, old_cfg_pg);
+        superblock_.set_config(cfg_page, cfg_npg);
+        n_vectors_disk_ = manifest_.n_vectors;
+    }
 
     alloc.flush_bitmap(file_);
     superblock_.set_leaf_table(lt_page, lt_npg);
@@ -1231,6 +1256,10 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
         write_leaf_(leaf_id, nb, new_npg, alloc);
     }
 
+    // Logical row count grows by the inserted rows (regardless of any
+    // splits). commit_mutable_ persists it to the manifest blob.
+    manifest_.n_vectors += points.size();
+
     // 5. Commit: rewrite leaf table blob, flush bitmap, commit superblock.
     commit_mutable_(alloc);
 
@@ -1345,6 +1374,10 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
 
     if (leaf_deletes.empty()) return;
 
+    // Logical row count: decrement by the rows actually deleted (row_ids
+    // minus the not-found ones). commit_mutable_ persists it.
+    manifest_.n_vectors -= (row_ids.size() - not_found);
+
     PageAllocator alloc;
     alloc.load(file_, superblock_.alloc_bitmap_page(),
                superblock_.alloc_bitmap_pages(),
@@ -1436,6 +1469,8 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
 }
 
 uint64_t IVFTreeIndex::live_count() const {
+    // Internal mutation diagnostics (reads every leaf header). For the
+    // cheap logical row count use manifest_.n_vectors / n_vectors().
     uint64_t total = 0;
     for (uint32_t lid = 0; lid < leaf_table_.size(); ++lid) {
         const auto& e = leaf_table_[lid];

@@ -53,6 +53,7 @@ std::string manifest_to_toml(const TreeManifest& m) {
     tree->insert("k_root", m.k_root);
     tree->insert("k_l1", m.k_l1);
     tree->insert("leaf_capacity", m.leaf_capacity);
+    tree->insert("n_vectors", m.n_vectors);
     tree->insert("n_leaves", m.n_leaves);
     tree->insert("n_probe_l0", m.n_probe_l0);
     tree->insert("n_probe_ln", m.n_probe_ln);
@@ -141,6 +142,10 @@ TreeManifest manifest_from_toml(const std::string& toml) {
         m.k_l1 = static_cast<uint32_t>(*kl1);
     }
     m.leaf_capacity = static_cast<uint32_t>(require_int(*tree, "leaf_capacity"));
+    // n_vectors is optional (older manifests omit it → 0 = unknown).
+    if (auto nv = tree->get_as<int64_t>("n_vectors")) {
+        m.n_vectors = static_cast<uint64_t>(*nv);
+    }
     m.n_leaves = static_cast<uint32_t>(require_int(*tree, "n_leaves"));
     m.n_probe_l0 = static_cast<uint32_t>(require_int(*tree, "n_probe_l0"));
     m.n_probe_ln = static_cast<uint32_t>(require_int(*tree, "n_probe_ln"));

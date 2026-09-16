@@ -230,9 +230,11 @@ uint32_t sextant_fetch_payload(const void* index, const void* leaf_ptr,
 int sextant_fetch_vector(const void* index, const void* leaf_ptr,
                          uint32_t slot, float* out);
 
-/// Total indexed rows (sum over leaves). Read-only-handle safe. On indexes
-/// built with closure replication a row stored in several leaves is counted
-/// once per copy (the manifest carries no logical row count).
+/// Logical row count: number of input rows indexed, each counted once
+/// (closure-replicated leaf slots are NOT counted). O(1) — read from the
+/// manifest; reflects the state at the last committed build/mutation.
+/// Read-only-handle safe. Returns 0 only for legacy manifests built
+/// before the logical count was persisted.
 uint64_t sextant_index_count(const void* index);
 
 // --- Streaming push build ------------------------------------------------

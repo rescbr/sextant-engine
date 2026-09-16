@@ -837,6 +837,7 @@ TEST(TreeFilterColumns, PayloadRoundTrip) {
     cfg.filter_column_data = make_filter_data_int32_string(n);
     cfg.payload_data = payload_data.data();
     cfg.payload_offsets = payload_offsets.data();
+    cfg.payload_offsets_count = payload_offsets.size();
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
     auto idx = IVFTreeIndex::open(tree_path);
@@ -923,6 +924,7 @@ TEST(TreeFilterColumns, DeleteBatchThrowsOnPayload) {
     cfg.filter_column_data = make_filter_data_int32_string(n);
     cfg.payload_data = payload_data.data();
     cfg.payload_offsets = payload_offsets.data();
+    cfg.payload_offsets_count = payload_offsets.size();
 
     ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
 
@@ -1457,5 +1459,235 @@ TEST(TreeCardinalityModes, UntrackedNumericEqUsesPriorRangeConservative) {
 }
 
 }  // namespace
-}  // namespace sextant::tree
 
+
+// ===========================================================================
+// Item A: brute-force filtered fallback honors exact_rerank_base and fills
+// payload_locs. A singleton string value with cardinality tracking on gives
+// ~1/N selectivity (<1%) → search_brute_force_filtered.
+// ===========================================================================
+
+TEST(TreeFilterColumns, BruteForceFallbackExactRerankAndPayloadLocs) {
+    const uint64_t n = 2000;
+    const uint32_t dim = 32;
+    const uint32_t n_clusters = 20;
+    const uint64_t rare_row = 777;
+    const std::string rare_url = "http://x/rare";
+    const auto base_path = write_test_fbin(
+        "tree_bf_exact.fbin", n, dim, n_clusters, 31337);
+    const auto tree_path = (std::filesystem::temp_directory_path() /
+                            "tree_bf_exact.tree").string();
+    std::filesystem::remove(tree_path);
+
+    Schema schema;
+    schema.columns.push_back({"url", ColumnType::String});
+    schema.has_payload = true;
+
+    // All rows share a common url; one singleton row has the rare url.
+    std::vector<ColumnData> cols(1);
+    cols[0].type = ColumnType::String;
+    for (uint64_t i = 0; i < n; ++i) {
+        const std::string& val =
+            (i == rare_row) ? rare_url : std::string("http://x/common");
+        cols[0].str_offsets.push_back(
+            static_cast<uint32_t>(cols[0].str_data.size()));
+        cols[0].str_lengths.push_back(static_cast<uint16_t>(val.size()));
+        cols[0].str_data.insert(cols[0].str_data.end(),
+                                val.data(), val.data() + val.size());
+    }
+
+    // Known payloads: "payload_<row_id>".
+    std::vector<uint8_t> payload_data;
+    std::vector<uint32_t> payload_offsets(n + 1);
+    for (uint64_t i = 0; i < n; ++i) {
+        payload_offsets[i] = static_cast<uint32_t>(payload_data.size());
+        const std::string blob = "payload_" + std::to_string(i);
+        payload_data.insert(payload_data.end(), blob.begin(), blob.end());
+    }
+    payload_offsets[n] = static_cast<uint32_t>(payload_data.size());
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "pq";
+    cfg.params.pq4_m = 8;
+    cfg.params.scan_pq_bits = 4;
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 500;
+    cfg.pca_dims = 16;
+    cfg.max_lloyd_passes = 2;
+    cfg.num_threads = 4;
+    cfg.filter_schema = schema;
+    cfg.filter_column_data = std::move(cols);
+    cfg.cardinality_spec = CardinalitySpec::all_on();
+    cfg.payload_data = payload_data.data();
+    cfg.payload_offsets = payload_offsets.data();
+    cfg.payload_offsets_count = payload_offsets.size();
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    auto idx = IVFTreeIndex::open(tree_path);
+
+    // Read the exact fp32 vectors back for exact_rerank_base + reference.
+    std::vector<float> store;
+    {
+        FILE* f = std::fopen(base_path.c_str(), "rb");
+        ASSERT_NE(f, nullptr);
+        uint32_t header[2];
+        ASSERT_EQ(std::fread(header, 4, 2, f), 2u);
+        ASSERT_EQ(header[0], n);
+        ASSERT_EQ(header[1], dim);
+        store.resize(static_cast<size_t>(n) * dim);
+        ASSERT_EQ(std::fread(store.data(), 4, store.size(), f), store.size());
+        std::fclose(f);
+    }
+
+    // Filtered search for the rare url with exact rerank base.
+    SearchConfig scfg;
+    scfg.k = 5;
+    Predicate pred;
+    pred.column = "url";
+    pred.op = PredicateOp::Eq;
+    pred.str_value = rare_url;
+    scfg.predicates.push_back(pred);
+    scfg.exact_rerank_base = store.data();
+
+    std::vector<float> query(dim, 0.5f);
+    std::vector<std::pair<const uint8_t*, uint32_t>> locs;
+    auto results = idx->search(query.data(), 5, scfg, &locs);
+
+    // Singleton match: exactly one result, the rare row.
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_EQ(results[0].row_id, static_cast<RowId>(rare_row));
+
+    // Distance must equal the exact fp32 L2sq for that row (not the
+    // lossy decoded distance).
+    double exact = 0.0;
+    for (uint32_t d = 0; d < dim; ++d) {
+        const double diff = static_cast<double>(query[d]) -
+            static_cast<double>(store[rare_row * dim + d]);
+        exact += diff * diff;
+    }
+    EXPECT_NEAR(results[0].dist, exact, 1e-4)
+        << "dist=" << results[0].dist << " exact=" << exact;
+
+    // payload_locs: entry i corresponds to results[i]; round-trips.
+    ASSERT_EQ(locs.size(), results.size());
+    const auto blob = idx->fetch_payload(locs[0].first, locs[0].second);
+    const std::string expected = "payload_" + std::to_string(rare_row);
+    EXPECT_EQ(blob.size(), expected.size());
+    EXPECT_TRUE(std::equal(blob.begin(), blob.end(), expected.begin()));
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
+// ===========================================================================
+// Item C: bad payload_offsets arrays fail fast at build entry with
+// InvalidParam — no file produced, no hang.
+// ===========================================================================
+
+TEST(TreeFilterColumns, PayloadOffsetsValidatedAtBuild) {
+    const uint64_t n = 500;
+    const uint32_t dim = 16;
+    const auto base_path = write_test_fbin(
+        "tree_bad_offsets.fbin", n, dim, 8, 99);
+    const auto tree_path = (std::filesystem::temp_directory_path() /
+                            "tree_bad_offsets.tree").string();
+    std::filesystem::remove(tree_path);
+
+    Schema schema;
+    schema.columns.push_back({"year", ColumnType::Int32});
+    schema.has_payload = true;
+
+    std::vector<ColumnData> cols(1);
+    cols[0].type = ColumnType::Int32;
+    cols[0].fixed_data.resize(n * 4);
+    for (uint64_t i = 0; i < n; ++i) {
+        const int32_t year = 2000 + static_cast<int32_t>(i % 50);
+        std::memcpy(&cols[0].fixed_data[i * 4], &year, 4);
+    }
+
+    std::vector<uint8_t> payload_data(n * 8, 0xAB);
+    std::vector<uint32_t> good_offsets(n + 1);
+    for (uint64_t i = 0; i <= n; ++i)
+        good_offsets[i] = static_cast<uint32_t>(i * 8);
+
+    auto make_cfg = [&](const std::vector<uint32_t>& offsets,
+                        uint64_t count) {
+        IVFTreeIndex::BuildConfig cfg;
+        cfg.params.metric = MetricKind::L2Sq;
+        cfg.params.quantizer_type = "pq";
+        cfg.params.pq4_m = 8;
+        cfg.params.scan_pq_bits = 4;
+        cfg.k_root = 8;
+        cfg.leaf_capacity = 500;
+        cfg.pca_dims = 8;
+        cfg.max_lloyd_passes = 2;
+        cfg.num_threads = 2;
+        cfg.filter_schema = schema;
+        cfg.filter_column_data = cols;
+        cfg.payload_data = payload_data.data();
+        cfg.payload_offsets = offsets.data();
+        cfg.payload_offsets_count = count;
+        return cfg;
+    };
+
+    // (a) N entries instead of N+1.
+    {
+        std::vector<uint32_t> bad(good_offsets.begin(),
+                                  good_offsets.end() - 1);
+        auto cfg = make_cfg(bad, bad.size());
+        FbinSource s(base_path);
+        bool threw = false;
+        try { IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); }
+        catch (const Error& e) {
+            threw = true;
+            EXPECT_EQ(e.code(), ErrorCode::InvalidParam);
+            EXPECT_NE(std::string(e.what()).find("n+1"), std::string::npos);
+        }
+        EXPECT_TRUE(threw);
+        EXPECT_FALSE(std::filesystem::exists(tree_path));
+    }
+    // (b) non-monotonic.
+    {
+        std::vector<uint32_t> bad = good_offsets;
+        bad[10] = bad[11] + 1;
+        auto cfg = make_cfg(bad, bad.size());
+        FbinSource s(base_path);
+        bool threw = false;
+        try { IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); }
+        catch (const Error& e) {
+            threw = true;
+            EXPECT_EQ(e.code(), ErrorCode::InvalidParam);
+            EXPECT_NE(std::string(e.what()).find("monotonic"),
+                      std::string::npos);
+        }
+        EXPECT_TRUE(threw);
+        EXPECT_FALSE(std::filesystem::exists(tree_path));
+    }
+    // (c) offsets without payload_data sidecar.
+    {
+        auto cfg = make_cfg(good_offsets, good_offsets.size());
+        cfg.payload_data = nullptr;
+        FbinSource s(base_path);
+        bool threw = false;
+        try { IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); }
+        catch (const Error& e) {
+            threw = true;
+            EXPECT_EQ(e.code(), ErrorCode::InvalidParam);
+        }
+        EXPECT_TRUE(threw);
+        EXPECT_FALSE(std::filesystem::exists(tree_path));
+    }
+    // Sanity: the good array still builds.
+    {
+        auto cfg = make_cfg(good_offsets, good_offsets.size());
+        FbinSource s(base_path);
+        IVFTreeIndex::build_streaming_pca(s, tree_path, cfg);
+        EXPECT_TRUE(std::filesystem::exists(tree_path));
+    }
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
+}  // namespace sextant::tree

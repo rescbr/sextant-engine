@@ -2472,7 +2472,7 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
     const float* query, uint32_t k, const SearchConfig& config,
     const std::vector<uint32_t>& pred_col_indices,
     const std::vector<uint32_t>& geo_lng_col_indices,
-    std::vector<std::pair<const uint8_t*, uint32_t>>* /*payload_locs*/) const {
+    std::vector<std::pair<const uint8_t*, uint32_t>>* payload_locs) const {
 
     // The brute-force body below is coder-generic (per-row rerank decode +
     // filter evaluation), but was originally implemented and validated only
@@ -2517,8 +2517,11 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
         }
     }
 
-    // Scan each leaf: check summary, then scan filter columns for exact matches.
-    std::vector<Candidate> results;
+    const MetricKind metric = coder_->metric();
+
+    // Track payload locations alongside each candidate so payload_locs can
+    // be emitted in result order (entry i <-> results[i]), like search().
+    std::vector<ResultWithLoc> results_loc;
 
     for (const auto& li : all_leaves) {
         const uint8_t* leaf_ptr = mmap_base_ +
@@ -2545,24 +2548,45 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
                                        config.predicates, pred_col_indices, geo_lng_col_indices))
                 continue;
 
-            // Exact match — decode the row and compute the exact distance.
-            const float dist = coder_->rerank(query, leaf_ptr, i, nullptr);
-            results.push_back({layout.row_ids[i], dist});
+            // Exact match — decode the row and compute the distance.
+            // Caller-provided exact rerank against the original f32 corpus
+            // takes precedence over the coder's decode (same as search()).
+            float dist;
+            if (config.exact_rerank_base) {
+                const float* v = config.exact_rerank_base +
+                    static_cast<size_t>(layout.row_ids[i]) * manifest_.dim;
+                dist = (metric == MetricKind::InnerProduct)
+                           ? -simd::dot_f32(query, v, manifest_.dim)
+                           : simd::l2sq_f32(query, v, manifest_.dim);
+            } else {
+                dist = coder_->rerank(query, leaf_ptr, i, nullptr);
+            }
+            results_loc.push_back({{layout.row_ids[i], dist}, leaf_ptr, i});
         }
     }
 
     // Sort by distance, return top-k.
-    if (results.size() > k) {
-        std::nth_element(results.begin(), results.begin() + k, results.end(),
-                          [](const Candidate& a, const Candidate& b) {
-                              return a.dist < b.dist;
-                          });
-        results.resize(k);
+    if (results_loc.size() > k) {
+        std::nth_element(results_loc.begin(), results_loc.begin() + k,
+                         results_loc.end(),
+                         [](const ResultWithLoc& a, const ResultWithLoc& b) {
+                             return a.cand.dist < b.cand.dist;
+                         });
+        results_loc.resize(k);
     }
-    std::sort(results.begin(), results.end(),
-              [](const Candidate& a, const Candidate& b) {
-                  return a.dist < b.dist;
+    std::sort(results_loc.begin(), results_loc.end(),
+              [](const ResultWithLoc& a, const ResultWithLoc& b) {
+                  return a.cand.dist < b.cand.dist;
               });
+    if (payload_locs) {
+        payload_locs->clear();
+        payload_locs->reserve(results_loc.size());
+        for (const auto& rl : results_loc)
+            payload_locs->push_back({rl.leaf_ptr, rl.local_idx});
+    }
+    std::vector<Candidate> results;
+    results.reserve(results_loc.size());
+    for (const auto& rl : results_loc) results.push_back(rl.cand);
     return results;
 }
 

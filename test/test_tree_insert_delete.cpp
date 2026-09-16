@@ -1654,4 +1654,77 @@ TEST(TreeInsertDelete, ChurnSplitWavesKeepAccounting) {
     std::filesystem::remove(base_path);
     std::filesystem::remove(tree_path);
 }
+
+// ===========================================================================
+// Manifest logical row count (n_vectors): build == input rows, insert +n,
+// delete -deleted, persisted across reopen.
+// ===========================================================================
+
+TEST(TreeInsertDelete, ManifestNVectorCountTracksMutations) {
+    const uint64_t n = 2000;
+    const uint32_t dim = 64;
+    const std::string base_path = write_test_fbin(
+        "phasej_nvec.fbin", n, dim, /*n_clusters=*/20, /*seed=*/4242);
+    const std::string tree_path = temp_path(".tree");
+    std::filesystem::remove(tree_path);
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "pq";
+    cfg.params.pq4_m = 16;
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.partition_balance_factor = 4.0f;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 8;
+    cfg.leaf_capacity = 500;
+    cfg.num_threads = 4;
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+
+    // Build: manifest n_vectors == logical input rows (even though closure
+    // replication may make live_count() larger).
+    {
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/false);
+        EXPECT_EQ(idx->n_vectors(), n);
+        EXPECT_GE(idx->live_count(), n);  // replication can exceed
+    }
+
+    // Insert 100: logical count +100.
+    {
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
+        const uint32_t n_insert = 100;
+        std::vector<IVFTreeIndex::InsertPoint> points;
+        std::vector<float> store(n_insert * dim);
+        std::mt19937 rng(7);
+        for (uint32_t i = 0; i < n_insert; ++i) {
+            for (uint32_t d = 0; d < dim; ++d)
+                store[i * dim + d] =
+                    std::uniform_real_distribution<float>(-10, 10)(rng);
+            points.push_back({&store[i * dim],
+                              static_cast<RowId>(n + i), {}, {}});
+        }
+        idx->insert_batch(points);
+        EXPECT_EQ(idx->n_vectors(), n + n_insert);
+    }
+    // Persisted: RO reopen sees the new count.
+    {
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/false);
+        EXPECT_EQ(idx->n_vectors(), n + 100);
+    }
+
+    // Delete 3 (one not found): logical count -3, not -4.
+    {
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
+        idx->delete_batch({0, 1, 2, 999999});
+        EXPECT_EQ(idx->n_vectors(), n + 100 - 3);
+    }
+    {
+        auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/false);
+        EXPECT_EQ(idx->n_vectors(), n + 100 - 3);
+    }
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
 }  // namespace sextant::tree

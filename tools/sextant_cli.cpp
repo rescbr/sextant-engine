@@ -652,6 +652,7 @@ int cmd_build_tree_pca(int argc, char* argv[]) {
             cfg.filter_schema.has_payload = true;
             cfg.payload_data = fdat.payload_data.data();
             cfg.payload_offsets = fdat.payload_offsets.data();
+            cfg.payload_offsets_count = fdat.payload_offsets.size();
         }
         std::cerr << "loaded filter data: " << fdat.n_rows << " rows, "
                   << fdat.schema.columns.size() << " columns"

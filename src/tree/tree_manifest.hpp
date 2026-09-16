@@ -35,6 +35,10 @@ struct TreeManifest {
     uint32_t k_l1 = 0;            // depth-3: actual root branching (n L1 nodes).
                                   // 0 = depth <= 2 (root children = L1 or leaves).
     uint32_t leaf_capacity = 0;   // max vectors per leaf
+    uint64_t n_vectors = 0;       // LOGICAL row count: input rows indexed
+                                  // at build, pre-closure-replication
+                                  // (mutations adjust it; leaves may hold
+                                  // more rows after closure replication)
     uint32_t n_leaves = 0;
     uint32_t n_probe_l0 = 0;      // probe count at level 0
     uint32_t n_probe_ln = 0;      // probe count at deeper levels

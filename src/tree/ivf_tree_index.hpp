@@ -138,6 +138,10 @@ public:
         /// this; the other build paths ignore it.
         const uint8_t* payload_data = nullptr;
         const uint32_t* payload_offsets = nullptr;  // N+1 entries
+        /// Number of entries in payload_offsets (must be N+1 when the
+        /// pointer is non-null). Validated at build entry; 0 with a
+        /// non-null pointer fails validation.
+        uint64_t payload_offsets_count = 0;
 
         /// Optional metrics sink (metrics.hpp). When null, phase records
         /// still accumulate into BuildResult::phases but emit only via the
@@ -459,7 +463,14 @@ public:
 
     /// Returns the number of live vectors across all leaves (sum of leaf
     /// counts). Requires a mutable open (reads leaf headers via file_).
+    /// Internal mutation diagnostics only — for the O(1) logical row
+    /// count use manifest().n_vectors (kept current by build/insert/delete).
     uint64_t live_count() const;
+
+    /// Logical row count from the manifest (O(1)). Counts input rows
+    /// indexed, NOT closure-replicated leaf slots. 0 = legacy manifest
+    /// built before n_vectors was persisted.
+    uint64_t n_vectors() const { return manifest_.n_vectors; }
 
 private:
     // --- Open state ---
@@ -490,6 +501,10 @@ private:
     PageFile file_;
     Superblock superblock_;
     TreeManifest manifest_;
+    // n_vectors as last persisted in the on-disk manifest blob. Differs
+    // from manifest_.n_vectors between an insert/delete and the next
+    // commit_mutable_ (which rewrites the config blob).
+    uint64_t n_vectors_disk_ = 0;
     CardinalityTable card_table_;  // per-value frequencies for selectivity (Phase D)
     std::unique_ptr<PlaneIndex> plane_;  // stage-1 routing plane (optional)
     // v2 layouts: per-leaf plane-suffix offset, cached from the leaf
