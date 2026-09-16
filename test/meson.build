@@ -29,6 +29,7 @@ test_sources = [
     'test_leaf_cache.cpp',
     'test_batch_search.cpp',
     'test_cluster_stage.cpp',
+    'test_dots4_kernel.cpp',
 
 ]
 

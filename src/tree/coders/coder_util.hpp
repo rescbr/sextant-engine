@@ -359,6 +359,14 @@ inline void scalar_cand_flush(ScalarCandBuf& b, RawScanHeap& heap) {
 // uses sum(a*c) = dpbusd(a^0x80, c) - 128*dpbusd(ones, c)  (a^0x80 == a+128
 // mod 256, so the bias term removes exactly).
 //
+// NEON (SEXTANT_HAS_NEON_DOTSCAN): unshaped nibbles are positive s8 lanes
+// so plain SDOT is already the exact product; shaped uses USDOT under
+// FEAT_I8MM or the exact two-SDOT bias split otherwise (see neon_gdot_s32).
+// All accumulation is integer, and the zero-masked tail folds into the same
+// i32 accumulators, so every NEON path is bit-identical to the _ref twin
+// for ANY dim (integer sums are associative; float() runs once on the exact
+// total).
+//
 // arith kernel semantics: dots[v] = sum_d a_uni[d] * f[nib_d] where f is
 // the 16-byte shared-shape table (u8) or the identity (nib as float).
 // a_uni is zero-padded to the 16-dim kernel width by scan_setup.
@@ -405,6 +413,26 @@ inline void scalar_arith_dots4_ref(const ScalarScanCtx& c,
     && defined(__AVX512BW__)
 #define SEXTANT_HAS_AVX512_SCAN 1
 #include <immintrin.h>
+#elif defined(__ARM_FEATURE_DOTPROD)
+// NEON DotProd scan path (SDOT) for the i8 dot kernels below. Guarded by
+// __ARM_FEATURE_DOTPROD (NOT by the meson simd_target string): a 'neon'
+// -march=native machine without FEAT_DOTPROD still compiles → _ref.
+// FEAT_I8MM (USDOT) is an inner refinement for the shaped g-table dot;
+// i8mm without dotprod is not a real configuration, so the outer guard is
+// dotprod alone.
+//
+// SVE2 analysis (why there is no sve2_dots4 in src/simd/sve2_kernels.cpp):
+// this kernel does NO table gather — the SVE2 win in scalar_dot_u4_sve2 is
+// the svld1_gather; here the cost is nibble unpack + 4-way byte dots, both
+// of which SVE2 svdot does at exactly NEON SDOT throughput per 128 bits.
+// Neoverse-V2 (c4a) runs SVE at 2×128-bit, so svdot at VL=256 would need
+// 32 nibble lanes unpacked per chunk (4× the vzip work) for the same dot
+// throughput the NEON loop already gets with unrolled 128-bit vectors —
+// no vector-width or gather advantage for THIS kernel. Engine TUs build
+// with -march=native, so sve2 builds get this NEON path directly; the
+// explicitly -march=armv8-a+sve2 sve2 TU never includes this header.
+#define SEXTANT_HAS_NEON_DOTSCAN 1
+#include <arm_neon.h>
 #endif
 
 #if defined(SEXTANT_HAS_AVX512_SCAN)
@@ -438,6 +466,87 @@ inline __m512i avx512_nibbles4(const uint8_t* const* cp, uint32_t d) {
         n3, 3);
 }
 #endif  // AVX512
+
+#if defined(SEXTANT_HAS_NEON_DOTSCAN)
+/// 16 nibbles of one 16-dim chunk of row `v`, dim-ordered, as uint8x16_t.
+/// 8 code bytes hold 16 dims: uint8x8 zip interleaves the lo/hi nibbles of
+/// bytes 0-3 into dims 0-7 (val[0]) and bytes 4-7 into dims 8-15 (val[1]).
+inline uint8x16_t neon_row_nibbles(const uint8_t* row, uint32_t d) {
+    const uint8x8_t b = vld1_u8(row + d / 2);
+    const uint8x8_t lo = vand_u8(b, vdup_n_u8(0x0F));
+    const uint8x8_t hi = vshr_n_u8(b, 4);
+    const uint8x8x2_t z = vzip_u8(lo, hi);
+    return vcombine_u8(z.val[0], z.val[1]);
+}
+
+/// Tail chunk (rem = dim % 16 ∈ 1..15): the (rem+1)/2 real bytes are
+/// copied into a zeroed 8-byte scratch (zero-pad, the house FHM-remainder
+/// pattern) and expanded like neon_row_nibbles — dims beyond the copy are
+/// naturally zero, EXCEPT the odd-dim high nibble of the last byte, which
+/// the byte copy alone would leave live. The lane mask returned by
+/// neon_tail_mask zeroes it (and must be applied AFTER the shaped g-table
+/// lookup: a zeroed nibble INDEX maps to g_tbl[0], which need not be 0).
+inline uint8x16_t neon_row_nibbles_tail(const uint8_t* row, uint32_t d,
+                                        uint32_t rem, uint8_t scratch[8]) {
+    const uint32_t nbytes = (rem + 1) / 2;   // 1..8
+    memset(scratch, 0, 8);
+    memcpy(scratch, row + d / 2, nbytes);
+    const uint8x8_t b = vld1_u8(scratch);
+    const uint8x8_t lo = vand_u8(b, vdup_n_u8(0x0F));
+    const uint8x8_t hi = vshr_n_u8(b, 4);
+    const uint8x8x2_t z = vzip_u8(lo, hi);
+    return vcombine_u8(z.val[0], z.val[1]);
+}
+
+/// 0xFF for the leading `rem` (1..15) nibble lanes, 0 beyond.
+inline uint8x16_t neon_tail_mask(uint32_t rem) {
+    static const uint8_t iota16[16] = {0,  1,  2,  3,  4,  5,  6,  7,
+                                       8,  9,  10, 11, 12, 13, 14, 15};
+    return vcltq_u8(vld1q_u8(iota16),
+                    vdupq_n_u8(static_cast<uint8_t>(rem)));
+}
+
+/// acc += Σ_j nib[j]·a[j] as i32 (SDOT). Unshaped nibbles are 0..15, i.e.
+/// POSITIVE s8 lanes, so the signed×signed SDOT reproduces the exact
+/// integer product the AVX-512 dpbusd computes — no bias trick needed.
+inline int32x4_t neon_nibdot_s32(int32x4_t acc, uint8x16_t nib, int8x16_t a) {
+    return vdotq_s32(acc, vreinterpretq_s8_u8(nib), a);
+}
+
+/// acc += Σ_j g[j]·a[j], g unsigned 0..255 (shaped g-table output).
+/// With FEAT_I8MM: USDOT (u8×s8→i32) — the exact analog of dpbusd,
+/// single instruction, exact.
+/// Without i8mm (dotprod-only cores, e.g. Neoverse-N1): the exact
+/// two-SDOT bias split
+///     g = (g & 0x7F) + 128·(g >> 7)
+///     Σ a·g = SDOT(a, g&0x7F) + 128·SDOT(a, g>>7)
+/// g>>7 ∈ {0,1} is a positive s8 lane; the <<7 scale is exact in i32 and
+/// every per-lane sum stays far below i32 overflow, so the split is exact.
+inline int32x4_t neon_gdot_s32(int32x4_t acc, uint8x16_t g, int8x16_t a) {
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    return vusdotq_s32(acc, g, a);
+#else
+    const int8x16_t gl = vreinterpretq_s8_u8(vandq_u8(g, vdupq_n_u8(0x7F)));
+    const int8x16_t gh = vreinterpretq_s8_u8(vshrq_n_u8(g, 7));
+    const int32x4_t lo = vdotq_s32(acc, gl, a);
+    const int32x4_t hi = vdotq_s32(vdupq_n_s32(0), gh, a);
+    return vaddq_s32(lo, vshlq_n_s32(hi, 7));
+#endif
+}
+
+/// Horizontal fold + the shared float epilogue. The i32 lane sums and the
+/// vaddvq reduction are EXACT integers (integer addition is associative,
+/// so lane order is irrelevant), and float(i32) rounds the same value the
+/// _ref twin's float(i64) rounds — bit-identical for any magnitude.
+inline float neon_i8_finish(int32x4_t s, int32x4_t s_lo, bool has_lo,
+                            float inv) {
+    const int32_t t = vaddvq_s32(s);
+    float lo = 0.0f;
+    if (has_lo)
+        lo = static_cast<float>(vaddvq_s32(s_lo)) / 127.0f;
+    return (static_cast<float>(t) + lo) * inv;
+}
+#endif  // NEON DOTPROD
 
 inline void scalar_i8_dots4(const ScalarScanCtx& c,
                             const uint8_t* const* cp, float dots[4]) {
@@ -504,6 +613,73 @@ inline void scalar_i8_dots4(const ScalarScanCtx& c,
             }
         }
     }
+    return;
+#elif defined(SEXTANT_HAS_NEON_DOTSCAN)
+    // NEON SDOT/USDOT. One 128-bit vector per row; 16 dims per chunk = one
+    // vdotq per (row, chunk). ALL accumulation stays integer — the tail
+    // chunk's nibbles are zero-masked so it folds into the SAME i32
+    // accumulators and the float epilogue runs exactly once, matching the
+    // _ref expression bit-for-bit for ANY dim (the AVX-512 single kernel's
+    // scalar float tail above is last-ulp-off on non-multiple-of-16 dims;
+    // this path is exact everywhere).
+    const uint32_t dim = c.dim;
+    const uint32_t cs = c.cs;
+    const uint32_t padded = (dim + 15) / 16 * 16;
+    const bool fully_padded = padded / 2 <= cs;
+    const uint32_t d16i = fully_padded ? padded : dim / 16 * 16;
+    const int8_t* a8p = c.a8;                       // zero-padded to `padded`
+    const int8_t* a8lop = c.i8_mode >= 2 ? c.a8_lo : nullptr;
+    const bool shaped = c.slm_shaped;
+    // Shaped: nibbles map through the 16-entry u8 f table (vqtbl1q — the
+    // exact 16-entry TBL analog of pshufb) before the dot; the affine f
+    // correction is folded into c0/i8_inv at setup time, as on AVX-512.
+    const uint8x16_t g_tbl = shaped
+        ? vld1q_u8(c.shape_u8) : vdupq_n_u8(0);
+    int32x4_t acc[4] = {vdupq_n_s32(0), vdupq_n_s32(0),
+                        vdupq_n_s32(0), vdupq_n_s32(0)};
+    int32x4_t acclo[4] = {vdupq_n_s32(0), vdupq_n_s32(0),
+                          vdupq_n_s32(0), vdupq_n_s32(0)};
+    for (uint32_t d = 0; d < d16i; d += 16) {
+        const int8x16_t a = vld1q_s8(a8p + d);
+        const int8x16_t al = a8lop ? vld1q_s8(a8lop + d) : vdupq_n_s8(0);
+        for (uint32_t v = 0; v < 4; ++v) {
+            uint8x16_t nib = neon_row_nibbles(cp[v], d);
+            // Unshaped nibbles (0..15) dot directly via SDOT; shaped map
+            // through g first and dot via USDOT / the bias split.
+            acc[v] = shaped
+                ? neon_gdot_s32(acc[v], vqtbl1q_u8(g_tbl, nib), a)
+                : neon_nibdot_s32(acc[v], nib, a);
+            if (a8lop)
+                acclo[v] = shaped
+                    ? neon_gdot_s32(acclo[v], vqtbl1q_u8(g_tbl, nib), al)
+                    : neon_nibdot_s32(acclo[v], nib, al);
+        }
+    }
+    if (!fully_padded) {
+        // Tail chunk (rem = 1..15): zero-masked nibbles + the zero-padded
+        // a8/a8_lo tail lanes fold into the same integer accumulators.
+        const uint32_t rem = dim - d16i;
+        const uint8x16_t m = neon_tail_mask(rem);
+        uint8_t scratch[4][8];
+        const int8x16_t a = vld1q_s8(a8p + d16i);
+        const int8x16_t al = a8lop ? vld1q_s8(a8lop + d16i) : vdupq_n_s8(0);
+        for (uint32_t v = 0; v < 4; ++v) {
+            uint8x16_t nib = neon_row_nibbles_tail(cp[v], d16i, rem,
+                                                  scratch[v]);
+            if (shaped) nib = vqtbl1q_u8(g_tbl, nib);  // mask AFTER tbl
+            nib = vandq_u8(nib, m);
+            acc[v] = shaped
+                ? neon_gdot_s32(acc[v], nib, a)
+                : neon_nibdot_s32(acc[v], nib, a);
+            if (a8lop)
+                acclo[v] = shaped
+                    ? neon_gdot_s32(acclo[v], nib, al)
+                    : neon_nibdot_s32(acclo[v], nib, al);
+        }
+    }
+    for (uint32_t v = 0; v < 4; ++v)
+        dots[v] = neon_i8_finish(acc[v], acclo[v], a8lop != nullptr,
+                                 c.i8_inv);
     return;
 #endif
     scalar_i8_dots4_ref(c, cp, dots);
@@ -614,7 +790,11 @@ inline void scalar_i8_dots4_q4(const ScalarScanCtx* const c4[4],
             row_masked(cp[3]), 3);
         const __m512i nibs_g =
             c0.slm_shaped ? _mm512_shuffle_epi8(g_tbl, nibs) : nibs;
-        const __mmask8 ma = static_cast<__mmask8>((1u << rem) - 1u);
+        // __mmask16, NOT __mmask8: rem is 9..14 for real tail dims (cs =
+        // ceil(dim/2) makes rem=15 fully-padded), and an 8-bit mask
+        // silently zeroed a8 lanes 8..15, dropping tail dims 8..14.
+        // Caught by test_dots4_kernel (q4-vs-ref diverged for rem >= 9).
+        const __mmask16 ma = static_cast<__mmask16>((1u << rem) - 1u);
         auto fold = [](__m512i v) {
             __m512i t = _mm512_add_epi32(
                 v, _mm512_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
@@ -650,6 +830,88 @@ inline void scalar_i8_dots4_q4(const ScalarScanCtx* const c4[4],
                 _mm_loadu_ps(&dots[q][0]),
                 _mm_mul_ps(f, _mm_set1_ps(cq.i8_inv))));
         }
+    }
+    return;
+#elif defined(SEXTANT_HAS_NEON_DOTSCAN)
+    // 4-QUERY batched NEON kernel: one nibble unpack per (row, chunk) shared
+    // by all 4 queries (same leaf → same dim/cs/shape), 4 independent
+    // accumulator sets for ILP. Per (query, row) the integer lane order is
+    // IDENTICAL to scalar_i8_dots4 above (same nibble expansion, same vdotq
+    // sequence), so dots[q][v] is bit-identical to a per-query
+    // scalar_i8_dots4 call — and the integer-only tail keeps that exact for
+    // non-multiple-of-16 dims as well.
+    const ScalarScanCtx& c0 = *c4[0];
+    const uint32_t dim = c0.dim;
+    const uint32_t cs = c0.cs;
+    const uint32_t padded = (dim + 15) / 16 * 16;
+    const bool fully_padded = padded / 2 <= cs;
+    const uint32_t d16i = fully_padded ? padded : dim / 16 * 16;
+    const bool shaped = c0.slm_shaped;
+    const uint8x16_t g_tbl = shaped
+        ? vld1q_u8(c0.shape_u8) : vdupq_n_u8(0);
+    int32x4_t acc[4][4], acclo[4][4];   // [query][row]
+    for (uint32_t q = 0; q < 4; ++q)
+        for (uint32_t v = 0; v < 4; ++v) {
+            acc[q][v] = vdupq_n_s32(0);
+            acclo[q][v] = vdupq_n_s32(0);
+        }
+    for (uint32_t d = 0; d < d16i; d += 16) {
+        uint8x16_t nib[4];              // unpack ONCE per row, shared
+        for (uint32_t v = 0; v < 4; ++v) {
+            nib[v] = neon_row_nibbles(cp[v], d);
+            if (shaped) nib[v] = vqtbl1q_u8(g_tbl, nib[v]);
+        }
+        for (uint32_t q = 0; q < 4; ++q) {
+            const ScalarScanCtx& cq = *c4[q];
+            const int8x16_t a = vld1q_s8(cq.a8 + d);
+            const bool lo = cq.i8_mode >= 2 && cq.a8_lo;
+            const int8x16_t al = lo ? vld1q_s8(cq.a8_lo + d) : vdupq_n_s8(0);
+            for (uint32_t v = 0; v < 4; ++v) {
+                acc[q][v] = shaped
+                    ? neon_gdot_s32(acc[q][v], nib[v], a)
+                    : neon_nibdot_s32(acc[q][v], nib[v], a);
+                if (lo)
+                    acclo[q][v] = shaped
+                        ? neon_gdot_s32(acclo[q][v], nib[v], al)
+                        : neon_nibdot_s32(acclo[q][v], nib[v], al);
+            }
+        }
+    }
+    if (!fully_padded) {
+        // Zero-masked tail chunk shared by all queries; a8/a8_lo tails are
+        // zero-padded buffers, so the full 16-lane loads are safe.
+        const uint32_t rem = dim - d16i;           // 1..15
+        const uint8x16_t m = neon_tail_mask(rem);
+        uint8_t scratch[4][8];
+        uint8x16_t nib[4];
+        for (uint32_t v = 0; v < 4; ++v) {
+            nib[v] = neon_row_nibbles_tail(cp[v], d16i, rem, scratch[v]);
+            if (shaped) nib[v] = vqtbl1q_u8(g_tbl, nib[v]);  // then mask
+            nib[v] = vandq_u8(nib[v], m);
+        }
+        for (uint32_t q = 0; q < 4; ++q) {
+            const ScalarScanCtx& cq = *c4[q];
+            const int8x16_t a = vld1q_s8(cq.a8 + d16i);
+            const bool lo = cq.i8_mode >= 2 && cq.a8_lo;
+            const int8x16_t al = lo ? vld1q_s8(cq.a8_lo + d16i)
+                                    : vdupq_n_s8(0);
+            for (uint32_t v = 0; v < 4; ++v) {
+                acc[q][v] = shaped
+                    ? neon_gdot_s32(acc[q][v], nib[v], a)
+                    : neon_nibdot_s32(acc[q][v], nib[v], a);
+                if (lo)
+                    acclo[q][v] = shaped
+                        ? neon_gdot_s32(acclo[q][v], nib[v], al)
+                        : neon_nibdot_s32(acclo[q][v], nib[v], al);
+            }
+        }
+    }
+    for (uint32_t q = 0; q < 4; ++q) {
+        const ScalarScanCtx& cq = *c4[q];
+        const bool lo = cq.i8_mode >= 2 && cq.a8_lo;
+        for (uint32_t v = 0; v < 4; ++v)
+            dots[q][v] = neon_i8_finish(acc[q][v], acclo[q][v], lo,
+                                        cq.i8_inv);
     }
     return;
 #endif
