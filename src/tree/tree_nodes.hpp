@@ -145,7 +145,7 @@ inline uint64_t node_extent_pages(uint16_t dim, uint64_t n_children,
 struct TreeLeafHeader {
     uint32_t magic;                  // kTreeLeafMagic
     uint64_t count;                  // live vector count
-    uint64_t tombstone_count;        // deleted vector count (Phase 4; 0 now)
+    uint64_t tombstone_count;        // RESERVED for v3 (tombstoning / raw-insert bootstrap) — never written/read in v1. Deleted vector count (Phase 4; 0 now)
     uint16_t m4;                     // PQ subquantizers (block_bytes = m4 × 16)
     uint8_t  pq_bits;                // 4 or 8
     uint32_t block_bytes;            // bytes per FastScan block
@@ -162,6 +162,8 @@ struct TreeLeafHeader {
     // --- Per-leaf residual PQ additions ---
     /// Leaf state: 0 = CODED (global PQ), 1 = ACCUMULATING (raw FP32),
     /// 2 = CODED_LOCAL (local per-leaf codebook).
+    /// ACCUMULATING is RESERVED for v3 (tombstoning / raw-insert bootstrap)
+    /// — never written/read in v1.
     uint8_t  leaf_state = 0;
     /// Padding to align the following u32 fields.
     uint8_t  pad1 = 0;

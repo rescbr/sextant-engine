@@ -2,7 +2,7 @@
 #include "fbin_source.hpp"
 #include "test_data.hpp"
 #include "tree/fsck.hpp"
-#include "tree/ivf_tree_index.hpp"
+#include "tree/ivf_tree_mutate.hpp"
 #include "mem_source.hpp"  // MemSourceBuilder
 #include <sextant/column_data.hpp>
 #include "sextant/config.hpp"

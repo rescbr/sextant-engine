@@ -3,7 +3,7 @@
 // PlaneIndex's per-leaf max scores against a brute-force f32 reference
 // computed from the SAME basis. (Mechanics only — no quality claims.)
 #include "../src/engine/memory_source.hpp"
-#include "../src/tree/ivf_tree_index.hpp"
+#include "../src/tree/ivf_tree_mutate.hpp"
 
 #include <cmath>
 #include <cstdio>

@@ -15,7 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "fbin_source.hpp"
-#include "tree/ivf_tree_index.hpp"
+#include "tree/ivf_tree_mutate.hpp"
 #include "sextant/config.hpp"
 #include "sextant/engine_trace.hpp"
 #include "sextant/types.hpp"

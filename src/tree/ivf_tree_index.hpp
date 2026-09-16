@@ -368,6 +368,15 @@ public:
     bool has_plane() const { return plane_ != nullptr; }
     const PlaneIndex* plane() const { return plane_.get(); }
 
+    // --- INTERNAL: mutation (v3 seed; not public API) ---
+    // The methods below (through the END marker) mutate an already-built
+    // index. They are NOT part of the v1 public C++ surface
+    // (build_streaming_pca / open / search / search_batch / fetch_payload /
+    // fetch_vector / stats / fsck). Kept for the CLI's tree-insert /
+    // tree-delete / tree-vacuum / tree-defrag / plane-attach commands,
+    // internal tests and as the seed for v3 raw-insert bootstrap.
+    // Canonical include for mutation consumers: "tree/ivf_tree_mutate.hpp".
+
     /// Attaches a routing plane to an ALREADY-BUILT, plane-less index:
     /// trains the PCA basis + per-dim codebooks on `base` (n×dim
     /// row-major, spread-sampled), encodes every stored member
@@ -466,6 +475,7 @@ public:
     /// Internal mutation diagnostics only — for the O(1) logical row
     /// count use manifest().n_vectors (kept current by build/insert/delete).
     uint64_t live_count() const;
+    // --- END INTERNAL: mutation (v3 seed; not public API) ---
 
     /// Logical row count from the manifest (O(1)). Counts input rows
     /// indexed, NOT closure-replicated leaf slots. 0 = legacy manifest

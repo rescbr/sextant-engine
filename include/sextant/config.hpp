@@ -833,16 +833,13 @@ struct EstimateResult {
 };
 
 /// Structural properties of a built graph, measured for parameter estimation.
+/// (Historical: consumed by the flat/Vamana stack — removed at vamana-eol;
+/// retained as inert metadata.)
 struct GraphStats {
     double avg_degree = 0.0;       ///< mean post-prune degree (R̄)
     double clustering_coeff = 0.0; ///< sampled triangle fraction
     double dead_end_frac = 0.0;    ///< fraction of nodes with degree ≤ 1
     double median_lid = 0.0;       ///< MLE LID from k-NN distances
 };
-
-/// Auto-resolve parameters from dataset properties + machine properties.
-/// If any field in `overrides` is non-zero/non-default, it takes precedence.
-ResolvedParams resolve_params(uint64_t n_vectors, Dim dim,
-                               const BuildConfig& overrides);
 
 }  // namespace sextant

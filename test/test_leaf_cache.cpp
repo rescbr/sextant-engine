@@ -8,7 +8,7 @@
 
 #include <gtest/gtest.h>
 
-#include "tree/ivf_tree_index.hpp"
+#include "tree/ivf_tree_mutate.hpp"
 #include "tree/leaf_extent_cache.hpp"
 
 #include <sextant/vector_source.hpp>

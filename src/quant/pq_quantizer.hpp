@@ -35,9 +35,9 @@ public:
 
     /// Configured distance metric. Drives `preprocess_query` (LUT semantics:
     /// L2sq distance vs negated IP) and the FP16/FP32 true-distance paths
-    /// (routing, rerank) via the `dist_f16`/`dist_f32` dispatch helpers in
-    /// `vamana_core.hpp`. For L2-normalized data both metrics are
-    /// rank-equivalent on true distances; IP is cheaper per eval.
+    /// (routing, rerank) via the `dist_f16`/`dist_f32` dispatch helpers. For
+    /// L2-normalized data both metrics are rank-equivalent on true
+    /// distances; IP is cheaper per eval.
     MetricKind metric() const { return metric_; }
 
     /// Number of PQ segments.

@@ -53,12 +53,6 @@ bench_mem = executable('bench_mem',
 )
 endif
 
-spike_colocated = executable('spike_colocated',
-    'spike_colocated.cpp',
-    dependencies: sextant_dep,
-    install: false,
-)
-
 if is_aarch64
 spike_margin_rerank = executable('spike_margin_rerank',
     'spike_margin_rerank.cpp',

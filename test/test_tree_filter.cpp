@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "fbin_source.hpp"
-#include "tree/ivf_tree_index.hpp"
+#include "tree/ivf_tree_mutate.hpp"
 #include "tree/tree_nodes.hpp"
 #include "tree/page_file.hpp"
 #include "tree/superblock.hpp"

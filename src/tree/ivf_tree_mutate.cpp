@@ -1,4 +1,4 @@
-#include "ivf_tree_index.hpp"
+#include "ivf_tree_mutate.hpp"
 
 #include "engine/manifest_io.hpp"
 #include "engine/probe.hpp"

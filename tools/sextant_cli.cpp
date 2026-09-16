@@ -1,14 +1,16 @@
-// sextant CLI — build / autobuild / search / insert / analyze.
+// sextant CLI — tree build / search / mutation / diagnostics.
 //
 // Uses the vendored cmdline.h (header-only) for argument parsing.
 // Commands:
-//   sextant build      — build an index from a .fbin file (explicit params)
-//   sextant autobuild  — estimate_config then build, in one process
-//   sextant search     — search an index with query vectors
-//   sextant insert     — insert a single vector into an index
-//   sextant analyze    — read-only dataset-adaptive parameter advisory
+//   sextant build-tree  — build a hierarchical IVF tree index (single file)
+//   sextant tree-search — search a tree index
+//   sextant tree-insert / tree-delete / tree-vacuum / tree-defrag
+//                     — (internal/experimental) mutation commands
+//   sextant plane-attach — (internal/experimental) routing-plane attach
+//   sextant sweep / trace / fsck — diagnostics
 //
-// build/autobuild/analyze share a common flag parser (tools/shared_cli.hpp).
+// The flat/Vamana stack (build/autobuild/search/insert/analyze over
+// sextant/Index) was removed for v1 — preserved at tag `vamana-eol`.
 //
 // The CLI catches all exceptions, prints to stderr, returns non-zero.
 
@@ -19,26 +21,19 @@
 #include "parquet_glob_source.hpp"
 #include "shared_cli.hpp"
 #include "sextant_version.hpp"
-#include "sextant/builder.hpp"
 #include "sextant/config.hpp"
 #include "sextant/crash_handler.hpp"
 #include "sextant/engine_trace.hpp"
 #include "sextant/ground_truth.hpp"
 #include "sextant/error.hpp"
-#include "sextant/estimator.hpp"
-#include "sextant/index.hpp"
 #include "sextant/logging.hpp"
-#include "sextant/searcher.hpp"
 #include "sextant/metrics.hpp"
 #include "tree/fsck.hpp"
 #include "tree/filter_data_io.hpp"
-#include "tree/ivf_tree_index.hpp"
+#include "tree/ivf_tree_mutate.hpp"
 
-#include "algo/vamana_core.hpp"
 #include "quant/pq_quantizer.hpp"
 #include "simd_kernels.hpp"
-#include "storage/memgraph.hpp"
-#include "storage/node_store.hpp"
 
 #include <cmdline/cmdline.h>
 #include <fcntl.h>
@@ -76,367 +71,6 @@ using namespace sextant::fbin_io;  // FbinHeader, read_fbin_header, read_fbin_ve
 // ---------------------------------------------------------------------------
 // Command handlers. Each returns a process exit code.
 // ---------------------------------------------------------------------------
-
-int cmd_build(int argc, char* argv[]) {
-    using namespace sextant_cli;
-    cmdline::parser p;
-    add_common_flags(p);
-    add_mode_extras(p, Mode::Build);
-    p.add<std::string>("metrics-file", 0,
-        "Append build phase metrics as JSON lines (build.* field names)",
-        false, "");
-    p.parse_check(argc, argv);
-    apply_log_level(p);
-
-    const std::string input = p.get<std::string>("input");
-    const std::string index_path = p.get<std::string>("index");
-    if (index_path.empty()) {
-        std::cerr << "sextant build: --index is required\n";
-        return 1;
-    }
-
-    sextant::FbinSource source(input);
-    const uint64_t n = source.count();
-    const sextant::Dim dim = source.dim();
-    if (n == 0 || dim == 0) {
-        std::cerr << "sextant build: empty or invalid source '" << input
-                  << "'\n";
-        return 1;
-    }
-
-    sextant::BuildConfig cfg = build_config_from_parser(p);
-    cfg.build_ram_budget = p.get<uint64_t>("build-ram");
-    cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
-
-    const std::string metrics_path = p.get<std::string>("metrics-file");
-    std::unique_ptr<sextant::metrics::JsonlMetricsSink> metrics_json;
-    sextant::metrics::LogMetricsSink metrics_log;
-    sextant::metrics::MultiMetricsSink metrics_sink;
-    metrics_sink.add(&metrics_log);
-    if (!metrics_path.empty()) {
-        metrics_json =
-            std::make_unique<sextant::metrics::JsonlMetricsSink>(metrics_path);
-        metrics_sink.add(metrics_json.get());
-    }
-    cfg.metrics_sink = &metrics_sink;
-
-    sextant::Index idx;
-    sextant::Builder builder(idx);
-    const sextant::BuildResult result =
-        builder.build(source, index_path, cfg);
-    std::cout << "built index '" << index_path
-              << "': n=" << result.n_vectors
-              << " dim=" << result.dim
-              << " R=" << result.R
-              << " L_build=" << result.L_build
-              << " pq_m=" << static_cast<int>(result.pq_m)
-              << " pq_bits=" << static_cast<int>(result.pq_bits)
-              << " in " << result.build_time_sec << "s"
-              << " (cpu " << result.cpu_time_sec << "s, util "
-              << (result.build_time_sec > 0
-                      ? 100.0 * result.cpu_time_sec / result.build_time_sec : 0.0)
-              << "%, src_wait " << result.source_wait_sec << "s, read "
-              << result.bytes_read << "B, peak rss " << result.peak_rss_bytes
-              << "B)\n";
-    return 0;
-}
-
-int cmd_autobuild(int argc, char* argv[]) {
-    using namespace sextant_cli;
-    cmdline::parser p;
-    add_common_flags(p);
-    add_mode_extras(p, Mode::Autobuild);
-    p.parse_check(argc, argv);
-    apply_log_level(p);
-
-    const std::string input = p.get<std::string>("input");
-    const std::string index_path = p.get<std::string>("index");
-    if (index_path.empty()) {
-        std::cerr << "sextant autobuild: --index is required\n";
-        return 1;
-    }
-
-    sextant::FbinSource source(input);
-    const uint64_t n = source.count();
-    const sextant::Dim dim = source.dim();
-    if (n == 0 || dim == 0) {
-        std::cerr << "sextant autobuild: empty or invalid source '" << input
-                  << "'\n";
-        return 1;
-    }
-
-    sextant::BuildConfig cfg = build_config_from_parser(p);
-    cfg.proximity_target = p.get<float>("proximity-target");
-    cfg.recall_target    = p.get<float>("recall-target");
-    cfg.build_ram_budget = p.get<uint64_t>("build-ram");
-    cfg.max_occlusion    = p.get<uint32_t>("prune-candidate-cap");
-
-    sextant::Estimator estimator;
-    // estimate_config handles all auto knobs; locked ones override.
-    sextant::EstimateResult est = estimator.estimate_config(source, cfg);
-
-    // Print the analysis (shared pretty-print with analyze).
-    print_analysis_(source, input, cfg, est.params, est.diag);
-
-    sextant::Index idx;
-    const sextant::BuildResult result =
-        sextant::Builder(idx).build(source, index_path, est.params);
-    std::cout << "\n═══ Build Result ═══\n";
-    std::cout << "built index '" << index_path << "': n=" << result.n_vectors
-              << " dim=" << result.dim
-              << " R=" << result.R
-              << " L_build=" << result.L_build
-              << " pq_m=" << static_cast<int>(result.pq_m)
-              << " pq_bits=" << static_cast<int>(result.pq_bits)
-              << " in " << result.build_time_sec << "s\n";
-    return 0;
-}
-
-int cmd_search(int argc, char* argv[]) {
-    cmdline::parser p;
-    p.add<std::string>("index", 0, "Index name/path prefix", true);
-    p.add<std::string>("query", 0, "Query .fbin file", true);
-    p.add<uint32_t>("topk", 0,
-        "Number of nearest neighbors to return per query (k in ANN literature). "
-        "Default 100 (VIBE / modern-retrieval convention).",
-        false, 100);
-    p.add<uint32_t>("search-beam-width", 0,
-        "Search-time beam width (L in Vamana literature). Higher = more accurate, "
-        "slower. Must be >= topk.",
-        false, 200);
-    p.add<uint32_t>("rerank", 0, "Rerank factor (0/1 = no rerank)", false, 10);
-    p.add<uint32_t>("threads", 0,
-        "Search threads (0 = hardware_concurrency; 1 = force serial path)",
-        false, 0);
-    p.add<std::string>("output", 0, "Output file (default: stdout)", false, "");
-    p.add<std::string>(
-        "base-data", 0,
-        "Original base .fbin for rerank (defaults to none)", false, "");
-    p.add<uint64_t>("cache-size", 0,
-                     "Search LRU cache size in bytes (0 = auto)", false, 0);
-    p.add("no-cache-rebalance", 0,
-          "Disable adaptive graph/code cache rebalancing (default: enabled in paged mode)");
-    p.add<std::string>("log-level", 0,
-                       "Log level: debug, info, warn, error", false, "info");
-    p.parse_check(argc, argv);
-
-    {
-        const auto lvl = p.get<std::string>("log-level");
-        if (lvl == "debug") sextant::set_log_level(sextant::LogLevel::Debug);
-        else if (lvl == "warn") sextant::set_log_level(sextant::LogLevel::Warn);
-        else if (lvl == "error") sextant::set_log_level(sextant::LogLevel::Error);
-    }
-
-    const std::string index_path = p.get<std::string>("index");
-    const std::string query_path = p.get<std::string>("query");
-    const uint32_t k = p.get<uint32_t>("topk");
-    const uint32_t L = p.get<uint32_t>("search-beam-width");
-    const uint32_t rerank = p.get<uint32_t>("rerank");
-    const std::string output = p.get<std::string>("output");
-    const std::string base_data = p.get<std::string>("base-data");
-    uint32_t num_threads = p.get<uint32_t>("threads");
-    // 0 = hardware_concurrency (parallel by default — ANN search is
-    // embarrassingly parallel across queries). 1 explicitly selects the
-    // serial code path (used for deterministic-output / single-query debug).
-    if (num_threads == 0) {
-        num_threads = std::max(1u, std::thread::hardware_concurrency());
-    }
-
-    std::unique_ptr<sextant::Index> idx =
-        sextant::Index::read(index_path, p.get<uint64_t>("cache-size"));
-    sextant::Searcher searcher(*idx, num_threads);
-    if (p.exist("no-cache-rebalance")) {
-        searcher.set_cache_rebalance_enabled(false);
-    }
-
-    // Read the query file header.
-    FbinHeader qh;
-    if (!read_fbin_header(query_path, qh) || qh.dim != idx->dim) {
-        std::cerr << "sextant search: invalid query file '" << query_path
-                  << "' (dim=" << qh.dim << ", expected " << idx->dim
-                  << ")\n";
-        return 1;
-    }
-    if (qh.n == 0) {
-        std::cerr << "sextant search: query file is empty\n";
-        return 1;
-    }
-
-    // For rerank: open the base .fbin and verify dim.
-    const bool do_rerank = (rerank > 1) && !base_data.empty();
-    FbinHeader bh{};
-    if (do_rerank) {
-        if (!read_fbin_header(base_data, bh) || bh.dim != idx->dim) {
-            std::cerr << "sextant search: invalid base-data file '" << base_data
-                      << "' for rerank; skipping rerank\n";
-        }
-    }
-    const bool rerank_ok = do_rerank && bh.dim == idx->dim;
-
-    std::ofstream out_file;
-    std::ostream* out = &std::cout;
-    if (!output.empty()) {
-        out_file.open(output);
-        if (!out_file) {
-            std::cerr << "sextant search: cannot open output '" << output
-                      << "'\n";
-            return 1;
-        }
-        out = &out_file;
-    }
-
-    const uint32_t dim = idx->dim;
-    const uint32_t fetch_k =
-        rerank_ok ? std::min<uint32_t>(k * rerank, idx->count) : k;
-
-    if (num_threads <= 1) {
-        // Serial path (unchanged): stream queries one at a time.
-        std::ifstream qf(query_path, std::ios::binary);
-        qf.seekg(8);  // skip header
-        std::vector<float> qvec(dim);
-
-        for (uint32_t qi = 0; qi < qh.n; qi++) {
-            qf.read(reinterpret_cast<char*>(qvec.data()),
-                    static_cast<std::streamsize>(dim * sizeof(float)));
-            if (!qf.good()) {
-                std::cerr << "sextant search: short read on query " << qi << "\n";
-                break;
-            }
-
-            sextant::SearchConfig scfg;
-            scfg.k = fetch_k;
-            scfg.L_search = L;
-            auto results = searcher.search(qvec.data(), scfg.k, scfg);
-
-            if (rerank_ok && !results.empty()) {
-                // Fetch actual vectors and re-sort by exact L2-sq distance.
-                std::vector<std::pair<float, sextant::RowId>> scored;
-                scored.reserve(results.size());
-                std::vector<float> base_vec(dim);
-                for (const auto& c : results) {
-                    if (c.row_id < 0 ||
-                        static_cast<uint64_t>(c.row_id) >= bh.n) {
-                        continue;
-                    }
-                    if (!read_fbin_vector(base_data, dim,
-                                          static_cast<uint64_t>(c.row_id),
-                                          base_vec)) {
-                        scored.emplace_back(c.dist, c.row_id);
-                        continue;
-                    }
-                    scored.emplace_back(
-                        l2sq_distance(qvec.data(), base_vec.data(), dim),
-                        c.row_id);
-                }
-                std::sort(scored.begin(), scored.end(),
-                          [](const auto& a, const auto& b) {
-                              return a.first < b.first;
-                          });
-                const uint32_t topk = std::min<uint32_t>(k, scored.size());
-                for (uint32_t i = 0; i < topk; i++) {
-                    (*out) << qi << "\t" << scored[i].second << "\t"
-                           << scored[i].first << "\n";
-                }
-            } else {
-                const uint32_t topk = std::min<uint32_t>(k, results.size());
-                for (uint32_t i = 0; i < topk; i++) {
-                    (*out) << qi << "\t" << results[i].row_id << "\t"
-                           << results[i].dist << "\n";
-                }
-            }
-        }
-    } else {
-        // Parallel path: read all queries into RAM, dispatch across threads.
-        std::vector<float> queries(static_cast<size_t>(qh.n) * dim);
-        {
-            std::ifstream qf(query_path, std::ios::binary);
-            qf.seekg(8);
-            qf.read(reinterpret_cast<char*>(queries.data()),
-                    static_cast<std::streamsize>(queries.size() *
-                                                 sizeof(float)));
-            if (!qf) {
-                std::cerr << "sextant search: short read on query file\n";
-                return 1;
-            }
-        }
-
-        const uint32_t n_threads =
-            std::max(1u, std::min(num_threads, qh.n));
-        // Chunked batch through the Searcher's pool (size = num_threads).
-        // Per-query formatting (rerank, base lookup) is cheap relative to
-        // search and runs inline on the caller thread as batches return.
-        constexpr uint32_t kChunkMin = 1;
-        const uint32_t chunk_size = std::max(kChunkMin, n_threads);
-        std::vector<std::string> formatted_results(qh.n);
-        std::vector<float> base_vec(dim);
-
-        for (uint32_t base = 0; base < qh.n; base += chunk_size) {
-            const uint32_t n_this =
-                std::min<uint32_t>(chunk_size, qh.n - base);
-            sextant::SearchConfig scfg;
-            scfg.k = fetch_k;
-            scfg.L_search = L;
-            const float* q0 = &queries[static_cast<size_t>(base) * dim];
-            auto batch = searcher.search_batch(q0, n_this, scfg.k, scfg);
-            for (uint32_t j = 0; j < n_this; j++) {
-                const uint32_t qi = base + j;
-                const float* q = &queries[static_cast<size_t>(qi) * dim];
-                auto& results = batch[j];
-                std::string buf;
-                if (rerank_ok && !results.empty()) {
-                    std::vector<std::pair<float, sextant::RowId>> scored;
-                    scored.reserve(results.size());
-                    for (const auto& c : results) {
-                        if (c.row_id < 0 ||
-                            static_cast<uint64_t>(c.row_id) >= bh.n) {
-                            continue;
-                        }
-                        if (!read_fbin_vector(base_data, dim,
-                                              static_cast<uint64_t>(c.row_id),
-                                              base_vec)) {
-                            scored.emplace_back(c.dist, c.row_id);
-                            continue;
-                        }
-                        scored.emplace_back(
-                            l2sq_distance(q, base_vec.data(), dim),
-                            c.row_id);
-                    }
-                    std::sort(scored.begin(), scored.end(),
-                              [](const auto& a, const auto& b) {
-                                  return a.first < b.first;
-                              });
-                    const uint32_t topk = std::min<uint32_t>(k, scored.size());
-                    for (uint32_t i = 0; i < topk; i++) {
-                        buf += std::to_string(qi);
-                        buf += "\t";
-                        buf += std::to_string(scored[i].second);
-                        buf += "\t";
-                        buf += std::to_string(scored[i].first);
-                        buf += "\n";
-                    }
-                } else {
-                    const uint32_t topk = std::min<uint32_t>(k, results.size());
-                    for (uint32_t i = 0; i < topk; i++) {
-                        buf += std::to_string(qi);
-                        buf += "\t";
-                        buf += std::to_string(results[i].row_id);
-                        buf += "\t";
-                        buf += std::to_string(results[i].dist);
-                        buf += "\n";
-                    }
-                }
-                formatted_results[qi] = std::move(buf);
-            }
-        }
-
-        // Emit in query order.
-        for (uint32_t qi = 0; qi < qh.n; qi++) {
-            (*out) << formatted_results[qi];
-        }
-    }
-
-    return 0;
-}
 
 // ---------------------------------------------------------------------------
 // build-tree-pca: PCA-preconditioned streaming build
@@ -2257,46 +1891,6 @@ int cmd_sweep(int argc, char* argv[]) {
     return 0;
 }
 
-int cmd_insert(int argc, char* argv[]) {
-    cmdline::parser p;
-    p.add<std::string>("index", 0, "Index name/path prefix", true);
-    p.add<std::string>("vector", 0, "Single-vector .fbin file", true);
-    p.add<int64_t>("row-id", 0, "Row ID for the inserted vector", true);
-    p.parse_check(argc, argv);
-
-    const std::string index_path = p.get<std::string>("index");
-    const std::string vector_path = p.get<std::string>("vector");
-    const int64_t row_id = p.get<int64_t>("row-id");
-
-    auto idx = sextant::Index::read(index_path);
-
-    FbinHeader vh;
-    if (!read_fbin_header(vector_path, vh) || vh.dim != idx->dim ||
-        vh.n != 1) {
-        std::cerr << "sextant insert: need a single-vector .fbin with dim="
-                  << idx->dim << " (got n=" << vh.n << " dim=" << vh.dim
-                  << ")\n";
-        return 1;
-    }
-
-    std::vector<float> vec(vh.dim);
-    std::ifstream vf(vector_path, std::ios::binary);
-    vf.seekg(8);
-    vf.read(reinterpret_cast<char*>(vec.data()),
-            static_cast<std::streamsize>(vh.dim * sizeof(float)));
-    if (!vf.good()) {
-        std::cerr << "sextant insert: failed to read vector\n";
-        return 1;
-    }
-
-    sextant::Builder builder(*idx);
-    builder.insert(vec.data(), vh.dim, static_cast<sextant::RowId>(row_id));
-    builder.flush();
-    std::cout << "inserted row_id=" << row_id
-              << " (count now " << idx->count << ")\n";
-    return 0;
-}
-
 // ---------------------------------------------------------------------------
 // tree-insert: batch-insert vectors from a .fbin into an existing tree index.
 // Row IDs are assigned sequentially starting from --start-row-id (default:
@@ -2782,18 +2376,8 @@ void print_usage() {
               << "              --index --query --topk --n-probe --fastscan-w\n"
               << "              --adaptive-probe-gap --ground-truth --threads\n"
               << "              --search-threads (within-query leaf-parallel scan)\n"
-              << "  build      Build an index from a .fbin file (explicit params).\n"
-              << "             Common flags: --input --index --max-node-neighbors (R)\n"
-              << "             --beam-width-ceiling (L) --prune-threshold (alpha)\n"
-              << "             --pq-segments (m) --pq-bits --threads --metric\n"
-              << "             --build-ram --prune-candidate-cap --partition-count\n"
-              << "             --log-level\n"
-              << "  autobuild  Estimate config (analyze) then build, in-process.\n"
-              << "             Accepts all build flags plus estimate knobs:\n"
-              << "             --proximity-target --recall-target\n"
-              << "  analyze    Read-only dataset-adaptive parameter advisory.\n"
-              << "             Flags: --input --metric --proximity-target\n"
-              << "             --recall-target --max-node-neighbors --prune-threshold\n"
+              << "  plane-attach (internal/experimental) Attach a routing plane to a built\n"
+              << "              plane-less tree index. --index --base --enc --rank\n"
               << "  sweep       n-probe × W recall/QPS grid with shared scans\n"
               << "             (one scan per n-probe serves all W)\n"
               << "             --pq-segments --pq-bits --pq-max-distortion --threads\n"
@@ -2803,23 +2387,18 @@ void print_usage() {
               << "  trace      Analyze an EngineTrace file: replay scan-feedback\n"
               << "             stop rules (fixed/stall/kth grids), report fraction\n"
               << "             distribution + pq-recall (--ground-truth)\n"
-              << "  search     Search an index with query vectors\n"
-              << "  insert     Insert a single vector into an index\n"
-              << "  tree-insert  Batch-insert vectors (.fbin) into a tree index.\n"
+              << "  tree-insert  (internal/experimental) Batch-insert vectors (.fbin) into a tree index.\n"
               << "              --index --vectors --start-row-id\n"
-              << "  tree-delete  Delete vectors by row ID from a tree index.\n"
+              << "  tree-delete  (internal/experimental) Delete vectors by row ID from a tree index.\n"
               << "              --index --row-ids --format (text|binary)\n"
-              << "  tree-vacuum Repair stale filter summaries after deletes.\n"
+              << "  tree-vacuum (internal/experimental) Repair stale filter summaries after deletes.\n"
               << "              --index --rebuild-cardinality --batch-size\n"
-              << "  tree-defrag Compact fragmented leaf extents + shrink file.\n"
+              << "  tree-defrag (internal/experimental) Compact fragmented leaf extents + shrink file.\n"
               << "              --index --no-shrink --batch-size\n"
               << "  fsck       Check a tree index file. --repair rebuilds the bitmap/free-list.\n";
 }
 
 }  // namespace
-
-/// Implemented in tools/analyze.cpp.
-int run_analyze(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
     sextant::install_crash_handler();
@@ -2850,22 +2429,14 @@ int main(int argc, char* argv[]) {
     int sub_argc = static_cast<int>(sub_argv.size());
 
     try {
-        if (cmd == "build") {
-            return cmd_build(sub_argc, sub_argv.data());
-        } else if (cmd == "build-tree" || cmd == "build-tree-pca") {
+        if (cmd == "build-tree" || cmd == "build-tree-pca") {
             return cmd_build_tree_pca(sub_argc, sub_argv.data());
-        } else if (cmd == "autobuild") {
-            return cmd_autobuild(sub_argc, sub_argv.data());
-        } else if (cmd == "search") {
-            return cmd_search(sub_argc, sub_argv.data());
         } else if (cmd == "plane-attach") {
             return cmd_plane_attach(sub_argc, sub_argv.data());
         } else if (cmd == "tree-search") {
             return cmd_tree_search(sub_argc, sub_argv.data());
         } else if (cmd == "sweep") {
             return cmd_sweep(sub_argc, sub_argv.data());
-        } else if (cmd == "insert") {
-            return cmd_insert(sub_argc, sub_argv.data());
         } else if (cmd == "tree-insert") {
             return cmd_tree_insert(sub_argc, sub_argv.data());
         } else if (cmd == "tree-delete") {
@@ -2878,8 +2449,6 @@ int main(int argc, char* argv[]) {
             return cmd_trace(sub_argc, sub_argv.data());
         } else if (cmd == "fsck") {
             return cmd_fsck(sub_argc, sub_argv.data());
-        } else if (cmd == "analyze") {
-            return run_analyze(sub_argc, sub_argv.data());
         } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {
             print_usage();
             return 0;

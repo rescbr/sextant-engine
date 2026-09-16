@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include "fbin_source.hpp"
 #include "test_data.hpp"
-#include "tree/ivf_tree_index.hpp"
+#include "tree/ivf_tree_mutate.hpp"
 #include <sextant/column_data.hpp>
 #include "sextant/config.hpp"
 #include "sextant/types.hpp"
