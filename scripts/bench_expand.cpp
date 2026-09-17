@@ -7,14 +7,18 @@
 // culturaX/cohere configuration.
 #include "tree/coders/coder_util.hpp"
 
-#include <arm_neon.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
+#endif
+#elif defined(SEXTANT_HAS_AVX512_SCAN)
+#include <immintrin.h>
 #endif
 
 using namespace sextant::tree::coders;
@@ -72,6 +76,7 @@ int main() {
     float sink = 0;
     uint64_t iters;
 
+#if defined(__aarch64__) || defined(__ARM_NEON)
     // --- A: real kernel over packed rows ---
     iters = 0;
     {
@@ -205,6 +210,74 @@ int main() {
     }
 #endif
 
+#elif defined(SEXTANT_HAS_AVX512_SCAN)
+    // x86: real packed kernel vs pure-dpbusd over expanded bytes.
+    iters = 0;
+    {
+        const double t0 = now_s();
+        while (now_s() - t0 < run_s) {
+            for (uint32_t base = 0; base + 4 <= n_rows; base += 4) {
+                const uint8_t* cp[4] = {rptr[base], rptr[base + 1],
+                                        rptr[base + 2], rptr[base + 3]};
+                float dots[4][4];
+                scalar_i8_dots4_q4(c4, cp, dots);
+                sink += dots[0][0];
+            }
+            ++iters;
+        }
+        const double dt = now_s() - t0;
+        printf("A real-kernel packed : %8.1f Mrows/s (%.2f GMAC/s)\n",
+               iters * (n_rows / 4.0) / dt / 1e6,
+               iters * static_cast<double>(n_rows) * dim / dt / 1e9);
+    }
+    iters = 0;
+    {
+        const double t0 = now_s();
+        while (now_s() - t0 < run_s) {
+            for (uint32_t base = 0; base + 4 <= n_rows; base += 4) {
+                __m512i acc[4][4];
+                for (uint32_t q = 0; q < 4; ++q)
+                    for (uint32_t v = 0; v < 4; ++v)
+                        acc[q][v] = _mm512_setzero_si512();
+                for (uint32_t d = 0; d < dim; d += 32) {
+                    // row bytes occupy quarters? No: expanded rows are
+                    // contiguous; process 32 dims = one zmm per row.
+                    const __m512i g0 = _mm512_loadu_si512(
+                        reinterpret_cast<const __m512i*>(eptr[base] + d));
+                    const __m512i g1 = _mm512_loadu_si512(
+                        reinterpret_cast<const __m512i*>(eptr[base + 1] + d));
+                    const __m512i g2 = _mm512_loadu_si512(
+                        reinterpret_cast<const __m512i*>(eptr[base + 2] + d));
+                    const __m512i g3 = _mm512_loadu_si512(
+                        reinterpret_cast<const __m512i*>(eptr[base + 3] + d));
+                    for (uint32_t q = 0; q < 4; ++q) {
+                        const __m512i a = _mm512_loadu_si512(
+                            reinterpret_cast<const __m512i*>(
+                                a8[q].data() + d));
+                        acc[q][0] = _mm512_dpbusd_epi32(acc[q][0], g0, a);
+                        acc[q][1] = _mm512_dpbusd_epi32(acc[q][1], g1, a);
+                        acc[q][2] = _mm512_dpbusd_epi32(acc[q][2], g2, a);
+                        acc[q][3] = _mm512_dpbusd_epi32(acc[q][3], g3, a);
+                    }
+                }
+                int32_t s = 0;
+                alignas(64) int32_t lanes[16];
+                for (uint32_t q = 0; q < 4; ++q)
+                    for (uint32_t v = 0; v < 4; ++v) {
+                        _mm512_store_si512(
+                            reinterpret_cast<__m512i*>(lanes), acc[q][v]);
+                        s += lanes[0] + lanes[8] + lanes[16 % 16];
+                    }
+                sink += static_cast<float>(s);
+            }
+            ++iters;
+        }
+        const double dt = now_s() - t0;
+        printf("B AVX512 dpbusd expanded: %8.1f Mrows/s (%.2f GMAC/s)\n",
+               iters * (n_rows / 4.0) / dt / 1e6,
+               iters * static_cast<double>(n_rows) * dim / dt / 1e9);
+    }
+#endif
     printf("(sink %f)\n", sink);
     return 0;
 }
