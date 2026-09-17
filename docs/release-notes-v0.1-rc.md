@@ -1,6 +1,6 @@
-# sextant v1.0-rc release notes
+# sextant v0.1-rc release notes
 
-## What v1 is
+## What this release is
 
 A vector-search index library for the batch/datalake regime:
 **build → search → drop**. The index is an immutable materialized view

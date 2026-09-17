@@ -103,10 +103,10 @@ meson test -C build                             # run the test suite (31 files)
 | `sweep` | n-probe × W recall/QPS grid with shared scans (one scan per n-probe serves all W); requires `--fastscan-w` plus a probe spec (`--n-probe` or `--probe-fraction`); scan-feedback rows via `--feedback fixed:F\|stall:M\|kth:M`. |
 | `trace` | Replay scan-feedback stop rules on an EngineTrace file. |
 `tree-insert` / `tree-delete` / `tree-vacuum` / `tree-defrag` / `plane-attach`
-are **internal/experimental** (help text says so): v1's public surface is the
+are **internal/experimental** (help text says so): this release's public surface is the
 immutable build -> search -> drop lifecycle. The flat Vamana-graph engine and
 its `build` / `search` / `insert` / `analyze` / `autobuild` commands were
-removed for the v1 library release — preserved at git tag `vamana-eol`.
+removed for the library release — preserved at git tag `vamana-eol`.
 
 ### Key `build-tree` flags
 
