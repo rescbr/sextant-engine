@@ -708,7 +708,43 @@ inline void scalar_i8_dots4_q4(const ScalarScanCtx* const c4[4],
                       _mm512_setzero_si512(), _mm512_setzero_si512()};
     __m512i acclo[4] = {_mm512_setzero_si512(), _mm512_setzero_si512(),
                         _mm512_setzero_si512(), _mm512_setzero_si512()};
-    for (uint32_t d = 0; d < d16i; d += 16) {
+    // 2-chunk unroll: even/odd accumulator halves break the per-query
+    // dpbusd dependency chain (latency ~2x its issue slot on Zen5) and
+    // overlap the next chunk's nibble unpack with the current dots.
+    // Integer accumulation reassociates exactly — bit-identical results.
+    __m512i acc1[4] = {acc[0], acc[1], acc[2], acc[3]};
+    __m512i acclo1[4] = {acclo[0], acclo[1], acclo[2], acclo[3]};
+    uint32_t d = 0;
+    for (; d + 32 <= d16i; d += 32) {
+        __m512i nibs = avx512_nibbles4(cp, d);  // unpack ONCE, shared
+        __m512i nibs1 = avx512_nibbles4(cp, d + 16);
+        if (c0.slm_shaped) {
+            nibs = _mm512_shuffle_epi8(g_tbl, nibs);
+            nibs1 = _mm512_shuffle_epi8(g_tbl, nibs1);
+        }
+        for (uint32_t q = 0; q < 4; ++q) {
+            const ScalarScanCtx& cq = *c4[q];
+            const __m128i a128 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(cq.a8 + d));
+            const __m128i a1281 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(cq.a8 + d + 16));
+            acc[q] = _mm512_dpbusd_epi32(
+                acc[q], nibs, _mm512_broadcast_i32x4(a128));
+            acc1[q] = _mm512_dpbusd_epi32(
+                acc1[q], nibs1, _mm512_broadcast_i32x4(a1281));
+            if (cq.i8_mode >= 2 && cq.a8_lo) {
+                const __m128i alo128 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(cq.a8_lo + d));
+                const __m128i alo1281 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(cq.a8_lo + d + 16));
+                acclo[q] = _mm512_dpbusd_epi32(
+                    acclo[q], nibs, _mm512_broadcast_i32x4(alo128));
+                acclo1[q] = _mm512_dpbusd_epi32(
+                    acclo1[q], nibs1, _mm512_broadcast_i32x4(alo1281));
+            }
+        }
+    }
+    for (; d < d16i; d += 16) {
         __m512i nibs = avx512_nibbles4(cp, d);  // unpack ONCE, shared
         if (c0.slm_shaped) nibs = _mm512_shuffle_epi8(g_tbl, nibs);
         for (uint32_t q = 0; q < 4; ++q) {
@@ -724,6 +760,10 @@ inline void scalar_i8_dots4_q4(const ScalarScanCtx* const c4[4],
                     acclo[q], nibs, _mm512_broadcast_i32x4(alo128));
             }
         }
+    }
+    for (uint32_t q = 0; q < 4; ++q) {
+        acc[q] = _mm512_add_epi32(acc[q], acc1[q]);
+        acclo[q] = _mm512_add_epi32(acclo[q], acclo1[q]);
     }
     // Epilogue: fold each 128-bit lane's four dwords into the row-v total
     // with SIMD shuffles only (row v lives in lane v). Single store; the
@@ -877,6 +917,10 @@ inline void scalar_i8_dots4_q4(const ScalarScanCtx* const c4[4],
             }
         }
     }
+    // (A 2-chunk even/odd-accumulator unroll was tried here and REVERTED:
+    // measured 64.6 vs 67.5 QPS on c4a/V2 culturaX f=1.0 — the [4][4]
+    // accumulator arrays already sit at the 32-q-register budget and the
+    // doubled chains spill. The AVX-512 unroll +6% does not carry over.)
     if (!fully_padded) {
         // Zero-masked tail chunk shared by all queries; a8/a8_lo tails are
         // zero-padded buffers, so the full 16-lane loads are safe.
