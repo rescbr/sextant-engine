@@ -102,9 +102,11 @@ meson test -C build                             # run the test suite (31 files)
 | `plane-attach` | Attach a routing plane to an existing plane-less tree (`--enc b1g\|u4lm`, `--rank`, `--train-rows`; also needs `--index` and `--base`). |
 | `sweep` | n-probe × W recall/QPS grid with shared scans (one scan per n-probe serves all W); requires `--fastscan-w` plus a probe spec (`--n-probe` or `--probe-fraction`); scan-feedback rows via `--feedback fixed:F\|stall:M\|kth:M`. |
 | `trace` | Replay scan-feedback stop rules on an EngineTrace file. |
-| `analyze` | Read-only dataset-adaptive parameter advisory (flat-engine params). |
-| `autobuild` | `analyze` + `build` in-process. |
-| `build` / `search` / `insert` | Flat Vamana-graph engine (legacy, see below). |
+`tree-insert` / `tree-delete` / `tree-vacuum` / `tree-defrag` / `plane-attach`
+are **internal/experimental** (help text says so): v1's public surface is the
+immutable build -> search -> drop lifecycle. The flat Vamana-graph engine and
+its `build` / `search` / `insert` / `analyze` / `autobuild` commands were
+removed for the v1 library release — preserved at git tag `vamana-eol`.
 
 ### Key `build-tree` flags
 
@@ -324,15 +326,31 @@ if (n > 0) {
 Smoke/QPS harnesses: `scripts/capi_smoke.cpp`, `scripts/capi_qps.cpp`; the
 v1 surface is covered by `test/test_capi.cpp`.
 
-## Parameter advisor (`analyze` / `autobuild`)
+## Release & compatibility (v1)
 
-The flat-engine parameter advisor lives in `tools/analyze.cpp` +
-`src/engine/estimator.cpp`: it samples the dataset (median LID, clustering
-coefficient, degree signals, norm distribution) and resolves `R`, `alpha`,
-`pq_m/bits`, `L_build`, `closure_factor`, and partition count `K`.
-`--recall-target` gates on recall@k (replaces the old
-`--id-recall-target`); `--proximity-target` gates on proximity in-band.
-`autobuild` runs the same estimate then builds, in-process.
+- **On-disk format**: not finalized. **No compatibility guarantees until
+  v1.0** — a tree built by any pre-1.0 build may be unreadable by the next;
+  rebuild indexes when upgrading. Reserved format space (`tombstone_count`,
+  `LeafState::ACCUMULATING`) is held for v3 serving (tombstoning /
+  raw-insert bootstrap) and is never written or read in v1.
+- **C API** (`include/sextant/sextant_c.h`) is the stable external seam:
+  ABI-fixed enums, tail-append-only structs, exception-proof boundary
+  (see above).
+- **Determinism**: search results use the total order (distance, row_id
+  DESC) — identical inputs give identical results regardless of batching,
+  scan order, or thread count. Multithreaded *builds* are not
+  byte-identical (documented notfix; `--threads 1` for reproducible
+  trees).
+- **Platforms**: x86-64 with AVX-512 (VNNI) is the primary target.
+  aarch64 is validated on Neoverse-V2 (NEON DotProd/i8mm; SVE2 builds
+  take the NEON kernels — see the analysis at the dispatch site in
+  `coder_util.hpp`). The 4-query batched scan kernel is bit-identical to
+  the reference on both; on V2 the compiler's auto-vectorized reference
+  matches the explicit NEON kernel, so the kernel's value there is
+  determinism, not speed.
+- **carquet** (parquet reader/writer, `subprojects/carquet`) is pinned as
+  a submodule; development happens on the fork
+  `github.com/rescbr/carquet` (upstream PR pending).
 
 ## Evaluation: recall, proximity, and ground truth
 

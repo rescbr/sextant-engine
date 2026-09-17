@@ -41,8 +41,12 @@ foreach src : test_sources
         include_directories: [test_inc, sources_inc],
         cpp_args: ['-DSEXTANT_SOURCE_DIR="' + meson.source_root() + '"'],
     )
-    test(name, exe, env: ['SEXTANT_TEST_DATA=' + meson.current_source_dir() / 'data',
-                      'SEXTANT_DATASETS=' + meson.current_source_dir() / '../datasets'])
+    # 180s: two suites (test_quantizer_families, test_tree_insert_delete)
+    # legitimately exceed meson's 30s default on ARM hardware (Neoverse-V2
+    # is ~4x slower than the x86 dev box on the training loops).
+    test(name, exe, timeout: 180,
+         env: ['SEXTANT_TEST_DATA=' + meson.current_source_dir() / 'data',
+               'SEXTANT_DATASETS=' + meson.current_source_dir() / '../datasets'])
 endforeach
 
 # test_capi links the C ABI shim library (sextant_c) on top of the engine.
