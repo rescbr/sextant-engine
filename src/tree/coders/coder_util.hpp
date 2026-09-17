@@ -1161,6 +1161,60 @@ inline float scalar_arith_dist1(const uint8_t* row, uint32_t dim, uint32_t cs,
         }
     }
     return dist;
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    // NEON float-FMA rerank: 16 dims/chunk, same structure as the AVX-512
+    // branch (g-mapped nibbles -> FMA with b/c). b/c are zero-padded to
+    // `padded` by the setup, so tail lanes contribute exact zeros — only
+    // the (rare) not-fully-padded tail runs scalar, as on x86. Fused FMA
+    // may differ from the pure-scalar fallback in the last ulp (the same
+    // is true of the AVX-512 branch); integer scan distances are exact.
+    const uint32_t padded = (dim + 15) / 16 * 16;
+    const bool fully_padded = padded / 2 <= cs;
+    const uint32_t d16 = fully_padded ? padded : dim / 16 * 16;
+    const uint8x16_t g_tbl = vld1q_u8(gu8);
+    const uint8x16_t m15 = vdupq_n_u8(0x0F);
+    float32x4_t acc1 = vdupq_n_f32(0);
+    float32x4_t acc2 = vdupq_n_f32(0);
+    for (uint32_t d = 0; d < d16; d += 16) {
+        // 8 code bytes hold dims d..d+15 (even dim = lo nibble, odd = hi).
+        const uint8x16_t bx =
+            vcombine_u8(vld1_u8(row + d / 2), vdup_n_u8(0));
+        const uint8x16_t nib = vzip1q_u8(vandq_u8(bx, m15),
+                                         vshrq_n_u8(bx, 4));
+        const uint8x16_t gf8 = vqtbl1q_u8(g_tbl, nib);
+        // u8x16 -> f32x4 lanes, twice per 8 dims.
+        const uint16x8_t g16lo = vmovl_u8(vget_low_u8(gf8));
+        const uint16x8_t g16hi = vmovl_u8(vget_high_u8(gf8));
+        const float32x4_t gf0 = vcvtq_f32_s32(vreinterpretq_s32_u32(
+            vmovl_u16(vget_low_u16(g16lo))));
+        const float32x4_t gf1 = vcvtq_f32_s32(vreinterpretq_s32_u32(
+            vmovl_u16(vget_high_u16(g16lo))));
+        const float32x4_t gf2 = vcvtq_f32_s32(vreinterpretq_s32_u32(
+            vmovl_u16(vget_low_u16(g16hi))));
+        const float32x4_t gf3 = vcvtq_f32_s32(vreinterpretq_s32_u32(
+            vmovl_u16(vget_high_u16(g16hi))));
+        const float* bp = b + d;
+        const float* cp = c + d;
+        acc1 = vfmaq_f32(acc1, gf0, vld1q_f32(bp));
+        acc1 = vfmaq_f32(acc1, gf1, vld1q_f32(bp + 4));
+        acc1 = vfmaq_f32(acc1, gf2, vld1q_f32(bp + 8));
+        acc1 = vfmaq_f32(acc1, gf3, vld1q_f32(bp + 12));
+        acc2 = vfmaq_f32(acc2, gf0, vmulq_f32(gf0, vld1q_f32(cp)));
+        acc2 = vfmaq_f32(acc2, gf1, vmulq_f32(gf1, vld1q_f32(cp + 4)));
+        acc2 = vfmaq_f32(acc2, gf2, vmulq_f32(gf2, vld1q_f32(cp + 8)));
+        acc2 = vfmaq_f32(acc2, gf3, vmulq_f32(gf3, vld1q_f32(cp + 12)));
+    }
+    float dist = a + vaddvq_f32(acc1) + vaddvq_f32(acc2);
+    if (!fully_padded) {
+        for (uint32_t d = d16; d < dim; ++d) {
+            const uint8_t byte = row[d / 2];
+            const uint8_t nib = (d % 2 == 0) ? (byte & 0xF)
+                                             : ((byte >> 4) & 0xF);
+            const float gf = static_cast<float>(gu8[nib]);
+            dist += b[d] * gf + c[d] * gf * gf;
+        }
+    }
+    return dist;
 #else
     // gf must be the RAW u8 table value (gu8[nib]) — the 1/sg scale is
     // already folded into b/c by the setup. Using g[nib] (= gu8/sg) here
