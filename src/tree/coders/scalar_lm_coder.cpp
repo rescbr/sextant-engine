@@ -213,6 +213,15 @@ std::unique_ptr<ScanSetup> ScalarLmCoder::scan_setup(const float* query) {
         // shape; the float fused rerank corrects the shortlist anyway).
         // Override 0 selects the float kernel.
         else s->i8_mode = 1;
+#elif defined(__ARM_FEATURE_DOTPROD)
+        // Same auto-default on DotProd ARM (measured on Neoverse-V2,
+        // 2026-09-17, identical index files): culturaX-2.9M f=0.1
+        // 60.6 -> 273.6 QPS; f=1.0 6.25 -> 67.5 QPS; cohere-10M f=0.1
+        // 24.0 -> 164.0 QPS; f=1.0 2.51 -> 30.4 QPS. Recall unchanged
+        // (the SDOT nibble kernel is integer-exact for the unshaped
+        // path and the shaped path runs through the g-mapped tables —
+        // same values the float kernel sees).
+        else s->i8_mode = 1;
 #endif
     }
 #endif
