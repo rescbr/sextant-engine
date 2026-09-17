@@ -111,7 +111,7 @@ int main() {
                         for (uint32_t q = 0; q < 4; ++q) {
                             const int8x16_t a =
                                 vld1q_s8(a8[q].data() + d);
-                            acc[q][v] = vusdotq_s32(acc[q][v], g, a);
+                            acc[q][v] = neon_gdot_s32(acc[q][v], g, a);
                             (void)aq;
                         }
                     }
@@ -157,22 +157,36 @@ int main() {
                     const svint8_t q1 = svld1_s8(pg, a8[1].data() + d);
                     const svint8_t q2 = svld1_s8(pg, a8[2].data() + d);
                     const svint8_t q3 = svld1_s8(pg, a8[3].data() + d);
-                    a00 = svusdot_s32(a00, g0, q0);
-                    a01 = svusdot_s32(a01, g0, q1);
-                    a02 = svusdot_s32(a02, g0, q2);
-                    a03 = svusdot_s32(a03, g0, q3);
-                    a10 = svusdot_s32(a10, g1, q0);
-                    a11 = svusdot_s32(a11, g1, q1);
-                    a12 = svusdot_s32(a12, g1, q2);
-                    a13 = svusdot_s32(a13, g1, q3);
-                    a20 = svusdot_s32(a20, g2, q0);
-                    a21 = svusdot_s32(a21, g2, q1);
-                    a22 = svusdot_s32(a22, g2, q2);
-                    a23 = svusdot_s32(a23, g2, q3);
-                    a30 = svusdot_s32(a30, g3, q0);
-                    a31 = svusdot_s32(a31, g3, q1);
-                    a32 = svusdot_s32(a32, g3, q2);
-                    a33 = svusdot_s32(a33, g3, q3);
+                    // Exact u8-s8 dot without i8mm:
+                    // g = (g&0x7F) + 128*(g>>7); both halves positive s8.
+                    #define SVE_GDOT(acc, g, q)                                   \
+                        do {                                                       \
+                            const svint8_t gl = svreinterpret_s8_u8(              \
+                                svand_u8_x(pg, g, svdup_n_u8(0x7F)));             \
+                            const svint8_t gh = svreinterpret_s8_u8(               \
+                                svlsr_n_u8_x(pg, g, 7));                           \
+                            acc = svdot_s32(acc, gl, q);                           \
+                            acc = svmla_s32_m(                                    \
+                                pg, acc, svdup_n_s32(128),                        \
+                                svdot_s32(svdup_n_s32(0), gh, q));                \
+                        } while (0)
+                    SVE_GDOT(a00, g0, q0);
+                    SVE_GDOT(a01, g0, q1);
+                    SVE_GDOT(a02, g0, q2);
+                    SVE_GDOT(a03, g0, q3);
+                    SVE_GDOT(a10, g1, q0);
+                    SVE_GDOT(a11, g1, q1);
+                    SVE_GDOT(a12, g1, q2);
+                    SVE_GDOT(a13, g1, q3);
+                    SVE_GDOT(a20, g2, q0);
+                    SVE_GDOT(a21, g2, q1);
+                    SVE_GDOT(a22, g2, q2);
+                    SVE_GDOT(a23, g2, q3);
+                    SVE_GDOT(a30, g3, q0);
+                    SVE_GDOT(a31, g3, q1);
+                    SVE_GDOT(a32, g3, q2);
+                    SVE_GDOT(a33, g3, q3);
+                    #undef SVE_GDOT
                 }
                 int32_t s = 0;
                 for (const svint32_t* p : {&a00, &a01, &a02, &a03, &a10,
