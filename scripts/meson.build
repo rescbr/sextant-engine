@@ -115,8 +115,6 @@ spike_routing_ceiling = executable('spike_routing_ceiling',
     'spike_routing_ceiling.cpp',
     include_directories: [engine_inc, src_inc, third_party_inc],
     dependencies: sextant_dep,
-    c_args: ['-fopenmp'],
-    link_args: ['-fopenmp'],
 )
 
 plane_selftest = executable('plane_selftest',
@@ -171,5 +169,20 @@ join_sim = executable('join_sim',
     'join_sim.cpp',
     include_directories: [engine_inc, src_inc, third_party_inc],
     dependencies: sextant_dep,
+    install: false,
+)
+
+probe_shape = executable('probe_shape',
+    'probe_shape.cpp',
+    include_directories: [engine_inc, src_inc, third_party_inc, sources_inc],
+    dependencies: [sextant_dep, sextant_sources_dep],
+    cpp_args: ['-DSEXTANT_SOURCE_DIR="' + meson.source_root() + '"'],
+    install: false,
+)
+
+probe_batch = executable('probe_batch',
+    'probe_batch.cpp',
+    include_directories: [engine_inc, src_inc, third_party_inc, sources_inc],
+    dependencies: [sextant_dep, sextant_sources_dep],
     install: false,
 )

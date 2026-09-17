@@ -1118,12 +1118,17 @@ inline float scalar_arith_dist1(const uint8_t* row, uint32_t dim, uint32_t cs,
     }
     return dist;
 #else
+    // gf must be the RAW u8 table value (gu8[nib]) — the 1/sg scale is
+    // already folded into b/c by the setup. Using g[nib] (= gu8/sg) here
+    // divided by sg a SECOND time (found on c4a: scalar_shape rerank
+    // distances ~470x off; the fallback never runs under AVX-512, so x86
+    // never saw it). Uniform (sg=1) was unaffected.
     float dist = a;
     for (uint32_t d = 0; d < dim; ++d) {
         const uint8_t byte = row[d / 2];
         const uint8_t nib = (d % 2 == 0) ? (byte & 0xF)
                                          : ((byte >> 4) & 0xF);
-        const float gf = g[nib];
+        const float gf = static_cast<float>(gu8[nib]);
         dist += b[d] * gf + c[d] * gf * gf;
     }
     return dist;

@@ -1625,6 +1625,8 @@ inline void pool_replace(std::vector<PoolEntry>& p, PoolEntry pe) {
 /// finalize variant.
 void cut_topk_results_(std::vector<Candidate>& results, uint32_t k,
                        const SearchConfig& config) {
+    // Dedup by row_id first (closure replication can store a row in
+    // several leaves; keep the min-dist copy).
     std::sort(results.begin(), results.end(),
               [](const Candidate& a, const Candidate& b) {
                   if (a.row_id != b.row_id) return a.row_id < b.row_id;
@@ -1635,6 +1637,21 @@ void cut_topk_results_(std::vector<Candidate>& results, uint32_t k,
                                 return a.row_id == b.row_id;
                             });
     results.erase(last, results.end());
+    // TOTAL order (dist, row_id DESC) from here on: scan distances are
+    // integer LUT sums, so top-k boundaries routinely fall inside large
+    // exact-tie sets. nth_element/std::sort with a dist-only comparator
+    // are unstable — tie membership and order then depend on the input
+    // order, which DIFFERS between search() (route-order scan) and the
+    // search_batch sweep (page-order scan): found as the ARM
+    // PerQueryProbeFractionParity divergence (x86 coincided). Ties break
+    // toward HIGHER row_id: equally deterministic, and freshly inserted
+    // rows (monotonically growing ids) stay searchable among pq-dist
+    // ties instead of being crowded out by older equal-distance rows
+    // (the insert-searchability contract, test_tree_insert_delete).
+    const auto total_less = [](const Candidate& a, const Candidate& b) {
+        if (a.dist != b.dist) return a.dist < b.dist;
+        return a.row_id > b.row_id;
+    };
     // Adaptive shortlist cut: keep up to W (not just k) and truncate at
     // the first distance gap past k. Clustered queries cut at ~k, noisy
     // queries keep the deep list. Off (0) or without rerank: plain top-k.
@@ -1643,10 +1660,7 @@ void cut_topk_results_(std::vector<Candidate>& results, uint32_t k,
     size_t keep = k;
     if (config.adaptive_w_gap > 0 && config.rerank &&
         results.size() > k) {
-        std::sort(results.begin(), results.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return a.dist < b.dist;
-                  });
+        std::sort(results.begin(), results.end(), total_less);
         const float dk = results[k - 1].dist;
         const float g = (dk - results[0].dist) / static_cast<float>(k - 1);
         const float scale = std::max(g, 1e-12f);
@@ -1660,16 +1674,10 @@ void cut_topk_results_(std::vector<Candidate>& results, uint32_t k,
     }
     if (results.size() > keep) {
         std::nth_element(results.begin(), results.begin() + keep,
-                         results.end(),
-                         [](const Candidate& a, const Candidate& b) {
-                             return a.dist < b.dist;
-                         });
+                         results.end(), total_less);
         results.resize(keep);
     }
-    std::sort(results.begin(), results.end(),
-              [](const Candidate& a, const Candidate& b) {
-                  return a.dist < b.dist;
-              });
+    std::sort(results.begin(), results.end(), total_less);
 }
 
 /// Pool-based finalize for the pread sweep path: look up each merged-

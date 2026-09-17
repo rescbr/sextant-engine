@@ -322,7 +322,8 @@ void ProductResidualQuantizer::train(const float* samples, uint64_t n) {
 
         for (uint32_t iter = 0; iter < lsq_train_iters_; iter++) {
             // --- Encode all vectors with current codebooks (ICM) ---
-            #pragma omp parallel for schedule(dynamic)
+            // (was #pragma omp parallel — inert: the engine never compiles with -fopenmp;
+            //  PRQ ICM/ILS training is serial. See scripts/meson.build cleanup.)
             for (uint32_t s = 0; s < nsplits_; s++) {
                 const float* sub = sub_vecs_all[s].data();
                 uint32_t* codes = all_codes[s].data();
@@ -375,7 +376,8 @@ void ProductResidualQuantizer::train(const float* samples, uint64_t n) {
             }
 
             // --- Update codebooks via regularized least-squares ---
-            #pragma omp parallel for schedule(dynamic)
+            // (was #pragma omp parallel — inert: the engine never compiles with -fopenmp;
+            //  PRQ ICM/ILS training is serial. See scripts/meson.build cleanup.)
             for (uint32_t s = 0; s < nsplits_; s++) {
                 update_codebooks_lsq_(sub_vecs_all[s].data(), n,
                                       all_codes[s].data(),
