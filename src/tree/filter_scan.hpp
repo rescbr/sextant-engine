@@ -31,6 +31,16 @@
 #include <limits>
 #include <string_view>
 
+// arm_neon.h must be included OUTSIDE any namespace (GCC declares every NEON
+// intrinsic inside it — including it within `namespace sextant::tree` puts
+// vld1q_s32 etc. into the namespace and breaks intrinsic argument types).
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#define FILTER_HAS_NEON 1
+#else
+#define FILTER_HAS_NEON 0
+#endif
+
 namespace sextant::tree {
 
 // ===========================================================================
@@ -168,16 +178,16 @@ inline bool eval_all_predicates(const std::vector<ColumnView>& cols,
     return true;
 }
 
-// ===========================================================================
-// SIMD batch predicate evaluation (4 candidates at once for numeric columns)
-// ===========================================================================
-
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
 #define FILTER_HAS_NEON 1
 #else
 #define FILTER_HAS_NEON 0
 #endif
+
+// ===========================================================================
+// SIMD batch predicate evaluation (4 candidates at once for numeric columns)
+// ===========================================================================
 
 /// Evaluate a single int32 equality predicate for 4 candidates using SIMD.
 /// Returns a 4-bit mask: bit j set = candidate (start_idx + j) passes.

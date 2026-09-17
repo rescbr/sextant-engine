@@ -2673,7 +2673,13 @@ BuildResult IVFTreeIndex::build_streaming_pca(VectorSource& source,
     // v2 (leaf): blocks already rode the leaf extents and the header-only
     // extent was committed by write_tree_structure — nothing to do.
     if (ctx.plane && cfg.plane_layout == 0) {
-        auto idx = IVFTreeIndex::open(output_path);
+        // Writable reopen: attach_plane_from appends the plane blocks
+        // extent (grows the file + rewrites the superblock). This is a
+        // build-internal mutation of the just-committed tree — NOT a
+        // search handle. (The read-only default caught this site: see
+        // 26ffbc1; every post-Phase-1 e2e ran --skip-build and missed it.)
+        auto idx = IVFTreeIndex::open(output_path, 0, 1, 0,
+                                      /*writable=*/true);
         idx->attach_plane_from(ctx.plane_writer, ctx.plane_leaf_counts);
     }
 

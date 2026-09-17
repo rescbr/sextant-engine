@@ -25,7 +25,7 @@ namespace sextant {
 /// Non-copyable, non-movable (contains an atomics-backed struct).
 class Mutex {
 public:
-    Mutex() { std::memset(&mu_, 0, sizeof(mu_)); }
+    Mutex() : mu_{} {}
     ~Mutex() = default;
 
     Mutex(const Mutex&) = delete;

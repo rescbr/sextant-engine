@@ -298,7 +298,7 @@ inline void scalar_cand_flush(ScalarCandBuf& b, RawScanHeap& heap) {
     // Threshold taken once: the max-heap front only DECREASES during the
     // flush, so a stale threshold merely admits a few candidates the
     // guarded replace then rejects.
-    const uint32_t thr = heap_front(heap);
+    const uint32_t thr [[maybe_unused]] = heap_front(heap);
 #if defined(__AVX512F__)
     const __m512i sgn = _mm512_set1_epi32(static_cast<int>(0x80000000u));
     size_t j = 0;

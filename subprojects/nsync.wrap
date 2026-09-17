@@ -4,7 +4,11 @@ source_url = https://github.com/google/nsync/archive/5b420ef6b16532a4fad4be1fde8
 source_filename = nsync-1.30.0.tar.gz
 source_hash = cea0b9be6039ea0b2ead2e430d0ecafa38ec54e1a918d2dcb94969cc666218ad
 patch_directory = nsync
-diff_files = nsync/delete-version-file.patch
+
+# Historical note: a diff_files patch deleted nsync's lowercase `version`
+# file (macOS case-insensitive collision with <version>). Upstream no longer
+# ships that file in the pinned tarball, so the patch failed on fresh
+# extractions and was removed (2026-09-16); cached extractions predate this.
 
 [provide]
 dependency_names = nsync
