@@ -100,11 +100,11 @@ int main() {
         const double t0 = now_s();
         while (now_s() - t0 < run_s) {
             for (uint32_t base = 0; base + 4 <= n_rows; base += 4) {
+                int32x4_t acc[4][4];
+                for (uint32_t q = 0; q < 4; ++q)
+                    for (uint32_t v = 0; v < 4; ++v)
+                        acc[q][v] = vdupq_n_s32(0);
                 for (uint32_t d = 0; d < dim; d += 16) {
-                    int32x4_t acc[4][4];
-                    for (uint32_t q = 0; q < 4; ++q)
-                        for (uint32_t v = 0; v < 4; ++v)
-                            acc[q][v] = vdupq_n_s32(static_cast<int32_t>(d));
                     for (uint32_t v = 0; v < 4; ++v) {
                         const uint8x16_t g =
                             vld1q_u8(eptr[base + v] + d);
@@ -115,12 +115,12 @@ int main() {
                             (void)aq;
                         }
                     }
-                    int32_t s = 0;
-                    for (uint32_t q = 0; q < 4; ++q)
-                        for (uint32_t v = 0; v < 4; ++v)
-                            s += vaddvq_s32(acc[q][v]);
-                    sink += static_cast<float>(s);
                 }
+                int32_t s = 0;
+                for (uint32_t q = 0; q < 4; ++q)
+                    for (uint32_t v = 0; v < 4; ++v)
+                        s += vaddvq_s32(acc[q][v]);
+                sink += static_cast<float>(s);
             }
             ++iters;
         }
@@ -131,7 +131,7 @@ int main() {
     }
 
 #if defined(__ARM_FEATURE_SVE)
-    // --- C: pure SVE svdot over pre-expanded rows ---
+    // --- C: pure SVE svdot over pre-expanded rows (all 16 dots) ---
     iters = 0;
     {
         const double t0 = now_s();
@@ -139,27 +139,48 @@ int main() {
         printf("SVE vector bytes: %u\n", vl);
         while (now_s() - t0 < run_s) {
             for (uint32_t base = 0; base + 4 <= n_rows; base += 4) {
+                svint32_t a00 = svdup_n_s32(0), a01 = svdup_n_s32(0);
+                svint32_t a02 = svdup_n_s32(0), a03 = svdup_n_s32(0);
+                svint32_t a10 = svdup_n_s32(0), a11 = svdup_n_s32(0);
+                svint32_t a12 = svdup_n_s32(0), a13 = svdup_n_s32(0);
+                svint32_t a20 = svdup_n_s32(0), a21 = svdup_n_s32(0);
+                svint32_t a22 = svdup_n_s32(0), a23 = svdup_n_s32(0);
+                svint32_t a30 = svdup_n_s32(0), a31 = svdup_n_s32(0);
+                svint32_t a32 = svdup_n_s32(0), a33 = svdup_n_s32(0);
                 for (uint32_t d = 0; d < dim; d += vl) {
                     const svbool_t pg = svwhilelt_b8(d, dim);
-                    svint32_t acc[4][4];
-                    for (uint32_t q = 0; q < 4; ++q)
-                        for (uint32_t v = 0; v < 4; ++v)
-                            acc[q][v] = svdup_n_s32(0);
-                    for (uint32_t v = 0; v < 4; ++v) {
-                        const svuint8_t g =
-                            svld1_u8(pg, eptr[base + v] + d);
-                        for (uint32_t q = 0; q < 4; ++q) {
-                            const svint8_t a =
-                                svld1_s8(pg, a8[q].data() + d);
-                            acc[q][v] = svusdot_s32(acc[q][v], g, a);
-                        }
-                    }
-                    int32_t s = 0;
-                    for (uint32_t q = 0; q < 4; ++q)
-                        for (uint32_t v = 0; v < 4; ++v)
-                            s += svaddv_s32(svptrue_b32(), acc[q][v]);
-                    sink += static_cast<float>(s);
+                    const svuint8_t g0 = svld1_u8(pg, eptr[base] + d);
+                    const svuint8_t g1 = svld1_u8(pg, eptr[base + 1] + d);
+                    const svuint8_t g2 = svld1_u8(pg, eptr[base + 2] + d);
+                    const svuint8_t g3 = svld1_u8(pg, eptr[base + 3] + d);
+                    const svint8_t q0 = svld1_s8(pg, a8[0].data() + d);
+                    const svint8_t q1 = svld1_s8(pg, a8[1].data() + d);
+                    const svint8_t q2 = svld1_s8(pg, a8[2].data() + d);
+                    const svint8_t q3 = svld1_s8(pg, a8[3].data() + d);
+                    a00 = svusdot_s32(a00, g0, q0);
+                    a01 = svusdot_s32(a01, g0, q1);
+                    a02 = svusdot_s32(a02, g0, q2);
+                    a03 = svusdot_s32(a03, g0, q3);
+                    a10 = svusdot_s32(a10, g1, q0);
+                    a11 = svusdot_s32(a11, g1, q1);
+                    a12 = svusdot_s32(a12, g1, q2);
+                    a13 = svusdot_s32(a13, g1, q3);
+                    a20 = svusdot_s32(a20, g2, q0);
+                    a21 = svusdot_s32(a21, g2, q1);
+                    a22 = svusdot_s32(a22, g2, q2);
+                    a23 = svusdot_s32(a23, g2, q3);
+                    a30 = svusdot_s32(a30, g3, q0);
+                    a31 = svusdot_s32(a31, g3, q1);
+                    a32 = svusdot_s32(a32, g3, q2);
+                    a33 = svusdot_s32(a33, g3, q3);
                 }
+                int32_t s = 0;
+                for (const svint32_t* p : {&a00, &a01, &a02, &a03, &a10,
+                                           &a11, &a12, &a13, &a20, &a21,
+                                           &a22, &a23, &a30, &a31, &a32,
+                                           &a33})
+                    s += svaddv_s32(svptrue_b32(), *p);
+                sink += static_cast<float>(s);
             }
             ++iters;
         }
