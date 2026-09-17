@@ -186,3 +186,12 @@ probe_batch = executable('probe_batch',
     dependencies: [sextant_dep, sextant_sources_dep],
     install: false,
 )
+
+if host_machine.cpu_family() == 'aarch64'
+bench_expand = executable('bench_expand',
+    'bench_expand.cpp',
+    include_directories: [engine_inc, src_inc, third_party_inc],
+    dependencies: [sextant_dep],
+    install: false,
+)
+endif
