@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <spdlog/spdlog.h>
 
 namespace sextant {
 
@@ -303,6 +304,13 @@ std::unique_ptr<StagedPushSource> PushStager::build_source() {
     if (spill_) {
         std::fflush(spill_);
     }
+    uint64_t mem_rows = 0;
+    for (const auto& c : memory_chunks_) mem_rows += c.count;
+    spdlog::info(
+        "[sextant] push staging: {} rows total, {} spilled chunks ({}), "
+        "{} chunks ({} rows) in memory tier (budget {} bytes)",
+        rows_, spilled_chunks_, spill_path_, memory_chunks_.size(), mem_rows,
+        staging_bytes_);
     return std::make_unique<StagedPushSource>(*this);
 }
 
@@ -345,7 +353,24 @@ const StagedChunk* StagedPushSource::next_staged() {
     return nullptr;
 }
 
+#ifdef SEXTANT_MEMPROFILE
+extern "C" void __sanitizer_print_memory_profile(unsigned, unsigned);
+#endif
+
 bool StagedPushSource::next(Chunk& out) {
+#ifdef SEXTANT_MEMPROFILE
+    {
+        static uint64_t reads = 0;
+        if (!vector_only_ && stager_.spilled_chunks_ > 0) {
+            ++reads;
+            if (reads == 1 || reads == 30 || reads == 60) {
+                std::fprintf(stderr, "[memprofile] emission read #%llu\n",
+                             (unsigned long long)reads);
+                __sanitizer_print_memory_profile(25, 8);
+            }
+        }
+    }
+#endif
     const StagedChunk* c = next_staged();
     if (!c) {
         return false;
