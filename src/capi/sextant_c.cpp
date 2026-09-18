@@ -238,6 +238,8 @@ sextant_build_opts sextant_default_build_opts(void) {
     o.metric = SEXTANT_METRIC_L2SQ;
     o.adaptive_probe_gap = 0.0f;
     return o;
+    o.plane_attach = 1;  // CLI serving parity: routing plane on
+    o.plane_rank = 0;
 }
 
 int sextant_build_fbin(const char* fbin_path, const char* out_path,
@@ -837,6 +839,8 @@ int sextant_build_finish(void* builder, const char* out_path,
         cfg.leaf_capacity = opts.leaf_capacity ? opts.leaf_capacity : 5000;
         cfg.pca_dims = opts.pca_dims ? opts.pca_dims : 32;
         cfg.num_threads = opts.num_threads;
+        cfg.plane_attach = opts.plane_attach != 0;
+        cfg.plane_rank = opts.plane_rank ? static_cast<uint16_t>(opts.plane_rank) : 128;
         cfg.max_lloyd_passes =
             opts.max_lloyd_passes ? opts.max_lloyd_passes : 10;
         cfg.adaptive_probe_gap = opts.adaptive_probe_gap;

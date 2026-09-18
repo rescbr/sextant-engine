@@ -39,6 +39,11 @@ typedef struct sextant_build_opts {
     uint32_t max_lloyd_passes; ///< 0 = 10
     int metric;                ///< SEXTANT_METRIC_*
     float adaptive_probe_gap;  ///< build-time bake (0 = off)
+    /// In-build routing plane (CLI serving default). ABI tail-append:
+    /// zero-filled by designated-init callers reads as off, matching the
+    /// historical C API behavior; sextant_default_build_opts() sets it on.
+    int plane_attach;          ///< 1 = attach B1G routing plane (default on)
+    uint32_t plane_rank;       ///< plane rank (0 = 128)
 } sextant_build_opts;
 
 /// Sensible defaults (pq, auto geometry, L2).
