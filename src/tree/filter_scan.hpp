@@ -211,22 +211,24 @@ inline uint32_t eval_predicate_batch4(const ColumnView& col, uint32_t start_idx,
 
 #if FILTER_HAS_NEON
     const int32x4_t v = vld1q_s32(vals);
+    // NEON comparisons return uint32x4_t lane masks directly — no
+    // reinterpret needed (gcc rejects the s32 reinterpret clang accepted).
     uint32x4_t cmp;
     switch (pred.op) {
         case PredicateOp::Eq:
-            cmp = vreinterpretq_u32_s32(vceqq_s32(v, vdupq_n_s32(pv))); break;
+            cmp = vceqq_s32(v, vdupq_n_s32(pv)); break;
         case PredicateOp::Lt:
-            cmp = vreinterpretq_u32_s32(vcltq_s32(v, vdupq_n_s32(pv))); break;
+            cmp = vcltq_s32(v, vdupq_n_s32(pv)); break;
         case PredicateOp::Le:
-            cmp = vreinterpretq_u32_s32(vcleq_s32(v, vdupq_n_s32(pv))); break;
+            cmp = vcleq_s32(v, vdupq_n_s32(pv)); break;
         case PredicateOp::Gt:
-            cmp = vreinterpretq_u32_s32(vcgtq_s32(v, vdupq_n_s32(pv))); break;
+            cmp = vcgtq_s32(v, vdupq_n_s32(pv)); break;
         case PredicateOp::Ge:
-            cmp = vreinterpretq_u32_s32(vcgeq_s32(v, vdupq_n_s32(pv))); break;
+            cmp = vcgeq_s32(v, vdupq_n_s32(pv)); break;
         case PredicateOp::Between: {
-            const int32x4_t ge_lo = vcgeq_s32(v, vdupq_n_s32(pv));
-            const int32x4_t le_hi = vcleq_s32(v, vdupq_n_s32(pv2));
-            cmp = vandq_u32(vreinterpretq_u32_s32(ge_lo), vreinterpretq_u32_s32(le_hi));
+            const uint32x4_t ge_lo = vcgeq_s32(v, vdupq_n_s32(pv));
+            const uint32x4_t le_hi = vcleq_s32(v, vdupq_n_s32(pv2));
+            cmp = vandq_u32(ge_lo, le_hi);
             break;
         }
         default:

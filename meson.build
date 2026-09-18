@@ -10,18 +10,18 @@ project('sextant-engine', 'cpp',
 )
 
 # Force clang: the engine does not build with GCC on x86 (float16_t is
-# __fp16, clang-only syntax there; ARM GCC also diverges on NEON typing).
+# __fp16, clang-only syntax there; ARM GCC also diverges on NEON typing —
+# comparisons return uint32x4_t, reinterpret mismatch = hard error).
 # Fail FAST with a clear message instead of a confusing types.hpp error.
 # To set up a build dir: `meson setup build --native-file clang.ini`
 # (clang.ini pins c/cpp to clang/clang++).
-if host_machine.cpu_family() == 'x86' or host_machine.cpu_family() == 'x86_64'
-    if meson.get_compiler('cpp').get_id() != 'clang'
-        error('\n' +
-              'sextant-engine requires clang on x86 (float16_t = __fp16).\n' +
-              'Your compiler is GCC. Configure with:\n' +
-              '  meson setup <builddir> --native-file clang.ini\n' +
-              'or export CC=clang CXX=clang++ before running meson setup.')
-    endif
+if meson.get_compiler('cpp').get_id() != 'clang'
+    error('\n' +
+          'sextant-engine requires clang on every architecture ' +
+          '(x86: float16_t = __fp16; ARM: NEON typing).\n' +
+          'Your compiler is GCC. Configure with:\n' +
+          '  meson setup <builddir> --native-file clang.ini\n' +
+          'or export CC=clang CXX=clang++ before running meson setup.')
 endif
 
 cpp = meson.get_compiler('cpp')
