@@ -299,6 +299,9 @@ FsckResult fsck(const std::string& path, bool repair) {
             spdlog::warn("fsck: manifest parse failed: {}", e.what());
         }
     }
+    if (!manifest.uuid.empty()) {
+        spdlog::info("fsck: tree uuid={}", manifest.uuid);
+    }
 
     // -----------------------------------------------------------------------
     // Level 1 + 3: Tree walk (collects magic/crc failures too).
