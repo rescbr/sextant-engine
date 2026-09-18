@@ -355,7 +355,13 @@ bool StagedPushSource::next(Chunk& out) {
     out.row_ids = buf_.row_ids.data();
     out.count = buf_.count;
 
-    if (!stager_.schema_.columns.empty()) {
+    // Build filter views only when the chunk actually carries the filter
+    // blob: vector-only reads (sample/PCA/Lloyd passes) skip it on the
+    // spill tier, leaving cols empty — indexing cols here is OOB
+    // (SIGSEGV, CulturaX-scale repro). Gate on the chunk's actual shape,
+    // not the caller's flag.
+    if (!stager_.schema_.columns.empty() &&
+        buf_.cols.size() == stager_.schema_.columns.size()) {
         filter_ptrs_.clear();
         for (size_t ci = 0; ci < stager_.schema_.columns.size(); ++ci) {
             const auto& col = buf_.cols[ci];
