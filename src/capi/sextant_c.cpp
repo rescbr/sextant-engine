@@ -13,6 +13,8 @@
 #include "tree/ivf_tree_index.hpp"
 #include "tree/scan_pool.hpp"
 
+#include "push_source.hpp"
+
 #include <sextant/column_data.hpp>
 #include <sextant/schema.hpp>
 
@@ -23,6 +25,8 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <cstdlib>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -205,18 +209,12 @@ bool validate_search_args(const IVFTreeIndex* idx, const float* query,
 struct PushBuilder {
     uint32_t dim = 0;
     sextant_build_opts opts = {};
-    sextant::MemSourceBuilder vecs;
-    sextant::Schema schema;                  // declared filter columns
-    std::vector<sextant::ColumnData> cols;   // one per schema column
-    std::vector<uint8_t> payload_data;
-    std::vector<uint32_t> payload_offsets;   // row_count + 1 entries
+    sextant::Schema schema;  // declared filter columns
     bool has_payload = false;
     uint64_t rows = 0;
-
-    explicit PushBuilder(uint32_t d) : dim(d), vecs(d) {
-        // Row 0's start; the invariant is rows+1 entries, last == total.
-        payload_offsets.push_back(0);
-    }
+    // Bounded-memory staging (spills to a temp file on overflow); the
+    // build streams the staged chunks like a parquet source.
+    std::unique_ptr<sextant::PushStager> stager;
 };
 
 }  // namespace
@@ -604,6 +602,23 @@ void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
         auto* b = new PushBuilder(dim);
         b->opts = *opts;
         b->has_payload = has_payload != 0;
+        // Temp spill location: TMPDIR (the final output path is unknown
+        // until finish). mkstemp for uniqueness.
+        std::string spill = (std::getenv("TMPDIR") ? std::getenv("TMPDIR")
+                                                   : "/tmp");
+        spill += "/sextant_push_stage_XXXXXX";
+        std::vector<char> tmpl(spill.begin(), spill.end());
+        tmpl.push_back('\0');
+        const int fd = ::mkstemp(tmpl.data());
+        if (fd < 0) {
+            delete b;
+            set_err(err, err_len, "sextant_build_begin: cannot create "
+                                  "staging temp file");
+            return nullptr;
+        }
+        ::close(fd);
+        ::unlink(tmpl.data());  // PushStager creates/owns the real file
+        spill = tmpl.data();
         for (uint32_t c = 0; c < n_cols; ++c) {
             if (!cols[c].name) {
                 delete b;
@@ -618,6 +633,7 @@ void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
                 case SEXTANT_COL_FLOAT:  t = sextant::ColumnType::Float; break;
                 case SEXTANT_COL_STRING: t = sextant::ColumnType::String; break;
                 case SEXTANT_COL_SET:    t = sextant::ColumnType::Set; break;
+                case SEXTANT_COL_BOOL:   t = sextant::ColumnType::Bool; break;
                 default:
                     delete b;
                     set_err(err, err_len,
@@ -625,14 +641,11 @@ void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
                     return nullptr;
             }
             b->schema.columns.push_back({cols[c].name, t});
-            b->cols.emplace_back().type = t;
         }
         b->schema.has_payload = b->has_payload;
-        // MemSource carries vectors ONLY (empty schema) — filter columns and
-        // payloads ride BuildConfig sidecars (cfg.filter_column_data indexed
-        // by global row id), mirroring the FbinSource filter tests. Giving
-        // MemSource the schema would route the build down the per-chunk
-        // filter path against empty chunk data.
+        b->stager = std::make_unique<sextant::PushStager>(
+            dim, b->schema, b->has_payload, std::move(spill),
+            opts->staging_bytes);
         return b;
     } catch (const std::exception& e) {
         set_err(err, err_len, e.what());
@@ -659,158 +672,134 @@ int sextant_build_push(void* builder, const float* vectors, uint32_t n_rows,
         return -1;
     }
     try {
-        const uint32_t n_cols = static_cast<uint32_t>(b->cols.size());
+        auto& st = *b->stager;
+        const uint32_t n_cols = static_cast<uint32_t>(b->schema.columns.size());
         for (uint32_t r = 0; r < n_rows; ++r) {
-            b->vecs.add_vector(vectors + static_cast<size_t>(r) * b->dim,
-                              static_cast<sextant::RowId>(b->rows + r));
+            st.append_vector(vectors + static_cast<size_t>(r) * b->dim,
+                             static_cast<sextant::RowId>(b->rows + r));
             for (uint32_t c = 0; c < n_cols; ++c) {
                 const void* fv = filter_values ? filter_values[c] : nullptr;
-                auto& col = b->cols[c];
-                switch (col.type) {
+                const auto t = b->schema.columns[c].type;
+                switch (t) {
                     case sextant::ColumnType::Int32: {
-                       int32_t v = 0;
-                       if (fv) v = static_cast<const int32_t*>(fv)[r];
-                       col.fixed_data.insert(
-                           col.fixed_data.end(),
-                           reinterpret_cast<const uint8_t*>(&v),
-                           reinterpret_cast<const uint8_t*>(&v) + 4);
-                       break;
+                        int32_t v = 0;
+                        if (fv) v = static_cast<const int32_t*>(fv)[r];
+                        st.append_fixed(c, reinterpret_cast<const uint8_t*>(&v), 4);
+                        break;
                     }
                     case sextant::ColumnType::Int64: {
-                       int64_t v = 0;
-                       if (fv) v = static_cast<const int64_t*>(fv)[r];
-                       col.fixed_data.insert(
-                           col.fixed_data.end(),
-                           reinterpret_cast<const uint8_t*>(&v),
-                           reinterpret_cast<const uint8_t*>(&v) + 8);
-                       break;
+                        int64_t v = 0;
+                        if (fv) v = static_cast<const int64_t*>(fv)[r];
+                        st.append_fixed(c, reinterpret_cast<const uint8_t*>(&v), 8);
+                        break;
                     }
                     case sextant::ColumnType::Float: {
-                       float v = 0.0f;
-                       if (fv) v = static_cast<const float*>(fv)[r];
-                       col.fixed_data.insert(
-                           col.fixed_data.end(),
-                           reinterpret_cast<const uint8_t*>(&v),
-                           reinterpret_cast<const uint8_t*>(&v) + 4);
-                       break;
+                        float v = 0.0f;
+                        if (fv) v = static_cast<const float*>(fv)[r];
+                        st.append_fixed(c, reinterpret_cast<const uint8_t*>(&v), 4);
+                        break;
+                    }
+                    case sextant::ColumnType::Bool: {
+                        // 1-byte-per-row fixed column (uint8, 0/1).
+                        uint8_t v = 0;
+                        if (fv) v = static_cast<const uint8_t*>(fv)[r] != 0;
+                        st.append_fixed(c, &v, 1);
+                        break;
                     }
                     case sextant::ColumnType::String: {
-                       const char* data = nullptr;
-                       uint32_t len = 0;
-                       if (fv) {
-                           const auto* sv =
-                               static_cast<const sextant_str_values*>(fv);
-                           if (sv->data && sv->lengths) {
-                               data = sv->data[r];
-                               len = sv->lengths[r];
-                           }
-                       }
-                       if (len > 65535) {
-                           set_err(err, err_len,
-                                   "sextant_build_push: string length "
-                                   "exceeds 65535");
-                           return -1;
-                       }
-                       col.str_offsets.push_back(
-                           static_cast<uint32_t>(col.str_data.size()));
-                       col.str_lengths.push_back(static_cast<uint16_t>(len));
-                       if (data && len)
-                           col.str_data.insert(col.str_data.end(), data,
-                                               data + len);
-                       break;
+                        const char* data = nullptr;
+                        uint32_t len = 0;
+                        if (fv) {
+                            const auto* sv =
+                                static_cast<const sextant_str_values*>(fv);
+                            if (sv->data && sv->lengths) {
+                                data = sv->data[r];
+                                len = sv->lengths[r];
+                            }
+                        }
+                        if (len > 65535) {
+                            set_err(err, err_len,
+                                    "sextant_build_push: string length "
+                                    "exceeds 65535");
+                            return -1;
+                        }
+                        st.append_string(c, data, len);
+                        break;
                     }
                     case sextant::ColumnType::Set: {
-                       // Row r's elements are the offset run [o_r, o_r+1)
-                       // of indices into elem_data/elem_lengths.
-                       uint32_t begin = 0, end = 0;
-                       const sextant_set_values* sv = nullptr;
-                       if (fv) {
-                           sv = static_cast<const sextant_set_values*>(fv);
-                           if (sv->counts && !sv->offsets) {
-                               set_err(err, err_len,
-                                       "sextant_build_push: set counts "
-                                       "require offsets");
-                               return -1;
-                           }
-                           if (sv->offsets) {
-                               begin = sv->offsets[r];
-                               end = sv->offsets[r + 1];
-                               if (end < begin) {
-                                   set_err(err, err_len,
-                                           "sextant_build_push: set offsets "
-                                           "not monotone");
-                                   return -1;
-                               }
-                               if (sv->counts && sv->counts[r] != end - begin) {
-                                   set_err(err, err_len,
-                                           "sextant_build_push: set count "
-                                           "mismatches offset run");
-                                   return -1;
-                               }
-                           }
-                       }
-                       const uint32_t count = end - begin;
-                       if (count > 255) {
-                           set_err(err, err_len,
-                                   "sextant_build_push: set element count "
-                                   "exceeds 255");
-                           return -1;
-                       }
-                       col.set_offsets.push_back(
-                           static_cast<uint32_t>(
-                               col.set_elem_lengths.size()));
-                       col.set_counts.push_back(
-                           static_cast<uint8_t>(count));
-                       if (count) {
-                           if (!sv->elem_data || !sv->elem_lengths) {
-                               set_err(err, err_len,
-                                       "sextant_build_push: set elements "
-                                       "require elem_data/elem_lengths");
-                               return -1;
-                           }
-                           for (uint32_t e = begin; e < end; ++e) {
-                               const uint32_t len = sv->elem_lengths[e];
-                               if (len > 65535) {
-                                   set_err(err, err_len,
-                                           "sextant_build_push: set element "
-                                           "length exceeds 65535");
-                                   return -1;
-                               }
-                               col.set_elem_lengths.push_back(
-                                   static_cast<uint16_t>(len));
-                               const char* d = sv->elem_data[e];
-                               if (d && len)
-                                   col.set_elem_data.insert(
-                                       col.set_elem_data.end(), d, d + len);
-                           }
-                       }
-                       break;
+                        uint32_t begin = 0, end = 0;
+                        if (fv) {
+                            const auto* sv =
+                                static_cast<const sextant_set_values*>(fv);
+                            // Row r's elements are offsets[r]..offsets[r+1];
+                            // counts (optional) must agree with the run.
+                            if (sv->offsets) {
+                                begin = sv->offsets[r];
+                                end = sv->offsets[r + 1];
+                            } else if (sv->counts) {
+                                begin = end;
+                                for (uint32_t i = 0; i < r; ++i)
+                                    end += sv->counts[i];
+                            }
+                            if (sv->counts &&
+                                uint32_t(sv->counts[r]) != end - begin) {
+                                set_err(err, err_len,
+                                        "sextant_build_push: set count "
+                                        "mismatches offset run");
+                                return -1;
+                            }
+                        }
+                        const uint32_t count = end - begin;
+                        if (count > 255) {
+                            set_err(err, err_len,
+                                    "sextant_build_push: set element count "
+                                    "exceeds 255");
+                            return -1;
+                        }
+                        if (count) {
+                            const auto* sv =
+                                static_cast<const sextant_set_values*>(fv);
+                            if (!sv->elem_data || !sv->elem_lengths) {
+                                set_err(err, err_len,
+                                        "sextant_build_push: set elements "
+                                        "require elem_data/elem_lengths");
+                                return -1;
+                            }
+                            for (uint32_t e = begin; e < end; ++e) {
+                                if (sv->elem_lengths[e] > 65535) {
+                                    set_err(err, err_len,
+                                            "sextant_build_push: set element "
+                                            "length exceeds 65535");
+                                    return -1;
+                                }
+                            }
+                            st.append_set_row(c, count, sv->elem_data + begin,
+                                              sv->elem_lengths + begin);
+                        } else {
+                            st.append_set_row(c, 0, nullptr, nullptr);
+                        }
+                        break;
                     }
-                    case sextant::ColumnType::Bool:
-                       set_err(err, err_len,
-                               "sextant_build_push: Bool columns "
-                               "unsupported in v1");
-                       return -4;
                 }
             }
-            // Payload row: append the blob, then record the new total.
-            // Invariant: payload_offsets has rows+1 entries, last == total.
             if (b->has_payload) {
-                const uint64_t start = payload_offsets[r];
-                const uint64_t end = payload_offsets[r + 1];
-                if (end < start) {
+                const uint64_t p0 = payload_offsets[r];
+                const uint64_t p1 = payload_offsets[r + 1];
+                if (p1 < p0) {
                     set_err(err, err_len,
-                           "sextant_build_push: payload_offsets not "
-                           "monotone");
+                            "sextant_build_push: payload offsets not "
+                            "monotone");
                     return -1;
                 }
-                if (payload_data && end > start)
-                    b->payload_data.insert(
-                       b->payload_data.end(), payload_data + start,
-                       payload_data + end);
-                b->payload_offsets.push_back(
-                    static_cast<uint32_t>(b->payload_data.size()));
+                if (p1 - p0 > 0xFFFFFFFFull) {
+                    set_err(err, err_len,
+                            "sextant_build_push: payload blob exceeds 4GB");
+                    return -1;
+                }
+                st.append_payload(payload_data + p0,
+                                  static_cast<uint32_t>(p1 - p0));
             }
+            st.end_row();
         }
         b->rows += n_rows;
         return 0;
@@ -832,7 +821,7 @@ int sextant_build_finish(void* builder, const char* out_path,
         return -1;
     }
     try {
-        auto source = b->vecs.build();
+        auto source = b->stager->build_source();
         const sextant_build_opts& opts = b->opts;
         sextant::tree::IVFTreeIndex::BuildConfig cfg;
         cfg.k_root = opts.k_root;
@@ -849,13 +838,9 @@ int sextant_build_finish(void* builder, const char* out_path,
         cfg.params.metric = opts.metric == SEXTANT_METRIC_IP
             ? sextant::MetricKind::InnerProduct
             : sextant::MetricKind::L2Sq;
-        cfg.filter_schema = b->schema;
-        if (!b->cols.empty()) cfg.filter_column_data = b->cols;
-        if (b->has_payload) {
-            cfg.payload_data = b->payload_data.data();
-            cfg.payload_offsets = b->payload_offsets.data();
-            cfg.payload_offsets_count = b->payload_offsets.size();
-        }
+        // Filter columns + payload stream per-chunk from the staged source
+        // (same path as the parquet sources) — bounded RAM end to end.
+        cfg.filter_schema = source->schema();
         sextant::tree::IVFTreeIndex::build_streaming_pca(*source, out_path,
                                                          cfg);
         delete b;

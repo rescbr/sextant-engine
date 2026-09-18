@@ -326,6 +326,7 @@ sources_inc = include_directories('sources')
 
 sextant_sources_lib = static_library('sextant_sources',
     ['sources/fbin_source.cpp', 'sources/mem_source.cpp',
+    'sources/push_source.cpp',
      'sources/parquet_source.cpp',
      'sources/parquet_glob_source.cpp'],
     include_directories: [sources_inc, engine_inc, src_inc, third_party_inc],

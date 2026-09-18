@@ -44,6 +44,10 @@ typedef struct sextant_build_opts {
     /// historical C API behavior; sextant_default_build_opts() sets it on.
     int plane_attach;          ///< 1 = attach B1G routing plane (default on)
     uint32_t plane_rank;       ///< plane rank (0 = 128)
+    /// In-memory staging budget for push builds; staged chunks beyond it
+    /// spill to a temp file and stream back at finish (bounded RAM end to
+    /// end). 0 = 256 MiB default. ABI tail-append (zero = default).
+    uint64_t staging_bytes;
 } sextant_build_opts;
 
 /// Sensible defaults (pq, auto geometry, L2).
@@ -203,6 +207,7 @@ enum {
     SEXTANT_COL_FLOAT = 2,  ///< engine-internal binary32
     SEXTANT_COL_STRING = 3,
     SEXTANT_COL_SET = 4,    ///< set of strings (via sextant_set_values)
+    SEXTANT_COL_BOOL = 5,   ///< 1 byte per row (0/1); ABI tail-append
 };
 
 typedef struct sextant_filter_col_def {
@@ -321,9 +326,9 @@ void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
 /// Push n_rows vectors (row-major, dim from sextant_build_begin). May be called
 /// any number of times; row ids continue across calls. `filter_values`, when
 /// non-NULL, holds one entry per declared column, each covering n_rows rows
-/// in push order: for Int32/Int64/Float a pointer to a contiguous array of
-/// that C type; for String a pointer to a sextant_str_values; for Set a
-/// pointer to a sextant_set_values. A NULL entry
+/// in push order: for Int32/Int64/Float/Bool a pointer to a contiguous
+/// array of that C type (Bool = 1 byte per row, 0/1); for String a pointer
+/// to a sextant_str_values; for Set a pointer to a sextant_set_values. A NULL entry
 /// (or NULL filter_values with declared columns) fills the rows with the
 /// type's default (0 / empty string / empty set). Payload: payload_offsets has n_rows+1
 /// entries delimiting n_rows blobs in payload_data (both required when the
