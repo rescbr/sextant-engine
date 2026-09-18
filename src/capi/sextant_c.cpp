@@ -560,6 +560,16 @@ uint32_t sextant_scan_pool_threads(void) {
     return sextant::tree::scan_pool_threads();
 }
 
+uint32_t sextant_index_code_size(const void* index) {
+    auto* idx = reinterpret_cast<const IVFTreeIndex*>(index);
+    if (!idx) return 0;
+    try {
+        return idx->coder().code_size();
+    } catch (...) {
+        return 0;
+    }
+}
+
 uint64_t sextant_index_count(const void* index) {
     auto* idx = reinterpret_cast<const IVFTreeIndex*>(index);
     if (!idx) return 0;

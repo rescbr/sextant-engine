@@ -299,6 +299,10 @@ uint32_t sextant_scan_pool_set_threads(uint32_t n);
 /// Current scan pool thread count.
 uint32_t sextant_scan_pool_threads(void);
 
+/// Scan code size in bytes per vector (drives the adaptive-W tau default:
+/// >= 288B -> 2.5, else 5.0 — same calibration the CLI ships).
+uint32_t sextant_index_code_size(const void* index);
+
 // --- Streaming push build ------------------------------------------------
 
 /// Begin a push build of `dim`-dimensional vectors. `cols` declares the
