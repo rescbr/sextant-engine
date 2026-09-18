@@ -25,7 +25,9 @@ struct TreeManifest {
     /// 32-char lowercase hex UUID (random, generated at build). Identifies
     /// the tree independent of its file path — the DuckDB extension stores
     /// it in the DuckDB-side index metadata and verifies it on every open
-    /// (stale/wrong-file detection). Empty = pre-UUID tree (legacy).
+    /// (stale/wrong-file detection). MANDATORY in the format: serialization
+    /// throws on an unset/short uuid and parsing rejects manifests without
+    /// one (format is pre-freeze; there are no legacy trees).
     std::string uuid;
 
     // [index]

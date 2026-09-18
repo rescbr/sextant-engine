@@ -339,6 +339,7 @@ TEST(TreeManifest, RoundTrip) {
     TreeManifest m;
     m.dim = 768;
     m.m4 = 192;
+    m.uuid = generate_tree_uuid();
     m.scan_pq_bits = 4;
     m.quantizer_type = "pq";
     m.prq_nsplits = 0;
@@ -368,6 +369,34 @@ TEST(TreeManifest, RoundTrip) {
     EXPECT_FLOAT_EQ(m2.adaptive_probe_gap, 1.606f);
     EXPECT_FLOAT_EQ(m2.median_lid, 13.21f);
     EXPECT_FLOAT_EQ(m2.balance_factor, 4.0f);
+    EXPECT_EQ(m2.uuid, m.uuid);
+}
+
+TEST(TreeManifest, MissingUuidThrows) {
+    std::string bad_toml = R"(
+[index]
+dim = 768
+m4 = 192
+scan_pq_bits = 4
+
+[tree]
+depth = 2
+k_root = 128
+leaf_capacity = 5000
+n_leaves = 2000
+n_probe_l0 = 16
+n_probe_ln = 4
+)";
+    EXPECT_THROW(manifest_from_toml(bad_toml), sextant::Error);
+}
+
+TEST(TreeManifest, MalformedUuidThrows) {
+    // Present but not 32 lowercase hex chars.
+    TreeManifest m;
+    m.dim = 8;
+    m.m4 = 8;
+    m.uuid = "NOT-A-UUID";
+    EXPECT_THROW(manifest_to_toml(m), sextant::Error);
 }
 
 TEST(TreeManifest, MissingFieldThrows) {

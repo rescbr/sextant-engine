@@ -57,12 +57,15 @@ std::string generate_tree_uuid() {
 std::string manifest_to_toml(const TreeManifest& m) {
     auto root = cpptoml::make_table();
 
-    // [meta]  (only when set; pre-UUID trees omit it)
-    if (!m.uuid.empty()) {
-        auto meta = cpptoml::make_table();
-        meta->insert("uuid", m.uuid);
-        root->insert("meta", meta);
+    // [meta]  (uuid is mandatory — the format is pre-freeze, no legacy)
+    if (m.uuid.size() != 32) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "TreeManifest: uuid must be set (32 hex chars) before "
+                    "serialization — builds must call generate_tree_uuid()");
     }
+    auto meta = cpptoml::make_table();
+    meta->insert("uuid", m.uuid);
+    root->insert("meta", meta);
 
     // [index]
     auto index = cpptoml::make_table();
@@ -129,11 +132,20 @@ TreeManifest manifest_from_toml(const std::string& toml) {
 
     TreeManifest m;
 
-    // [meta]  (optional; pre-UUID trees have no uuid)
-    if (auto meta = root->get_table("meta")) {
-        if (auto u = meta->get_as<std::string>("uuid")) {
-            m.uuid = *u;
-        }
+    // [meta]  (uuid is mandatory — the format is pre-freeze, no legacy)
+    auto meta = root->get_table("meta");
+    if (!meta) {
+        throw Error(ErrorCode::CorruptIndex, "TreeManifest: missing [meta] section (uuid required)");
+    }
+    auto uuid = meta->get_as<std::string>("uuid");
+    if (!uuid) {
+        throw Error(ErrorCode::CorruptIndex, "TreeManifest: missing required field uuid");
+    }
+    m.uuid = *uuid;
+    if (m.uuid.size() != 32 ||
+        m.uuid.find_first_not_of("0123456789abcdef") != std::string::npos) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "TreeManifest: uuid must be 32 lowercase hex chars, got '" + m.uuid + "'");
     }
 
     auto require_int = [&](const cpptoml::table& tbl,
