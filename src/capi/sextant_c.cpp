@@ -356,7 +356,10 @@ sextant_search_opts sextant_default_search_opts(void) {
     o.n_probe_ln = 0;
     o.fastscan_W = 0;
     o.adaptive_probe_gap = 0.0f;
-    o.rerank = 0;
+    // Rerank by default, matching the CLI serving default: int8_scan auto
+    // (on) + rerank off produces raw i8 scores whose ranking is lossy —
+    // rerank-on is the quality contract callers expect from a default.
+    o.rerank = 1;
     o.search_threads = 0;
     o.int8_scan = -1;  // -1 = auto (int8 on AVX512/VNNI); 0 here previously
                         // force-disabled the i8 kernel for default callers
