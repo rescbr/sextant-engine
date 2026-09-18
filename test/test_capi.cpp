@@ -10,6 +10,7 @@
 #include <sextant/sextant_c.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -292,6 +294,114 @@ TEST_F(CApiTest, TreeUuidIdentity) {
     EXPECT_EQ(sextant_index_uuid(nullptr, uuid, sizeof(uuid)), -1);
     EXPECT_EQ(sextant_index_uuid(index, nullptr, sizeof(uuid)), -1);
     EXPECT_EQ(sextant_index_uuid(index, uuid, 32), -1);  // no room for NUL
+}
+
+// (a3) DuckDB-shaped concurrency: one shared handle, waves of short-lived
+// worker threads (DuckDB creates/joins scan workers per query), mixed
+// single/filtered/batch searches plus scan-pool fan-out, all concurrent.
+// Correctness contract: no crash/deadlock, and results match the
+// single-threaded reference exactly (search is deterministic per config).
+TEST_F(CApiTest, ConcurrentSearchStress) {
+    // Single-threaded reference results (k=5).
+    sextant_search_opts ref_opts = sextant_default_search_opts();
+    ref_opts.k = 5;
+    std::vector<std::vector<uint64_t>> ref(kClusters);
+    for (uint32_t c = 0; c < kClusters; ++c) {
+        uint64_t ids[5];
+        float dists[5];
+        char err[512] = {0};
+        ASSERT_EQ(sextant_search(index, corpus.centers[c].data(), &ref_opts,
+                                 ids, dists, 5, err, sizeof(err)),
+                  5)
+            << err;
+        ref[c].assign(ids, ids + 5);
+    }
+
+    // Scan pool fan-out exercises pool sharing across caller threads.
+    ASSERT_GE(sextant_scan_pool_set_threads(8), 1u);
+    sextant_search_opts par_opts = sextant_default_search_opts();
+    par_opts.k = 5;
+    par_opts.search_threads = 4;
+
+    std::atomic<uint32_t> failures{0};
+    std::atomic<uint64_t> total_searches{0};
+    const uint32_t kWaves = 8;
+    const uint32_t kWorkersPerWave = 6;
+
+    for (uint32_t wave = 0; wave < kWaves; ++wave) {
+        std::vector<std::thread> workers;
+        workers.reserve(kWorkersPerWave);
+        for (uint32_t w = 0; w < kWorkersPerWave; ++w) {
+            workers.emplace_back([&, w] {
+                for (uint32_t iter = 0; iter < 25; ++iter) {
+                    const uint32_t c = (w + iter) % kClusters;
+                    uint64_t ids[5];
+                    float dists[5];
+                    char err[512] = {0};
+                    const sextant_search_opts* opts =
+                        (iter % 2) ? &par_opts : &ref_opts;
+                    const int32_t n = sextant_search(
+                        index, corpus.centers[c].data(), opts, ids, dists,
+                        5, err, sizeof(err));
+                    if (n != 5) {
+                        ++failures;
+                        return;
+                    }
+                    // Same config as reference (search_threads does not
+                    // change results; the sweep is bit-stable).
+                    for (uint32_t i = 0; i < 5; ++i) {
+                        if (ids[i] != ref[c][i]) {
+                            ++failures;
+                            return;
+                        }
+                    }
+                    ++total_searches;
+                }
+            });
+        }
+        // Wave barrier: threads are joined before the next wave spawns —
+        // the churn pattern DuckDB produces per query batch.
+        for (auto& t : workers) t.join();
+    }
+
+    EXPECT_EQ(failures.load(), 0u);
+    EXPECT_EQ(total_searches.load(),
+              uint64_t{kWaves} * kWorkersPerWave * 25);
+
+    // Batch API concurrently with singles on the same handle.
+    {
+        std::vector<float> queries;
+        for (uint32_t c = 0; c < kClusters; ++c)
+            queries.insert(queries.end(), corpus.centers[c].begin(),
+                           corpus.centers[c].end());
+        std::thread batch_thread([&] {
+            sextant_search_opts bopts = sextant_default_search_opts();
+            bopts.k = 5;
+            char err[512] = {0};
+            uint64_t ids[kClusters * 5];
+            float dists[kClusters * 5];
+            uint32_t n_per[kClusters];
+            const int32_t n = sextant_search_batch(
+                index, queries.data(), kClusters, &bopts, nullptr, 0,
+                ids, dists, 5, n_per, err, sizeof(err));
+            if (n < 0) ++failures;
+        });
+        std::thread single_thread([&] {
+            uint64_t ids[5];
+            float dists[5];
+            char err[512] = {0};
+            sextant_search_opts s = sextant_default_search_opts();
+            s.k = 5;
+            if (sextant_search(index, queries.data(), &s, ids, dists, 5,
+                               err, sizeof(err)) != 5)
+                ++failures;
+        });
+        batch_thread.join();
+        single_thread.join();
+        EXPECT_EQ(failures.load(), 0u);
+    }
+    // Restore default pool size so later tests are unaffected.
+    sextant_scan_pool_set_threads(0);
 }
 
 // (b) Filtered-search parity: string Eq and int32 Eq.
