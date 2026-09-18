@@ -21,6 +21,13 @@ namespace sextant::tree {
 
 /// Tree manifest: all parameters needed to search the tree.
 struct TreeManifest {
+    // [meta]
+    /// 32-char lowercase hex UUID (random, generated at build). Identifies
+    /// the tree independent of its file path — the DuckDB extension stores
+    /// it in the DuckDB-side index metadata and verifies it on every open
+    /// (stale/wrong-file detection). Empty = pre-UUID tree (legacy).
+    std::string uuid;
+
     // [index]
     uint32_t dim = 0;
     uint16_t m4 = 0;             // PQ subquantizers for scan codes
@@ -61,6 +68,9 @@ struct TreeManifest {
 
 /// Serialize a TreeManifest to a TOML string.
 std::string manifest_to_toml(const TreeManifest& m);
+
+/// Generate a fresh random 32-char lowercase-hex tree UUID (v4-shaped).
+std::string generate_tree_uuid();
 
 /// Parse a TOML string into a TreeManifest. Throws on parse error or
 /// missing required fields.

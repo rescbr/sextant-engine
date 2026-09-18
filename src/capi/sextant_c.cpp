@@ -333,6 +333,16 @@ uint32_t sextant_index_dim(const void* index) {
     return idx ? idx->dim() : 0;
 }
 
+int32_t sextant_index_uuid(const void* index, char* out, size_t out_len) {
+    auto* idx = reinterpret_cast<const sextant::tree::IVFTreeIndex*>(index);
+    if (!idx || !out) return -1;
+    const std::string& uuid = idx->tree_uuid();
+    if (uuid.empty()) return 0;  // pre-UUID legacy tree
+    if (out_len < uuid.size() + 1) return -1;
+    std::memcpy(out, uuid.c_str(), uuid.size() + 1);
+    return static_cast<int32_t>(uuid.size());
+}
+
 uint64_t sextant_index_live_count(void* index) {
     auto* idx = reinterpret_cast<sextant::tree::IVFTreeIndex*>(index);
     return idx ? idx->live_count() : 0;

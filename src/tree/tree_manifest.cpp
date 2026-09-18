@@ -4,6 +4,9 @@
 
 #include <cpptoml.h>
 
+#include <chrono>
+#include <cstddef>
+#include <random>
 #include <sstream>
 
 namespace sextant::tree {
@@ -34,8 +37,32 @@ ColumnType column_type_from_string(std::string_view s) {
 
 }  // namespace
 
+std::string generate_tree_uuid() {
+    // 128 random bits, v4-shaped (version/variant nibbles set). Two builds
+    // must never share an identity, so no deterministic seeding.
+    std::random_device rd;
+    std::uniform_int_distribution<uint32_t> dist;
+    uint32_t b[4] = {dist(rd), dist(rd), dist(rd), dist(rd)};
+    b[1] = (b[1] & 0xFFFF'0FFFu) | 0x0000'4000u;  // version 4
+    b[2] = (b[2] & 0x3FFF'FFFFu) | 0x8000'0000u;  // variant 10
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(32);
+    for (uint32_t w : b)
+        for (int shift = 28; shift >= 0; shift -= 4)
+            out.push_back(hex[(w >> shift) & 0xFu]);
+    return out;
+}
+
 std::string manifest_to_toml(const TreeManifest& m) {
     auto root = cpptoml::make_table();
+
+    // [meta]  (only when set; pre-UUID trees omit it)
+    if (!m.uuid.empty()) {
+        auto meta = cpptoml::make_table();
+        meta->insert("uuid", m.uuid);
+        root->insert("meta", meta);
+    }
 
     // [index]
     auto index = cpptoml::make_table();
@@ -101,6 +128,13 @@ TreeManifest manifest_from_toml(const std::string& toml) {
     auto root = p.parse();
 
     TreeManifest m;
+
+    // [meta]  (optional; pre-UUID trees have no uuid)
+    if (auto meta = root->get_table("meta")) {
+        if (auto u = meta->get_as<std::string>("uuid")) {
+            m.uuid = *u;
+        }
+    }
 
     auto require_int = [&](const cpptoml::table& tbl,
                            const char* key) -> int64_t {

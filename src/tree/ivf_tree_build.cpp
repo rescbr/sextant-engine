@@ -2348,6 +2348,7 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     }
 
     TreeManifest manifest;
+    manifest.uuid = generate_tree_uuid();
     manifest.dim = dim; manifest.m4 = m4; manifest.scan_pq_bits = scan_bits;
     manifest.quantizer_type = params.quantizer_type;
     manifest.prq_nsplits = ctx.coder->prq_nsplits();

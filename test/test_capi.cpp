@@ -252,6 +252,48 @@ TEST_F(CApiTest, PushBuildAndCount) {
     EXPECT_EQ(sextant_index_count(index), kN);
 }
 
+// (a2) Tree UUID: 32 lowercase hex chars, stable across re-open, unique
+// per build (the DuckDB extension's stale-sidecar guard relies on this).
+TEST_F(CApiTest, TreeUuidIdentity) {
+    char uuid[40] = {0};
+    ASSERT_EQ(sextant_index_uuid(index, uuid, sizeof(uuid)), 32);
+    ASSERT_EQ(uuid[32], '\0');
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_TRUE((uuid[i] >= '0' && uuid[i] <= '9') ||
+                    (uuid[i] >= 'a' && uuid[i] <= 'f'))
+            << "non-hex char at " << i;
+    }
+    // v4 shape: version nibble 4 at offset 12, variant nibble 8-b at 16.
+    EXPECT_EQ(uuid[12], '4');
+    ASSERT_TRUE(uuid[16] == '8' || uuid[16] == '9' || uuid[16] == 'a' ||
+                uuid[16] == 'b');
+
+    // Stable across re-open of the same file.
+    char err[512] = {0};
+    void* again = sextant_open_index(path.c_str(), err, sizeof(err));
+    ASSERT_NE(again, nullptr) << err;
+    char uuid2[40] = {0};
+    EXPECT_EQ(sextant_index_uuid(again, uuid2, sizeof(uuid2)), 32);
+    EXPECT_STREQ(uuid, uuid2);
+    sextant_close_index(again);
+
+    // Unique per build: a second corpus builds a different identity.
+    Corpus other{91};
+    const std::string path2 =
+        build_test_index(other, "capi_v1_uuid_other.tree");
+    void* idx2 = sextant_open_index(path2.c_str(), err, sizeof(err));
+    ASSERT_NE(idx2, nullptr) << err;
+    char uuid3[40] = {0};
+    EXPECT_EQ(sextant_index_uuid(idx2, uuid3, sizeof(uuid3)), 32);
+    EXPECT_STRNE(uuid, uuid3);
+    sextant_close_index(idx2);
+
+    // Argument contract: nulls and too-small buffers are rejected.
+    EXPECT_EQ(sextant_index_uuid(nullptr, uuid, sizeof(uuid)), -1);
+    EXPECT_EQ(sextant_index_uuid(index, nullptr, sizeof(uuid)), -1);
+    EXPECT_EQ(sextant_index_uuid(index, uuid, 32), -1);  // no room for NUL
+}
+
 // (b) Filtered-search parity: string Eq and int32 Eq.
 TEST_F(CApiTest, FilteredSearchParity) {
     sextant_search_opts opts = sextant_default_search_opts();

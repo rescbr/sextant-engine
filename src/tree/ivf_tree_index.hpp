@@ -328,6 +328,8 @@ public:
     // --- Accessors ---
 
     uint32_t dim() const { return manifest_.dim; }
+    /// Tree identity (32-char lowercase hex; empty on pre-UUID trees).
+    const std::string& tree_uuid() const { return manifest_.uuid; }
     uint16_t m4() const { return manifest_.m4; }
     uint16_t depth() const { return manifest_.depth; }
     uint32_t k_root() const { return manifest_.k_root; }

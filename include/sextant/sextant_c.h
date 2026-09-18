@@ -105,6 +105,10 @@ void* sextant_open_index(const char* path, char* err, size_t err_len);
 void sextant_close_index(void* index);
 
 uint32_t sextant_index_dim(const void* index);
+/// Copy the tree UUID (32 lowercase hex chars) into `out` (NUL-terminated;
+/// pass out_len >= 33). Returns 32 on success, 0 when the tree predates
+/// UUIDs (legacy manifest), -1 on bad arguments.
+int32_t sextant_index_uuid(const void* index, char* out, size_t out_len);
 uint64_t sextant_index_live_count(void* index); ///< requires mutable open
 
 /// Single-query search. Writes up to `k` (row_id, dist) pairs, ascending
