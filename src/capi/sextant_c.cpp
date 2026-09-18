@@ -11,6 +11,7 @@
 #include "fbin_source.hpp"
 #include "mem_source.hpp"
 #include "tree/ivf_tree_index.hpp"
+#include "tree/scan_pool.hpp"
 
 #include <sextant/column_data.hpp>
 #include <sextant/schema.hpp>
@@ -542,6 +543,18 @@ int sextant_fetch_vector(const void* index, const void* leaf_ptr,
     } catch (...) {
         return -3;
     }
+}
+
+uint32_t sextant_scan_pool_set_threads(uint32_t n) {
+    try {
+        return sextant::tree::scan_pool_set_threads(n);
+    } catch (...) {
+        return sextant::tree::scan_pool_threads();
+    }
+}
+
+uint32_t sextant_scan_pool_threads(void) {
+    return sextant::tree::scan_pool_threads();
 }
 
 uint64_t sextant_index_count(const void* index) {

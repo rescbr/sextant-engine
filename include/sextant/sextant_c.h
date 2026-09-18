@@ -287,6 +287,18 @@ int sextant_fetch_vector(const void* index, const void* leaf_ptr,
 /// before the logical count was persisted.
 uint64_t sextant_index_count(const void* index);
 
+// --- Scan worker pool -------------------------------------------------------
+
+/// Resize the process-wide scan pool (shared by within-query parallel
+/// scanning and batch sweeps; threads are warm and long-lived). n == 0
+/// selects hardware_concurrency. Returns the new thread count. Embedders
+/// running their own query-level parallelism (e.g. a DuckDB extension)
+/// should size this to their thread budget.
+uint32_t sextant_scan_pool_set_threads(uint32_t n);
+
+/// Current scan pool thread count.
+uint32_t sextant_scan_pool_threads(void);
+
 // --- Streaming push build ------------------------------------------------
 
 /// Begin a push build of `dim`-dimensional vectors. `cols` declares the

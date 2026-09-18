@@ -19,6 +19,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "tree/scan_pool.hpp"
 #include <ctpl/ctpl_stl_tls.h>
 
 #include <algorithm>
@@ -1157,8 +1158,8 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                 const uint32_t start = t * per;
                 const uint32_t end = std::min(start + per, n_scan);
                 if (start >= end) break;
-                futs.push_back(std::async(std::launch::async,
-                    [&](uint32_t s, uint32_t e, uint32_t ti) {
+                futs.push_back(scan_pool().push(
+                    [&, s = start, e = end, ti = t](int, ScanWorkerTag&) {
                         auto& my = th[ti];
                         heap_init(my, W);
                         std::unique_ptr<ScanSetup> own_setup;
@@ -1185,7 +1186,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                             RawScanHeap heap{&my, W, c};
                             coder_->scan_leaf(*use, leaf_ptr, heap);
                         }
-                    }, start, end, t));
+                    }));
             }
             for (auto& f : futs) f.get();
             // Adopt worker pins (refcounts held) so they live until guard exit.
@@ -2047,9 +2048,10 @@ void IVFTreeIndex::search_batch(
             route_worker();
         } else {
             std::vector<std::future<void>> futs;
+            auto& pool = scan_pool();
             for (uint32_t t = 0; t < T; ++t)
-                futs.push_back(
-                    std::async(std::launch::async, route_worker));
+                futs.push_back(pool.push(
+                    [&](int, ScanWorkerTag&) { route_worker(); }));
             for (auto& f : futs) f.get();
         }
     }
@@ -2419,9 +2421,10 @@ void IVFTreeIndex::search_batch(
                 sweep_worker();
             } else {
                 std::vector<std::future<void>> futs;
+                auto& pool = scan_pool();
                 for (uint32_t t = 0; t < T; ++t)
-                    futs.push_back(
-                        std::async(std::launch::async, sweep_worker));
+                    futs.push_back(pool.push(
+                        [&](int, ScanWorkerTag&) { sweep_worker(); }));
                 for (auto& f : futs) f.get();
             }
         }
@@ -2527,9 +2530,10 @@ void IVFTreeIndex::search_batch(
             finalize_worker();
         } else {
             std::vector<std::future<void>> futs;
+            auto& pool = scan_pool();
             for (uint32_t t = 0; t < T; ++t)
-                futs.push_back(
-                    std::async(std::launch::async, finalize_worker));
+                futs.push_back(pool.push(
+                    [&](int, ScanWorkerTag&) { finalize_worker(); }));
             for (auto& f : futs) f.get();
         }
         (void)fallback_count;

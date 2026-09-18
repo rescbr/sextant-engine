@@ -263,6 +263,7 @@ engine_sources = [
     'src/tree/tree_manifest.cpp',
     'src/tree/ivf_tree_index.cpp',
     'src/tree/ivf_tree_build.cpp',
+    'src/tree/scan_pool.cpp',
     'src/tree/ivf_tree_search.cpp',
     'src/tree/ivf_tree_plane.cpp',
     'src/tree/ivf_tree_mutate.cpp',
