@@ -237,9 +237,9 @@ sextant_build_opts sextant_default_build_opts(void) {
     o.max_lloyd_passes = 0;
     o.metric = SEXTANT_METRIC_L2SQ;
     o.adaptive_probe_gap = 0.0f;
-    return o;
     o.plane_attach = 1;  // CLI serving parity: routing plane on
-    o.plane_rank = 0;
+    o.plane_rank = 0;    // 0 = default rank 128 at finish
+    return o;
 }
 
 int sextant_build_fbin(const char* fbin_path, const char* out_path,
