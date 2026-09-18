@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <random>
 #include <set>
 #include <string>
@@ -898,6 +899,107 @@ double haversine_km_test(double lat1, double lng1, double lat2, double lng2) {
                      std::sin(dlng / 2) * std::sin(dlng / 2);
     return 2 * kR * std::asin(std::sqrt(a));
 }
+
+//===--------------------------------------------------------------------===//
+// Streaming-push staging tiers. Every fixture above fits the stager's
+// default 256 MiB memory tier, which left the spill read path untested
+// (the CulturaX-scale OOB in StagedPushSource::next was invisible to the
+// suite). The builds below replay the same corpus under a tiny
+// staging_bytes budget so chunks spill to the temp file: the builder's
+// sample/PCA/Lloyd passes then run vector-only seeks over the spill and
+// the emission pass reads the filter/payload blobs back.
+//===--------------------------------------------------------------------===//
+
+/// Bool filter column: row i is true iff i % 7 == 0.
+bool flag_of(uint32_t i) { return i % 7 == 0; }
+
+/// Push build parameterized on staging budget and corpus size. Schema
+/// covers every column type incl. Bool; payloads like build_test_index.
+std::string build_push_index(const float* data, const std::string& name,
+                             uint64_t staging_bytes, uint32_t n_rows,
+                             uint32_t chunk, uint32_t leaf_capacity,
+                             uint32_t lloyd_passes) {
+    const std::string path =
+        (std::filesystem::temp_directory_path() / name).string();
+    std::filesystem::remove(path);
+
+    char err[512] = {0};
+    sextant_build_opts bopts = sextant_default_build_opts();
+    bopts.quantizer = "local_scalar";
+    bopts.k_root = 8;
+    bopts.leaf_capacity = leaf_capacity;
+    bopts.pca_dims = 16;
+    bopts.max_lloyd_passes = lloyd_passes;
+    bopts.num_threads = 4;
+    bopts.staging_bytes = staging_bytes;
+
+    sextant_filter_col_def cols[6] = {{"year", SEXTANT_COL_INT32},
+                                      {"category", SEXTANT_COL_STRING},
+                                      {"tags", SEXTANT_COL_SET},
+                                      {"lat", SEXTANT_COL_FLOAT},
+                                      {"lng", SEXTANT_COL_FLOAT},
+                                      {"flag", SEXTANT_COL_BOOL}};
+    void* b = sextant_build_begin(&bopts, kDim, cols, 6, 1, err, sizeof(err));
+    EXPECT_NE(b, nullptr) << err;
+    if (!b) return path;
+
+    for (uint32_t row = 0; row < n_rows; row += chunk) {
+        const uint32_t n = std::min(chunk, n_rows - row);
+        std::vector<int32_t> years(n);
+        std::vector<uint8_t> flags(n);
+        std::vector<const char*> strs(n);
+        std::vector<uint32_t> lens(n);
+        std::vector<std::string> keep(n);
+        std::vector<float> lats(n), lngs(n);
+        std::vector<const char*> eptr;
+        std::vector<uint32_t> elen;
+        std::vector<uint32_t> scnt(n), soff(n + 1);
+        std::vector<std::string> keep_elems;
+        std::vector<uint64_t> offs(n + 1);
+        std::vector<uint8_t> pdata;
+        for (uint32_t r = 0; r < n; ++r) {
+            const uint32_t i = row + r;
+            years[r] = year_of(i);
+            flags[r] = flag_of(i) ? 1 : 0;
+            keep[r] = category_of(i);
+            strs[r] = keep[r].data();
+            lens[r] = static_cast<uint32_t>(keep[r].size());
+            lats[r] = lat_of(i);
+            lngs[r] = lng_of(i);
+            scnt[r] = static_cast<uint32_t>(tags_of(i).size());
+            soff[r] = static_cast<uint32_t>(elen.size());
+            for (const auto& t : tags_of(i)) {
+                keep_elems.push_back(t);
+                elen.push_back(static_cast<uint32_t>(t.size()));
+            }
+            offs[r] = pdata.size();
+            const std::string blob = payload_of(i);
+            pdata.insert(pdata.end(), blob.begin(), blob.end());
+        }
+        offs[n] = pdata.size();
+        soff[n] = static_cast<uint32_t>(elen.size());
+        eptr.resize(elen.size());
+        for (size_t e = 0; e < elen.size(); ++e)
+            eptr[e] = keep_elems[e].data();
+        sextant_str_values sv{strs.data(), lens.data()};
+        sextant_set_values setv{scnt.data(), soff.data(), eptr.data(),
+                                elen.data()};
+        const void* fvals[6] = {years.data(), &sv, &setv, lats.data(),
+                                lngs.data(), flags.data()};
+        const int rc = sextant_build_push(b, data + static_cast<size_t>(row) * kDim,
+                                          n, fvals, offs.data(), pdata.data(),
+                                          err, sizeof(err));
+        if (rc != 0) {
+            ADD_FAILURE() << err;
+            sextant_build_abort(b);
+            return path;
+        }
+    }
+
+    const int rc = sextant_build_finish(b, path.c_str(), err, sizeof(err));
+    EXPECT_EQ(rc, 0) << err;
+    return path;
+}
 }  // namespace
 
 TEST_F(CApiTest, GeoPredicates) {
@@ -944,4 +1046,271 @@ TEST_F(CApiTest, GeoPredicates) {
         ASSERT_GE(boxed.size(), 10u);
         run_filtered_parity(pred, boxed);
     }
+}
+
+//===--------------------------------------------------------------------===//
+// Streaming-push staging tiers: forced spill parity incl. Bool columns
+// and multi-chunk mixed-tier builds (regression closure for the
+// CulturaX spill OOB — see build_push_index above).
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+/// Exact top-k row ids over `allowed` from raw row-major data.
+std::set<uint64_t> brute_force_topk_ids(const std::set<uint64_t>& allowed,
+                                        const float* query,
+                                        const float* data, uint32_t k) {
+    std::vector<std::pair<float, uint64_t>> scored;
+    scored.reserve(allowed.size());
+    for (uint64_t i : allowed) {
+        const float* v = data + static_cast<size_t>(i) * kDim;
+        float d = 0.0f;
+        for (uint32_t dd = 0; dd < kDim; ++dd) {
+            const float e = v[dd] - query[dd];
+            d += e * e;
+        }
+        scored.emplace_back(d, i);
+    }
+    std::sort(scored.begin(), scored.end());
+    std::set<uint64_t> out;
+    for (uint32_t i = 0; i < k && i < scored.size(); ++i)
+        out.insert(scored[i].second);
+    return out;
+}
+
+/// Exhaustive + exact-rerank filtered search: with the corpus as rerank
+/// base the result set is the deterministic top-k over `allowed`, so
+/// independently built trees must agree with it exactly.
+std::set<uint64_t> exact_topk(void* index, const float* query,
+                              const float* rerank_base,
+                              const std::vector<sextant_predicate>& preds,
+                              const std::set<uint64_t>& allowed,
+                              uint32_t k, const char* case_name = "") {
+    sextant_search_opts opts = sextant_default_search_opts();
+    opts.k = k;
+    opts.exhaustive = 1;
+    opts.rerank = 1;
+    opts.int8_scan = 0;
+    opts.exact_rerank_base = rerank_base;
+    // Exact rerank only sees the decoded-distance shortlist, and W is
+    // applied BEFORE predicates: with W = |allowed| the shortlist holds
+    // only ~|allowed|^2/N predicate-matching rows (measured: n=3 of 10
+    // on a 2000-row index with a 57-row allowed set). Size W to the
+    // full row count so exhaustive + exact rerank is the true top-k.
+    opts.fastscan_W = std::max<uint32_t>(
+        static_cast<uint32_t>(sextant_index_count(index)), k);
+    std::vector<uint64_t> ids(k);
+    std::vector<float> dists(k);
+    char err[512] = {0};
+    const int32_t n = sextant_search_filtered(
+        index, query, &opts, preds.data(),
+        static_cast<uint32_t>(preds.size()), ids.data(), dists.data(), k,
+        err, sizeof(err));
+    EXPECT_GE(n, 0) << err;
+    EXPECT_GT(n, 0);
+    for (int32_t i = 0; i < n; ++i)
+        EXPECT_NE(allowed.count(ids[i]), 0u) << "row " << ids[i] << " failed predicate";
+    std::set<uint64_t> got(ids.begin(), ids.begin() + n);
+    const auto truth = brute_force_topk_ids(allowed, query, rerank_base, k);
+    EXPECT_EQ(got, truth) << "exact-rerank top-k mismatch (" << case_name << ")";
+    return got;
+}
+
+}  // namespace
+
+// (h) Forced spill (staging_bytes = 1 → every chunk hits the spill file
+// at finish; the build's vector-only passes seek across it) must behave
+// identically to the memory tier: same count and the same deterministic
+// filtered results across a battery covering every column type incl.
+// Bool, plus identical payload round-trips.
+TEST_F(CApiTest, ForcedSpillMatchesMemoryTier) {
+    const std::string mem_path = build_push_index(
+        corpus.data.data(), "capi_spill_mem.tree", 0, kN, 700, 500, 2);
+    const std::string spill_path = build_push_index(
+        corpus.data.data(), "capi_spill_forced.tree", 1, kN, 700, 500, 2);
+
+    char err[512] = {0};
+    void* mem = sextant_open_index(mem_path.c_str(), err, sizeof(err));
+    ASSERT_NE(mem, nullptr) << err;
+    void* spill = sextant_open_index(spill_path.c_str(), err, sizeof(err));
+    ASSERT_NE(spill, nullptr) << err;
+
+    EXPECT_EQ(sextant_index_count(mem), kN);
+    EXPECT_EQ(sextant_index_count(spill), kN);
+
+    struct Case {
+        const char* name;
+        std::vector<sextant_predicate> preds;
+        std::set<uint64_t> allowed;
+    };
+    std::vector<Case> cases;
+    auto add = [&](const char* name, std::vector<sextant_predicate> preds,
+                   const std::function<bool(uint32_t)>& keep) {
+        Case c{name, std::move(preds), {}};
+        for (uint32_t i = 0; i < kN; ++i)
+            if (keep(i)) c.allowed.insert(i);
+        ASSERT_GE(c.allowed.size(), 10u) << name;
+        cases.push_back(std::move(c));
+    };
+    auto pred = [](const char* col, int op, double value) {
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = col;
+        p.op = op;
+        p.value = value;
+        return p;
+    };
+
+    add("flag=1", {pred("flag", SEXTANT_PRED_EQ, 1)},
+        [](uint32_t i) { return flag_of(i); });
+    add("flag!=1", {pred("flag", SEXTANT_PRED_NEQ, 1)},
+        [](uint32_t i) { return !flag_of(i); });
+    {
+        sextant_predicate p = pred("year", SEXTANT_PRED_BETWEEN, 2005);
+        p.value2 = 2014;
+        add("flag=1 AND year 2005..2014", {pred("flag", SEXTANT_PRED_EQ, 1), p},
+            [](uint32_t i) {
+                return flag_of(i) && i % 50 >= 5 && i % 50 <= 14;
+            });
+    }
+    {
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = "category";
+        p.op = SEXTANT_PRED_EQ;
+        p.str_value = "cat_3";
+        add("cat_3 AND flag=0",
+            {p, pred("flag", SEXTANT_PRED_EQ, 0)},
+            [](uint32_t i) { return i != 1234 && i % 10 == 3 && !flag_of(i); });
+    }
+    {
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = "tags";
+        p.op = SEXTANT_PRED_CONTAINS;
+        p.str_value = "x5";
+        add("tags∋x5 AND flag=1", {p, pred("flag", SEXTANT_PRED_EQ, 1)},
+            [](uint32_t i) { return i % 5 == 0 && flag_of(i); });
+    }
+    {
+        const double clat = 40.5, clng = -121.4, radius = 55.0;
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = "lat";
+        p.op = SEXTANT_PRED_GEO_RADIUS;
+        p.geo_lng_column = "lng";
+        p.value = clat;
+        p.value2 = clng;
+        p.radius_km = radius;
+        add("geo+flag=1", {p, pred("flag", SEXTANT_PRED_EQ, 1)}, [&](uint32_t i) {
+            return flag_of(i) &&
+                   haversine_km_test(clat, clng, lat_of(i), lng_of(i)) <= radius;
+        });
+    }
+
+    for (const auto& c : cases) {
+        for (uint32_t trial = 0; trial < 3; ++trial) {
+            const float* query = corpus.centers[trial % kClusters].data();
+            const auto got_mem =
+                exact_topk(mem, query, corpus.data.data(), c.preds, c.allowed, 10, c.name);
+            const auto got_spill =
+                exact_topk(spill, query, corpus.data.data(), c.preds, c.allowed, 10, c.name);
+            EXPECT_EQ(got_mem, got_spill) << c.name << ": memory vs spill mismatch";
+        }
+    }
+
+    // Payload round-trip parity on the spilled build.
+    {
+        sextant_search_opts opts = sextant_default_search_opts();
+        opts.k = 5;
+        opts.exhaustive = 1;
+        uint64_t ids[5];
+        float dists[5];
+        void* leafs[5];
+        uint32_t slots[5];
+        const int32_t n = sextant_search2(
+            spill, corpus.centers[0].data(), &opts, nullptr, 0, ids, dists,
+            leafs, slots, 5, err, sizeof(err));
+        ASSERT_GT(n, 0) << err;
+        for (int32_t i = 0; i < n; ++i) {
+            const std::string expected =
+                payload_of(static_cast<uint32_t>(ids[i]));
+            std::vector<uint8_t> buf(expected.size() + 1);
+            const uint32_t sized = sextant_fetch_payload(
+                spill, leafs[i], slots[i], buf.data(),
+                static_cast<uint32_t>(buf.size()));
+            EXPECT_EQ(sized, expected.size());
+            EXPECT_EQ(std::string(buf.begin(), buf.begin() + sized), expected);
+        }
+    }
+
+    sextant_close_index(mem);
+    sextant_close_index(spill);
+    std::error_code ec;
+    std::filesystem::remove(mem_path, ec);
+    std::filesystem::remove(spill_path, ec);
+}
+
+// (i) More than one sealed staging chunk (kChunkRows = 32768): chunk 1
+// seals mid-push and spills under the 1 MiB budget; the 232-row tail
+// stays in memory → mixed tiers drained spill-first at emission. The
+// build's sample/PCA/Lloyd passes reset and re-seek the spill
+// vector-only across passes (the exact CulturaX code path).
+TEST_F(CApiTest, MultiChunkSpillVectorPasses) {
+    constexpr uint32_t kBigN = 33000;  // 32768 + 232 across 4 pushes
+    std::vector<float> data(static_cast<size_t>(kBigN) * kDim);
+    {
+        std::mt19937 rng(5150);
+        std::normal_distribution<float> noise(0.0f, 0.5f);
+        for (uint32_t i = 0; i < kBigN; ++i) {
+            const uint32_t ci = i % kClusters;
+            for (uint32_t d = 0; d < kDim; ++d)
+                data[static_cast<size_t>(i) * kDim + d] =
+                    corpus.centers[ci][d] + noise(rng);
+        }
+    }
+
+    const std::string path = build_push_index(
+        data.data(), "capi_spill_multi.tree", 1 << 20, kBigN, 8250, 5000, 1);
+    char err[512] = {0};
+    void* index = sextant_open_index(path.c_str(), err, sizeof(err));
+    ASSERT_NE(index, nullptr) << err;
+    EXPECT_EQ(sextant_index_count(index), kBigN);
+
+    // Unfiltered exhaustive + exact rerank: the vector stream through
+    // the spill seeks must be intact — results are the exact top-k.
+    for (uint32_t trial = 0; trial < 2; ++trial) {
+        const float* query = corpus.centers[trial % kClusters].data();
+        std::set<uint64_t> all;
+        for (uint32_t i = 0; i < kBigN; ++i) all.insert(i);
+        const auto got = exact_topk(index, query, data.data(), {}, all, 10);
+        EXPECT_EQ(got.size(), 10u);
+    }
+
+    // Filtered parity incl. Bool over the mixed-tier build.
+    {
+        sextant_predicate fp;
+        std::memset(&fp, 0, sizeof(fp));
+        fp.column = "flag";
+        fp.op = SEXTANT_PRED_EQ;
+        fp.value = 1;
+        sextant_predicate yp;
+        std::memset(&yp, 0, sizeof(yp));
+        yp.column = "year";
+        yp.op = SEXTANT_PRED_BETWEEN;
+        yp.value = 2000;
+        yp.value2 = 2019;
+        std::set<uint64_t> allowed;
+        for (uint32_t i = 0; i < kBigN; ++i)
+            if (flag_of(i) && i % 50 <= 19) allowed.insert(i);
+        ASSERT_GE(allowed.size(), 10u);
+        for (uint32_t trial = 0; trial < 2; ++trial) {
+            const float* query = corpus.centers[trial % kClusters].data();
+            exact_topk(index, query, data.data(), {fp, yp}, allowed, 10);
+        }
+    }
+
+    sextant_close_index(index);
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
 }

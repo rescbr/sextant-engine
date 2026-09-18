@@ -56,6 +56,7 @@ test_capi_exe = executable('test_capi', 'test_capi.cpp',
     cpp_args: ['-DSEXTANT_SOURCE_DIR="' + meson.source_root() + '"'],
 )
 test('test_capi', test_capi_exe,
+     timeout: 300,  # the forced-spill suite includes a 33k-row multi-chunk build
      env: ['SEXTANT_TEST_DATA=' + meson.current_source_dir() / 'data',
            'SEXTANT_DATASETS=' + meson.current_source_dir() / '../datasets'])
 
