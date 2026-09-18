@@ -156,6 +156,9 @@ void IVFTreeIndex::plane_route_batch_(
     std::vector<float> survive;  // [qi][l] 1.0 / 0.0 (f32 for simplicity)
     if (config.plane_pre_prune > 0.0f && pca_dims_ > 0 &&
         manifest_.depth == 2 &&
+        // Exhaustive (capi opts->exhaustive → n_probe = UINT32_MAX) means
+        // probe-ALL: the survivor pre-prune must not drop leaves either.
+        config.n_probe != UINT32_MAX &&
         pca_leaf_centroids_.size() ==
             static_cast<size_t>(n_leaves) * pca_dims_) {
         std::vector<float> qp(pca_dims_);
@@ -388,6 +391,11 @@ void IVFTreeIndex::plane_route_batch_(
                 if (f <= 0.0f) f = config.probe_fraction;
                 if (f <= 0.0f) f = manifest_.probe_fraction;
                 if (f <= 0.0f) f = 0.5f;
+                // Exhaustive (n_probe = UINT32_MAX) = probe all leaves:
+                // the fraction budget must not cap the candidate set, or
+                // exact-rerank ground-truth parity fails (rows beyond the
+                // plane's top-fraction are unreachable).
+                if (config.n_probe == UINT32_MAX) f = 1.0f;
                 auto& candidates = out[static_cast<size_t>(qi)];
                 candidates.reserve(n_leaves);
                 uint64_t cum = 0;

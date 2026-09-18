@@ -1000,10 +1000,10 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
                         static_cast<uint64_t>(lc.page) * kPageSize;
                     const auto* lh =
                         reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
-                    const RowId* rids = reinterpret_cast<const RowId*>(
-                        leaf_ptr + coder_->geometry(lh).rowids_offset);
+                    const uint8_t* rids = leaf_ptr +
+                        coder_->geometry(lh).rowids_offset;
                     if (j) ids += ',';
-                    ids += std::to_string(rids[e.local_idx]);
+                    ids += std::to_string(load_rowid(rids, e.local_idx));
                 }
                 config.trace->record_fmt(
                     "FB q={} b={} child={} pages={} cum={} tot={} kth={} "
@@ -1274,9 +1274,9 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
             const LeafCandidate& c = candidates[ci];
             const uint8_t* leaf_ptr = ptrs[ci];
             const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
-            const RowId* rids = reinterpret_cast<const RowId*>(
-                leaf_ptr + coder_->geometry(lh).rowids_offset);
-            hf.push_back({e.pq_dist, rids[e.local_idx], leaf_ptr,
+            const uint8_t* rids = leaf_ptr +
+                coder_->geometry(lh).rowids_offset;
+            hf.push_back({e.pq_dist, load_rowid(rids, e.local_idx), leaf_ptr,
                           mmap_base_ + static_cast<uint64_t>(c.page) * kPageSize,
                           e.local_idx});
         }
@@ -1785,9 +1785,9 @@ void IVFTreeIndex::finalize_query_(const float* query, uint32_t k,
             const LeafCandidate& c = candidates[ci];
             const uint8_t* leaf_ptr = ptrs[ci];
             const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf_ptr);
-            const RowId* rids = reinterpret_cast<const RowId*>(
-                leaf_ptr + coder_->geometry(lh).rowids_offset);
-            hf.push_back({e.pq_dist, rids[e.local_idx], leaf_ptr,
+            const uint8_t* rids = leaf_ptr +
+                coder_->geometry(lh).rowids_offset;
+            hf.push_back({e.pq_dist, load_rowid(rids, e.local_idx), leaf_ptr,
                           mmap_base_ + static_cast<uint64_t>(c.page) * kPageSize,
                           e.local_idx});
         }
@@ -2001,12 +2001,69 @@ void IVFTreeIndex::search_batch(
                 }
                 if (s.plane_done) {
                     // Candidates + routing_ns came from the Phase 0
-                    // batched plane sweep. Same W policy as the Ok path
-                    // (plane queries are predicate-free here).
-                    s.W = std::max(
+                    // batched plane sweep. Mirror the SOLO plane path
+                    // (route phase) for predicate queries: resolve
+                    // predicate columns, summary-prune the plane
+                    // candidates, and trigger the extreme-low-selectivity
+                    // brute-force fallback. Without this, s.pred_col_indices
+                    // stays empty and the sweep harvest's
+                    // eval_all_predicates subscripts it (SIGSEGV), and plane
+                    // candidates reach the scan unpruned (solo/batch
+                    // candidate-set divergence).
+                    uint32_t W = std::max(
                         config.fastscan_W > 0 ? config.fastscan_W : 1000u,
                         k);
-                    continue;  // releaseLeafPins no-op (no pins taken)
+                    if (!qcfg.predicates.empty()) {
+                        if (!resolve_pred_columns_(
+                                qcfg, s.pred_col_indices,
+                                s.geo_lng_col_indices)) {
+                            s.candidates.clear();  // unknown predicate col
+                        } else {
+                            const float sel = card_table_.empty()
+                                ? 1.0f
+                                : card_table_.selectivity_combined(
+                                      manifest_.schema, qcfg.predicates,
+                                      s.pred_col_indices,
+                                      s.geo_lng_col_indices);
+                            if (sel > 0.0f && sel < 0.01f) {
+                                s.fallback = true;
+                            } else {
+                                std::vector<LeafCandidate> pruned;
+                                pruned.reserve(s.candidates.size());
+                                for (const auto& cand : s.candidates) {
+                                    if (cand.page == kInvalidPage) continue;
+                                    LeafExtentCache::Handle h;
+                                    const uint8_t* leaf_ptr = pin_leaf_(
+                                        cand.page,
+                                        static_cast<uint32_t>(cand.pages),
+                                        h);
+                                    if (h.entry) rscratch.pins.push_back(h);
+                                    const uint8_t* summary =
+                                        leaf_ptr + leaf_filter_offset();
+                                    if (summary_may_match(
+                                            summary, manifest_.summary_size,
+                                            manifest_.schema,
+                                            qcfg.predicates,
+                                            s.pred_col_indices,
+                                            s.geo_lng_col_indices))
+                                        pruned.push_back(cand);
+                                }
+                                s.candidates = std::move(pruned);
+                                // Adaptive W: same policy as the Ok path.
+                                constexpr float kOverscan = 2.0f;
+                                const uint32_t adaptive_w =
+                                    sel > 0.001f
+                                        ? static_cast<uint32_t>(
+                                              static_cast<float>(k) / sel *
+                                              kOverscan)
+                                        : k * 200u;
+                                W = std::max(W, adaptive_w);
+                                W = std::max(W, k * 10u);  // floor
+                            }
+                        }
+                    }
+                    s.W = W;
+                    continue;  // pins released below with route pins
                 }
                 const auto tr0 = std::chrono::steady_clock::now();
                 const RouteStatus st =
@@ -2298,10 +2355,9 @@ void IVFTreeIndex::search_batch(
                                        const ProbeRef& fr) {
                         const auto* lh = reinterpret_cast<
                             const TreeLeafHeader*>(leaf_ptr);
-                        const RowId* rids =
-                            reinterpret_cast<const RowId*>(
-                                leaf_ptr +
-                                coder_->geometry(lh).rowids_offset);
+                        const uint8_t* rids =
+                            leaf_ptr +
+                            coder_->geometry(lh).rowids_offset;
                         const bool has_preds = !s.predicates->empty();
                         for (const auto& e : p->heap) {
                             if (e.leaf_slot != fr.slot) continue;
@@ -2313,7 +2369,7 @@ void IVFTreeIndex::search_batch(
                             pe.pq_dist = e.pq_dist;
                             pe.leaf_slot = e.leaf_slot;
                             pe.local_idx = e.local_idx;
-                            pe.row_id = rids[e.local_idx];
+                            pe.row_id = load_rowid(rids, e.local_idx);
                             pe.dist = 0.0f;
                             pe.reranked = false;
                             pe.pred_ok = true;
@@ -2636,14 +2692,14 @@ std::vector<Candidate> IVFTreeIndex::search_brute_force_filtered(
             float dist;
             if (config.exact_rerank_base) {
                 const float* v = config.exact_rerank_base +
-                    static_cast<size_t>(layout.row_ids[i]) * manifest_.dim;
+                    static_cast<size_t>(load_rowid(layout.row_ids_base, i)) * manifest_.dim;
                 dist = (metric == MetricKind::InnerProduct)
                            ? -simd::dot_f32(query, v, manifest_.dim)
                            : simd::l2sq_f32(query, v, manifest_.dim);
             } else {
                 dist = coder_->rerank(query, leaf_ptr, i, nullptr);
             }
-            results_loc.push_back({{layout.row_ids[i], dist}, leaf_ptr, i});
+            results_loc.push_back({{load_rowid(layout.row_ids_base, i), dist}, leaf_ptr, i});
         }
     }
 

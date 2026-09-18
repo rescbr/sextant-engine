@@ -33,6 +33,11 @@
 #ifndef CTPL_H_INCLUDED
 #define CTPL_H_INCLUDED
 
+#if defined(__SANITIZE_ADDRESS__)
+#include <sanitizer/lsan_interface.h>  // __lsan_disable: TLS tags are
+                                       // deliberately never freed (below)
+#endif
+
 #include <functional>
 #include <thread>
 #include <atomic>
@@ -276,9 +281,19 @@ namespace ctpl {
                 // If no init function was provided, default-construct the TLS
                 // so the dereference below is never UB on a null shared_ptr.
                 if (!tls_ptr_ref) {
+                    // Pool threads park forever (the pool is deliberately
+                    // never destroyed — see scan_pool.cpp), so this
+                    // allocation is never released. Mark it as an
+                    // intentional leak or LeakSanitizer fails the test
+                    // binary at exit.
+#if defined(__SANITIZE_ADDRESS__)
+                    __lsan_disable();
+#endif
                     tls_ptr_ref = std::make_shared<TLS>();
-                }
-                TLS& tls = *tls_ptr_ref;
+#if defined(__SANITIZE_ADDRESS__)
+                    __lsan_enable();
+#endif
+                }                TLS& tls = *tls_ptr_ref;
 
                 base_func_type * _f = nullptr;
                 bool more_tasks = m_queue.pop(_f);

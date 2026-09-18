@@ -11,6 +11,7 @@
 #include <cstring>
 #include <numeric>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace sextant::tree {
@@ -155,9 +156,13 @@ void LeafExtentCache::Shard::release_buf(uint8_t* buf, uint64_t cap) {
 LeafExtentCache::Shard::~Shard() {
     // Engine shutdown: live entries (refs ignored — no searchers remain) and
     // pooled buffers all go back to the heap. Multi-key (run) entries appear
-    // once per alias in the map — the `deleted` claim flag dedups.
+    // once per alias in the map — dedupe BEFORE touching the Entry: the
+    // `deleted` claim flag lives on the entry itself, so reading it after a
+    // prior iteration freed that entry is a use-after-free.
+    std::unordered_set<Entry*> freed;
     for (auto& [page, e] : map) {
         (void)page;
+        if (!freed.insert(e).second) continue;
         bool expected = false;
         if (!e->deleted.compare_exchange_strong(expected, true)) continue;
         delete[] e->data;
@@ -622,8 +627,13 @@ void LeafExtentCache::invalidate_all() {
     for (auto& sp : shards_) {
         Shard& s = *sp;
         ScopedWriteLock lock(s.mu);
+        // Alias-merged run entries appear under MULTIPLE map keys. The
+        // first occurrence retires + frees the Entry (refs==0 under the
+        // shard lock); later keys must not touch the freed Entry — dedupe.
+        std::unordered_set<Entry*> seen;
         for (auto& [page, e] : s.map) {
             (void)page;
+            if (!seen.insert(e).second) continue;
             // Multi-key (run) entries appear once per key — retire only once.
             if (e->retired.load(std::memory_order_relaxed)) continue;
             switch (e->status) {

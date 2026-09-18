@@ -22,8 +22,7 @@ LeafFilterLayout LeafFilterLayout::compute(const uint8_t* leaf_ptr, uint16_t m4,
     l.block_bytes = m4 * 16;
     l.n_blocks = (l.count + l.codes_per_block - 1) / l.codes_per_block;
     l.codes = leaf_ptr + leaf_codes_offset(summary_size);
-    l.row_ids = reinterpret_cast<const RowId*>(
-        leaf_ptr + leaf_rowids_offset(summary_size, l.n_blocks, l.block_bytes));
+    l.row_ids_base = leaf_ptr + leaf_rowids_offset(summary_size, l.n_blocks, l.block_bytes);
     l.filter_base = leaf_ptr + leaf_rowids_offset(summary_size, l.n_blocks,
                                                      l.block_bytes)
                      + static_cast<uint64_t>(l.count) * sizeof(RowId);
@@ -40,7 +39,7 @@ LeafFilterLayout LeafFilterLayout::from_geometry(
     l.block_bytes = lh->m4 * 16;
     l.n_blocks = (l.count + l.codes_per_block - 1) / l.codes_per_block;
     l.codes = leaf_ptr + geo.codes_offset;
-    l.row_ids = reinterpret_cast<const RowId*>(leaf_ptr + geo.rowids_offset);
+    l.row_ids_base = leaf_ptr + geo.rowids_offset;
     l.filter_base = leaf_ptr + geo.filter_offset;
     return l;
 }

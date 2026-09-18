@@ -16,27 +16,18 @@ namespace sextant::tree {
 
 namespace {
 
-constexpr size_t kHllBytes = (ColumnCardinality::kHllRegs * 6 + 7) / 8;  // 3072
+// One byte per register (kHllRegs bytes): ranks max out at kHllPadding+1
+// (21), so a byte is plenty. Earlier this was 6-bit-packed (3072 B) to
+// save 1 KB per string column of build-time RAM — never serialized, so
+// the saving bought only bit-twiddling and an OOB on the last register.
+constexpr size_t kHllBytes = ColumnCardinality::kHllRegs;
 
 inline uint8_t hll_get(const std::vector<uint8_t>& p, uint32_t i) {
-    const uint64_t bit = static_cast<uint64_t>(i) * 6;
-    const size_t byte = bit >> 3;
-    const uint32_t shift = bit & 7;
-    const uint32_t v = static_cast<uint32_t>(p[byte]) |
-                       (static_cast<uint32_t>(p[byte + 1]) << 8);
-    return static_cast<uint8_t>((v >> shift) & 63);
+    return p[i];
 }
 
 inline void hll_set(std::vector<uint8_t>& p, uint32_t i, uint8_t r) {
-    const uint64_t bit = static_cast<uint64_t>(i) * 6;
-    const size_t byte = bit >> 3;
-    const uint32_t shift = bit & 7;
-    const uint32_t mask = 63u << shift;
-    uint32_t v = static_cast<uint32_t>(p[byte]) |
-                 (static_cast<uint32_t>(p[byte + 1]) << 8);
-    v = (v & ~mask) | (static_cast<uint32_t>(r) << shift);
-    p[byte] = static_cast<uint8_t>(v);
-    p[byte + 1] = static_cast<uint8_t>(v >> 8);
+    p[i] = r;
 }
 
 inline uint32_t sat_inc(uint32_t v) { return v == UINT32_MAX ? v : v + 1; }

@@ -188,12 +188,29 @@ inline uint32_t leaf_filter_offset() {
 }
 
 /// Byte offset of the first FastScan code block within a leaf.
-/// Aligned to 8 bytes so that subsequent row_ids and filter column arrays
-/// (which use reinterpret_cast<const RowId*> etc.) are naturally aligned.
+/// Aligned to 8 bytes. NOTE: this does NOT make the downstream row_ids
+/// array aligned for every family — the scalar leaf layouts size the
+/// codes region as count*code_size, which can leave rowids_offset at
+/// 4-mod-8. Use load_rowid() for all row_ids reads.
 inline uint64_t leaf_codes_offset(uint32_t summary_size) {
     constexpr uint64_t align = 8;
     const uint64_t raw = sizeof(TreeLeafHeader) + summary_size;
     return (raw + align - 1) & ~(align - 1);
+}
+
+/// Alignment-safe load of row_ids[i] from an on-disk leaf buffer. The
+/// row_ids array is not guaranteed 8-aligned (see leaf_codes_offset),
+/// so typed RowId loads/stores there are UB under UBSAN. Compiles to the
+/// same single mov on x86/ARM when the pointer happens to be aligned.
+inline RowId load_rowid(const uint8_t* rowids_base, uint64_t i) {
+    RowId v;
+    std::memcpy(&v, rowids_base + i * sizeof(RowId), sizeof(v));
+    return v;
+}
+
+/// Alignment-safe counterpart for writes (e.g. leaf compaction).
+inline void store_rowid(uint8_t* rowids_base, uint64_t i, RowId v) {
+    std::memcpy(rowids_base + i * sizeof(RowId), &v, sizeof(v));
 }
 
 /// Byte offset of the row_ids array within a leaf.

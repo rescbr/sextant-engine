@@ -276,7 +276,9 @@ bool staged_parse(const uint8_t* rec, uint32_t rec_len, StagedRow& out,
         uint32_t n; std::memcpy(&n, p, 4); p += 4;
         if (n % 2) { err = "fp16 vector has odd byte length"; return false; }
         if (!need(n)) return false;
-        out.fp16_vec = reinterpret_cast<const float16_t*>(p);
+        // Untyped: the record is byte-packed and this field can sit at an
+        // ODD offset — a typed float16_t* here invites misaligned derefs.
+        out.fp16_vec = p;
         out.fp16_vec_bytes = n; p += n;
     }
     if (out.flags & kStagedHasIpBias) {

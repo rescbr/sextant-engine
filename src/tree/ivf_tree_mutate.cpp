@@ -496,8 +496,7 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
     }
 
     // 5. Read old row_ids + filter column data (if present).
-    const RowId* old_rids = reinterpret_cast<const RowId*>(
-        old_buf.data() + old_geo.rowids_offset);
+    const uint8_t* old_rids = old_buf.data() + old_geo.rowids_offset;
     const bool has_filter = manifest_.schema.n_filter_columns() > 0;
     std::vector<ColumnData> old_filter_cols;
     if (has_filter) {
@@ -561,7 +560,7 @@ uint32_t IVFTreeIndex::split_leaf_(uint32_t leaf_id, PageAllocator& alloc) {
             gin.src_biases = gbiases.data();
         }
         std::vector<RowId> grids(gc);
-        for (uint32_t i = 0; i < gc; ++i) grids[i] = old_rids[group[i]];
+        for (uint32_t i = 0; i < gc; ++i) grids[i] = load_rowid(old_rids, group[i]);
         gin.row_ids = grids.data();
 
         // Family-owned re-encode: per-leaf state + codes (+ biases) +
@@ -1014,13 +1013,13 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
             auto* nlh0 = reinterpret_cast<TreeLeafHeader*>(nb.data());
             nlh0->count = new_count;
             const LeafGeometry new_geo = coder_->geometry(nlh0);
-            RowId* nrid = reinterpret_cast<RowId*>(
-                nb.data() + new_geo.rowids_offset);
+            uint8_t* nrid = nb.data() + new_geo.rowids_offset;
             std::memcpy(nrid,
                         buf.data() + old_geo.rowids_offset,
                         old_count * sizeof(RowId));
             for (uint32_t ai = 0; ai < indices.size(); ++ai)
-                nrid[old_count + ai] = points[indices[ai]].row_id;
+                store_rowid(nrid, old_count + ai,
+                            points[indices[ai]].row_id);
         }
 
         // --- Rebuild filter column data ---
@@ -1352,10 +1351,10 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
         const auto* lh = reinterpret_cast<const TreeLeafHeader*>(buf.data());
         const uint32_t count = static_cast<uint32_t>(lh->count);
         if (count == 0) continue;
-        const RowId* rids = reinterpret_cast<const RowId*>(
-            buf.data() + coder_->geometry(lh).rowids_offset);
+        const uint8_t* rids = buf.data() +
+            coder_->geometry(lh).rowids_offset;
         for (uint32_t s = 0; s < count; ++s) {
-            auto it = row_to_leaf_slot.find(rids[s]);
+            auto it = row_to_leaf_slot.find(load_rowid(rids, s));
             if (it != row_to_leaf_slot.end()) {
                 it->second = {lid, s};
                 leaf_deletes[lid].push_back(s);
@@ -1432,12 +1431,11 @@ void IVFTreeIndex::delete_batch(const std::vector<RowId>& row_ids) {
 
         // --- Rebuild row_ids ---
         const LeafGeometry new_geo = coder_->geometry(nlh);
-        RowId* nrid = reinterpret_cast<RowId*>(
-            nb_buf.data() + new_geo.rowids_offset);
+        uint8_t* nrid = nb_buf.data() + new_geo.rowids_offset;
         for (uint32_t i = 0; i < new_count; ++i)
-            nrid[i] = *reinterpret_cast<const RowId*>(
-                buf.data() + old_geo.rowids_offset +
-                survivors[i] * sizeof(RowId));
+            store_rowid(nrid, i,
+                        load_rowid(buf.data() + old_geo.rowids_offset,
+                                   survivors[i]));
 
         // --- Compact filter column data (remove deleted rows) ---
         if (old_filter_bytes > 0) {

@@ -141,7 +141,7 @@ struct ColumnCardinality {
     static constexpr uint32_t kHllBits = 12;
     static constexpr uint32_t kHllRegs = 1u << kHllBits;  // 4096
     static constexpr uint32_t kHllPadding = 32 - kHllBits;  // bits left after the index
-    std::vector<uint8_t> hll;  // packed 6-bit registers; empty until first add
+    std::vector<uint8_t> hll;  // one byte per register; empty until first add
 
     /// Current distinct estimate: HLL if it has data, else the value stored
     /// at deserialize time, else the exact freq-map size.

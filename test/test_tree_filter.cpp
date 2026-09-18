@@ -1133,8 +1133,11 @@ ColumnView make_float_view(const std::vector<float>& vals) {
     ColumnView v;
     v.type = ColumnType::Float;
     v.fixed_width = 4;
-    // Persist the data: leak intentionally (test-only, process-exit reclaims).
-    auto* buf = new float[vals.size()];
+    // Persist the data for the returned view's lifetime: park the buffer
+    // in a process-lifetime pool (a bare leak fails LeakSanitizer).
+    static std::vector<std::unique_ptr<float[]>> pool;
+    pool.push_back(std::make_unique<float[]>(vals.size()));
+    float* buf = pool.back().get();
     std::memcpy(buf, vals.data(), vals.size() * sizeof(float));
     v.fixed_base = reinterpret_cast<const uint8_t*>(buf);
     return v;

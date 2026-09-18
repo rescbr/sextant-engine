@@ -73,7 +73,14 @@ void LocalScalarCoder::encode_one(const float* x, uint16_t dim,
     for (uint16_t d = 0; d < dim; ++d) {
         const float lo_d = static_cast<float>(lo[d]);
         const float st_d = static_cast<float>(steps[d]);
-        int c = static_cast<int>((x[d] - lo_d) / st_d + 0.5f);
+        const float t = (x[d] - lo_d) / st_d + 0.5f;
+        // Degenerate levels (zero/negative step, NaN data — e.g. the
+        // abort-path builds) must not reach the int cast: NaN/±inf → int
+        // is UB. Saturate instead; the clamp below then no-ops.
+        int c = std::isnan(t) ? 0
+              : t >= 15.f    ? 15
+              : t <= 0.f     ? 0
+                             : static_cast<int>(t);
         c = std::clamp(c, 0, 15);
         const float r = lo_d + st_d * c;
         sx += static_cast<double>(x[d]) * x[d];

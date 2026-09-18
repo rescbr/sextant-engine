@@ -72,7 +72,9 @@ struct StagedRow {
     uint16_t flags = 0;
     const uint8_t* code = nullptr;      // code bytes or null
     uint32_t code_len = 0;
-    const float16_t* fp16_vec = nullptr;  // dim floats or null
+    const uint8_t* fp16_vec = nullptr;    // dim halves, BYTE-PACKED at an
+                                           // arbitrary (possibly odd) record
+                                           // offset — copy with memcpy only
     uint32_t fp16_vec_bytes = 0;
     bool has_ip_bias = false;
     float16_t ip_bias{1.0f};

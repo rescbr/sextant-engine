@@ -200,12 +200,17 @@ TEST(ShardedLRU, BufferPoolRecycles) {
     EXPECT_LE(pool.free_count(), 4u)
         << "pool should not accumulate leaked buffers under churn";
 
-    // Drain anything left so the pool destructor frees cleanly.
-    while (pool.free_count() > 0) {
-        uint8_t* p = pool.acquire();
-        // Every drained buffer must be one the pool originally handed out.
+    // Drain anything left so the pool destructor frees cleanly. Acquire
+    // everything out, sanity-check, then hand the buffers BACK — the pool
+    // destructor frees its free_list_ (a bare acquire-loop leaks the last
+    // buffer: it sits live in `p`, outside both the pool and the shard).
+    std::vector<uint8_t*> drained;
+    while (pool.free_count() > 0)
+        drained.push_back(pool.acquire());
+    for (uint8_t* p : drained)
         EXPECT_NE(nullptr, p);
-    }
+    for (uint8_t* p : drained)
+        pool.release(p);
 }
 
 }  // namespace

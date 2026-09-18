@@ -60,7 +60,8 @@ struct LeafFilterLayout {
 
     // Pointers into the mmap'd leaf (all relative to leaf_ptr):
     const uint8_t* codes = nullptr;
-    const RowId*   row_ids = nullptr;
+    const uint8_t* row_ids_base = nullptr;  // NOT 8-aligned for scalar
+                                               // leaves — use load_rowid()
     // Filter column data starts after row_ids.
     const uint8_t* filter_base = nullptr;
 

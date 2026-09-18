@@ -416,9 +416,10 @@ std::vector<RowId> IVFTreeIndex::debug_leaf_row_ids(uint32_t leaf_id) const {
     if (count == 0) return {};
 
     // row_ids sit after the codes region; the offsets are family-owned.
-    const RowId* rids = reinterpret_cast<const RowId*>(
-        leaf_ptr + coder_->geometry(lh).rowids_offset);
-    return std::vector<RowId>(rids, rids + count);
+    const uint8_t* rids = leaf_ptr + coder_->geometry(lh).rowids_offset;
+    std::vector<RowId> out(count);
+    for (uint64_t i = 0; i < count; ++i) out[i] = load_rowid(rids, i);
+    return out;
 }
 
 // ===========================================================================

@@ -1300,9 +1300,15 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             if (row.code)
                 buf.codes.insert(buf.codes.end(), row.code,
                                  row.code + row.code_len);
-            if (row.fp16_vec)
-                buf.fp16_vecs.insert(buf.fp16_vecs.end(), row.fp16_vec,
-                                     row.fp16_vec + row.fp16_vec_bytes / 2);
+            if (row.fp16_vec) {
+                // Staged records pack fields at byte granularity — the fp16
+                // vector can sit at an ODD offset, so a typed insert would
+                // be UB (misaligned half copies under UBSAN). Byte-copy.
+                const size_t prev = buf.fp16_vecs.size();
+                buf.fp16_vecs.resize(prev + row.fp16_vec_bytes / 2);
+                std::memcpy(buf.fp16_vecs.data() + prev, row.fp16_vec,
+                            row.fp16_vec_bytes);
+            }
             if (row.has_ip_bias)
                 buf.ip_biases.push_back(row.ip_bias);
             buf.row_ids.push_back(row.row_id);
@@ -1444,8 +1450,10 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         fin.summary_size = summary_size;
         const uint64_t rowids_off = ctx.coder->flush_leaf(fin, obuf.data());
 
-        RowId* rids = reinterpret_cast<RowId*>(obuf.data() + rowids_off);
-        std::memcpy(rids, buf.row_ids.data(), count * sizeof(RowId));
+        // Byte-copy: scalar-family leaves can place row_ids at a 4-mod-8
+        // offset, so a typed RowId* here is UB (misaligned store).
+        std::memcpy(obuf.data() + rowids_off, buf.row_ids.data(),
+                    count * sizeof(RowId));
 
         // Phase C: filter column data region (after row_ids). This must
         // match LeafFilterLayout::compute's filter_base offset.
