@@ -12,6 +12,7 @@
 namespace sextant::tree {
 
 using coders::lloyd_split_f32;
+using coders::scalar_expand_codes;
 using coders::scalar_scan_leaf;
 using coders::scalar_scan_leaf_batch;
 using coders::ScalarScanCtx;
@@ -325,6 +326,48 @@ void ScalarLmCoder::scan_leaf_batch(const ScanSetup* const setups[4],
     }
     // The kernel touches all 4 ctx slots: pad with the last valid one
     // (its pad-row dots are computed but never pushed).
+    for (uint32_t q = n; q < 4; ++q) c4[q] = c4[n - 1];
+    scalar_scan_leaf_batch(c4, n, heaps);
+}
+
+uint32_t ScalarLmCoder::expand_leaf_codes(const uint8_t* leaf,
+                                          uint8_t* out) const {
+    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
+    if (lh->count == 0) return 0;
+    const bool shaped =
+        quantizer_->arithmetic_scan() && !quantizer_->is_uniform();
+    return scalar_expand_codes(
+        leaf + leaf_codes_offset(lh->summary_size), lh->count,
+        quantizer_->code_size(), params_.dim, shaped,
+        shaped ? quantizer_->shape_u8() : nullptr, out);
+}
+
+void ScalarLmCoder::scan_leaf_batch_expanded(
+        const ScanSetup* const setups[4], const uint8_t* leaf,
+        const uint8_t* expanded_codes, uint32_t expanded_stride,
+        RawScanHeap* const heaps[4], uint32_t n) {
+    const auto* lh = reinterpret_cast<const TreeLeafHeader*>(leaf);
+    if (lh->count == 0) return;
+    // The expanded kernel is i8-only; any non-i8 setup (or shape mismatch
+    // vs the baked g-map) takes the packed path — identical results.
+    for (uint32_t q = 0; q < n; ++q) {
+        const auto& s = static_cast<const Setup&>(*setups[q]);
+        if (!s.i8_mode) {
+            scan_leaf_batch(setups, leaf, heaps, n);
+            return;
+        }
+    }
+    ScalarScanCtx ctxs[4];
+    const ScalarScanCtx* c4[4];
+    for (uint32_t q = 0; q < n; ++q) {
+        ctxs[q] = make_scan_ctx(*setups[q], leaf);
+        // Swap in the staged rows; ip_bias keeps addressing the PACKED
+        // leaf (make_scan_ctx computed it before this override).
+        ctxs[q].codes = expanded_codes;
+        ctxs[q].cs = expanded_stride;
+        ctxs[q].expanded = true;
+        c4[q] = &ctxs[q];
+    }
     for (uint32_t q = n; q < 4; ++q) c4[q] = c4[n - 1];
     scalar_scan_leaf_batch(c4, n, heaps);
 }

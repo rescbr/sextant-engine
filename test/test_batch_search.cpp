@@ -162,6 +162,67 @@ void expect_same_results(const std::vector<sextant::Candidate>& a,
 // Result equivalence vs per-query search().
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Sweep-local expanded staging (scalar families): forcing
+// batch_expand_min_refs=0 routes every batchable leaf through the
+// expanded 1B/dim scratch + pure-dot kernel (NEON dot stream on ARM,
+// portable scalar twin on x86). Results must be IDENTICAL to the packed
+// path — expansion is a pure layout change with bit-exact kernels (see
+// test_dots4_kernel's Expanded* tests).
+// ---------------------------------------------------------------------------
+
+TEST(BatchSearch, ExpandedStagingMatchesPacked) {
+    const auto dir =
+        std::filesystem::temp_directory_path() / "batch_expand_int";
+    std::filesystem::create_directories(dir);
+    const uint32_t dim = 32;
+    const std::string base =
+        write_test_fbin((dir / "base.fbin").string(), 4000, dim, 8, 23);
+    const std::string tree = (dir / "tree").string();
+    sextant::FbinSource s(base);
+    sextant::tree::IVFTreeIndex::BuildConfig cfg;
+    cfg.k_root = 4;
+    cfg.leaf_capacity = 800;
+    cfg.pca_dims = 0;
+    cfg.num_threads = 2;
+    cfg.closure_multiplier = 0.0f;
+    cfg.params.quantizer_type = "scalar_lloydmax";
+    sextant::tree::IVFTreeIndex::build_streaming_pca(s, tree, cfg);
+
+    auto idx = sextant::tree::IVFTreeIndex::open(tree);
+    auto sc = base_config();
+    sc.search_threads = 1;  // bit-exact comparison needs the serial paths
+    // Queries near the 8 cluster centers → overlapping probe sets, so the
+    // sweep sees multi-query fanout per leaf (the staging regime).
+    std::mt19937 rng(5);
+    const uint32_t nq = 24;
+    std::vector<float> queries(static_cast<size_t>(nq) * dim);
+    for (uint32_t i = 0; i < nq; ++i)
+        for (uint32_t d = 0; d < dim; ++d)
+            queries[static_cast<size_t>(i) * dim + d] =
+                std::uniform_real_distribution(-0.1f, 0.1f)(rng) +
+                (i % 2 ? 0.6f : -0.6f);
+
+    std::vector<std::vector<sextant::Candidate>> packed;
+    idx->search_batch(queries.data(), nq, 10, sc, packed);
+    ASSERT_EQ(packed.size(), nq);
+
+    auto scx = sc;
+    scx.batch_expand_min_refs = 0;  // force staged expansion
+    std::vector<std::vector<sextant::Candidate>> expanded;
+    idx->search_batch(queries.data(), nq, 10, scx, expanded);
+    ASSERT_EQ(expanded.size(), nq);
+
+    for (uint32_t i = 0; i < nq; ++i) {
+        ASSERT_FALSE(packed[i].empty());
+        expect_same_results(packed[i], expanded[i], /*exact_order=*/true);
+        const auto single = idx->search(
+            queries.data() + static_cast<size_t>(i) * dim, 10, sc);
+        expect_same_results(single, expanded[i], /*exact_order=*/true);
+    }
+    std::filesystem::remove_all(dir);
+}
+
 TEST(BatchSearch, BatchOfOneMatchesSearchExactly) {
     const auto& fx = fixture();
     auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);

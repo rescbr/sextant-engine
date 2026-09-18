@@ -228,6 +228,93 @@ TEST(Dots4Kernel, Q4KernelVsFourSingles) {
                     expect_match(kq[q][v], singles[q][v], exact);
         }
 }
+// Sweep-local expanded staging: the expanded q4 kernel (1B/dim, g-map
+// baked, tail lanes zeroed) must reproduce the packed _ref exactly —
+// integer-only everywhere (the portable scalar twin mirrors the _ref
+// float epilogue verbatim), so this is bit-exact on every host.
+TEST(Dots4Kernel, ExpandedKernelVsRef) {
+    for (uint32_t dim : kDims)
+        for (int mode : {1, 2})
+            for (bool shaped : {false, true}) {
+                std::mt19937 rng(dim * 3571 + mode * 19 + shaped);
+                Fixture f0 = make_fixture(rng, dim, mode, shaped,
+                                          1.0f / 100.0f);
+                std::vector<Fixture> fx;
+                fx.push_back(std::move(f0));
+                for (int q = 1; q < 4; ++q)
+                    fx.push_back(make_fixture(rng, dim, mode, shaped,
+                                              1.0f / (100.0f + q),
+                                              fx[0].shape.data()));
+                // Expand the shared packed rows once (count=4 rows).
+                std::vector<uint8_t> exp(
+                    static_cast<size_t>(4) * ((dim + 15) / 16 * 16));
+                const uint32_t stride = scalar_expand_codes(
+                    fx[0].codes.data(), 4, fx[0].c.cs, dim, shaped,
+                    shaped ? fx[0].shape.data() : nullptr, exp.data());
+                const uint8_t* ecp[4];
+                for (int v = 0; v < 4; ++v) ecp[v] = exp.data() + v * stride;
+                const ScalarScanCtx* c4[4] = {&fx[0].c, &fx[1].c, &fx[2].c,
+                                              &fx[3].c};
+                float kq[4][4];
+                scalar_i8_dots4_q4_expanded(c4, ecp, kq);
+                for (int q = 0; q < 4; ++q) {
+                    float rd[4];
+                    const uint8_t* cp[4];
+                    row_ptrs(fx[0], cp);
+                    scalar_i8_dots4_ref(fx[q].c, cp, rd);
+                    for (int v = 0; v < 4; ++v)
+                        EXPECT_EQ(kq[q][v], rd[v])
+                            << "dim=" << dim << " mode=" << mode
+                            << " shaped=" << shaped << " q=" << q
+                            << " v=" << v;
+                }
+            }
+}
+
+// Expanded vs PACKED q4: same values either way (tolerance only where a
+// compiled path finishes in float: the AVX-512 float tail, and its mode-2
+// epilogue's 1/127f reciprocal multiply vs the twin's /127.0f division).
+TEST(Dots4Kernel, ExpandedVsPackedQ4) {
+#if defined(SEXTANT_HAS_NEON_DOTSCAN)
+    const bool lo_epilogue_exact = true;   // integer through the tail
+#elif defined(SEXTANT_HAS_AVX512_SCAN)
+    const bool lo_epilogue_exact = false;  // 1/127f reciprocal, last-ulp
+#else
+    const bool lo_epilogue_exact = true;
+#endif
+    for (uint32_t dim : kDims)
+        for (int mode : {1, 2})
+            for (bool shaped : {false, true}) {
+                std::mt19937 rng(dim * 7919 + mode * 23 + shaped);
+                Fixture f0 = make_fixture(rng, dim, mode, shaped,
+                                          1.0f / 100.0f);
+                std::vector<Fixture> fx;
+                fx.push_back(std::move(f0));
+                for (int q = 1; q < 4; ++q)
+                    fx.push_back(make_fixture(rng, dim, mode, shaped,
+                                              1.0f / (100.0f + q),
+                                              fx[0].shape.data()));
+                std::vector<uint8_t> exp(
+                    static_cast<size_t>(4) * ((dim + 15) / 16 * 16));
+                const uint32_t stride = scalar_expand_codes(
+                    fx[0].codes.data(), 4, fx[0].c.cs, dim, shaped,
+                    shaped ? fx[0].shape.data() : nullptr, exp.data());
+                const uint8_t* ecp[4];
+                for (int v = 0; v < 4; ++v) ecp[v] = exp.data() + v * stride;
+                const uint8_t* cp[4];
+                row_ptrs(fx[0], cp);
+                const ScalarScanCtx* c4[4] = {&fx[0].c, &fx[1].c, &fx[2].c,
+                                              &fx[3].c};
+                float packed[4][4], expanded[4][4];
+                scalar_i8_dots4_q4(c4, cp, packed);
+                scalar_i8_dots4_q4_expanded(c4, ecp, expanded);
+                const bool exact = tail_exact(dim)
+                    && (mode == 1 || lo_epilogue_exact);
+                for (int q = 0; q < 4; ++q)
+                    for (int v = 0; v < 4; ++v)
+                        expect_match(expanded[q][v], packed[q][v], exact);
+            }
+}
 #endif  // fast path present
 
 }  // namespace

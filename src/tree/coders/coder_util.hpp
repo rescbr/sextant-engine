@@ -198,6 +198,12 @@ struct ScalarScanCtx {
     const uint8_t* codes = nullptr;   // flat code rows
     uint32_t count = 0;
     uint32_t cs = 0;                  // bytes per code row
+    // Sweep-local expanded staging (ARM value): when true, `codes` points
+    // at PRE-EXPANDED 1-byte-per-dim rows (g-map already baked by
+    // scalar_expand_codes, tail lanes zero) and `cs` is the expanded row
+    // stride. Only the i8 kernels honor it; ip_bias keeps pointing into
+    // the PACKED leaf (it is addressed separately from codes).
+    bool expanded = false;
     const float16_t* ip_bias = nullptr;  // count entries or null
     // Query transform (arith kernels)
     const float* a_uni = nullptr;     // padded to 16 dims
@@ -547,6 +553,54 @@ inline float neon_i8_finish(int32x4_t s, int32x4_t s_lo, bool has_lo,
     return (static_cast<float>(t) + lo) * inv;
 }
 #endif  // NEON DOTPROD
+
+/// Expand packed 4-bit flat-nibble code rows into 1-byte-per-dim rows,
+/// baking the shaped g-table (when `shaped`) at expand time. Tail lanes
+/// (dims >= dim up to the 16-dim padded width) are written as ZERO — the
+/// same value the packed kernels mask in — so expanded kernels need no
+/// tail handling. Returns the expanded row stride (= dim padded to 16).
+/// Bit-exact twin of the packed nibble decode: a zeroed nibble INDEX
+/// reads g_tbl[0] (need not be 0), so the tail mask applies AFTER the tbl
+/// lookup, exactly like neon_row_nibbles_tail consumers.
+inline uint32_t scalar_expand_codes(const uint8_t* codes, uint32_t count,
+                                    uint32_t cs, uint32_t dim, bool shaped,
+                                    const uint8_t* shape_u8, uint8_t* out) {
+    const uint32_t padded = (dim + 15) / 16 * 16;
+#if defined(SEXTANT_HAS_NEON_DOTSCAN)
+    const uint32_t d16i = dim / 16 * 16;
+    const uint8x16_t g_tbl = shaped
+        ? vld1q_u8(shape_u8) : vdupq_n_u8(0);
+    for (uint32_t r = 0; r < count; ++r, codes += cs, out += padded) {
+        for (uint32_t d = 0; d < d16i; d += 16) {
+            uint8x16_t nib = neon_row_nibbles(codes, d);
+            if (shaped) nib = vqtbl1q_u8(g_tbl, nib);
+            vst1q_u8(out + d, nib);
+        }
+        if (d16i < dim) {
+            const uint32_t rem = dim - d16i;
+            uint8_t scratch[8];
+            uint8x16_t nib =
+                neon_row_nibbles_tail(codes, d16i, rem, scratch);
+            if (shaped) nib = vqtbl1q_u8(g_tbl, nib);  // mask AFTER tbl
+            vst1q_u8(out + d16i, vandq_u8(nib, neon_tail_mask(rem)));
+        }
+    }
+#else
+    for (uint32_t r = 0; r < count; ++r, codes += cs, out += padded) {
+        for (uint32_t d = 0; d < padded; ++d) {
+            uint8_t g = 0;
+            if (d < dim) {
+                const uint8_t byte = codes[d / 2];
+                const uint8_t nib = (d % 2 == 0) ? (byte & 0xF)
+                                                 : (byte >> 4);
+                g = shaped ? shape_u8[nib] : nib;
+            }
+            out[d] = g;
+        }
+    }
+#endif
+    return padded;
+}
 
 inline void scalar_i8_dots4(const ScalarScanCtx& c,
                             const uint8_t* const* cp, float dots[4]) {
@@ -963,6 +1017,76 @@ inline void scalar_i8_dots4_q4(const ScalarScanCtx* const c4[4],
         scalar_i8_dots4_ref(*c4[q], cp, dots[q]);
 }
 
+/// 4-QUERY batched i8 kernel over PRE-EXPANDED rows (see ScalarScanCtx::
+/// expanded / scalar_expand_codes): codes are 1 byte/dim with the g-map
+/// baked and tail lanes zero, so this is a pure dot stream — no nibble
+/// unpack, no tbl, no tail masking. ARM-only value (x86 Zen5 measured the
+/// expanded layout SLOWER: dpbusd is load-bound and the unpack is already
+/// amortized over 4 queries); kept portable via a scalar twin so the
+/// bit-exactness tests run on any host.
+inline void scalar_i8_dots4_q4_expanded(const ScalarScanCtx* const c4[4],
+                                        const uint8_t* const* cp,
+                                        float dots[4][4]) {
+#if defined(SEXTANT_HAS_NEON_DOTSCAN)
+    const ScalarScanCtx& c0 = *c4[0];
+    const uint32_t dim = c0.dim;
+    const uint32_t padded = (dim + 15) / 16 * 16;
+    const bool shaped = c0.slm_shaped;
+    int32x4_t acc[4][4], acclo[4][4];   // [query][row]
+    for (uint32_t q = 0; q < 4; ++q)
+        for (uint32_t v = 0; v < 4; ++v) {
+            acc[q][v] = vdupq_n_s32(0);
+            acclo[q][v] = vdupq_n_s32(0);
+        }
+    for (uint32_t d = 0; d < padded; d += 16) {
+        uint8x16_t g[4];               // load ONCE per row, shared
+        for (uint32_t v = 0; v < 4; ++v) g[v] = vld1q_u8(cp[v] + d);
+        for (uint32_t q = 0; q < 4; ++q) {
+            const ScalarScanCtx& cq = *c4[q];
+            const int8x16_t a = vld1q_s8(cq.a8 + d);
+            const bool lo = cq.i8_mode >= 2 && cq.a8_lo;
+            const int8x16_t al = lo ? vld1q_s8(cq.a8_lo + d) : vdupq_n_s8(0);
+            for (uint32_t v = 0; v < 4; ++v) {
+                acc[q][v] = shaped
+                    ? neon_gdot_s32(acc[q][v], g[v], a)
+                    : neon_nibdot_s32(acc[q][v], g[v], a);
+                if (lo)
+                    acclo[q][v] = shaped
+                        ? neon_gdot_s32(acclo[q][v], g[v], al)
+                        : neon_nibdot_s32(acclo[q][v], g[v], al);
+            }
+        }
+    }
+    for (uint32_t q = 0; q < 4; ++q) {
+        const ScalarScanCtx& cq = *c4[q];
+        const bool lo = cq.i8_mode >= 2 && cq.a8_lo;
+        for (uint32_t v = 0; v < 4; ++v)
+            dots[q][v] = neon_i8_finish(acc[q][v], acclo[q][v], lo,
+                                        cq.i8_inv);
+    }
+    return;
+#endif
+    // Portable scalar twin — mirrors scalar_i8_dots4_ref's exact float
+    // epilogue; expanded tail lanes are zero so looping dim-only is exact.
+    for (uint32_t q = 0; q < 4; ++q) {
+        const ScalarScanCtx& cq = *c4[q];
+        const int8_t* a8 = cq.a8;
+        const int8_t* a8_lo = cq.i8_mode >= 2 ? cq.a8_lo : nullptr;
+        for (uint32_t v = 0; v < 4; ++v) {
+            int64_t acc = 0, acc_lo = 0;
+            for (uint32_t d = 0; d < cq.dim; ++d) {
+                const int64_t g = cp[v][d];
+                acc += static_cast<int64_t>(a8[d]) * g;
+                if (a8_lo) acc_lo += static_cast<int64_t>(a8_lo[d]) * g;
+            }
+            dots[q][v] =
+                (static_cast<float>(acc)
+                 + (a8_lo ? static_cast<float>(acc_lo) / 127.0f : 0.0f))
+                * cq.i8_inv;
+        }
+    }
+}
+
 inline void scalar_arith_dots4(const ScalarScanCtx& c,
                                const uint8_t* const* cp, float dots[4]) {
 #if defined(SEXTANT_HAS_AVX512_SCAN)
@@ -1090,10 +1214,14 @@ inline void scalar_scan_i8_batch(const ScalarScanCtx* const c4[4],
     // single-query kernel's thread-local cbuf).
     static thread_local detail::ScalarCandBuf cbufs[4];
     for (uint32_t q = 0; q < qn; ++q) cbufs[q].reset();
+    const bool expanded = c0.expanded;
     for (uint32_t i = 0; i < c0.count; i += 4) {
         const auto r = detail::scalar_rows(c0, i, pad_row_buf.data());
         float dots[4][4];
-        scalar_i8_dots4_q4(c4, r.cp, dots);
+        if (expanded)
+            scalar_i8_dots4_q4_expanded(c4, r.cp, dots);
+        else
+            scalar_i8_dots4_q4(c4, r.cp, dots);
         for (uint32_t q = 0; q < qn; ++q)
             detail::scalar_cand_push4(cbufs[q], *c4[q], i, r.nv, dots[q]);
     }

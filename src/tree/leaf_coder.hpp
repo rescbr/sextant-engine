@@ -306,6 +306,27 @@ public:
         for (uint32_t q = 0; q < n; ++q)
             scan_leaf(*setups[q], leaf, *heaps[q]);
     }
+    /// Sweep-local expanded staging: expand this leaf's packed code rows
+    /// into 1-byte-per-dim g-mapped rows in `out` (caller-sized to
+    /// count * (2*code_size() + 16) bytes). Returns the expanded row
+    /// stride, or 0 when the coder does not support it. Query-independent.
+    virtual uint32_t expand_leaf_codes(const uint8_t* leaf,
+                                       uint8_t* out) const {
+        (void)leaf; (void)out;
+        return 0;
+    }
+    /// Batch scan reading PRE-EXPANDED rows (`expanded_codes`, stride
+    /// `expanded_stride`, from expand_leaf_codes) instead of the packed
+    /// codes. Rerank/harvest still read the PACKED `leaf`. Default (and
+    /// any setup the coder can't serve expanded) falls back to
+    /// scan_leaf_batch — identical results either way.
+    virtual void scan_leaf_batch_expanded(
+            const ScanSetup* const setups[4], const uint8_t* leaf,
+            const uint8_t* expanded_codes, uint32_t expanded_stride,
+            RawScanHeap* const heaps[4], uint32_t n) {
+        (void)expanded_codes; (void)expanded_stride;
+        scan_leaf_batch(setups, leaf, heaps, n);
+    }
     /// Exact(ish) rerank of one candidate: returns the refined distance.
     /// When `scratch_decoded` != nullptr it receives the decoded vector
     /// (dim floats); families whose rerank never materializes a decode may

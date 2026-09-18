@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <random>
 #include <chrono>
 #include <cmath>
@@ -49,6 +50,18 @@ namespace sextant::tree {
 // ===========================================================================
 
 namespace {
+
+/// Resolve SearchConfig::batch_expand_min_refs to the effective threshold
+/// (UINT32_MAX = staged expansion disabled; see that field's doc for the
+/// ARM-only rationale).
+uint32_t resolve_expand_min_refs(int32_t cfg) {
+#if defined(SEXTANT_HAS_NEON_DOTSCAN)
+    const uint32_t def = 8;
+#else
+    const uint32_t def = UINT32_MAX;
+#endif
+    return cfg < 0 ? def : static_cast<uint32_t>(cfg);
+}
 
 /// A max-heap entry for the FastScan candidate selection. Carries enough
 /// state to decode the candidate's PQ code back to FP32 for reranking:
@@ -2141,6 +2154,11 @@ void IVFTreeIndex::search_batch(
             // and shared by every query in its fanout (column layout is
             // query-independent; predicates are per query).
             std::vector<ColumnView> leaf_cols;
+            // Per-thread expanded-staging scratch (resolved threshold
+            // comes from SearchConfig::batch_expand_min_refs).
+            std::vector<uint8_t> expand_buf;
+            const uint32_t expand_min =
+                resolve_expand_min_refs(config.batch_expand_min_refs);
             for (;;) {
                 const uint32_t start =
                     next_chunk.fetch_add(kChunk, std::memory_order_relaxed);
@@ -2313,6 +2331,23 @@ void IVFTreeIndex::search_batch(
                             pool_replace(p->pool, std::move(pe));
                         }
                     };
+                    // Sweep-local expanded staging: expand this leaf's
+                    // packed codes ONCE into the per-thread scratch; all
+                    // 4-query groups then scan the expanded buffer with the
+                    // pure-dot kernel. Rerank/harvest/predicates keep
+                    // reading the PACKED leaf. Only pays when several query
+                    // groups share the leaf (expand_min refs).
+                    uint32_t expand_stride = 0;
+                    if (nrefs >= expand_min) {
+                        const auto* lh = reinterpret_cast<
+                            const TreeLeafHeader*>(leaf_ptr);
+                        const size_t row_max =
+                            static_cast<size_t>(coder_->code_size()) * 2 + 16;
+                        expand_buf.resize(
+                            static_cast<size_t>(lh->count) * row_max);
+                        expand_stride = coder_->expand_leaf_codes(
+                            leaf_ptr, expand_buf.data());
+                    }
                     // Scan: group this leaf's refs into batches of 4 when
                     // the coder shares the row decode across queries (one
                     // pass over the code rows per group instead of per
@@ -2333,7 +2368,13 @@ void IVFTreeIndex::search_batch(
                                                      fr.slot};
                                 rhs_p[b] = &rhs[b];
                             }
-                            coder_->scan_leaf_batch(st, leaf_ptr, rhs_p, bn);
+                            if (expand_stride)
+                                coder_->scan_leaf_batch_expanded(
+                                    st, leaf_ptr, expand_buf.data(),
+                                    expand_stride, rhs_p, bn);
+                            else
+                                coder_->scan_leaf_batch(
+                                    st, leaf_ptr, rhs_p, bn);
                             for (uint32_t b = 0; b < bn; ++b) {
                                 const auto& fr =
                                     refs[ul.ref_begin + k + b];

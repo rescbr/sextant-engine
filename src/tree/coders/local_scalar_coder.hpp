@@ -52,6 +52,14 @@ public:
     void scan_leaf_batch(const ScanSetup* const setups[4],
                          const uint8_t* leaf, RawScanHeap* const heaps[4],
                          uint32_t n) override;
+    uint32_t expand_leaf_codes(const uint8_t* leaf,
+                              uint8_t* out) const override;
+    void scan_leaf_batch_expanded(const ScanSetup* const setups[4],
+                                 const uint8_t* leaf,
+                                 const uint8_t* expanded_codes,
+                                 uint32_t expanded_stride,
+                                 RawScanHeap* const heaps[4],
+                                 uint32_t n) override;
     float rerank(const float* query, const uint8_t* leaf, uint32_t local_idx,
                  float* scratch_decoded) override;
 

@@ -673,6 +673,13 @@ int cmd_tree_search(int argc, char* argv[]) {
         false, -1);
     p.add<uint32_t>("search-threads", 0,
         "Within-query leaf-parallel scan threads (0=serial; orthorgonal to --threads)", false, 0);
+    p.add<int>("expand-min-refs", 0,
+        "Batch sweep expanded-code staging threshold: minimum (query,leaf) "
+        "refs before a leaf's packed 4-bit codes are expanded into a "
+        "per-thread 1B/dim scratch and scanned with the pure-dot kernel "
+        "(ARM only; -1=auto: 8 on NEON DotProd builds, off elsewhere; "
+        "0=force where supported; >0=explicit). Results identical either "
+        "way.", false, -1);
     p.add<uint32_t>("batch-window", 0,
         "Subtree-major batch mode: queries per search_batch window. Routes "
         "the window, inverts probe sets, and sweeps each UNIQUE probed leaf "
@@ -837,6 +844,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.plane_pre_prune = p.get<float>("plane-pre-prune");
     scfg.adaptive_probe_gap = p.get<float>("adaptive-probe-gap");
     scfg.search_threads = p.get<uint32_t>("search-threads");
+    scfg.batch_expand_min_refs = p.get<int>("expand-min-refs");
     const uint32_t batch_window = p.get<uint32_t>("batch-window");
     if (batch_window > 0) {
         if (with_payload) {

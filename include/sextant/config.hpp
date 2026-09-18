@@ -598,6 +598,19 @@ struct SearchConfig {
     /// the latency regime (few queries, high n-probe → many candidate leaves).
     /// The serial path (<=1) is byte-identical to the pre-option behavior.
     uint32_t search_threads = 0;
+
+    /// Batch-sweep expanded-code staging threshold (scalar 4-bit families,
+    /// search_batch Phase 3): minimum (query, leaf) refs before the sweep
+    /// expands a leaf's packed codes into a per-thread 1-byte/dim scratch
+    /// (g-map baked) and scans it with the pure-dot kernel. ARM-only
+    /// value — measured SLOWER on x86 (Zen5 dpbusd is load-bound; the
+    /// nibble unpack is already amortized over the 4-query groups):
+    ///   -1 = auto (default): 8 refs on NEON DotProd builds, off elsewhere
+    ///    0 = force expansion wherever the coder supports it
+    ///   >0 = explicit threshold
+    /// Results are identical either way (bit-exact kernels; see
+    /// test_dots4_kernel's Expanded* tests).
+    int32_t batch_expand_min_refs = -1;
 };
 
 /// Adaptive parameters resolved from dataset/machine properties (Issue 37).
