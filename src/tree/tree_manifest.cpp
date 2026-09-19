@@ -75,6 +75,9 @@ std::string manifest_to_toml(const TreeManifest& m) {
     index->insert("quantizer_type", m.quantizer_type);
     index->insert("prq_nsplits", m.prq_nsplits);
     index->insert("metric", static_cast<int64_t>(m.metric));
+    if (m.scalar_row_bias) {
+        index->insert("scalar_row_bias", true);
+    }
     root->insert("index", index);
 
     // [tree]
@@ -174,6 +177,10 @@ TreeManifest manifest_from_toml(const std::string& toml) {
     }
     if (auto mt = index->get_as<int64_t>("metric")) {
         m.metric = static_cast<uint8_t>(*mt);
+    }
+    // Optional (L2 trees predating the ||x|^2 sweep fix omit it → false).
+    if (auto rb = index->get_as<bool>("scalar_row_bias")) {
+        m.scalar_row_bias = *rb;
     }
 
     // [tree]

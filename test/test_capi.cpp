@@ -1298,6 +1298,100 @@ TEST_F(CApiTest, MetricsJsonlExport) {
     std::filesystem::remove(mpath);
 }
 
+// (h) L2 raw-sweep ||x|^2 bias: a near-origin cluster must not be buried
+// by higher-norm clusters for off-center queries. Before the fix the
+// sweep ranked by -q.x_hat (an IP surrogate missing the ||x||^2 term of
+// L2), so exhaustive search returned the max-norm cluster (d~40) while
+// the true neighbors sat at d~0.26. Regression: default AND exhaustive
+// paths, NO exact_rerank_base (the decoded rerank must see the rows).
+TEST_F(CApiTest, L2SweepNearZeroClusterNotBuried) {
+    constexpr uint32_t kC = 8;  // cluster of row i is i % kC; cluster 0
+                                 // sits at the origin (near-zero norm)
+    std::vector<float> data(static_cast<size_t>(kN) * kDim);
+    {
+        std::mt19937 rng(90210);
+        std::uniform_real_distribution<float> noise(0.0f, 0.02f);
+        for (uint32_t i = 0; i < kN; ++i) {
+            const uint32_t ci = i % kC;
+            for (uint32_t d = 0; d < kDim; ++d) {
+                const bool in_span = d >= 4 * ci && d < 4 * ci + 4;
+                data[static_cast<size_t>(i) * kDim + d] =
+                    (ci > 0 && in_span ? 0.3f : 0.0f) + noise(rng);
+            }
+        }
+    }
+
+    char err[512] = {0};
+    sextant_build_opts bopts = sextant_default_build_opts();
+    bopts.quantizer = "local_scalar";
+    bopts.k_root = 4;  // leaves mix clusters (the burial precondition)
+    bopts.leaf_capacity = 500;
+    bopts.pca_dims = 16;
+    bopts.max_lloyd_passes = 2;
+    bopts.num_threads = 4;
+    void* b = sextant_build_begin(&bopts, kDim, nullptr, 0, 0,
+                                  err, sizeof(err));
+    ASSERT_NE(b, nullptr) << err;
+    ASSERT_EQ(sextant_build_push(b, data.data(), kN, nullptr, nullptr,
+                                 nullptr, err, sizeof(err)),
+              0)
+        << err;
+    const std::string tpath =
+        (std::filesystem::temp_directory_path() / "capi_l2bias.tree")
+            .string();
+    std::filesystem::remove(tpath);
+    ASSERT_EQ(sextant_build_finish(b, tpath.c_str(), err, sizeof(err)), 0)
+        << err;
+
+    void* idx = sextant_open_index(tpath.c_str(), err, sizeof(err));
+    ASSERT_NE(idx, nullptr) << err;
+
+    float q[kDim];
+    for (uint32_t d = 0; d < kDim; ++d) q[d] = 0.1f;
+
+    // Brute-force ground truth over the pushed rows.
+    std::vector<std::pair<float, uint32_t>> all(kN);
+    for (uint32_t i = 0; i < kN; ++i) {
+        float s = 0;
+        for (uint32_t d = 0; d < kDim; ++d) {
+            const float e = q[d] - data[static_cast<size_t>(i) * kDim + d];
+            s += e * e;
+        }
+        all[i] = {s, i};
+    }
+    std::sort(all.begin(), all.end());
+    // Sanity: the true neighbors are the near-origin cluster (row i is
+    // cluster i % kC). With 4-bit codes the decoded distances run ~0.2
+    // below the true ~0.5 (coarse in-leaf rulers), so exact set equality
+    // with brute force is not assertable — cluster identity is.
+    for (uint32_t i = 0; i < 10; ++i) ASSERT_EQ(all[i].second % kC, 0u);
+    const float brute_min_d = std::sqrt(all[0].first);
+
+    for (int exhaustive = 0; exhaustive <= 1; ++exhaustive) {
+        uint64_t ids[10];
+        float ds[10];
+        sextant_search_opts so = sextant_default_search_opts();
+        so.k = 10;
+        so.exhaustive = exhaustive;
+        so.rerank = 1;
+        const int n = sextant_search(idx, q, &so, ids, ds, 10,
+                                     err, sizeof(err));
+        ASSERT_EQ(n, 10) << err;
+        for (int i = 0; i < n; ++i) {
+            EXPECT_EQ(ids[i] % kC, 0u)
+                << (exhaustive ? "exhaustive" : "default")
+                << " path buried the near-zero cluster (id " << ids[i] << ")";
+            // Decoded distance stays within the 4-bit quantization band
+            // of the brute-force minimum (pre-fix exhaustive returned
+            // d~40 from the max-norm cluster).
+            EXPECT_LT(ds[i], brute_min_d + 0.4);
+            EXPECT_GT(ds[i], brute_min_d - 0.4);
+        }
+    }
+    sextant_close_index(idx);
+    std::filesystem::remove(tpath);
+}
+
 // (i) More than one sealed staging chunk (kChunkRows = 32768): chunk 1
 // seals mid-push and spills under the 1 MiB budget; the 232-row tail
 // stays in memory → mixed tiers drained spill-first at emission. The

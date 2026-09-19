@@ -201,6 +201,7 @@ struct CoderParams {
     uint8_t pq_bits = 4;
     MetricKind metric = MetricKind::L2Sq;
     bool has_ip_bias = false;    // scalar families + InnerProduct
+    bool bias_is_normsq = false; // scalar families, L2: bias holds ||x|^2
     uint32_t prq_nsplits = 0;    // prq only
     uint8_t scan_i8_mode = 0;    // scalar scan kernel selection (0/1/2)
     uint32_t prq_beam_size = 1;  // prq only (build)

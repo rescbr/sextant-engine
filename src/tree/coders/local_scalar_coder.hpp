@@ -87,7 +87,8 @@ public:
     /// bias ||x||/||x_hat||.
     static void encode_one(const float* x, uint16_t dim,
                            const float16_t* lo, const float16_t* steps,
-                           uint8_t* code, float16_t* bias_out);
+                           uint8_t* code, float16_t* bias_out,
+                           bool normsq_bias = false);
 
     /// Decode one flat nibble code with the leaf's rulers.
     static void decode_one_with_levels(const float16_t* lo,

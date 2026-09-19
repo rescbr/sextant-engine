@@ -68,7 +68,8 @@ void LocalScalarCoder::fit_local_scalar_levels(const float* vecs,
 
 void LocalScalarCoder::encode_one(const float* x, uint16_t dim,
                                   const float16_t* lo, const float16_t* steps,
-                                  uint8_t* code, float16_t* bias_out) {
+                                  uint8_t* code, float16_t* bias_out,
+                                  bool normsq_bias) {
     double sx = 0, sxh = 0;
     for (uint16_t d = 0; d < dim; ++d) {
         const float lo_d = static_cast<float>(lo[d]);
@@ -91,10 +92,18 @@ void LocalScalarCoder::encode_one(const float* x, uint16_t dim,
                 : ((code[d / 2] & 0x0Fu) | ((c & 0x0Fu) << 4)));
     }
     if (bias_out) {
-        const float nx = static_cast<float>(std::sqrt(sx));
-        const float nxh = static_cast<float>(
-            std::sqrt(std::max(sxh, 1e-30)));
-        *bias_out = float16_t(nx / nxh);
+        if (normsq_bias) {
+            // L2 serving: bias is ||x_hat||^2 so the sweep ranks by
+            // ||x_hat||^2 - 2 q.x_hat = ||q - x_hat||^2 - ||q||^2 — the
+            // decoded distance minus the query constant (exact ADC
+            // ordering, robust to code saturation). Clamp to fp16 max.
+            *bias_out = float16_t(std::min(sxh, 65504.0));
+        } else {
+            const float nx = static_cast<float>(std::sqrt(sx));
+            const float nxh = static_cast<float>(
+                std::sqrt(std::max(sxh, 1e-30)));
+            *bias_out = float16_t(nx / nxh);
+        }
     }
 }
 
@@ -179,7 +188,8 @@ uint64_t LocalScalarCoder::flush_leaf(const LeafFlushInput& in,
         for (uint16_t d = 0; d < dim; ++d) x[d] = static_cast<float>(fv[d]);
         encode_one(x.data(), dim, lo.data(), steps.data(),
                    codes.data() + static_cast<size_t>(i) * cs,
-                   params_.has_ip_bias ? &biases[i] : nullptr);
+                   params_.has_ip_bias ? &biases[i] : nullptr,
+                   params_.bias_is_normsq);
     }
     auto* lh = reinterpret_cast<TreeLeafHeader*>(leaf_out);
     lh->leaf_state = static_cast<uint8_t>(LeafState::CodedLocalScalar);
@@ -275,10 +285,11 @@ ScalarScanCtx LocalScalarCoder::make_scan_ctx(const ScanSetup& setup,
     c.cs = code_size();
     // IP queries scan with a per-leaf bias block appended after the codes
     // (reconstruction shrinkage correction); it is always used when present.
-    c.ip_bias = (params_.metric == MetricKind::InnerProduct
+    c.ip_bias = (params_.has_ip_bias
                ? reinterpret_cast<const float16_t*>(
                      c.codes + static_cast<uint64_t>(count) * c.cs)
                : nullptr);
+    c.bias_is_normsq = params_.bias_is_normsq;
     c.a_uni = s.a_uni.data();
     c.c0 = s.c0;
     c.query = s.query_copy.data();
@@ -435,11 +446,12 @@ void LocalScalarCoder::encode_group(const GroupEncodeInput& in,
         std::memcpy(nbias, in.src_biases,
                     static_cast<size_t>(in.count) * sizeof(float16_t));
     }
-    RowId* nrid = reinterpret_cast<RowId*>(
-        leaf_out + lsc_codes_offset(in.summary_size, dim) +
-        static_cast<uint64_t>(in.count) * cs +
-        scalar_bias_bytes(in.count, params_.has_ip_bias));
-    std::memcpy(nrid, in.row_ids, static_cast<size_t>(in.count) * sizeof(RowId));
+    // Byte-copy: the bias block can place row_ids at a 4-mod-8 offset,
+    // so a typed RowId* here is UB (misaligned store).
+    std::memcpy(leaf_out + lsc_codes_offset(in.summary_size, dim) +
+                    static_cast<uint64_t>(in.count) * cs +
+                    scalar_bias_bytes(in.count, params_.has_ip_bias),
+                in.row_ids, static_cast<size_t>(in.count) * sizeof(RowId));
     auto* lh = reinterpret_cast<TreeLeafHeader*>(leaf_out);
     lh->leaf_state = static_cast<uint8_t>(LeafState::CodedLocalScalar);
     std::memcpy(leaf_out + lsc_levels_offset(in.summary_size), lo.data(),
@@ -476,7 +488,8 @@ void LocalScalarCoder::append_encode(const AppendInput& in) {
     for (uint32_t ai = 0; ai < in.n_vecs; ++ai)
         encode_one(in.vecs[ai], dim, lo16, st16,
                    ncb + static_cast<uint64_t>(in.old_count + ai) * cs,
-                   nbias ? &nbias[in.old_count + ai] : nullptr);
+                   nbias ? &nbias[in.old_count + ai] : nullptr,
+                   params_.bias_is_normsq);
 }
 
 }  // namespace sextant::tree

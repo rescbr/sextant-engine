@@ -2379,6 +2379,7 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
     manifest.quantizer_type = params.quantizer_type;
     manifest.prq_nsplits = ctx.coder->prq_nsplits();
     manifest.metric = static_cast<uint8_t>(params.metric);
+    manifest.scalar_row_bias = ctx.coder->leaf_has_ip_bias();
     manifest.depth = depth; manifest.k_root = k_root; manifest.k_l1 = k_l1;
     manifest.leaf_capacity = leaf_cap; manifest.n_leaves = n_leaves_total;
     // Logical row count: input rows indexed (ctx.n), NOT the post-closure

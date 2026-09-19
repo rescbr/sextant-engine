@@ -37,6 +37,9 @@ struct TreeManifest {
     std::string quantizer_type = "pq";
     uint32_t prq_nsplits = 0;
     uint8_t  metric = 0;           // MetricKind as uint8_t (0=L2Sq, 1=InnerProduct)
+    bool scalar_row_bias = false;  // scalar-family leaves carry a per-row fp16
+                                   // bias block (L2 builds since the ||x|^2
+                                   // sweep fix; IP trees imply it via metric)
 
     // [tree]
     uint16_t depth = 0;

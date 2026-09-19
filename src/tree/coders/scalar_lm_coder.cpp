@@ -109,18 +109,28 @@ void ScalarLmCoder::encode(const float* vec, uint8_t* code_out,
                            float* ip_bias_out) {
     quantizer_->encode(vec, code_out);
     if (ip_bias_out) {
-        // bias = ||x||/||x_hat||: cancels the per-vector reconstruction
-        // norm shrinkage in the IP scan ordering.
         std::vector<float> dec(params_.dim);
         quantizer_->decode(code_out, dec.data());
-        double sx = 0, sxh = 0;
+        double sxh = 0;
         for (uint16_t d = 0; d < params_.dim; ++d) {
-            sx += static_cast<double>(vec[d]) * vec[d];
             sxh += static_cast<double>(dec[d]) * dec[d];
         }
-        const float nx = static_cast<float>(std::sqrt(sx));
-        const float nxh = static_cast<float>(std::sqrt(std::max(sxh, 1e-30)));
-        *ip_bias_out = float16_t(nx / nxh);
+        if (params_.bias_is_normsq) {
+            // L2 serving: bias is ||x_hat||^2 — sweep ranks by decoded
+            // distance minus the query constant (see ScalarScanCtx).
+            *ip_bias_out = float16_t(std::min(sxh, 65504.0));
+        } else {
+            // bias = ||x||/||x_hat||: cancels the per-vector reconstruction
+            // norm shrinkage in the IP scan ordering.
+            double sx = 0;
+            for (uint16_t d = 0; d < params_.dim; ++d) {
+                sx += static_cast<double>(vec[d]) * vec[d];
+            }
+            const float nx = static_cast<float>(std::sqrt(sx));
+            const float nxh = static_cast<float>(
+                std::sqrt(std::max(sxh, 1e-30)));
+            *ip_bias_out = float16_t(nx / nxh);
+        }
     }
 }
 
@@ -283,12 +293,14 @@ ScalarScanCtx ScalarLmCoder::make_scan_ctx(const ScanSetup& setup,
     c.codes = leaf + leaf_codes_offset(lh->summary_size);
     c.count = count;
     c.cs = quantizer_->code_size();
-    // IP queries scan with a per-leaf bias block appended after the codes
-    // (reconstruction shrinkage correction); it is always used when present.
-    c.ip_bias = (params_.metric == MetricKind::InnerProduct
+    // Bias block appended after the codes: IP keeps the reconstruction
+    // shrinkage ratio, L2 carries ||x||^2 (bias_is_normsq). Always used
+    // when present.
+    c.ip_bias = (params_.has_ip_bias
                ? reinterpret_cast<const float16_t*>(
                      c.codes + static_cast<uint64_t>(count) * c.cs)
                : nullptr);
+    c.bias_is_normsq = params_.bias_is_normsq;
     c.a_uni = s.a_uni.data();
     c.c0 = s.c0;
     c.query = s.query_copy.data();
@@ -460,10 +472,11 @@ void ScalarLmCoder::encode_group(const GroupEncodeInput& in,
         std::memcpy(nbias, in.src_biases,
                     static_cast<size_t>(in.count) * sizeof(float16_t));
     }
-    RowId* nrid = reinterpret_cast<RowId*>(
-        leaf_out + scalar_rowids_offset(in.summary_size, in.count, cs,
-                                        params_.has_ip_bias));
-    std::memcpy(nrid, in.row_ids, static_cast<size_t>(in.count) * sizeof(RowId));
+    // Byte-copy: the bias block can place row_ids at a 4-mod-8 offset,
+    // so a typed RowId* here is UB (misaligned store).
+    std::memcpy(leaf_out + scalar_rowids_offset(in.summary_size, in.count,
+                                               cs, params_.has_ip_bias),
+                in.row_ids, static_cast<size_t>(in.count) * sizeof(RowId));
 }
 
 void ScalarLmCoder::append_encode(const AppendInput& in) {
@@ -488,15 +501,23 @@ void ScalarLmCoder::append_encode(const AppendInput& in) {
         if (params_.has_ip_bias) {
             quantizer_->decode(dst, dec.data());
             const float* xv = in.vecs[ai];
-            double sx = 0, sxh = 0;
+            double sxh = 0;
             for (uint16_t d = 0; d < params_.dim; ++d) {
-                sx += static_cast<double>(xv[d]) * xv[d];
                 sxh += static_cast<double>(dec[d]) * dec[d];
             }
-            const float nx = static_cast<float>(std::sqrt(sx));
-            const float nxh = static_cast<float>(
-                std::sqrt(std::max(sxh, 1e-30)));
-            nbias[in.old_count + ai] = float16_t(nx / nxh);
+            if (params_.bias_is_normsq) {
+                nbias[in.old_count + ai] =
+                    float16_t(std::min(sxh, 65504.0));
+            } else {
+                double sx = 0;
+                for (uint16_t d = 0; d < params_.dim; ++d) {
+                    sx += static_cast<double>(xv[d]) * xv[d];
+                }
+                const float nx = static_cast<float>(std::sqrt(sx));
+                const float nxh = static_cast<float>(
+                    std::sqrt(std::max(sxh, 1e-30)));
+                nbias[in.old_count + ai] = float16_t(nx / nxh);
+            }
         }
     }
 }

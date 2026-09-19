@@ -205,6 +205,10 @@ struct ScalarScanCtx {
     // the PACKED leaf (it is addressed separately from codes).
     bool expanded = false;
     const float16_t* ip_bias = nullptr;  // count entries or null
+    // L2 serving: ip_bias entries hold ||x_hat|^2 and the score is combined
+    // as bias - 2*score (= ||q - x_hat||^2 minus the query constant) instead
+    // of the IP metric's multiplicative -(score * bias).
+    bool bias_is_normsq = false;
     // Query transform (arith kernels)
     const float* a_uni = nullptr;     // padded to 16 dims
     float c0 = 0.f;
@@ -255,9 +259,13 @@ inline void scalar_heap_push4(RawScanHeap& heap, const ScalarScanCtx& c,
     // Heap push — real vectors only (padding never enters).
     for (uint32_t v = 0; v < nv; ++v) {
         const float score = dots[v] + c.c0;
-        float dist = c.ip_bias
-            ? -(score * static_cast<float>(c.ip_bias[i + v]))
-            : -score;
+        float dist;
+        if (c.ip_bias) {
+            const float b = static_cast<float>(c.ip_bias[i + v]);
+            dist = c.bias_is_normsq ? (b - 2.f * score) : -(score * b);
+        } else {
+            dist = -score;
+        }
         const uint32_t pq_dist = f32_to_dist_key(dist);
         if (!heap_full(heap)) {
             heap_push(heap, pq_dist, i + v);
@@ -285,9 +293,14 @@ inline void scalar_cand_push4(ScalarCandBuf& b, const ScalarScanCtx& c,
                               const float* dots) {
     for (uint32_t v = 0; v < nv; ++v) {
         const float score = dots[v] + c.c0;
-        b.dist.push_back(c.ip_bias
-            ? -(score * static_cast<float>(c.ip_bias[i + v]))
-            : -score);
+        float dist;
+        if (c.ip_bias) {
+            const float b = static_cast<float>(c.ip_bias[i + v]);
+            dist = c.bias_is_normsq ? (b - 2.f * score) : -(score * b);
+        } else {
+            dist = -score;
+        }
+        b.dist.push_back(dist);
         b.idx.push_back(i + v);
     }
 }

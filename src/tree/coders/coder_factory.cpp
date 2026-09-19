@@ -76,7 +76,14 @@ std::unique_ptr<LeafCoder> make_leaf_coder(const std::string& quantizer_type,
                 "local_scalar currently supports only --pq-bits 4");
         }
         params.m4 = static_cast<uint16_t>(params.dim);
-        params.has_ip_bias = params.metric == MetricKind::InnerProduct;
+        // Builds always emit the per-row bias (IP ratio or L2 ||x|^2);
+        // at open the caller seeds has_ip_bias from the manifest so
+        // pre-bias L2 trees keep parsing (they lack the bias block).
+        params.has_ip_bias = params.has_ip_bias ||
+                             params.metric == MetricKind::InnerProduct ||
+                             !for_open;
+        params.bias_is_normsq =
+            params.has_ip_bias && params.metric != MetricKind::InnerProduct;
         return std::make_unique<LocalScalarCoder>(params);
     }
     if (quantizer_type == "scalar_lloydmax" ||
@@ -89,7 +96,11 @@ std::unique_ptr<LeafCoder> make_leaf_coder(const std::string& quantizer_type,
         }
         // Scalar quantization is sub_dim=1: m = dim subquantizers.
         params.m4 = static_cast<uint16_t>(params.dim);
-        params.has_ip_bias = params.metric == MetricKind::InnerProduct;
+        params.has_ip_bias = params.has_ip_bias ||
+                             params.metric == MetricKind::InnerProduct ||
+                             !for_open;
+        params.bias_is_normsq =
+            params.has_ip_bias && params.metric != MetricKind::InnerProduct;
         ScalarLmCoder::LevelPolicy policy =
             ScalarLmCoder::LevelPolicy::LloydMax;
         if (quantizer_type == "scalar_uniform")
