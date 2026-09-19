@@ -405,6 +405,26 @@ TEST_F(CApiTest, ConcurrentSearchStress) {
     sextant_scan_pool_set_threads(0);
 }
 
+// (b0) Filter-schema introspection: names + types round-trip.
+TEST_F(CApiTest, FilterColumnIntrospection) {
+    EXPECT_EQ(sextant_index_filter_col_count(index), 5u);
+    struct Expect { const char* name; int type; };
+    const Expect expected[5] = {
+        {"year", SEXTANT_COL_INT32}, {"category", SEXTANT_COL_STRING},
+        {"tags", SEXTANT_COL_SET},   {"lat", SEXTANT_COL_FLOAT},
+        {"lng", SEXTANT_COL_FLOAT}};
+    for (uint32_t i = 0; i < 5; ++i) {
+        char name[128] = {0};
+        int type = -1;
+        EXPECT_EQ(sextant_index_filter_col(index, i, name, sizeof(name), &type), 0);
+        EXPECT_STREQ(name, expected[i].name);
+        EXPECT_EQ(type, expected[i].type);
+    }
+    char name[128];
+    EXPECT_LT(sextant_index_filter_col(index, 5, name, sizeof(name), nullptr), 0);
+    EXPECT_LT(sextant_index_filter_col(nullptr, 0, name, sizeof(name), nullptr), 0);
+}
+
 // (b) Filtered-search parity: string Eq and int32 Eq.
 TEST_F(CApiTest, FilteredSearchParity) {
     sextant_search_opts opts = sextant_default_search_opts();

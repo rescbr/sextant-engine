@@ -583,6 +583,44 @@ int sextant_index_metric(const void* index) {
     }
 }
 
+uint32_t sextant_index_filter_col_count(const void* index) {
+    if (!index) return 0;
+    try {
+        const auto& tree = *reinterpret_cast<const sextant::tree::IVFTreeIndex*>(index);
+        return static_cast<uint32_t>(tree.filter_schema().columns.size());
+    } catch (...) {
+        return 0;
+    }
+}
+
+int32_t sextant_index_filter_col(const void* index, uint32_t i,
+                                 char* out_name, size_t name_len,
+                                 int* out_type) {
+    if (!index || !out_name || name_len == 0) return -1;
+    try {
+        const auto& tree = *reinterpret_cast<const sextant::tree::IVFTreeIndex*>(index);
+        const auto& cols = tree.filter_schema().columns;
+        if (i >= cols.size()) return -2;
+        const auto& col = cols[i];
+        if (col.name.size() + 1 > name_len) return -3;
+        std::memcpy(out_name, col.name.c_str(), col.name.size() + 1);
+        if (out_type) {
+            switch (col.type) {
+                case sextant::ColumnType::Int32:  *out_type = SEXTANT_COL_INT32;  break;
+                case sextant::ColumnType::Int64:  *out_type = SEXTANT_COL_INT64;  break;
+                case sextant::ColumnType::Float:  *out_type = SEXTANT_COL_FLOAT;  break;
+                case sextant::ColumnType::String: *out_type = SEXTANT_COL_STRING; break;
+                case sextant::ColumnType::Set:    *out_type = SEXTANT_COL_SET;    break;
+                case sextant::ColumnType::Bool:   *out_type = SEXTANT_COL_BOOL;   break;
+                default: return -4;
+            }
+        }
+        return 0;
+    } catch (...) {
+        return -5;
+    }
+}
+
 uint64_t sextant_index_count(const void* index) {
     auto* idx = reinterpret_cast<const IVFTreeIndex*>(index);
     if (!idx) return 0;

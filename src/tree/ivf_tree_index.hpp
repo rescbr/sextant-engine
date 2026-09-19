@@ -347,6 +347,10 @@ public:
     /// The per-family leaf coder owning all quantizer state.
     const LeafCoder& coder() const { return *coder_; }
 
+    /// Declared filter schema (empty when the tree has no filter columns).
+    /// Read from the manifest; read-only-handle safe.
+    const Schema& filter_schema() const { return manifest_.schema; }
+
     /// Safe metric accessor: works even when quantizer_ is null (local_pq).
     /// Uses the manifest's metric field (stored for all trees).
     MetricKind metric() const {

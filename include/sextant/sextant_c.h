@@ -321,6 +321,17 @@ uint32_t sextant_index_code_size(const void* index);
 /// Read from the manifest; read-only-handle safe. Negative on error.
 int sextant_index_metric(const void* index);
 
+/// Number of declared filter columns in the index's schema (0 when the
+/// tree was built without filter_cols). Read-only-handle safe.
+uint32_t sextant_index_filter_col_count(const void* index);
+
+/// Copy filter column i's name (NUL-terminated; pass name_len >= 128)
+/// into out_name and its SEXTANT_COL_* type into out_type. Returns 0 on
+/// success, a negative value on bad arguments / out-of-range index.
+int32_t sextant_index_filter_col(const void* index, uint32_t i,
+                                 char* out_name, size_t name_len,
+                                 int* out_type);
+
 // --- Streaming push build ------------------------------------------------
 
 /// Begin a push build of `dim`-dimensional vectors. `cols` declares the
