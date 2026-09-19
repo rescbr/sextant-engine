@@ -57,6 +57,10 @@ typedef struct sextant_build_opts {
     /// columns). NULL/empty = all off (historical default). Same grammar
     /// as the CLI --cardinality-col flag. ABI tail-append (zero = off).
     const char* cardinality;
+    /// RAM budget (MiB) for the emission-pass cluster staging arenas
+    /// (clusters spill to a temp file beyond it; 0 = BuildConfig default
+    /// of 512). Mirrors the CLI --stage-budget-mb flag. ABI tail-append.
+    uint64_t stage_budget_mb;
 } sextant_build_opts;
 
 /// Sensible defaults (pq, auto geometry, L2).

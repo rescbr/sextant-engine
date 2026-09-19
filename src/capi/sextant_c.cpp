@@ -942,6 +942,11 @@ int sextant_build_finish(void* builder, const char* out_path,
             cfg.cardinality_spec =
                 sextant::tree::parse_cardinality_spec(opts.cardinality);
         }
+        // Emission-pass cluster staging RAM budget (0 = BuildConfig
+        // default). Mirrors the CLI --stage-budget-mb flag.
+        if (opts.stage_budget_mb) {
+            cfg.stage_budget_mb = opts.stage_budget_mb;
+        }
         sextant::tree::IVFTreeIndex::build_streaming_pca(*source, out_path,
                                                          cfg);
         delete b;
