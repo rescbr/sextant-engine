@@ -41,10 +41,17 @@ foreach src : test_sources
         include_directories: [test_inc, sources_inc],
         cpp_args: ['-DSEXTANT_SOURCE_DIR="' + meson.source_root() + '"'],
     )
-    # 180s: two suites (test_quantizer_families, test_tree_insert_delete)
-    # legitimately exceed meson's 30s default on ARM hardware (Neoverse-V2
-    # is ~4x slower than the x86 dev box on the training loops).
-    test(name, exe, timeout: 180,
+    # Slow suites under the sanitizer build (ASAN+UBSAN with
+    # MALLOC_PERTURB_): test_tree_insert_delete needs ~240s and
+    # test_quantizer_families ~533s on the x86 dev box (they pass well
+    # under 180s in release). Per-test overrides so the full sanitizer
+    # suite passes in one pass; everything else keeps the 180s bound
+    # that also covers slow ARM hardware.
+    slow_timeout = {
+        'test_tree_insert_delete': 600,
+        'test_quantizer_families': 900,
+    }
+    test(name, exe, timeout: slow_timeout.get(name, 180),
          env: ['SEXTANT_TEST_DATA=' + meson.current_source_dir() / 'data',
                'SEXTANT_DATASETS=' + meson.current_source_dir() / '../datasets'])
 endforeach
