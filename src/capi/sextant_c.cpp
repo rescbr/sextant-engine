@@ -571,6 +571,18 @@ uint32_t sextant_index_code_size(const void* index) {
     }
 }
 
+int sextant_index_metric(const void* index) {
+    if (!index) return -1;
+    try {
+        const auto& tree = *reinterpret_cast<const sextant::tree::IVFTreeIndex*>(index);
+        return tree.metric() == sextant::MetricKind::InnerProduct
+                   ? SEXTANT_METRIC_IP
+                   : SEXTANT_METRIC_L2SQ;
+    } catch (...) {
+        return -2;
+    }
+}
+
 uint64_t sextant_index_count(const void* index) {
     auto* idx = reinterpret_cast<const IVFTreeIndex*>(index);
     if (!idx) return 0;

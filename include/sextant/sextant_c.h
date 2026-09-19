@@ -317,6 +317,10 @@ uint32_t sextant_scan_pool_threads(void);
 /// >= 288B -> 2.5, else 5.0 — same calibration the CLI ships).
 uint32_t sextant_index_code_size(const void* index);
 
+/// Distance metric of the tree: SEXTANT_METRIC_L2SQ or SEXTANT_METRIC_IP.
+/// Read from the manifest; read-only-handle safe. Negative on error.
+int sextant_index_metric(const void* index);
+
 // --- Streaming push build ------------------------------------------------
 
 /// Begin a push build of `dim`-dimensional vectors. `cols` declares the
