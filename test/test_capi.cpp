@@ -556,6 +556,87 @@ TEST(CApiNull, NullableFilterColumns) {
     sextant_close_index(idx);
 }
 
+// Tiny match set with cardinality tracking ON (extension default "auto"):
+// selectivity 4/2000 < 1% must trigger the brute-force filtered path and
+// return ALL matching rows, not a W-shortlist filter that misses most.
+TEST(CApiCardinality, TinyMatchSetTracked) {
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "capi_card.tree").string();
+    std::filesystem::remove(path);
+
+    constexpr uint32_t kRows = 2000;
+    char err[512] = {0};
+    sextant_build_opts bopts = sextant_default_build_opts();
+    bopts.quantizer = "local_scalar";
+    bopts.cardinality = "auto";
+    sextant_filter_col_def cols[1] = {{"tag", SEXTANT_COL_STRING, 1}};
+    void* b = sextant_build_begin(&bopts, kDim, cols, 1, 0, err, sizeof(err));
+    ASSERT_NE(b, nullptr) << err;
+
+    std::vector<float> vecs(static_cast<size_t>(kRows) * kDim, 0.0f);
+    for (uint32_t i = 0; i < kRows; ++i) {
+        for (uint32_t j = 0; j < kDim; ++j) {
+            vecs[static_cast<size_t>(i) * kDim + j] = static_cast<float>(
+                static_cast<double>(static_cast<float>(
+                    (i * 7919u + j * 104729u) % 1009u)) / 1009.0 * 0.02 +
+                static_cast<double>(i % 8) * 0.3);
+        }
+    }
+    std::vector<std::string> tags(kRows);
+    std::vector<const char*> tag_str(kRows);
+    std::vector<uint32_t> tag_len(kRows);
+    for (uint32_t i = 0; i < kRows; ++i) {
+        tags[i] = i < 4 ? "rare" : "common";
+        tag_str[i] = tags[i].data();
+        tag_len[i] = static_cast<uint32_t>(tags[i].size());
+    }
+    sextant_str_values tag_vals{tag_str.data(), tag_len.data()};
+    const void* fvals[1] = {&tag_vals};
+    std::vector<uint8_t> tag_nulls(kRows, 0);
+    const uint8_t* fnulls[1] = {tag_nulls.data()};
+    ASSERT_EQ(sextant_build_push_validity(b, vecs.data(), kRows, fvals,
+                                          fnulls, nullptr, nullptr, err,
+                                          sizeof(err)), 0) << err;
+    ASSERT_EQ(sextant_build_finish(b, path.c_str(), err, sizeof(err)), 0) << err;
+
+    void* idx = sextant_open_index(path.c_str(), err, sizeof(err));
+    ASSERT_NE(idx, nullptr) << err;
+
+    // Same serving opts as the extension's index scan (no exhaustive, no
+    // int8, rerank on, adaptive-W tau like code_size < 288).
+    sextant_search_opts opts = sextant_default_search_opts();
+    opts.k = 10;
+    opts.rerank = 1;
+    opts.int8_scan = 0;
+    opts.adaptive_w_gap = 5.0f;
+    opts.search_threads = 8;
+
+    float query[kDim];
+    for (uint32_t j = 0; j < kDim; ++j) query[j] = 0.1f;
+
+    sextant_predicate pred;
+    std::memset(&pred, 0, sizeof(pred));
+    pred.column = "tag";
+    pred.op = SEXTANT_PRED_EQ;
+    pred.str_value = "rare";
+
+    uint64_t ids[10];
+    float dists[10];
+    char qerr[512] = {0};
+    const int32_t n = sextant_search_filtered(
+        idx, query, &opts, &pred, 1, ids, dists, 10, qerr, sizeof(qerr));
+    ASSERT_GE(n, 0) << qerr;
+    // The 4 rare rows (rowid 0..3, cluster 0 — the query's cluster).
+    ASSERT_EQ(n, 4) << "tiny tracked match set must be served exhaustively";
+    std::set<uint64_t> got(ids, ids + n);
+    for (uint64_t r = 0; r < 4; ++r) {
+        EXPECT_NE(got.count(r), 0u) << "missing rare row " << r;
+    }
+
+    sextant_close_index(idx);
+    std::filesystem::remove(path);
+}
+
 // (b) Filtered-search parity: string Eq and int32 Eq.
 TEST_F(CApiTest, FilteredSearchParity) {
     sextant_search_opts opts = sextant_default_search_opts();
@@ -646,7 +727,7 @@ TEST_F(CApiTest, RareStringEqSingleRow) {
     // bit-exact equality.
     opts.exhaustive = 1;
     opts.rerank = 1;
-    opts.int8_scan = 0;  // force the float kernel (score-exact scan)
+    opts.int8_scan = -1; // auto: int8 kernel on AVX512 (extension default)
 
     sextant_predicate pred;
     std::memset(&pred, 0, sizeof(pred));

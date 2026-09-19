@@ -936,6 +936,12 @@ int sextant_build_finish(void* builder, const char* out_path,
                     opts.metrics_path);
             cfg.metrics_sink = metrics_json.get();
         }
+        // Cardinality tracking spec (NULL/empty = all off, the historical
+        // default). Grammar shared with the CLI --cardinality-col flag.
+        if (opts.cardinality && *opts.cardinality) {
+            cfg.cardinality_spec =
+                sextant::tree::parse_cardinality_spec(opts.cardinality);
+        }
         sextant::tree::IVFTreeIndex::build_streaming_pca(*source, out_path,
                                                          cfg);
         delete b;

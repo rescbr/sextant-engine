@@ -87,6 +87,12 @@ struct CardinalitySpec {
     }
 };
 
+/// Parse a comma-separated cardinality spec ("name", "name=on|off|auto",
+/// bare "auto" for the default mode). Throws std::invalid_argument on a
+/// bad token. Shared by the CLI --cardinality-col flag and the C API
+/// sextant_build_opts.cardinality field.
+CardinalitySpec parse_cardinality_spec(const std::string& s);
+
 /// Number of linear bins used when a numeric histogram overflows its cap.
 inline constexpr uint32_t kCardinalityNumBins = 4096;
 

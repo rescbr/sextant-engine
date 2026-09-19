@@ -52,6 +52,11 @@ typedef struct sextant_build_opts {
     /// field names, one record per phase, flushed per record so tail -F
     /// streams live). NULL/empty = no file. ABI tail-append (zero = off).
     const char* metrics_path;
+    /// Cardinality tracking spec for filter columns, comma-separated:
+    /// "name", "name=on|off|auto", or bare "auto" (default mode for all
+    /// columns). NULL/empty = all off (historical default). Same grammar
+    /// as the CLI --cardinality-col flag. ABI tail-append (zero = off).
+    const char* cardinality;
 } sextant_build_opts;
 
 /// Sensible defaults (pq, auto geometry, L2).

@@ -5,8 +5,68 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 namespace sextant::tree {
+
+CardinalitySpec parse_cardinality_spec(const std::string& s) {
+    CardinalitySpec spec;
+    const auto apply_token = [&s](const std::string& raw,
+                                  CardinalitySpec& out) {
+        const size_t b = raw.find_first_not_of(" \t");
+        if (b == std::string::npos) {
+            return;
+        }
+        const size_t e = raw.find_last_not_of(" \t");
+        const std::string tok = raw.substr(b, e - b + 1);
+        if (tok == "auto") {
+            out.default_mode = CardinalityMode::Auto;
+            return;
+        }
+        if (tok == "on") {
+            out.default_mode = CardinalityMode::On;
+            return;
+        }
+        if (tok == "off") {
+            out.default_mode = CardinalityMode::Off;
+            return;
+        }
+        const size_t eq = tok.find('=');
+        const std::string name =
+            eq == std::string::npos ? tok : tok.substr(0, eq);
+        const std::string mode_s =
+            eq == std::string::npos ? "on" : tok.substr(eq + 1);
+        if (name.empty()) {
+            throw std::invalid_argument(
+                "cardinality spec '" + s + "': empty column name");
+        }
+        CardinalityMode mode;
+        if (mode_s == "on") {
+            mode = CardinalityMode::On;
+        } else if (mode_s == "off") {
+            mode = CardinalityMode::Off;
+        } else if (mode_s == "auto") {
+            mode = CardinalityMode::Auto;
+        } else {
+            throw std::invalid_argument(
+                "cardinality spec '" + s + "': unknown mode '" + mode_s +
+                "' for column '" + name + "' (expected on|off|auto)");
+        }
+        out.per_column[name] = mode;
+    };
+    std::string cur;
+    for (char ch : s) {
+        if (ch == ',') {
+            apply_token(cur, spec);
+            cur.clear();
+        } else {
+            cur += ch;
+        }
+    }
+    apply_token(cur, spec);
+    return spec;
+}
+
 
 // ===========================================================================
 // HyperLogLog distinct estimator (2^12 registers, 6 bits each, ~3 KB/column).
