@@ -164,6 +164,12 @@ int translate_one(const sextant_predicate& p, sextant::Predicate& ep,
             ep.value3 = p.value3;  // max_lat
             ep.value4 = p.value4;  // max_lng
             break;
+        case SEXTANT_PRED_IS_NULL:
+            ep.op = sextant::PredicateOp::IsNull;
+            break;
+        case SEXTANT_PRED_IS_NOT_NULL:
+            ep.op = sextant::PredicateOp::IsNotNull;
+            break;
         default:
             set_err(err, err_len, "predicate: unknown op value");
             return -1;
@@ -595,7 +601,7 @@ uint32_t sextant_index_filter_col_count(const void* index) {
 
 int32_t sextant_index_filter_col(const void* index, uint32_t i,
                                  char* out_name, size_t name_len,
-                                 int* out_type) {
+                                 int* out_type, int* out_nullable) {
     if (!index || !out_name || name_len == 0) return -1;
     try {
         const auto& tree = *reinterpret_cast<const sextant::tree::IVFTreeIndex*>(index);
@@ -604,6 +610,9 @@ int32_t sextant_index_filter_col(const void* index, uint32_t i,
         const auto& col = cols[i];
         if (col.name.size() + 1 > name_len) return -3;
         std::memcpy(out_name, col.name.c_str(), col.name.size() + 1);
+        if (out_nullable) {
+            *out_nullable = col.nullable ? 1 : 0;
+        }
         if (out_type) {
             switch (col.type) {
                 case sextant::ColumnType::Int32:  *out_type = SEXTANT_COL_INT32;  break;
@@ -691,7 +700,8 @@ void* sextant_build_begin(const sextant_build_opts* opts, uint32_t dim,
                            "sextant_build_begin: unknown column type");
                     return nullptr;
             }
-            b->schema.columns.push_back({cols[c].name, t});
+            b->schema.columns.push_back({cols[c].name, t,
+                                          cols[c].nullable != 0});
         }
         b->schema.has_payload = b->has_payload;
         b->stager = std::make_unique<sextant::PushStager>(
@@ -712,6 +722,19 @@ int sextant_build_push(void* builder, const float* vectors, uint32_t n_rows,
                        const uint64_t* payload_offsets,
                        const uint8_t* payload_data,
                        char* err, size_t err_len) {
+    return sextant_build_push_validity(builder, vectors, n_rows,
+                                       filter_values, nullptr,
+                                       payload_offsets, payload_data,
+                                       err, err_len);
+}
+
+int sextant_build_push_validity(void* builder, const float* vectors,
+                                uint32_t n_rows,
+                                const void* const* filter_values,
+                                const uint8_t* const* filter_nulls,
+                                const uint64_t* payload_offsets,
+                                const uint8_t* payload_data,
+                                char* err, size_t err_len) {
     auto* b = reinterpret_cast<PushBuilder*>(builder);
     if (!b || !vectors || n_rows == 0) {
         set_err(err, err_len, "sextant_build_push: null/zero argument");
@@ -730,6 +753,18 @@ int sextant_build_push(void* builder, const float* vectors, uint32_t n_rows,
                              static_cast<sextant::RowId>(b->rows + r));
             for (uint32_t c = 0; c < n_cols; ++c) {
                 const void* fv = filter_values ? filter_values[c] : nullptr;
+                const uint8_t* fn =
+                    filter_nulls ? filter_nulls[c] : nullptr;
+                if (fn && fn[r]) {
+                    if (!b->schema.columns[c].nullable) {
+                        set_err(err, err_len,
+                                "sextant_build_push: NULL pushed for "
+                                "non-nullable column");
+                        return -1;
+                    }
+                    st.append_null(c);
+                    continue;
+                }
                 const auto t = b->schema.columns[c].type;
                 switch (t) {
                     case sextant::ColumnType::Int32: {

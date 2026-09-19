@@ -45,6 +45,9 @@ struct StagedChunk {
         std::vector<uint32_t> set_offsets;
         std::vector<uint16_t> set_elem_lengths;
         std::vector<char> set_elem_data;
+        /// Per-row NULL flags (1 = NULL). Only filled for nullable columns;
+        /// end_row pads non-null rows with 0.
+        std::vector<uint8_t> nulls;
     };
     std::vector<Column> cols;
     std::vector<uint8_t> payload_data;
@@ -63,12 +66,16 @@ public:
 
     /// Row-append surface (the C ABI decodes its structs and calls these).
     /// append_vector starts a new row; column appends follow in schema
-    /// order.
+    /// order. For a nullable column, call EITHER append_null(col) OR the
+    /// value append — never both (append_null stores placeholder bytes so
+    /// the dense arrays stay row-aligned).
     void append_vector(const float* v, RowId id);
     void append_fixed(uint32_t col, const uint8_t* bytes, uint32_t width);
     void append_string(uint32_t col, const char* s, uint32_t len);
     void append_set_row(uint32_t col, uint32_t n_elems, const char* const* elems,
                         const uint32_t* lens);
+    /// Mark the current row's column `col` NULL (nullable columns only).
+    void append_null(uint32_t col);
     void append_payload(const uint8_t* data, uint32_t len);
     /// Close the current row (flushes the chunk when it is full).
     void end_row();
@@ -135,6 +142,7 @@ private:
     std::vector<FilterStringColumn> str_views_;
     std::vector<FilterSetColumn> set_views_;
     std::vector<const void*> filter_ptrs_;
+    std::vector<const uint8_t*> null_ptrs_;
     std::vector<uint32_t> payload_offsets_view_;
 };
 

@@ -96,6 +96,11 @@ inline uint64_t filter_columns_bytes(uint32_t count, const Schema& schema,
                 break;
             }
         }
+        // Nullable columns append a per-row validity byte (1 = NULL)
+        // after their data section.
+        if (col.nullable) {
+            total += static_cast<uint64_t>(count);
+        }
         // Align to 4 bytes after each column so the next column's typed
         // arrays (uint32_t*, uint16_t*) are naturally aligned.
         total = align4(total);
@@ -143,11 +148,10 @@ inline uint64_t write_filter_columns(uint8_t* buf, uint32_t count,
                 if (count > 0)
                     std::memcpy(p, fc.fixed_data.data(), static_cast<size_t>(count) * w);
                 p += static_cast<uint64_t>(count) * w;
-                // Align after EVERY column, matching filter_columns_bytes and
-                // parse_filter_columns — a Bool column (odd byte count) left
-                // unaligned shifts every subsequent string column by 1 byte
-                // and turns their u32 offsets into garbage.
-                p = buf + align4(static_cast<uint64_t>(p - buf));
+                // (No per-column align here: nullable validity bytes are
+                // appended below BEFORE the single shared align, matching
+                // filter_columns_bytes. The old align here would pad
+                // between data and validity for odd-width Bool columns.)
                 break;
             }
             case ColumnType::String: {
@@ -211,6 +215,19 @@ inline uint64_t write_filter_columns(uint8_t* buf, uint32_t count,
                 break;
             }
         }
+        // Nullable columns: per-row validity byte (1 = NULL) after the
+        // data section. A null row's stored value bytes are arbitrary
+        // (writers store zeros/empty) — evaluation never reads them.
+        if (col.nullable) {
+            if (count > 0) {
+                if (!fc.null_mask.empty()) {
+                    std::memcpy(p, fc.null_mask.data(), count);
+                } else {
+                    std::memset(p, 0, count);
+                }
+            }
+            p += static_cast<uint64_t>(count);
+        }
         // Align the write pointer to 4 bytes after each column, matching
         // filter_columns_bytes (which adds the same padding).
         p = buf + align4(static_cast<uint64_t>(p - buf));
@@ -254,6 +271,7 @@ inline std::vector<uint32_t> distinct_hashes_string(const ColumnData& col,
     seen.reserve(count);
     std::vector<uint32_t> out;
     for (uint32_t i = 0; i < count; ++i) {
+        if (i < col.null_mask.size() && col.null_mask[i]) continue;  // NULL
         const uint16_t len = col.str_lengths[i];
         const char* s = col.str_data.data() + col.str_offsets[i];
         const uint32_t h = filter_hash(std::string_view(s, len));
@@ -273,6 +291,7 @@ inline std::vector<uint32_t> distinct_hashes_set(const ColumnData& col,
     std::unordered_set<uint32_t> seen;
     std::vector<uint32_t> out;
     for (uint32_t i = 0; i < count; ++i) {
+        if (i < col.null_mask.size() && col.null_mask[i]) continue;  // NULL
         const uint8_t ec = col.set_counts[i];
         const uint32_t off = col.set_offsets[i];
         for (uint32_t e = 0; e < ec; ++e) {
@@ -323,7 +342,9 @@ inline void write_filter_summary(uint8_t* buf, uint32_t summary_size,
             continue;
         double lo = std::numeric_limits<double>::max();
         double hi = std::numeric_limits<double>::lowest();
+        const auto& nulls = filter_cols[c].null_mask;
         for (uint32_t i = 0; i < count; ++i) {
+            if (i < nulls.size() && nulls[i]) continue;  // NULL: skip
             const double v = detail::read_numeric(filter_cols[c], i);
             if (v < lo) lo = v;
             if (v > hi) hi = v;

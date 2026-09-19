@@ -98,11 +98,11 @@ std::string build_test_index(const Corpus& c, const std::string& name) {
     bopts.max_lloyd_passes = 2;
     bopts.num_threads = 4;
 
-    sextant_filter_col_def cols[5] = {{"year", SEXTANT_COL_INT32},
-                                      {"category", SEXTANT_COL_STRING},
-                                      {"tags", SEXTANT_COL_SET},
-                                      {"lat", SEXTANT_COL_FLOAT},
-                                      {"lng", SEXTANT_COL_FLOAT}};
+    sextant_filter_col_def cols[5] = {{"year", SEXTANT_COL_INT32, 0},
+                                      {"category", SEXTANT_COL_STRING, 0},
+                                      {"tags", SEXTANT_COL_SET, 0},
+                                      {"lat", SEXTANT_COL_FLOAT, 0},
+                                      {"lng", SEXTANT_COL_FLOAT, 0}};
     void* b = sextant_build_begin(&bopts, kDim, cols, 5, 1, err, sizeof(err));
     EXPECT_NE(b, nullptr) << err;
     if (!b) return path;
@@ -416,13 +416,144 @@ TEST_F(CApiTest, FilterColumnIntrospection) {
     for (uint32_t i = 0; i < 5; ++i) {
         char name[128] = {0};
         int type = -1;
-        EXPECT_EQ(sextant_index_filter_col(index, i, name, sizeof(name), &type), 0);
+        EXPECT_EQ(sextant_index_filter_col(index, i, name, sizeof(name), &type, nullptr), 0);
         EXPECT_STREQ(name, expected[i].name);
         EXPECT_EQ(type, expected[i].type);
     }
     char name[128];
-    EXPECT_LT(sextant_index_filter_col(index, 5, name, sizeof(name), nullptr), 0);
-    EXPECT_LT(sextant_index_filter_col(nullptr, 0, name, sizeof(name), nullptr), 0);
+    EXPECT_LT(sextant_index_filter_col(index, 5, name, sizeof(name), nullptr, nullptr), 0);
+    EXPECT_LT(sextant_index_filter_col(nullptr, 0, name, sizeof(name), nullptr, nullptr), 0);
+}
+
+// (b1) Nullable filter columns: SQL three-valued predicate semantics.
+TEST(CApiNull, NullableFilterColumns) {
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "capi_null.tree").string();
+    std::filesystem::remove(path);
+
+    constexpr uint32_t kRows = 160;
+    char err[512] = {0};
+    sextant_build_opts bopts = sextant_default_build_opts();
+    bopts.quantizer = "local_scalar";
+    sextant_filter_col_def cols[2] = {{"year", SEXTANT_COL_INT32, 1},
+                                      {"category", SEXTANT_COL_STRING, 1}};
+    void* b = sextant_build_begin(&bopts, kDim, cols, 2, 0, err, sizeof(err));
+    ASSERT_NE(b, nullptr) << err;
+
+    std::vector<float> vecs(static_cast<size_t>(kRows) * kDim, 0.0f);
+    for (uint32_t i = 0; i < kRows; ++i) {
+        // 4 clusters like the shared corpus so searches are stable.
+        const float base = (i % 4) * 0.5f;
+        for (uint32_t j = 0; j < kDim; ++j) {
+            vecs[static_cast<size_t>(i) * kDim + j] = base + 0.01f * j;
+        }
+    }
+    std::vector<int32_t> years(kRows);
+    std::vector<uint8_t> year_nulls(kRows, 0);
+    std::vector<const char*> cat_str(kRows);
+    std::vector<uint32_t> cat_len(kRows);
+    std::vector<uint8_t> cat_nulls(kRows, 0);
+    std::vector<std::string> cats(kRows);
+    for (uint32_t i = 0; i < kRows; ++i) {
+        years[i] = 1990 + static_cast<int32_t>(i % 40);
+        year_nulls[i] = (i % 7 == 3) ? 1 : 0;
+        cats[i] = "cat_" + std::to_string(i % 5);
+        cat_str[i] = cats[i].data();
+        cat_len[i] = static_cast<uint32_t>(cats[i].size());
+        cat_nulls[i] = (i % 11 == 5) ? 1 : 0;
+    }
+    sextant_str_values cat_vals{cat_str.data(), cat_len.data()};
+    const void* fvals[2] = {years.data(), &cat_vals};
+    const uint8_t* fnulls[2] = {year_nulls.data(), cat_nulls.data()};
+    ASSERT_EQ(sextant_build_push_validity(b, vecs.data(), kRows, fvals, fnulls,
+                                          nullptr, nullptr, err, sizeof(err)), 0)
+        << err;
+    ASSERT_EQ(sextant_build_finish(b, path.c_str(), err, sizeof(err)), 0) << err;
+
+    void* idx = sextant_open_index(path.c_str(), err, sizeof(err));
+    ASSERT_NE(idx, nullptr) << err;
+
+    // Introspection reports the nullable flags.
+    ASSERT_EQ(sextant_index_filter_col_count(idx), 2u);
+    char name[128];
+    int type = -1, nullable = -1;
+    EXPECT_EQ(sextant_index_filter_col(idx, 0, name, sizeof(name), &type, &nullable), 0);
+    EXPECT_EQ(nullable, 1);
+    EXPECT_EQ(sextant_index_filter_col(idx, 1, name, sizeof(name), &type, &nullable), 0);
+    EXPECT_EQ(nullable, 1);
+
+    // SQL-semantics allowed sets over the known row data.
+    std::set<uint64_t> eq_allowed, neq_allowed, range_allowed, is_null_allowed,
+        not_null_allowed, str_eq_allowed, str_is_null;
+    for (uint32_t i = 0; i < kRows; ++i) {
+        if (!year_nulls[i] && years[i] == 2010) eq_allowed.insert(i);
+        if (!year_nulls[i] && years[i] != 2010) neq_allowed.insert(i);
+        if (!year_nulls[i] && years[i] >= 2000 && years[i] <= 2015)
+            range_allowed.insert(i);
+        if (year_nulls[i]) is_null_allowed.insert(i);
+        if (!year_nulls[i]) not_null_allowed.insert(i);
+        if (!cat_nulls[i] && cats[i] == "cat_2") str_eq_allowed.insert(i);
+        if (cat_nulls[i]) str_is_null.insert(i);
+    }
+    ASSERT_FALSE(is_null_allowed.empty());
+    ASSERT_FALSE(str_is_null.empty());
+
+    sextant_search_opts opts = sextant_default_search_opts();
+    opts.k = 8;
+    opts.exhaustive = 1;
+    opts.rerank = 1;
+    opts.int8_scan = 0;
+
+    float query[kDim];
+    for (uint32_t j = 0; j < kDim; ++j) query[j] = 0.5f + 0.01f * j;
+
+    const auto check = [&](const sextant_predicate& pred,
+                           const std::set<uint64_t>& allowed) {
+        uint64_t ids[8];
+        float dists[8];
+        char qerr[512] = {0};
+        const int32_t n = sextant_search_filtered(
+            idx, query, &opts, &pred, 1, ids, dists, 8, qerr, sizeof(qerr));
+        ASSERT_GE(n, 0) << qerr;
+        ASSERT_GT(n, 0);
+        for (int32_t i = 0; i < n; ++i) {
+            EXPECT_NE(allowed.count(ids[i]), 0u)
+                << "row " << ids[i] << " failed SQL predicate semantics";
+        }
+    };
+
+    {
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = "year"; p.op = SEXTANT_PRED_EQ; p.value = 2010.0;
+        check(p, eq_allowed);
+        p.op = SEXTANT_PRED_NEQ;
+        check(p, neq_allowed);
+        p.op = SEXTANT_PRED_BETWEEN; p.value = 2000.0; p.value2 = 2015.0;
+        check(p, range_allowed);
+        p.op = SEXTANT_PRED_IS_NULL;
+        check(p, is_null_allowed);
+        p.op = SEXTANT_PRED_IS_NOT_NULL;
+        check(p, not_null_allowed);
+        std::memset(&p, 0, sizeof(p));
+        p.column = "category"; p.op = SEXTANT_PRED_EQ; p.str_value = "cat_2";
+        check(p, str_eq_allowed);
+        p.op = SEXTANT_PRED_IS_NULL;
+        check(p, str_is_null);
+    }
+
+    // Pushing a NULL for a non-nullable column must be rejected.
+    sextant_filter_col_def strict[1] = {{"year", SEXTANT_COL_INT32, 0}};
+    void* sb = sextant_build_begin(&bopts, kDim, strict, 1, 0, err, sizeof(err));
+    ASSERT_NE(sb, nullptr) << err;
+    const uint8_t bad_nulls[kRows] = {1};
+    const void* svals[1] = {years.data()};
+    const uint8_t* snulls[1] = {bad_nulls};
+    EXPECT_LT(sextant_build_push_validity(sb, vecs.data(), 4, svals, snulls,
+                                          nullptr, nullptr, err, sizeof(err)), 0);
+    sextant_build_abort(sb);
+
+    sextant_close_index(idx);
 }
 
 // (b) Filtered-search parity: string Eq and int32 Eq.
@@ -722,7 +853,7 @@ TEST(CApiBuild, AbortLeavesNoFile) {
 
     char err[512] = {0};
     sextant_build_opts bopts = sextant_default_build_opts();
-    sextant_filter_col_def cols[1] = {{"year", SEXTANT_COL_INT32}};
+    sextant_filter_col_def cols[1] = {{"year", SEXTANT_COL_INT32, 0}};
     void* b = sextant_build_begin(&bopts, kDim, cols, 1, 0, err, sizeof(err));
     ASSERT_NE(b, nullptr) << err;
 
@@ -743,7 +874,7 @@ TEST(CApiBuild, AbortLeavesNoFile) {
         (std::filesystem::temp_directory_path() / "capi_setnull.tree")
             .string();
     std::filesystem::remove(setpath);
-    sextant_filter_col_def setcol[1] = {{"tags", SEXTANT_COL_SET}};
+    sextant_filter_col_def setcol[1] = {{"tags", SEXTANT_COL_SET, 0}};
     std::memset(err, 0, sizeof(err));
     void* sb = sextant_build_begin(&bopts, kDim, setcol, 1, 0,
                                    err, sizeof(err));
@@ -953,12 +1084,12 @@ std::string build_push_index(const float* data, const std::string& name,
     bopts.num_threads = 4;
     bopts.staging_bytes = staging_bytes;
 
-    sextant_filter_col_def cols[6] = {{"year", SEXTANT_COL_INT32},
-                                      {"category", SEXTANT_COL_STRING},
-                                      {"tags", SEXTANT_COL_SET},
-                                      {"lat", SEXTANT_COL_FLOAT},
-                                      {"lng", SEXTANT_COL_FLOAT},
-                                      {"flag", SEXTANT_COL_BOOL}};
+    sextant_filter_col_def cols[6] = {{"year", SEXTANT_COL_INT32, 0},
+                                      {"category", SEXTANT_COL_STRING, 0},
+                                      {"tags", SEXTANT_COL_SET, 0},
+                                      {"lat", SEXTANT_COL_FLOAT, 0},
+                                      {"lng", SEXTANT_COL_FLOAT, 0},
+                                      {"flag", SEXTANT_COL_BOOL, 0}};
     void* b = sextant_build_begin(&bopts, kDim, cols, 6, 1, err, sizeof(err));
     EXPECT_NE(b, nullptr) << err;
     if (!b) return path;

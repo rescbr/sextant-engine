@@ -117,6 +117,9 @@ std::string manifest_to_toml(const TreeManifest& m) {
             auto ct = cpptoml::make_table();
             ct->insert("name", col.name);
             ct->insert("type", std::string(column_type_to_string(col.type)));
+            if (col.nullable) {
+                ct->insert("nullable", true);
+            }
             cols->push_back(std::move(ct));
         }
         schema_tbl->insert("filter_columns", cols);
@@ -244,6 +247,9 @@ TreeManifest manifest_from_toml(const std::string& toml) {
                 }
                 if (auto type = ct->get_as<std::string>("type")) {
                     col.type = column_type_from_string(*type);
+                }
+                if (auto nullable = ct->get_as<bool>("nullable")) {
+                    col.nullable = *nullable;
                 }
                 m.schema.columns.push_back(std::move(col));
             }

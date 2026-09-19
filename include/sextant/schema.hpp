@@ -61,6 +61,11 @@ inline std::string_view column_type_name(ColumnType t) {
 struct FilterColumn {
     std::string name;
     ColumnType type = ColumnType::Int32;
+    /// Nullable columns store a per-row validity byte in leaf extents
+    /// (1 = NULL) and evaluate predicates with SQL three-valued logic:
+    /// NULL fails every comparison. Non-nullable columns (default, and
+    /// all trees built before the flag existed) store no validity data.
+    bool nullable = false;
 };
 
 /// A declared schema (set of filter columns + payload flag).
@@ -154,6 +159,9 @@ enum class PredicateOp : uint8_t {
     Contains, ContainsAny, ContainsAll,
     // Geo
     GeoRadius, GeoBox,
+    // Null tests (SQL IS NULL / IS NOT NULL). On non-nullable columns
+    // IsNull is statically false / IsNotNull statically true.
+    IsNull, IsNotNull,
 };
 
 /// A single predicate on one filter column.
@@ -216,6 +224,9 @@ inline bool predicate_applies_to(PredicateOp op, ColumnType type) {
         case PredicateOp::GeoRadius:
         case PredicateOp::GeoBox:
             return numeric;  // lat + lng columns
+        case PredicateOp::IsNull:
+        case PredicateOp::IsNotNull:
+            return true;  // applies to every column type
     }
     return false;
 }

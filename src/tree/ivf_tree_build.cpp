@@ -1169,6 +1169,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
     // cardinality/payload dual-path logic.
     bool chunk_has_filter = false;
     const void* const* chunk_fcols = nullptr;
+    const uint8_t* const* chunk_fnulls = nullptr;
 
     // Serialize the filter column values for one row into staged-record
     // filter-row format (same dual-path value extraction the old in-RAM
@@ -1179,6 +1180,23 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         const uint32_t r = static_cast<uint32_t>(row_id);
         for (uint32_t c = 0; c < n_schema_cols; ++c) {
             const ColumnType t = cfg.filter_schema.columns[c].type;
+            const bool col_nullable = cfg.filter_schema.columns[c].nullable;
+            // NULL lookup: chunk path (per-chunk flags) or cfg path
+            // (ColumnData.null_mask by global row id).
+            const bool is_null = col_nullable && (
+                (chunk_has_filter && chunk_fnulls && chunk_fnulls[c] &&
+                 chunk_fnulls[c][local_idx]) ||
+                (!chunk_has_filter &&
+                 r < cfg.filter_column_data[c].null_mask.size() &&
+                 cfg.filter_column_data[c].null_mask[r]));
+            if (col_nullable) {
+                // Staged-record null flag: 1 byte before the value; a null
+                // row carries NO value bytes.
+                out.push_back(is_null ? 1 : 0);
+            }
+            if (is_null) {
+                continue;
+            }
             switch (t) {
                 case ColumnType::Int32:
                 case ColumnType::Int64:
@@ -1682,6 +1700,7 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
             // (e.g. from a ParquetSource). The lambdas below read these.
             chunk_has_filter = (chunk.filter_columns != nullptr);
             chunk_fcols = chunk.filter_columns;
+            chunk_fnulls = chunk.filter_nulls;
             const bool chunk_has_payload = (chunk.payload_data != nullptr);
             if (has_payload && !chunk_has_payload && !cfg_payload) {
                 throw Error(ErrorCode::InvalidParam,
@@ -1819,6 +1838,21 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
                                          ++c) {
                                         const auto& col =
                                             cfg.filter_schema.columns[c];
+                                        // NULL rows contribute nothing to
+                                        // the cardinality table.
+                                        if (col.nullable) {
+                                            const bool is_null =
+                                                (chunk_has_filter &&
+                                                 chunk_fnulls &&
+                                                 chunk_fnulls[c] &&
+                                                 chunk_fnulls[c][i]) ||
+                                                (!chunk_has_filter &&
+                                                 r < cfg.filter_column_data[c]
+                                                          .null_mask.size() &&
+                                                 cfg.filter_column_data[c]
+                                                     .null_mask[r]);
+                                            if (is_null) continue;
+                                        }
                                         if (col.type == ColumnType::String) {
                                             std::string_view sv;
                                             if (chunk_has_filter) {

@@ -1049,6 +1049,10 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
                 new_cols[c].type = col.type;
                 for (uint32_t ai = 0; ai < indices.size(); ++ai) {
                     const auto& pfc = points[indices[ai]].filter_values[c];
+                    if (col.nullable) {
+                        new_cols[c].null_mask.push_back(
+                            pfc.null_mask.empty() ? 0 : pfc.null_mask[0]);
+                    }
                     switch (col.type) {
                         case ColumnType::Int32:
                         case ColumnType::Int64:
@@ -1201,6 +1205,10 @@ void IVFTreeIndex::insert_batch(const std::vector<InsertPoint>& points) {
                 new_cols[c].type = col.type;
                 for (uint32_t ai = 0; ai < indices.size(); ++ai) {
                     const auto& pfc = points[indices[ai]].filter_values[c];
+                    if (col.nullable) {
+                        new_cols[c].null_mask.push_back(
+                            pfc.null_mask.empty() ? 0 : pfc.null_mask[0]);
+                    }
                     switch (col.type) {
                         case ColumnType::Int32: case ColumnType::Int64:
                         case ColumnType::Float: case ColumnType::Bool: {
@@ -1593,6 +1601,10 @@ IVFTreeIndex::VacuumResult IVFTreeIndex::vacuum(const VacuumConfig& config) {
                 for (uint32_t c = 0; c < manifest_.schema.columns.size(); ++c) {
                     const auto& col = manifest_.schema.columns[c];
                     const auto& fc = cols[c];
+                    // NULL rows contribute nothing to the cardinality table.
+                    if (col.nullable && i < fc.null_mask.size() && fc.null_mask[i]) {
+                        continue;
+                    }
                     switch (col.type) {
                         case ColumnType::String:
                             new_card.add_string(c,

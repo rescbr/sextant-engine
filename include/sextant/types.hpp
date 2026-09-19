@@ -57,6 +57,12 @@ struct Chunk {
     /// FilterSetColumn structure (defined in filter_column_data.hpp).
     const void* const* filter_columns = nullptr;
 
+    /// Per-row NULL flags for the filter columns (1 = NULL), in schema
+    /// order. May be NULL (= no NULLs in any column); individual entries
+    /// may also be NULL (that column has no NULLs). Only columns declared
+    /// nullable in the schema carry meaningful flags.
+    const uint8_t* const* filter_nulls = nullptr;
+
     /// Opaque payload blobs (Phase E). Nullptr when no payload.
     /// payload_offsets[i] .. payload_offsets[i+1] gives the byte range for row i.
     const uint8_t* payload_data = nullptr;

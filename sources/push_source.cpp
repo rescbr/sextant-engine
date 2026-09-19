@@ -87,6 +87,36 @@ void PushStager::append_set_row(uint32_t col, uint32_t n_elems, const char* cons
     }
 }
 
+void PushStager::append_null(uint32_t col) {
+    if (col >= schema_.columns.size() || !schema_.columns[col].nullable) {
+        throw Error(ErrorCode::InvalidParam,
+                    "append_null: column " + std::to_string(col) +
+                        " is not a nullable filter column");
+    }
+    auto& c = current_.cols[col];
+    // Align the flag array to the current row (previous rows default 0),
+    // then mark this row NULL.
+    c.nulls.resize(current_.row_ids.size() - 1, 0);
+    c.nulls.push_back(1);
+    // Placeholder value bytes keep the dense arrays row-aligned.
+    switch (schema_.columns[col].type) {
+        case ColumnType::Int32:
+        case ColumnType::Int64:
+        case ColumnType::Float:
+        case ColumnType::Bool:
+            c.fixed.insert(c.fixed.end(), column_type_width(schema_.columns[col].type), 0);
+            break;
+        case ColumnType::String:
+            c.str_offsets.push_back(static_cast<uint32_t>(c.str_data.size()));
+            c.str_lengths.push_back(0);
+            break;
+        case ColumnType::Set:
+            c.set_counts.push_back(0);
+            c.set_offsets.push_back(static_cast<uint32_t>(c.set_elem_lengths.size()));
+            break;
+    }
+}
+
 void PushStager::append_payload(const uint8_t* data, uint32_t len) {
     current_.payload_data.insert(current_.payload_data.end(), data, data + len);
     payload_bytes_ += len;
@@ -96,6 +126,13 @@ void PushStager::end_row() {
     ++rows_;
     current_.count = static_cast<uint32_t>(current_.row_ids.size());
     current_.payload_offsets.push_back(static_cast<uint32_t>(current_.payload_data.size()));
+    // Nullable columns: pad the flag array — rows that took a value append
+    // (not append_null) default to non-NULL.
+    for (uint32_t ci = 0; ci < schema_.columns.size(); ++ci) {
+        if (schema_.columns[ci].nullable) {
+            current_.cols[ci].nulls.resize(current_.count, 0);
+        }
+    }
     if (current_.count >= kChunkRows) {
         memory_chunks_.push_back(std::move(current_));
         current_ = StagedChunk{};
@@ -167,6 +204,8 @@ void PushStager::write_chunk(const StagedChunk& c) {
             for (uint8_t v : col.set_counts) blob.push_back(v);
             w_u64(blob, col.set_offsets.size());
             for (uint32_t o : col.set_offsets) w_u32(blob, o);
+            w_u64(blob, col.nulls.size());
+            blob.insert(blob.end(), col.nulls.begin(), col.nulls.end());
         }
         std::vector<uint8_t> len;
         w_u64(len, blob.size());
@@ -262,6 +301,9 @@ void PushStager::read_chunk(StagedChunk& c, bool vector_only) {
                 n = r_u64(p);
                 col.set_offsets.resize(n);
                 for (uint64_t i = 0; i < n; ++i) col.set_offsets[i] = r_u32(p);
+                n = r_u64(p);
+                col.nulls.assign(p, p + n);
+                p += n;
             }
         }
     }
@@ -420,8 +462,22 @@ bool StagedPushSource::next(Chunk& out) {
             }
         }
         out.filter_columns = filter_ptrs_.data();
+        // Null flags: only nullable columns carry them.
+        bool any_nulls = false;
+        null_ptrs_.clear();
+        for (size_t ci = 0; ci < stager_.schema_.columns.size(); ++ci) {
+            if (stager_.schema_.columns[ci].nullable &&
+                buf_.cols[ci].nulls.size() == buf_.count) {
+                null_ptrs_.push_back(buf_.cols[ci].nulls.data());
+                any_nulls = true;
+            } else {
+                null_ptrs_.push_back(nullptr);
+            }
+        }
+        out.filter_nulls = any_nulls ? null_ptrs_.data() : nullptr;
     } else {
         out.filter_columns = nullptr;
+        out.filter_nulls = nullptr;
     }
 
     if (stager_.has_payload_) {

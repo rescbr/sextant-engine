@@ -848,6 +848,102 @@ TEST(TreeInsertDelete, InsertWithFilterColumns) {
     std::filesystem::remove(tree_path);
 }
 
+// Insert rows with NULL filter values into a nullable column: IS NULL
+// finds them, value comparisons never do.
+TEST(TreeInsertDelete, InsertWithNullFilterValues) {
+    const uint32_t dim = 32;
+    const uint32_t n = 400;
+    const std::string base_path = "tree_null_ins_test.fbin";
+    const std::string tree_path = temp_path(".tree");
+    std::filesystem::remove(tree_path);
+    write_test_fbin(base_path, n, dim, /*n_clusters=*/10, /*seed=*/7);
+
+    Schema schema;
+    schema.columns.push_back({"year", ColumnType::Int32, /*nullable=*/true});
+
+    std::vector<ColumnData> filter_data(1);
+    filter_data[0].type = ColumnType::Int32;
+    filter_data[0].fixed_data.resize(static_cast<size_t>(n) * 4);
+    for (uint32_t i = 0; i < n; ++i) {
+        const int32_t year = 2000 + static_cast<int32_t>(i % 25);
+        std::memcpy(&filter_data[0].fixed_data[static_cast<size_t>(i) * 4],
+                    &year, 4);
+        filter_data[0].null_mask.push_back(i % 9 == 4 ? 1 : 0);
+    }
+
+    IVFTreeIndex::BuildConfig cfg;
+    cfg.params.metric = MetricKind::L2Sq;
+    cfg.params.quantizer_type = "pq";
+    cfg.params.pq4_m = 8;
+    cfg.params.scan_pq_bits = 4;
+    cfg.params.closure_epsilon = -1.0f;
+    cfg.k_root = 4;
+    cfg.leaf_capacity = 200;
+    cfg.num_threads = 2;
+    cfg.adaptive_probe_gap = 0.0f;
+    cfg.filter_schema = schema;
+    cfg.filter_column_data = filter_data;
+
+    ([&]{ FbinSource s(base_path); return IVFTreeIndex::build_streaming_pca(s, tree_path, cfg); })();
+    auto idx = IVFTreeIndex::open(tree_path, 0, 1, 0, /*writable=*/true);
+
+    uint64_t fbin_n;
+    uint32_t fbin_dim;
+    auto base_data = read_fbin(base_path, fbin_n, fbin_dim);
+
+    // Insert 30 rows: every one NULL year.
+    const uint32_t n_insert = 30;
+    std::vector<IVFTreeIndex::InsertPoint> points;
+    std::vector<float> storage(n_insert * dim);
+    std::mt19937 rng(3);
+    for (uint32_t i = 0; i < n_insert; ++i) {
+        for (uint32_t d = 0; d < dim; ++d)
+            storage[i * dim + d] = std::uniform_real_distribution<float>(-10, 10)(rng);
+        std::vector<ColumnData> fv(1);
+        fv[0].type = ColumnType::Int32;
+        int32_t zero = 0;
+        fv[0].fixed_data.resize(4);
+        std::memcpy(fv[0].fixed_data.data(), &zero, 4);
+        fv[0].null_mask.push_back(1);
+        points.push_back({&storage[i * dim],
+                          static_cast<RowId>(n + i), std::move(fv), {}});
+    }
+    idx->insert_batch(points);
+    EXPECT_GE(idx->live_count(), n + n_insert);
+
+    const auto search_with = [&](PredicateOp op, double value) {
+        Predicate pred;
+        pred.column = "year";
+        pred.op = op;
+        pred.value = value;
+        SearchConfig scfg;
+        scfg.k = 10;
+        scfg.n_probe = 4;
+        scfg.adaptive_probe_gap = 0.0f;
+        scfg.predicates = {pred};
+        return idx->search(&base_data[0], 10, scfg);
+    };
+
+    // IS NULL finds base NULL rows and inserted rows; inserted row ids are
+    // >= n (the stored 0 year must never surface under value predicates).
+    auto is_null = search_with(PredicateOp::IsNull, 0.0);
+    bool saw_inserted = false;
+    for (const auto& c : is_null) {
+        if (c.row_id >= n) saw_inserted = true;
+    }
+    EXPECT_TRUE(saw_inserted) << "IS NULL did not find inserted NULL rows";
+
+    auto eq_zero = search_with(PredicateOp::Eq, 0.0);
+    for (const auto& c : eq_zero) {
+        EXPECT_GE(c.row_id, n)
+            << "base row leaked through NULL as year=0? (only inserted "
+               "rows hold a stored 0)";
+    }
+
+    std::filesystem::remove(base_path);
+    std::filesystem::remove(tree_path);
+}
+
 // ===========================================================================
 // Depth-3 split: verify add_child_to_parent_ works at depth=3.
 // Forces depth=3 by setting k_root_max_depth2 low, then inserts enough vectors

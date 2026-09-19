@@ -87,6 +87,10 @@ struct LeafFilterLayout {
 struct ColumnView {
     ColumnType type = ColumnType::Int32;
 
+    /// Per-row NULL flags (1 = NULL), count entries, or nullptr for
+    /// non-nullable columns / legacy trees.
+    const uint8_t* nulls = nullptr;
+
     // Fixed-width.
     const uint8_t* fixed_base = nullptr;
     uint8_t fixed_width = 0;

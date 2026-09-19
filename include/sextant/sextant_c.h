@@ -178,6 +178,9 @@ enum {
     SEXTANT_PRED_GEO_RADIUS = 13,      ///< haversine((lat,lng),(value,value2))
                                       ///< <= radius_km
     SEXTANT_PRED_GEO_BOX = 14,         ///< lat/lng inside [min,max] box
+    SEXTANT_PRED_IS_NULL = 15,         ///< column value is NULL (nullable
+                                      ///< columns only)
+    SEXTANT_PRED_IS_NOT_NULL = 16,     ///< column value is not NULL
 };
 
 typedef struct sextant_predicate {
@@ -217,6 +220,11 @@ enum {
 typedef struct sextant_filter_col_def {
     const char* name;  ///< column name (required, non-NULL)
     int type;          ///< SEXTANT_COL_*
+    // --- tail-appended fields (ABI: old callers read them as zeroed) ---
+    int nullable;      ///< 1 = store per-row NULL flags and evaluate
+                       ///< predicates with SQL three-valued logic; 0
+                       ///< (default/legacy) = no NULL support for this
+                       ///< column
 } sextant_filter_col_def;
 
 /// Per-column string values for one sextant_build_push() call. The
@@ -326,11 +334,13 @@ int sextant_index_metric(const void* index);
 uint32_t sextant_index_filter_col_count(const void* index);
 
 /// Copy filter column i's name (NUL-terminated; pass name_len >= 128)
-/// into out_name and its SEXTANT_COL_* type into out_type. Returns 0 on
-/// success, a negative value on bad arguments / out-of-range index.
+/// into out_name and its SEXTANT_COL_* type into out_type. out_nullable
+/// (optional) receives 1 when the column carries per-row NULL flags.
+/// Returns 0 on success, a negative value on bad arguments / out-of-range
+/// index.
 int32_t sextant_index_filter_col(const void* index, uint32_t i,
                                  char* out_name, size_t name_len,
-                                 int* out_type);
+                                 int* out_type, int* out_nullable);
 
 // --- Streaming push build ------------------------------------------------
 
@@ -358,6 +368,19 @@ int sextant_build_push(void* builder, const float* vectors, uint32_t n_rows,
                        const uint64_t* payload_offsets,
                        const uint8_t* payload_data,
                        char* err, size_t err_len);
+
+/// Like sextant_build_push, plus per-column NULL flags: filter_nulls[c]
+/// (may be NULL per column, or NULL overall) holds one byte per row
+/// (1 = NULL). A NULL row needs no meaningful value in filter_values.
+/// NULLs are only allowed for columns declared nullable at
+/// sextant_build_begin; pushing one for a non-nullable column is an error.
+int sextant_build_push_validity(void* builder, const float* vectors,
+                               uint32_t n_rows,
+                               const void* const* filter_values,
+                               const uint8_t* const* filter_nulls,
+                               const uint64_t* payload_offsets,
+                               const uint8_t* payload_data,
+                               char* err, size_t err_len);
 
 /// Finish: run the (blocking) build and write the index to out_path. Frees
 /// the builder on BOTH success and failure. Returns 0 on success.

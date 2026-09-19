@@ -122,6 +122,12 @@ std::vector<ColumnView> parse_filter_columns(const uint8_t* filter_base,
                 break;
             }
         }
+        // Nullable columns: per-row validity byte after the data section
+        // (mirrors write_filter_columns / filter_columns_bytes).
+        if (col.nullable) {
+            views[c].nulls = p;
+            p += count;
+        }
         // Align after EVERY column, matching the writer's per-column pad.
         p = filter_base + align4(static_cast<uint64_t>(p - filter_base));
     }
@@ -224,6 +230,14 @@ inline bool set_contains_string(const ColumnView& col, uint32_t idx,
 }  // namespace
 
 bool eval_predicate(const ColumnView& col, uint32_t idx, const Predicate& pred) {
+    // SQL three-valued logic: a NULL value fails every comparison and
+    // passes only IS NULL. (Legacy trees without validity bytes have
+    // col.nulls == nullptr — non-NULL by construction.)
+    if (col.nulls && col.nulls[idx]) {
+        return pred.op == PredicateOp::IsNull;
+    }
+    if (pred.op == PredicateOp::IsNull) return false;
+    if (pred.op == PredicateOp::IsNotNull) return true;
     switch (col.type) {
         // --- Numeric types ---
         case ColumnType::Int32:
@@ -364,6 +378,11 @@ bool eval_predicate(const ColumnView& col, uint32_t idx, const Predicate& pred) 
 bool eval_predicate_geo(const ColumnView& lat_col, const ColumnView& lng_col,
                          uint32_t idx, const Predicate& pred) {
     // Geo columns are stored as Float (latitude, longitude). Read both values.
+    // A NULL in either coordinate fails the predicate (SQL semantics).
+    if ((lat_col.nulls && lat_col.nulls[idx]) ||
+        (lng_col.nulls && lng_col.nulls[idx])) {
+        return false;
+    }
     const double lat = read_fixed_as_double(lat_col, idx);
     const double lng = read_fixed_as_double(lng_col, idx);
 
@@ -441,6 +460,12 @@ bool summary_may_match(const uint8_t* summary, uint32_t summary_size,
         const auto& pred = preds[pi];
         const uint32_t col_idx = pred_col_indices[pi];
         const auto& col = schema.columns[col_idx];
+
+        // IS NULL / IS NOT NULL: no summary pruning (would need per-leaf
+        // null counts; conservative for now).
+        if (pred.op == PredicateOp::IsNull || pred.op == PredicateOp::IsNotNull) {
+            continue;
+        }
 
         // --- Geo predicates span two columns (lat + lng) ---
         if (pred.op == PredicateOp::GeoBox || pred.op == PredicateOp::GeoRadius) {

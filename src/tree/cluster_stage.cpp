@@ -316,6 +316,43 @@ bool staged_append_filter_row(const uint8_t* fr, uint32_t fr_len,
     }
     for (uint32_t c = 0; c < n; ++c) {
         auto& d = dst[c];
+        // Nullable columns: 1 flag byte before the value; a null row
+        // carries NO value bytes (writers store zero values so the
+        // dense arrays stay consistent).
+        const bool col_nullable = schema.columns[c].nullable;
+        bool is_null = false;
+        if (col_nullable) {
+            if (p >= end) {
+                err = "null flag truncated";
+                return false;
+            }
+            is_null = get_u8(p) != 0;
+            ++p;
+            d.null_mask.push_back(is_null ? 1 : 0);
+        }
+        if (is_null) {
+            switch (d.type) {
+                case ColumnType::Int32:
+                case ColumnType::Int64:
+                case ColumnType::Float:
+                case ColumnType::Bool:
+                    d.fixed_data.insert(
+                        d.fixed_data.end(),
+                        column_type_width(d.type), 0);
+                    break;
+                case ColumnType::String:
+                    d.str_offsets.push_back(
+                        static_cast<uint32_t>(d.str_data.size()));
+                    d.str_lengths.push_back(0);
+                    break;
+                case ColumnType::Set:
+                    d.set_counts.push_back(0);
+                    d.set_offsets.push_back(
+                        static_cast<uint32_t>(d.set_elem_lengths.size()));
+                    break;
+            }
+            continue;
+        }
         switch (d.type) {
             case ColumnType::Int32:
             case ColumnType::Int64:

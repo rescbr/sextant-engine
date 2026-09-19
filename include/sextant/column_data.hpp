@@ -11,6 +11,11 @@ namespace sextant {
 struct ColumnData {
     ColumnType type = ColumnType::Int32;
 
+    /// Per-row NULL flags (1 = NULL), parallel to the row arrays. Empty =
+    /// no NULLs (or a non-nullable column). Writers only consult it for
+    /// schema columns declared nullable.
+    std::vector<uint8_t> null_mask;
+
     // Fixed-width: raw bytes, width per row. width = column_type_width(type).
     std::vector<uint8_t> fixed_data;
 

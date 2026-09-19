@@ -56,6 +56,10 @@ inline uint64_t read_filter_columns(const uint8_t* buf, uint32_t count,
                 const uint8_t w = column_type_width(col.type);
                 fc.fixed_data.assign(p, p + static_cast<size_t>(count) * w);
                 p += static_cast<size_t>(count) * w;
+                if (col.nullable) {
+                    fc.null_mask.assign(p, p + count);
+                    p += count;
+                }
                 break;
             }
             case ColumnType::String: {
@@ -80,6 +84,10 @@ inline uint64_t read_filter_columns(const uint8_t* buf, uint32_t count,
                     reinterpret_cast<const char*>(p),
                     reinterpret_cast<const char*>(p) + total_data);
                 p += total_data;
+                if (col.nullable) {
+                    fc.null_mask.assign(p, p + count);
+                    p += count;
+                }
                 break;
             }
             case ColumnType::Set: {
@@ -119,6 +127,10 @@ inline uint64_t read_filter_columns(const uint8_t* buf, uint32_t count,
                         ++elem_acc;
                     }
                 }
+                if (col.nullable) {
+                    fc.null_mask.assign(p, p + count);
+                    p += count;
+                }
                 break;
             }
         }
@@ -145,6 +157,14 @@ inline std::vector<ColumnData> select_filter_rows(
         const auto& s = src[c];
         auto& d = out[c];
         d.type = col.type;
+
+        // Nullable columns: slice the per-row null flags.
+        if (col.nullable && !s.null_mask.empty()) {
+            d.null_mask.reserve(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                d.null_mask.push_back(s.null_mask[indices[i]]);
+            }
+        }
 
         switch (col.type) {
             case ColumnType::Int32:
@@ -212,6 +232,14 @@ inline void append_filter_rows(
         const auto& s = src[c];
         auto& d = dst[c];
         d.type = col.type;
+
+        // Nullable columns: carry the per-row null flags over.
+        if (col.nullable && !s.null_mask.empty()) {
+            for (uint32_t idx : indices) {
+                d.null_mask.push_back(idx < s.null_mask.size()
+                                          ? s.null_mask[idx] : 0);
+            }
+        }
 
         switch (col.type) {
             case ColumnType::Int32:
