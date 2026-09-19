@@ -1251,6 +1251,53 @@ TEST_F(CApiTest, ForcedSpillMatchesMemoryTier) {
     std::filesystem::remove(spill_path, ec);
 }
 
+// (j) metrics_path: the push build writes JSON-lines phase metrics,
+// one record per phase, flushed per record.
+TEST_F(CApiTest, MetricsJsonlExport) {
+    const std::string mpath =
+        (std::filesystem::temp_directory_path() / "capi_metrics.jsonl").string();
+    std::filesystem::remove(mpath);
+    char err[512] = {0};
+    sextant_build_opts bopts = sextant_default_build_opts();
+    bopts.quantizer = "local_scalar";
+    bopts.k_root = 8;
+    bopts.leaf_capacity = 500;
+    bopts.pca_dims = 16;
+    bopts.max_lloyd_passes = 2;
+    bopts.num_threads = 4;
+    bopts.metrics_path = mpath.c_str();
+
+    void* b = sextant_build_begin(&bopts, kDim, nullptr, 0, 0,
+                                  err, sizeof(err));
+    ASSERT_NE(b, nullptr) << err;
+    ASSERT_EQ(sextant_build_push(b, corpus.data.data(), kN, nullptr,
+                                 nullptr, nullptr, err, sizeof(err)),
+              0)
+        << err;
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "capi_metrics.tree").string();
+    std::filesystem::remove(path);
+    ASSERT_EQ(sextant_build_finish(b, path.c_str(), err, sizeof(err)), 0)
+        << err;
+
+    FILE* f = std::fopen(mpath.c_str(), "r");
+    ASSERT_NE(f, nullptr);
+    char line[512];
+    int phases = 0;
+    bool saw_stream = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        ++phases;
+        if (std::strstr(line, "\"phase\":\"stream\"") ||
+            std::strstr(line, "phase=stream"))
+            saw_stream = true;
+    }
+    std::fclose(f);
+    EXPECT_GE(phases, 3) << "expected several phase records";
+    EXPECT_TRUE(saw_stream) << "no stream phase record";
+    std::filesystem::remove(path);
+    std::filesystem::remove(mpath);
+}
+
 // (i) More than one sealed staging chunk (kChunkRows = 32768): chunk 1
 // seals mid-push and spills under the 1 MiB budget; the 232-row tail
 // stays in memory → mixed tiers drained spill-first at emission. The

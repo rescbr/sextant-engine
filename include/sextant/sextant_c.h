@@ -48,6 +48,10 @@ typedef struct sextant_build_opts {
     /// spill to a temp file and stream back at finish (bounded RAM end to
     /// end). 0 = 256 MiB default. ABI tail-append (zero = default).
     uint64_t staging_bytes;
+    /// Write build phase metrics as JSON lines to this file (build.*
+    /// field names, one record per phase, flushed per record so tail -F
+    /// streams live). NULL/empty = no file. ABI tail-append (zero = off).
+    const char* metrics_path;
 } sextant_build_opts;
 
 /// Sensible defaults (pq, auto geometry, L2).

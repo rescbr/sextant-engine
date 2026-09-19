@@ -14,6 +14,7 @@
 #include "tree/scan_pool.hpp"
 
 #include "push_source.hpp"
+#include <sextant/metrics.hpp>
 
 #include <sextant/column_data.hpp>
 #include <sextant/schema.hpp>
@@ -841,6 +842,15 @@ int sextant_build_finish(void* builder, const char* out_path,
         // Filter columns + payload stream per-chunk from the staged source
         // (same path as the parquet sources) — bounded RAM end to end.
         cfg.filter_schema = source->schema();
+        // Optional JSON-lines phase metrics (jsonl sink owns the FILE*;
+        // must outlive the build call).
+        std::unique_ptr<sextant::metrics::JsonlMetricsSink> metrics_json;
+        if (opts.metrics_path && *opts.metrics_path) {
+            metrics_json =
+                std::make_unique<sextant::metrics::JsonlMetricsSink>(
+                    opts.metrics_path);
+            cfg.metrics_sink = metrics_json.get();
+        }
         sextant::tree::IVFTreeIndex::build_streaming_pca(*source, out_path,
                                                          cfg);
         delete b;

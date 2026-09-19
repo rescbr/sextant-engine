@@ -1531,6 +1531,24 @@ void run_emission_pass(TreeBuildContext& ctx, PageFile& file, PageAllocator& all
         buf.payload_offs.clear();
         buf.payload_store.clear();
         buf.staged_rows = 0;
+        // Release the big buffers' capacity: clear() alone retains a
+        // leaf-sized (multi-MB) high-water mark PER CLUSTER — k_root of
+        // them live for the whole emission, which held ~2.5GB of fp16
+        // capacity + ~1GB of payload capacity on CulturaX (256 clusters
+        // x ~7.7MB fp16). Each leaf cycle regrows geometrically, so the
+        // added memcpy is O(final size) per cycle — negligible next to
+        // the encode/write work. Everything below a small floor keeps
+        // its capacity (no churn on tiny leaves).
+        constexpr size_t kRetainFloor = 1u << 20;  // 1 MiB
+        auto trim = [&](auto& v, size_t elem_bytes) {
+            if (v.capacity() * elem_bytes > kRetainFloor) {
+                std::remove_reference_t<decltype(v)> empty;
+                v.swap(empty);
+            }
+        };
+        trim(buf.fp16_vecs, 2);
+        trim(buf.codes, 1);
+        trim(buf.payload_store, 1);
         stage.drop(c);
         if (has_filter) {
             buf.filter_cols.assign(n_schema_cols, ColumnData{});
