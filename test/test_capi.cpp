@@ -926,6 +926,137 @@ TEST_F(CApiTest, ErrorPaths) {
     EXPECT_NE(err[0], '\0');
 }
 
+// (g2) typed-domain predicate comparison. All fixed-width predicate
+// comparisons happen in the COLUMN's type, not in double: SQL casts the
+// constant to the column type before comparing. Regression guard for the
+// old read_fixed_as_double widening, which was wrong twice:
+//   - Int64 beyond 2^53: (double)(2^54 + 2) rounds to 2^54, so EQ on
+//     2^54 falsely matched rows holding 2^54+2 (and ranges blurred).
+//   - Float: (double)0.1f != 0.1, so EQ matched nothing and GT/LE
+//     included/excluded rows against SQL float semantics.
+TEST(CApiPred, TypedDomainComparisons) {
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "capi_typed_pred.tree")
+            .string();
+    std::filesystem::remove(path);
+
+    constexpr uint32_t kRows = 512;
+    // big_id = 2^54 + {0,2,4,6}: spacing 2, but double ulp at 2^54 is 4 —
+    // 2^54+2 and 2^54+6 are NOT representable in double (they round).
+    const auto big_id_of = [](uint32_t i) -> int64_t {
+        return (1LL << 54) + static_cast<int64_t>(i % 4) * 2;
+    };
+    // lat = float(37.0 + k*0.1): mirrors SQL float-column semantics where
+    // the constant is cast to FLOAT before comparing.
+    const auto lat_of = [](uint32_t i) -> float {
+        return static_cast<float>(37.0 + (i % 90) * 0.1);
+    };
+
+    char err[512] = {0};
+    sextant_build_opts bopts = sextant_default_build_opts();
+    bopts.quantizer = "local_scalar";
+    bopts.k_root = 4;
+    bopts.pca_dims = 8;
+    sextant_filter_col_def cols[2] = {{"big_id", SEXTANT_COL_INT64, 1},
+                                      {"lat", SEXTANT_COL_FLOAT, 1}};
+    void* b = sextant_build_begin(&bopts, kDim, cols, 2, 0, err, sizeof(err));
+    ASSERT_NE(b, nullptr) << err;
+
+    std::vector<float> vecs(static_cast<size_t>(kRows) * kDim);
+    for (uint32_t i = 0; i < kRows; ++i)
+        for (uint32_t d = 0; d < kDim; ++d)
+            vecs[static_cast<size_t>(i) * kDim + d] =
+                0.01f * static_cast<float>((i * 31 + d * 7) % 97);
+    std::vector<int64_t> bigs(kRows);
+    std::vector<float> lats(kRows);
+    for (uint32_t i = 0; i < kRows; ++i) {
+        bigs[i] = big_id_of(i);
+        lats[i] = lat_of(i);
+    }
+    const void* fvals[2] = {bigs.data(), lats.data()};
+    ASSERT_EQ(sextant_build_push(b, vecs.data(), kRows, fvals, nullptr,
+                                 nullptr, err, sizeof(err)), 0)
+        << err;
+    ASSERT_EQ(sextant_build_finish(b, path.c_str(), err, sizeof(err)), 0)
+        << err;
+
+    void* idx = sextant_open_index(path.c_str(), err, sizeof(err));
+    ASSERT_NE(idx, nullptr) << err;
+
+    const float* q = vecs.data();  // any query; predicates do the work
+    sextant_search_opts sopts = sextant_default_search_opts();
+    sopts.k = 8;
+    sopts.exhaustive = 1;
+
+    const auto check = [&](sextant_predicate& pred,
+                           const std::function<bool(uint32_t)>& sql_ok,
+                           const char* what, uint32_t k = 8) {
+        uint64_t ids[8];
+        float ds[8];
+        char e[256] = {0};
+        sopts.k = k;
+        const int32_t n = sextant_search_filtered(idx, q, &sopts, &pred, 1,
+                                                  ids, ds, k, e, sizeof(e));
+        ASSERT_GE(n, 0) << what << ": " << e;
+        uint32_t pool = 0;
+        for (uint32_t i = 0; i < kRows; ++i) pool += sql_ok(i) ? 1 : 0;
+        ASSERT_GE(pool, k) << what << ": fixture pool too small";
+        EXPECT_EQ(static_cast<uint32_t>(n), k) << what;
+        for (int32_t r = 0; r < n; ++r) {
+            EXPECT_TRUE(sql_ok(static_cast<uint32_t>(ids[r])))
+                << what << ": row " << ids[r]
+                << " (big_id=" << big_id_of(static_cast<uint32_t>(ids[r]))
+                << ", lat=" << lat_of(static_cast<uint32_t>(ids[r]))
+                << ") failed the SQL predicate";
+        }
+    };
+
+    // Int64 EQ beyond 2^53: old double-widening matched 2^54+2 rows too.
+    {
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = "big_id";
+        p.op = SEXTANT_PRED_EQ;
+        p.value = static_cast<double>(1LL << 54);
+        check(p, [](uint32_t i) { return (i % 4) == 0; }, "int64 eq 2^54");
+    }
+    // Int64 GE at a representable boundary (2^54+4): excludes +0/+2 rows.
+    {
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = "big_id";
+        p.op = SEXTANT_PRED_GE;
+        p.value = static_cast<double>((1LL << 54) + 4);
+        check(p, [](uint32_t i) { return (i % 4) >= 2; }, "int64 ge 2^54+4");
+    }
+    // Float EQ against a double constant 37.1 (not representable in
+    // binary32): SQL compares lat == (float)37.1 — old widening matched
+    // nothing.
+    {
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = "lat";
+        p.op = SEXTANT_PRED_EQ;
+        p.value = 37.1;
+        check(p, [&](uint32_t i) { return lat_of(i) == 37.1f; },
+              "float eq 37.1", 4);
+    }
+    // Float GT: SQL says lat > (float)37.1 — old widening compared
+    // against the double and pulled boundary rows in.
+    {
+        sextant_predicate p;
+        std::memset(&p, 0, sizeof(p));
+        p.column = "lat";
+        p.op = SEXTANT_PRED_GT;
+        p.value = 37.1;
+        check(p, [&](uint32_t i) { return lat_of(i) > 37.1f; },
+              "float gt 37.1", 4);
+    }
+
+    sextant_close_index(idx);
+    std::filesystem::remove(path);
+}
+
 // (h) build_begin without finish: abort leaves no file behind.
 TEST(CApiBuild, AbortLeavesNoFile) {
     const std::string path =

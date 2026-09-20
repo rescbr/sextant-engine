@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
 
 namespace sextant::tree {
 
@@ -229,6 +230,51 @@ inline bool set_contains_string(const ColumnView& col, uint32_t idx,
 
 }  // namespace
 
+/// Compare a stored fixed-width value against the predicate comparand in
+/// the COLUMN'S domain, not in double. The double comparand is cast the
+/// way SQL would cast a constant to the column type (round-half-away for
+/// integers, binary32 rounding for Float). Widening both sides to double
+/// instead was wrong twice:
+///   - Int64: values beyond 2^53 lose precision in double, so Eq/Lt/...
+///     could silently mis-compare (Snowflake-scale ids, ns timestamps).
+///   - Float: (double)0.1f != 0.1, so `f = 0.1` matched nothing and
+///     `f > 0.1` included rows SQL excludes (SQL casts the constant to
+///     FLOAT, so the comparison happens in binary32).
+template <typename T>
+inline bool typed_compare(PredicateOp op, T val, double value, double value2,
+                          const std::vector<std::string>& in_values) {
+    const auto round_to = [](double d) -> T {
+        // SQL integer cast: round-half-away-from-zero (std::llround).
+        if constexpr (std::is_integral_v<T>) {
+            return static_cast<T>(std::llround(d));
+        } else {
+            return static_cast<T>(d);
+        }
+    };
+    const T pv  = round_to(value);
+    const T pv2 = round_to(value2);
+    switch (op) {
+        case PredicateOp::Eq:       return val == pv;
+        case PredicateOp::NotEq:    return val != pv;
+        case PredicateOp::Lt:       return val <  pv;
+        case PredicateOp::Le:       return val <= pv;
+        case PredicateOp::Gt:       return val >  pv;
+        case PredicateOp::Ge:       return val >= pv;
+        case PredicateOp::Between:  return val >= pv && val <= pv2;
+        case PredicateOp::In:
+        case PredicateOp::NotIn: {
+            bool found = false;
+            for (const auto& s : in_values) {
+                try {
+                    if (val == round_to(std::stod(s))) { found = true; break; }
+                } catch (...) { continue; }
+            }
+            return op == PredicateOp::In ? found : !found;
+        }
+        default: return true;
+    }
+}
+
 bool eval_predicate(const ColumnView& col, uint32_t idx, const Predicate& pred) {
     // SQL three-valued logic: a NULL value fails every comparison and
     // passes only IS NULL. (Legacy trees without validity bytes have
@@ -239,39 +285,22 @@ bool eval_predicate(const ColumnView& col, uint32_t idx, const Predicate& pred) 
     if (pred.op == PredicateOp::IsNull) return false;
     if (pred.op == PredicateOp::IsNotNull) return true;
     switch (col.type) {
-        // --- Numeric types ---
-        case ColumnType::Int32:
-        case ColumnType::Int64:
+        // --- Numeric types: compare in the column's domain (see
+        // typed_compare) ---
+        case ColumnType::Int32: {
+            int32_t val;
+            std::memcpy(&val, col.fixed_base + static_cast<size_t>(idx) * col.fixed_width, 4);
+            return typed_compare<int32_t>(pred.op, val, pred.value, pred.value2, pred.values);
+        }
+        case ColumnType::Int64: {
+            int64_t val;
+            std::memcpy(&val, col.fixed_base + static_cast<size_t>(idx) * col.fixed_width, 8);
+            return typed_compare<int64_t>(pred.op, val, pred.value, pred.value2, pred.values);
+        }
         case ColumnType::Float: {
-            const double val = read_fixed_as_double(col, idx);
-            switch (pred.op) {
-                case PredicateOp::Eq:       return val == pred.value;
-                case PredicateOp::NotEq:    return val != pred.value;
-                case PredicateOp::Lt:       return val <  pred.value;
-                case PredicateOp::Le:       return val <= pred.value;
-                case PredicateOp::Gt:       return val >  pred.value;
-                case PredicateOp::Ge:       return val >= pred.value;
-                case PredicateOp::Between:  return val >= pred.value && val <= pred.value2;
-                case PredicateOp::In: {
-                    // `values` is the operand. The legacy scalar fast-path
-                    // (value..value4) consulted slots shared with Eq/Between/
-                    // geo — callers building In via values left them zeroed,
-                    // silently matching every row holding 0. Removed.
-                    for (const auto& s : pred.values) {
-                        try { if (val == std::stod(s)) return true; }
-                        catch (...) { continue; }
-                    }
-                    return false;
-                }
-                case PredicateOp::NotIn: {
-                    for (const auto& s : pred.values) {
-                        try { if (val == std::stod(s)) return false; }
-                        catch (...) { continue; }
-                    }
-                    return true;
-                }
-                default: return true;  // geo/set ops don't apply to numeric
-            }
+            float val;
+            std::memcpy(&val, col.fixed_base + static_cast<size_t>(idx) * col.fixed_width, 4);
+            return typed_compare<float>(pred.op, val, pred.value, pred.value2, pred.values);
         }
 
         // --- Bool ---
