@@ -2,7 +2,7 @@
 
 **Date**: 2026-08-08, critically revised 2026-08-31  
 **Status**: Implemented, validated, and re-benchmarked after the
-`adaptive_probe_gap` bug fix (git b63712d). This revision separates numbers that
+`adaptive_probe_gap` bug fix (git f17c42a). This revision separates numbers that
 are valid (measured without the tree, or post-fix) from those that were tainted,
 and adds what the gap-bug investigation taught us about *methodology* — which
 changes how quantizer research should proceed.
