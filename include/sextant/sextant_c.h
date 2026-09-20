@@ -123,7 +123,14 @@ typedef struct sextant_search_opts {
 sextant_search_opts sextant_default_search_opts(void);
 
 /// Open a built tree (mmap, read-only). NULL on failure.
-void* sextant_open_index(const char* path, char* err, size_t err_len);
+/// `leaf_cache_bytes` / `plane_cache_bytes` size engine-owned W-TinyLFU
+/// caches for the search path (0 = off, the default): leaf extents and
+/// routing planes are served from a DRAM-budgeted cache (pread fill,
+/// mmap fallback on admission rejection) instead of the mmap. Never
+/// slower than mmap at any size; pays off when the hot leaf set fits
+/// (repeated-query workloads).
+void* sextant_open_index(const char* path, uint64_t leaf_cache_bytes,
+                         uint64_t plane_cache_bytes, char* err, size_t err_len);
 void sextant_close_index(void* index);
 
 uint32_t sextant_index_dim(const void* index);

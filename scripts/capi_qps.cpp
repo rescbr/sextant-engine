@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
             "  exact_base.fbin: rerank against the original corpus "
             "(exact_rerank_base) instead of decode.\n"
             "  Remaining knobs are env (bench-harness convention): "
-            "EXH I8 W TAU NP ROUNDS.\n");
+            "EXH I8 W TAU NP ROUNDS LC (leaf cache MiB) PC (plane cache MiB).\n");
         return 1;
     }
     const char* tree = argv[1];
@@ -61,9 +61,11 @@ int main(int argc, char** argv) {
     const float tau = atof(env("TAU", "2"));
     const uint32_t np = atoi(env("NP", "8"));
     const uint32_t rounds = atoi(env("ROUNDS", "3"));
+    const uint64_t leaf_cache = strtoull(env("LC", "0"), nullptr, 10) << 20;
+    const uint64_t plane_cache = strtoull(env("PC", "0"), nullptr, 10) << 20;
 
     char err[512] = {0};
-    void* idx = sextant_open_index(tree, err, sizeof err);
+    void* idx = sextant_open_index(tree, leaf_cache, plane_cache, err, sizeof err);
     if (!idx) { fprintf(stderr, "open: %s\n", err); return 1; }
 
     for (uint32_t r = 0; r < rounds; ++r) {

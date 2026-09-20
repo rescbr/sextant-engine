@@ -316,13 +316,16 @@ int sextant_build_mem(const float* vectors, uint32_t n, uint32_t dim,
     }
 }
 
-void* sextant_open_index(const char* path, char* err, size_t err_len) {
+void* sextant_open_index(const char* path, uint64_t leaf_cache_bytes,
+                         uint64_t plane_cache_bytes, char* err, size_t err_len) {
     if (!path) {
         set_err(err, err_len, "sextant_open_index: null path");
         return nullptr;
     }
     try {
-        return sextant::tree::IVFTreeIndex::open(path).release();
+        return IVFTreeIndex::open(path, leaf_cache_bytes,
+                                  /*cache_window_pct=*/1, plane_cache_bytes)
+            .release();
     } catch (const std::exception& e) {
         set_err(err, err_len, e.what());
         return nullptr;

@@ -199,7 +199,7 @@ struct CApiTest : public ::testing::Test {
 
     void SetUp() override {
         char err[512] = {0};
-        index = sextant_open_index(path.c_str(), err, sizeof(err));
+        index = sextant_open_index(path.c_str(), 0, 0, err, sizeof(err));
         ASSERT_NE(index, nullptr) << err;
         ASSERT_EQ(sextant_index_dim(index), kDim);
     }
@@ -273,7 +273,7 @@ TEST_F(CApiTest, TreeUuidIdentity) {
 
     // Stable across re-open of the same file.
     char err[512] = {0};
-    void* again = sextant_open_index(path.c_str(), err, sizeof(err));
+    void* again = sextant_open_index(path.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(again, nullptr) << err;
     char uuid2[40] = {0};
     EXPECT_EQ(sextant_index_uuid(again, uuid2, sizeof(uuid2)), 32);
@@ -284,7 +284,7 @@ TEST_F(CApiTest, TreeUuidIdentity) {
     Corpus other{91};
     const std::string path2 =
         build_test_index(other, "capi_v1_uuid_other.tree");
-    void* idx2 = sextant_open_index(path2.c_str(), err, sizeof(err));
+    void* idx2 = sextant_open_index(path2.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(idx2, nullptr) << err;
     char uuid3[40] = {0};
     EXPECT_EQ(sextant_index_uuid(idx2, uuid3, sizeof(uuid3)), 32);
@@ -470,7 +470,7 @@ TEST(CApiNull, NullableFilterColumns) {
         << err;
     ASSERT_EQ(sextant_build_finish(b, path.c_str(), err, sizeof(err)), 0) << err;
 
-    void* idx = sextant_open_index(path.c_str(), err, sizeof(err));
+    void* idx = sextant_open_index(path.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(idx, nullptr) << err;
 
     // Introspection reports the nullable flags.
@@ -599,7 +599,7 @@ TEST(CApiCardinality, TinyMatchSetTracked) {
                                           sizeof(err)), 0) << err;
     ASSERT_EQ(sextant_build_finish(b, path.c_str(), err, sizeof(err)), 0) << err;
 
-    void* idx = sextant_open_index(path.c_str(), err, sizeof(err));
+    void* idx = sextant_open_index(path.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(idx, nullptr) << err;
 
     // Same serving opts as the extension's index scan (no exhaustive, no
@@ -980,7 +980,7 @@ TEST(CApiPred, TypedDomainComparisons) {
     ASSERT_EQ(sextant_build_finish(b, path.c_str(), err, sizeof(err)), 0)
         << err;
 
-    void* idx = sextant_open_index(path.c_str(), err, sizeof(err));
+    void* idx = sextant_open_index(path.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(idx, nullptr) << err;
 
     const float* q = vecs.data();  // any query; predicates do the work
@@ -1097,7 +1097,7 @@ TEST(CApiBuild, AbortLeavesNoFile) {
     EXPECT_EQ(sextant_build_finish(sb, setpath.c_str(), err, sizeof(err)), 0)
         << err;
 
-    void* sidx = sextant_open_index(setpath.c_str(), err, sizeof(err));
+    void* sidx = sextant_open_index(setpath.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(sidx, nullptr) << err;
     {
         sextant_search_opts sopts = sextant_default_search_opts();
@@ -1493,9 +1493,9 @@ TEST_F(CApiTest, ForcedSpillMatchesMemoryTier) {
         corpus.data.data(), "capi_spill_forced.tree", 1, kN, 700, 500, 2);
 
     char err[512] = {0};
-    void* mem = sextant_open_index(mem_path.c_str(), err, sizeof(err));
+    void* mem = sextant_open_index(mem_path.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(mem, nullptr) << err;
-    void* spill = sextant_open_index(spill_path.c_str(), err, sizeof(err));
+    void* spill = sextant_open_index(spill_path.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(spill, nullptr) << err;
 
     EXPECT_EQ(sextant_index_count(mem), kN);
@@ -1706,7 +1706,7 @@ TEST_F(CApiTest, L2SweepNearZeroClusterNotBuried) {
     ASSERT_EQ(sextant_build_finish(b, tpath.c_str(), err, sizeof(err)), 0)
         << err;
 
-    void* idx = sextant_open_index(tpath.c_str(), err, sizeof(err));
+    void* idx = sextant_open_index(tpath.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(idx, nullptr) << err;
 
     float q[kDim];
@@ -1777,7 +1777,7 @@ TEST_F(CApiTest, MultiChunkSpillVectorPasses) {
     const std::string path = build_push_index(
         data.data(), "capi_spill_multi.tree", 1 << 20, kBigN, 8250, 5000, 1);
     char err[512] = {0};
-    void* index = sextant_open_index(path.c_str(), err, sizeof(err));
+    void* index = sextant_open_index(path.c_str(), 0, 0, err, sizeof(err));
     ASSERT_NE(index, nullptr) << err;
     EXPECT_EQ(sextant_index_count(index), kBigN);
 

@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
         std::chrono::steady_clock::now() - t0).count();
     printf("build: %.2fs\n", build_s);
 
-    void* idx = sextant_open_index(tree_path.c_str(), err, sizeof(err));
+    void* idx = sextant_open_index(tree_path.c_str(), 0, 0, err, sizeof(err));
     if (!idx) { fprintf(stderr, "open failed: %s\n", err); return 1; }
     printf("opened: dim=%u live=%llu\n", sextant_index_dim(idx),
            (unsigned long long)sextant_index_live_count(idx));
