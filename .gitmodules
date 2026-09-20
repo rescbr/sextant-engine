@@ -3,4 +3,4 @@
 	url = https://github.com/ashvardanian/NumKong.git
 [submodule "subprojects/carquet"]
 	path = subprojects/carquet
-	url = git@github.com:Vitruves/carquet.git
+	url = https://github.com/rescbr/carquet.git
