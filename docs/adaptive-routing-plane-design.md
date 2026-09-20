@@ -42,7 +42,7 @@ NAND-tier mid-scale option retained. Grounded in measurements from
 
 ## 1. Problem and opportunity
 
-`probe_fraction` (a5e9064) made the probe budget a corpus fraction: recall
+`probe_fraction` (4386a1c) made the probe budget a corpus fraction: recall
 holds across corpus growth at ~f× flat-scan cost (0.99 @ f = 0.5). The
 decomposition report shows where the remaining headroom lives:
 

@@ -49,7 +49,7 @@ family; remaining headroom lives in the scan, not the router.
 An IVF-style index routes each query to a subset of its leaves; recall
 is capped by *routing containment* — the probability that a true
 neighbor's leaf is probed — before scan and rerank even matter. We
-shipped `probe_fraction` (a5e9064: probe budget as a corpus fraction)
+shipped `probe_fraction` (4386a1c: probe budget as a corpus fraction)
 and observed recall track coverage almost exactly: f = 0.5 held 0.99
 recall@10 across a 9.3× corpus growth. This report asks what bounds
 that curve — data structure, routing metric, or leaf-summary form — and
@@ -318,9 +318,9 @@ at `/mnt/ssd/data/cohere10m/`.
 
 *Spike: `scripts/spike_routing_ceiling.cpp` (mmap + OpenMP + batched
 member-min; `SPIKE_NO_ANCHORS`, `SPIKE_NO_BOUND`, `SPIKE_ADAPTIVE`,
-basis-window knobs). Engine: `probe_fraction` (a5e9064), rerank +
+basis-window knobs). Engine: `probe_fraction` (4386a1c), rerank +
 `adaptive_w_gap`. During the arc the same spike work also surfaced and
 fixed three engine bugs (pca_dims=0 zero-dim k-means; PageAllocator
 stale free-list pointers; stale-mmap parent scan) and a ~1.5× build
 throughput win (double-buffered source prefetch + `--chunk-vectors`) —
-see git log 2128e2f, e86353d.*
+see git log b9339cc, f1e8dcc.*
