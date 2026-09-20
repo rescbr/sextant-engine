@@ -7,7 +7,7 @@ n-probe serves all W values; bit-exact vs standalone runs)
 > **Context:** all numbers in `companding-quantization.md` and earlier benchmark docs were
 > measured with the `adaptive_probe_gap=1.5` bug active (pruned probing to 4-10 of 26
 > leaves; damage scaled with quantizer quality — scalar_lm lost 40pp). This document
-> supersedes them for recall comparisons. See git 322796b.
+> supersedes them for recall comparisons. See git b63712d.
 
 ## n-probe sweep (n-probe-ln=8, W=100)
 

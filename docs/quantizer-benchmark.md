@@ -102,14 +102,14 @@ PQ4 with higher m always beats PQ8 (~2× QPS at same recall) due to FastScan
 
 ## Rerank
 
-Disabled by default (commit a7f73e3). PQ-decode rerank showed <0.001 recall
+Disabled by default (commit d75c3d5). PQ-decode rerank showed <0.001 recall
 delta at all m values (2-192). A true rerank would need stored FP16 vectors
 (storage ruled out for our use case).
 
 ## PRQ4 nsplits bug (FIXED)
 
 Default nsplits = dim/8 (96 for 768d). When m < 96 or m % 96 != 0, build crashed.
-Fixed (commit 4d57ad0): auto-clamp nsplits to largest divisor of m that also
+Fixed (commit c9ff5bc): auto-clamp nsplits to largest divisor of m that also
 divides dim.
 
 ## Build times (uncompressed Parquet)
