@@ -37,7 +37,7 @@ The closure factor controls the **replication rate** `R` — the fraction of
 vectors assigned to ≥2 cells. Higher `R` → better boundary recall but more
 storage and scan cost.
 
-The existing formula (`docs/design_decisions.md:518–553`):
+The existing formula (flat-era design register, archived):
 
 $$c = (1 - f_{\text{target}})^{-1/d_{\text{eff}}}$$
 
@@ -96,7 +96,7 @@ probability is:
 
 $$R(c) = 1 - e^{-\mu(c)} = 1 - e^{-(c^{d_{\text{eff}}} - 1)}$$
 
-At the boundary-volume level, the complementary result (`docs/design_decisions.md:541`):
+At the boundary-volume level, the complementary result (flat-era design register, archived):
 
 $$R(c) = 1 - c^{-d_{\text{eff}}}$$
 
@@ -242,5 +242,5 @@ scheme is the principled fix.
 - SPANN: Chen et al., "SPANN: Highly-efficient Billion-scale Approximate
   Nearest Neighbor Search", NeurIPS 2021.
 - The `np ∝ √K` law: `docs/np-sqrt-k-law-2026-07-28.md` (this workspace).
-- Existing closure derivation: `docs/design_decisions.md:518–553`.
+- Existing closure derivation: flat-era design register (archived).
 - K-sweep routing recall drop: `docs/ivf_k_sweep.md:33–35` (archived 2026-09-13 to workspace `old-docs/`).

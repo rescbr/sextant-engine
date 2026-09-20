@@ -833,7 +833,7 @@ int cmd_tree_search(int argc, char* argv[]) {
     scfg.rerank = !p.exist("no-rerank");
     scfg.adaptive_w_gap = p.get<float>("adaptive-w-gap");
     if (scfg.adaptive_w_gap < 0) {
-        // AUTO: tau calibrated per scan-code size (billion-scale doc:
+        // AUTO: tau calibrated per scan-code size (archived doc:
         // tau 2-3 for 384B codes; 5-10 for the low-byte tiers).
         const uint32_t cs = idx->coder().code_size();
         scfg.adaptive_w_gap = cs >= 288 ? 2.5f : 5.0f;

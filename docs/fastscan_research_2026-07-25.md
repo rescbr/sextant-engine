@@ -16,8 +16,7 @@ by training PQ at **4 bits (K=16)** so the LUT row fits in 16 entries
 is 256 entries and the shuffle trick "doesn't fit" — FAISS ships no
 8-bit FastScan kernel.
 
-Our workload cannot drop to 4-bit:
-`docs/optimization_levers_and_attribution.md:66` documents 4-bit recall
+Our workload cannot drop to 4-bit: flat-graph-era measurements documented 4-bit recall
 collapsing to 0.72-0.76 (navigation broken; 16 centroids/segment
 insufficient at our recall target 0.9931).
 

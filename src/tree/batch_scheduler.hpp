@@ -22,7 +22,7 @@
 // when it completes — a busy sweep IS the window. (Mid-sweep joining,
 // where a late query rides the in-flight sweep's reads for leaves not
 // yet scanned, requires a mutable sweep work list and is deliberately
-// not in v1; see docs/design_decisions.md.)
+// not in v1; see the flat-era design register, archived.)
 //
 // Result cache (result_cache_entries > 0): exact-repeat queries (the
 // zipf head) are resolved from a small LRU keyed on the full query

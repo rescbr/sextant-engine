@@ -26,7 +26,7 @@ the blog: we bench the hard problem, not the cache.)
 - `primarycache=metadata` — the ARC may cache metadata but **not data**.
   This is deliberate: it makes cold reads structural, not a matter of
   discipline.
-- **CAVEAT (measured 2026-09-07, see results/leaf_cache/):** on this box
+- **CAVEAT (measured 2026-09-07):** on this box
   `primarycache=metadata` does NOT keep data out of RAM — it pushes it out
   of the 2 GB ARC into the *unbounded* Linux page cache. Repeated mmap
   passes retain the whole index (`Cached` grows by the file size; a 4.6 GB

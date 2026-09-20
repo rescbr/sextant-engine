@@ -162,16 +162,15 @@ removed for the library release — preserved at git tag `vamana-eol`.
 Every recipe below assumes the measured-best defaults: `scalar_shape`
 quantizer, b1g r128 plane auto-attached, plane routing with pre-prune 0.25,
 engine caches off (zero DRAM). Zero flags = the validated config; each flag
-is an explicit contract choice
-([docs/blog-cold-path.md](docs/blog-cold-path.md), canonical-table-v3).
+is an explicit contract choice.
 
 | Goal | Command sketch | Expected result |
 |---|---|---|
-| Fastest build | `build-tree corpus.fbin --threads 16` | Default tree (best quantizer + plane, streaming, bounded RSS). arxiv-1M × 768: ~28 s wall at 16 threads ([results/build_cpu_attribution_20260909.md](results/build_cpu_attribution_20260909.md)) |
+| Fastest build | `build-tree corpus.fbin --threads 16` | Default tree (best quantizer + plane, streaming, bounded RSS). arxiv-1M × 768: ~28 s wall at 16 threads |
 | Highest throughput | `tree-search tree queries.fbin --batch-window 256 --threads 16 --probe-fraction 0.05` | Canonical numbers measured at bw 256, 16 threads, t8: f=.05 → **401 cold / 525 warm QPS** @ recall@10 0.8921 (b1g plane, 16 threads) |
 | Balanced (default operating point) | `tree-search ... --batch-window 256 --probe-fraction 0.1` | **332 cold / 397 warm QPS @ 0.9174**; 462 MB leaf/q vs legacy f=.2's 917 MB at 260/276 @ 0.9202 |
 | Warm serving | `tree-search ... --batch-window 256 --cache-mb 8192 --plane-cache-mb 512` | Zero-DRAM by default; caches never lose to mmap. Full residency: 397 → 457 QPS (+15%), +8–13% at half a gigabyte |
-| Max recall | `--probe-fraction 0.2+`, or `--exact-rerank-base corpus.fbin` | Exact rerank = 1.000 recall (containment-bound) but the resident fp32 base is 6.5× the tree at 10M (30 GB vs 4.6 GB) — [docs/design_decisions.md](docs/design_decisions.md) |
+| Max recall | `--probe-fraction 0.2+`, or `--exact-rerank-base corpus.fbin` | Exact rerank = 1.000 recall (containment-bound) but the resident fp32 base is 6.5× the tree at 10M (30 GB vs 4.6 GB) |
 
 Notes:
 
@@ -442,16 +441,9 @@ default auto) supersedes it; see
 
 ## Benchmarks
 
-Canonical current results live under `results/`:
-
-- `results/plane_quant_20260911/` — plane × quantizer matrix (cohere10m,
-  arxiv1m, dbpedia933k; warm/spread traffic)
-- `results/fixes_20260909/`, `results/audit_20260909*` — post-audit fix
-  validation
-- `results/leaf_cache/` — engine cache vs page-cache behavior (the
-  measurement that reshaped [docs/BENCHMARK_RULES.md](docs/BENCHMARK_RULES.md))
-- `docs/blog-cold-path.md` carries the **canonical-table-v3** numbers
-  (current-defaults trees, 2026-09-13)
+Canonical numbers are in the performance guide above. Methodology:
+[docs/BENCHMARK_RULES.md](docs/BENCHMARK_RULES.md); datasets:
+[docs/benchmark_datasets.md](docs/benchmark_datasets.md).
 
 ### Early validation (flat engine, July 2026)
 
@@ -504,7 +496,6 @@ sextant-engine/
 ├── docs/               # design docs + results narratives (see links above)
 ├── subprojects/
 │   └── carquet/        # vendored C parquet library (v0.7.1, MIT)
-├── results/            # canonical benchmark outputs
 ├── third_party/        # nsync, NumKong (submodules); CTPL, cmdline (committed)
 ├── bootstrap.sh        # submodule init
 ├── meson.build

@@ -188,7 +188,7 @@ variable-size whole-extent entries, per-shard FrequencySketch admission
 (reused from the graph path's BlockCache), byte-budget capacity, per-entry
 refcount + deferred free (no locks held during scans), recycled buffer pool
 (glibc mmap-churn fix), wholesale invalidation on remap_(). Evidence and
-sizing contract: `results/leaf_cache/cohere10m_20260907.md` — full-residency
+sizing contract (archived measurement): full-residency
 cache: 8.5× cold QPS (255 vs 30) and warm parity vs mmap; undersized caches
 are strictly harmful (size ≥ hot working set or leave off). CacheController
 was NOT extended — a single tree cache segment, no rebalancing.

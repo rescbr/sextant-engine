@@ -4,7 +4,7 @@
 /// Stage-1 routing plane (plan D): a per-vector quantized PCA-128 plane,
 /// leaf-aligned, used to rank leaves by max over members of query·proj.
 ///
-/// Two encodings (measured in results/plane_quant_20260911/):
+/// Two encodings (archived measurement):
 ///   U4LM    64 B/vec — per-dim Lloyd-Max 4-bit centroids (128×16 f32
 ///                     codebook), nibble FastScan blocks ([m][16], 32
 ///                     vectors/block — same interleave as leaf codes, so

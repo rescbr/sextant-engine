@@ -48,7 +48,7 @@ struct FeedbackProbe {
 /// Graph construction distance source (build-time only; search always
 /// uses PQ LUTs regardless). Controls which representation the graph
 /// builder's prune/construct distances are computed against.
-/// Measured impact (docs/optimization_levers_and_attribution.md): FP16
+/// Measured impact (flat-graph-era attribution): FP16
 /// build −0.5pp recall (FP16 precision < PQ LUT's FP32 accumulation);
 /// FP32 build −0.6pp (train/serve skew — graph optimized for the wrong
 /// metric). PQ-construct is the default and the RAM-lightest option;
@@ -504,7 +504,7 @@ struct SearchConfig {
     /// nearest centroid's distance). 1.0 = strict n_probe (off, back-compat).
     /// Values >1.0 catch true NNs that live in boundary shards routing missed.
     /// Increases recall at variable per-query cost (boundary queries probe more
-    /// shards). See docs/ivf_routing_analysis.md. Measured (c4a K=21, np=1):
+    /// shards). Measured (c4a K=21, np=1):
     /// ratio=1.05 recovers +11.8pp routing recall for +0.51 avg shards/query
     /// (large win at low n_probe; negligible at np≥4 where routing is already
     /// near-optimal). Harmless when the threshold isn't triggered.

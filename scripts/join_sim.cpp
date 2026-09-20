@@ -11,8 +11,7 @@
 //     global page order (the sweep order of search_batch).
 //   - sweep of a window W: walks the UNION of its queries' leaf
 //     positions in page order; wall = (fixed + per_leaf*|union| +
-//     per_scan*|pairs|) / threads (99% busy measured — see
-//     results/leaf_cache/read_layer_20260909.md).
+//     per_scan*|pairs|) / threads (99% busy, archived measurement).
 //   - NEXT policy (current BatchScheduler, offline): a free slot
 //     closes its window at max(slot-free, last-arrival + idle gap),
 //     capped by the front's deadline (100 ms); latency = dispatch

@@ -3,8 +3,7 @@
 // Question: at arxiv-nomic 1.34M scale, what recall-QPS Pareto does the
 // "route to n_probe shards, 4-bit-FastScan each shard, rerank" pattern give?
 // How does it compare to (a) brute-force global scan (no routing), and
-// (b) the current production graph-inside-IVF (which we don't measure here
-// — see results/post_cleanup_c4a_20260724/matrix.tsv for those numbers).
+// (b) the current production graph-inside-IVF (archived measurement).
 //
 // What this spike IS: an algorithm-level Pareto measurement. We do our own
 // simple k-means IVF (k-means++ init, 10 iterations) on the dataset, encode

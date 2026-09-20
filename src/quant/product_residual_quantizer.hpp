@@ -51,7 +51,7 @@
 /// Recommended default: nsplits=96 (auto when sub_dim=8), beam_size=5.
 /// At matched QPS (~290, np=64), PRQ s96 b1 delivers 0.905 vs PQ's 0.875.
 /// The 8-bit PQ ceiling (0.999) remains unreachable at 4-bit; PRQ closes
-/// ~43% of the gap. See docs/quantization_findings.md §PRQ for full analysis.
+/// ~43% of the gap. (Archived analysis, flat-engine era.)
 
 #include "pq_quantizer.hpp"
 #include <sextant/types.hpp>
@@ -120,8 +120,7 @@ private:
     uint32_t lsq_train_iters_ = 0;
 
     /// On-the-fly ICM+ILS encoding (no precomputed tables).
-    /// See docs/quantization_findings.md §PRQ and the plan at
-    /// ~/.local/state/maki/plans/amazing-striking-toad.md.
+    /// (Archived analysis, flat-engine era.)
     void encode_icm_(const float* vec, uint8_t* code_out) const;
 
     /// LSQ codebook update: solve (BᵀB + ρI) Cᵀ = XBᵀ for one sub-space.
