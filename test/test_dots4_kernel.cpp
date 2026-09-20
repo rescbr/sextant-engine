@@ -105,7 +105,7 @@ void naive(const Fixture& f, double dots[4]) {
     }
 }
 
-[[maybe_unused]] void expect_match(float got, float want, bool bit_exact) {
+void expect_match(float got, float want, bool bit_exact) {
     if (bit_exact) {
         EXPECT_EQ(got, want) << " got=" << got << " want=" << want;
     } else {
@@ -116,7 +116,7 @@ void naive(const Fixture& f, double dots[4]) {
     }
 }
 
-[[maybe_unused]] bool tail_exact(uint32_t dim) {
+bool tail_exact(uint32_t dim) {
 #if defined(DOTS4_TAIL_EXACT)
     return dim % 16 == 0 || DOTS4_TAIL_EXACT;
 #else

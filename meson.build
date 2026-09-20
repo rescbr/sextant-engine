@@ -54,16 +54,6 @@ else
     git_dirty = '0'
 endif
 
-# --- CPU architecture --------------------------------------------------------
-# 'native' (default): -march=native, tuned to the build host (local dev
-# machines). Any other value is passed through as -march=<value> for
-# portable builds — e.g. -Dcpu_arch=x86-64-v3 targets AVX2+FMA+F16C
-# (any x86 server since Haswell/2013) for CI artifacts and prebuilt
-# distributions. Probes below always use the same flag so the detected
-# SIMD tier matches the compiled code.
-cpu_arch = get_option('cpu_arch')
-march_flag = cpu_arch == 'native' ? '-march=native' : '-march=' + cpu_arch
-
 # --- SIMD target detection ---------------------------------------------------
 # Determines which scalar-dot kernel tier is compiled in. Stored as
 # SEXTANT_SIMD_TARGET in version.h alongside the git SHA.
@@ -78,28 +68,28 @@ if cpp.compiles('''
     #error no sve
     #endif
     int main() { return 0; }
-''', args: [march_flag])
+''', args: ['-march=native'])
     simd_target = 'sve2'
 elif cpp.compiles('''
     #if !(defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__))
     #error no avx512 suite
     #endif
     int main() { return 0; }
-''', args: [march_flag])
+''', args: ['-march=native'])
     simd_target = 'avx512'
 elif cpp.compiles('''
     #ifndef __AVX2__
     #error no avx2
     #endif
     int main() { return 0; }
-''', args: [march_flag])
+''', args: ['-march=native'])
     simd_target = 'avx2'
 elif cpp.compiles('''
     #ifndef __ARM_FEATURE_MATMUL_INT8
     #error no i8mm
     #endif
     int main() { return 0; }
-''', args: [march_flag])
+''', args: ['-march=native'])
     simd_target = 'neon+i8mm'
 else
     simd_target = 'neon'
@@ -153,11 +143,11 @@ if is_debug
             add_project_arguments(flag, language: 'cpp')
         endif
     endforeach
-    # Debug builds also get the CPU arch flag (user call): sanitizers don't
-    # change the ISA requirement, and x86 needs F16C for util/fp16.hpp
-    # regardless.
-    if cpp.has_argument(march_flag)
-        add_project_arguments(march_flag, language: 'cpp')
+    # Debug builds also get -march=native (user call): sanitizers don't change
+    # the ISA requirement, and x86 needs F16C for util/fp16.hpp regardless.
+    march_native = cpp.has_argument('-march=native')
+    if march_native
+        add_project_arguments('-march=native', language: 'cpp')
     endif
     # Sanitizer flags must ALSO be on the link line (Gentoo ld.bfd does not
     # pull the runtime in otherwise; the macOS linker did).
@@ -172,8 +162,9 @@ else
             add_project_arguments(flag, language: 'cpp')
         endif
     endforeach
-    if cpp.has_argument(march_flag)
-        add_project_arguments(march_flag, language: 'cpp')
+    march_native = cpp.has_argument('-march=native')
+    if march_native
+        add_project_arguments('-march=native', language: 'cpp')
     endif
 endif
 
@@ -207,7 +198,7 @@ fp16_ok = cpp.compiles('''
     #else
     #error unsupported architecture
     #endif
-''', args: [march_flag])
+''', args: ['-march=native'])
 if not fp16_ok
     error('Sextant requires hardware FP16 support (NEON on ARM, F16C on x86). ' +
           'Ensure -march=native or -mf16c is enabled, or build on AArch64.')

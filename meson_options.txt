@@ -2,5 +2,3 @@ option('tests', type: 'feature', value: 'enabled', description: 'Build unit test
 option('benchmarks', type: 'feature', value: 'disabled', description: 'Build benchmarks')
 option('capi_shared', type: 'boolean', value: false,
        description: 'Also build libsextant_c.so for external FFI harnesses')
-option('cpu_arch', type: 'string', value: 'native',
-       description: 'CPU architecture passed to -march (native or e.g. x86-64-v3 for portable builds)')
