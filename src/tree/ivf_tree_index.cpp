@@ -116,8 +116,8 @@ std::unique_ptr<IVFTreeIndex> IVFTreeIndex::open(const std::string& path,
         cp.pq_bits = idx->manifest_.scan_pq_bits;
         cp.metric = static_cast<MetricKind>(idx->manifest_.metric);
         cp.prq_nsplits = idx->manifest_.prq_nsplits;
-        // Pre-bias L2 trees (no scalar_row_bias key) keep has_ip_bias
-        // false so their leaf layout parses unchanged.
+        // scalar-family leaves carry the per-row fp16 bias block iff the
+        // manifest says so (mandatory field since format v1).
         cp.has_ip_bias = idx->manifest_.scalar_row_bias;
         idx->coder_ = make_leaf_coder(idx->manifest_.quantizer_type, cp,
                                       /*for_open=*/true);

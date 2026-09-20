@@ -12,8 +12,9 @@ flat Vamana-graph engine (July 2026, still present and buildable — see
 [Flat graph engine](#flat-graph-engine-legacy) below); since August 2026 the
 heart of the system is a streaming-built, single-file IVF tree with a
 PCA-based routing plane and per-leaf quantizers (`src/tree/`). Sextant ships
-today as a **standalone C++ library + CLI**. A DuckDB extension integration
-remains unstarted future work — there is no code for it in this repo.
+today as a **standalone C++ library + CLI**, and is consumable from SQL through
+the DuckDB extension in the sibling `sextant-duckdb` repo (statically linked
+via the C API in `include/sextant/sextant_c.h`).
 
 ## The tree engine
 

@@ -277,7 +277,7 @@ inline bool typed_compare(PredicateOp op, T val, double value, double value2,
 
 bool eval_predicate(const ColumnView& col, uint32_t idx, const Predicate& pred) {
     // SQL three-valued logic: a NULL value fails every comparison and
-    // passes only IS NULL. (Legacy trees without validity bytes have
+    // passes only IS NULL. (Non-nullable columns have no validity bytes:
     // col.nulls == nullptr — non-NULL by construction.)
     if (col.nulls && col.nulls[idx]) {
         return pred.op == PredicateOp::IsNull;

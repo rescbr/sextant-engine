@@ -374,6 +374,53 @@ TEST(TreeManifest, RoundTrip) {
 
 TEST(TreeManifest, MissingUuidThrows) {
     std::string bad_toml = R"(
+[meta]
+format_version = 1
+
+[index]
+dim = 768
+m4 = 192
+scan_pq_bits = 4
+
+[tree]
+depth = 2
+k_root = 128
+leaf_capacity = 5000
+n_leaves = 2000
+n_probe_l0 = 16
+n_probe_ln = 4
+)";
+    EXPECT_THROW(manifest_from_toml(bad_toml), sextant::Error);
+}
+
+TEST(TreeManifest, MissingFormatVersionThrows) {
+    std::string bad_toml = R"(
+[meta]
+uuid = "0123456789abcdef0123456789abcdef"
+
+[index]
+dim = 768
+m4 = 192
+scan_pq_bits = 4
+
+[tree]
+depth = 2
+k_root = 128
+leaf_capacity = 5000
+n_leaves = 2000
+n_probe_l0 = 16
+n_probe_ln = 4
+)";
+    EXPECT_THROW(manifest_from_toml(bad_toml), sextant::Error);
+}
+
+TEST(TreeManifest, WrongFormatVersionThrows) {
+    // A future/unknown format_version must fail loudly, not limp along.
+    std::string bad_toml = R"(
+[meta]
+format_version = 2
+uuid = "0123456789abcdef0123456789abcdef"
+
 [index]
 dim = 768
 m4 = 192
@@ -405,7 +452,7 @@ TEST(TreeManifest, MissingFieldThrows) {
 dim = 768
 m4 = 192
 scan_pq_bits = 4
-# missing quantizer_type is optional, but missing depth is fatal
+# missing quantizer_type is fatal in v1, and so is missing depth
 
 [tree]
 depth = 2

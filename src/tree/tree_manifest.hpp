@@ -20,6 +20,10 @@
 namespace sextant::tree {
 
 /// Tree manifest: all parameters needed to search the tree.
+///
+/// Format v1: the manifest carries [meta].format_version = 1; parsing
+/// rejects any other version (no legacy trees are supported — the format
+/// was frozen at v1 and everything older was dev-only).
 struct TreeManifest {
     // [meta]
     /// 32-char lowercase hex UUID (random, generated at build). Identifies
@@ -60,8 +64,8 @@ struct TreeManifest {
     float median_lid = 0.0f;          // median local intrinsic dimensionality
     uint32_t pca_dims = 0;            // PCA routing dims (0 = no PCA routing)
     float probe_fraction = 0.0f;      // default probe budget as a corpus
-                                     // fraction (0 = legacy count routing;
-                                     // new builds persist 0.5)
+                                     // fraction (0 = count routing; new
+                                     // builds persist 0.5)
 
     // [partition]
     float balance_factor = 4.0f;

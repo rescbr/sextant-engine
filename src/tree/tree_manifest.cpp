@@ -11,6 +11,11 @@
 
 namespace sextant::tree {
 
+/// Manifest format version. The manifest declares this in [meta]; parsing
+/// rejects any other value. Bump when the format changes incompatibly
+/// (all pre-v1 trees were dev-only and are expected to be rebuilt).
+constexpr int64_t kManifestFormatVersion = 1;
+
 namespace {
 
 const char* column_type_to_string(ColumnType t) {
@@ -64,6 +69,7 @@ std::string manifest_to_toml(const TreeManifest& m) {
                     "serialization — builds must call generate_tree_uuid()");
     }
     auto meta = cpptoml::make_table();
+    meta->insert("format_version", kManifestFormatVersion);
     meta->insert("uuid", m.uuid);
     root->insert("meta", meta);
 
@@ -75,9 +81,7 @@ std::string manifest_to_toml(const TreeManifest& m) {
     index->insert("quantizer_type", m.quantizer_type);
     index->insert("prq_nsplits", m.prq_nsplits);
     index->insert("metric", static_cast<int64_t>(m.metric));
-    if (m.scalar_row_bias) {
-        index->insert("scalar_row_bias", true);
-    }
+    index->insert("scalar_row_bias", m.scalar_row_bias);
     root->insert("index", index);
 
     // [tree]
@@ -143,6 +147,17 @@ TreeManifest manifest_from_toml(const std::string& toml) {
     if (!meta) {
         throw Error(ErrorCode::CorruptIndex, "TreeManifest: missing [meta] section (uuid required)");
     }
+    auto fv = meta->get_as<int64_t>("format_version");
+    if (!fv) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "TreeManifest: missing required field format_version");
+    }
+    if (*fv != kManifestFormatVersion) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "TreeManifest: format_version " + std::to_string(*fv) +
+                    " unsupported (expected " +
+                    std::to_string(kManifestFormatVersion) + ") — rebuild the index");
+    }
     auto uuid = meta->get_as<std::string>("uuid");
     if (!uuid) {
         throw Error(ErrorCode::CorruptIndex, "TreeManifest: missing required field uuid");
@@ -172,19 +187,20 @@ TreeManifest manifest_from_toml(const std::string& toml) {
     m.dim = static_cast<uint32_t>(require_int(*index, "dim"));
     m.m4 = static_cast<uint16_t>(require_int(*index, "m4"));
     m.scan_pq_bits = static_cast<uint8_t>(require_int(*index, "scan_pq_bits"));
-    if (auto qt = index->get_as<std::string>("quantizer_type")) {
-        m.quantizer_type = *qt;
+    auto qt = index->get_as<std::string>("quantizer_type");
+    if (!qt) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "TreeManifest: missing required field quantizer_type");
     }
-    if (auto ns = index->get_as<int64_t>("prq_nsplits")) {
-        m.prq_nsplits = static_cast<uint32_t>(*ns);
+    m.quantizer_type = *qt;
+    m.prq_nsplits = static_cast<uint32_t>(require_int(*index, "prq_nsplits"));
+    m.metric = static_cast<uint8_t>(require_int(*index, "metric"));
+    auto rb = index->get_as<bool>("scalar_row_bias");
+    if (!rb) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "TreeManifest: missing required field scalar_row_bias");
     }
-    if (auto mt = index->get_as<int64_t>("metric")) {
-        m.metric = static_cast<uint8_t>(*mt);
-    }
-    // Optional (L2 trees predating the ||x|^2 sweep fix omit it → false).
-    if (auto rb = index->get_as<bool>("scalar_row_bias")) {
-        m.scalar_row_bias = *rb;
-    }
+    m.scalar_row_bias = *rb;
 
     // [tree]
     auto tree = root->get_table("tree");
@@ -193,31 +209,34 @@ TreeManifest manifest_from_toml(const std::string& toml) {
     }
     m.depth = static_cast<uint16_t>(require_int(*tree, "depth"));
     m.k_root = static_cast<uint32_t>(require_int(*tree, "k_root"));
-    // k_l1 is optional (depth-3 trees; older trees omit it → 0).
-    if (auto kl1 = tree->get_as<int64_t>("k_l1")) {
-        m.k_l1 = static_cast<uint32_t>(*kl1);
-    }
+    m.k_l1 = static_cast<uint32_t>(require_int(*tree, "k_l1"));
     m.leaf_capacity = static_cast<uint32_t>(require_int(*tree, "leaf_capacity"));
-    // n_vectors is optional (older manifests omit it → 0 = unknown).
-    if (auto nv = tree->get_as<int64_t>("n_vectors")) {
-        m.n_vectors = static_cast<uint64_t>(*nv);
-    }
+    m.n_vectors = static_cast<uint64_t>(require_int(*tree, "n_vectors"));
     m.n_leaves = static_cast<uint32_t>(require_int(*tree, "n_leaves"));
     m.n_probe_l0 = static_cast<uint32_t>(require_int(*tree, "n_probe_l0"));
     m.n_probe_ln = static_cast<uint32_t>(require_int(*tree, "n_probe_ln"));
 
-    // [routing]
+    // [routing]  (probe_fraction stays optional: 0 = count routing is a
+    // live setting, not a legacy read)
     auto routing = root->get_table("routing");
-    if (routing) {
-        if (auto gap = routing->get_as<double>("adaptive_probe_gap")) {
-            m.adaptive_probe_gap = static_cast<float>(*gap);
+    if (!routing) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "TreeManifest: missing [routing] section");
+    }
+    {
+        auto gap = routing->get_as<double>("adaptive_probe_gap");
+        if (!gap) {
+            throw Error(ErrorCode::CorruptIndex,
+                        "TreeManifest: missing required field adaptive_probe_gap");
         }
-        if (auto lid = routing->get_as<double>("median_lid")) {
-            m.median_lid = static_cast<float>(*lid);
+        m.adaptive_probe_gap = static_cast<float>(*gap);
+        auto lid = routing->get_as<double>("median_lid");
+        if (!lid) {
+            throw Error(ErrorCode::CorruptIndex,
+                        "TreeManifest: missing required field median_lid");
         }
-        if (auto pd = routing->get_as<int64_t>("pca_dims")) {
-            m.pca_dims = static_cast<uint32_t>(*pd);
-        }
+        m.median_lid = static_cast<float>(*lid);
+        m.pca_dims = static_cast<uint32_t>(require_int(*routing, "pca_dims"));
         if (auto pf = routing->get_as<double>("probe_fraction")) {
             m.probe_fraction = static_cast<float>(*pf);
         }
@@ -225,10 +244,17 @@ TreeManifest manifest_from_toml(const std::string& toml) {
 
     // [partition]
     auto partition = root->get_table("partition");
-    if (partition) {
-        if (auto bf = partition->get_as<double>("balance_factor")) {
-            m.balance_factor = static_cast<float>(*bf);
+    if (!partition) {
+        throw Error(ErrorCode::CorruptIndex,
+                    "TreeManifest: missing [partition] section");
+    }
+    {
+        auto bf = partition->get_as<double>("balance_factor");
+        if (!bf) {
+            throw Error(ErrorCode::CorruptIndex,
+                        "TreeManifest: missing required field balance_factor");
         }
+        m.balance_factor = static_cast<float>(*bf);
     }
 
     // [schema]  (optional; absent → empty schema, summary_size 0)
