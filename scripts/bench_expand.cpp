@@ -23,7 +23,7 @@
 
 using namespace sextant::tree::coders;
 
-static double now_s() {
+[[maybe_unused]] static double now_s() {
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -32,7 +32,7 @@ int main() {
     const uint32_t dim = 768;
     const uint32_t cs = dim / 2;               // packed bytes/row
     const uint32_t n_rows = 1u << 16;          // 64k rows
-    const double run_s = 1.0;
+    [[maybe_unused]] const double run_s = 1.0;
 
     // Synthetic codes + g-table.
     std::vector<uint8_t> rows(static_cast<size_t>(n_rows) * cs);
@@ -65,7 +65,7 @@ int main() {
         ctx[q].slm_shaped = true;
         ctx[q].shape_u8 = g_tbl;
     }
-    const ScalarScanCtx* c4[4] = {&ctx[0], &ctx[1], &ctx[2], &ctx[3]};
+    [[maybe_unused]] const ScalarScanCtx* c4[4] = {&ctx[0], &ctx[1], &ctx[2], &ctx[3]};
 
     // Row pointer groups of 4 (like scalar_rows does).
     std::vector<const uint8_t*> rptr(n_rows);
@@ -74,7 +74,7 @@ int main() {
     for (uint32_t r = 0; r < n_rows; ++r) eptr[r] = &expanded[r * dim];
 
     float sink = 0;
-    uint64_t iters;
+    [[maybe_unused]] uint64_t iters;
 
 #if defined(__aarch64__) || defined(__ARM_NEON)
     // --- A: real kernel over packed rows ---
