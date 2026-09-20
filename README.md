@@ -22,7 +22,6 @@ via the C API in `include/sextant/sextant_c.h`).
   two-level tree — a small root fanout (`--k-root`) over PCA-projected
   centroids, leaves capped at `--leaf-capacity` vectors (default 5000).
   Build RAM is bounded by chunk size, not corpus size. See
-  [docs/hierarchical_tree_design.md](docs/hierarchical_tree_design.md) and
   [docs/hierarchical_tree_design.md](docs/hierarchical_tree_design.md).
 - **Per-leaf quantizers** (`--quantizer`): each leaf stores quantized codes
   with a quantizer chosen per build. Local quantizers (per-leaf rulers /
