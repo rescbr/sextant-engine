@@ -38,6 +38,21 @@ NAND-tier mid-scale option retained. Grounded in measurements from
 > (§4.2, §6.1) remain valid measurements. Verification milestones in
 > §9; owner: sextant engine.
 
+> **ADDENDUM (2026-09-20, SP geocoder 23M × 768, second measured role):**
+> the plane is not only a cold-scan amortizer — it is **routing
+> precision under probe starvation**. At low probe fractions on hard
+> query tiers it is what keeps recall alive: recall@10 @ f=0.02,
+> plane on → off: typo 0.9946 → 0.9408, abbrev 0.9966 → 0.9206,
+> drop_num 0.9820 → 0.9554, and no-city (scattered-GT) 0.5928 →
+> 0.2578 — **recall more than halves** exactly when the probe budget
+> is small. The warm ~1.5x QPS tax on easy queries is real (easy
+> tiers pay it for nothing: 167 → 228 QPS plane on → off), but any
+> workload with hard query traffic should keep the plane ON by
+> default. Full tables: `sextant-geo/bench/sp-pareto-hardqueries.md`.
+> Eventual lever: per-query adaptive plane usage driven by leaf-score
+> entropy (peaked → skip the plane, flat → keep it and/or escalate
+> probing). Not built; the data above is the motivation.
+
 ---
 
 ## 1. Problem and opportunity

@@ -2407,6 +2407,11 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
         file.write_pages(cb_page, cb_npg, b.data());
     }
 
+    // Default absolute probe budget (vectors per query) behind the
+    // manifest's scaled probe-fraction default. See the comment at
+    // manifest.probe_fraction assignment below.
+    static constexpr double kDefaultProbeVectors = 500'000.0;
+
     TreeManifest manifest;
     manifest.uuid = generate_tree_uuid();
     manifest.dim = dim; manifest.m4 = m4; manifest.scan_pq_bits = scan_bits;
@@ -2436,10 +2441,19 @@ BuildResult write_tree_structure(TreeBuildContext& ctx, PageFile& file,
         manifest.n_probe_ln = cfg.n_probe_ln > 0 ? cfg.n_probe_ln
                                                  : max_leaves_per_child;
     }
-    // Corpus-fraction probe budget: the scale-stable default. New trees
-    // persist 0.5 (measured ~0.99 recall@10 across 100K→933K at half the
-    // flat-scan cost); legacy count fields remain for expert overrides.
-    manifest.probe_fraction = cfg.probe_fraction > 0.0f ? cfg.probe_fraction : 0.5f;
+    // Corpus-fraction probe budget. The default targets a fixed ABSOLUTE
+    // budget of vectors probed per query (~500K) — the quantity that
+    // actually drives recall — capped at 0.5 so small corpora keep the
+    // historically measured behavior (f=0.5 ≈0.99 recall@10 at 100K→1M,
+    // half the flat-scan cost). A flat 0.5 at large n silently probes
+    // millions of vectors per query: on a 23M-row geocoder corpus the
+    // recall knee sat at f≈0.02 (≈460K vecs), leaving 20-40x QPS on the
+    // table vs the 0.5 default. f = min(0.5, 500K/n) reproduces both
+    // knees. Experts override via BuildConfig; legacy count fields
+    // remain for absolute-control overrides.
+    manifest.probe_fraction = cfg.probe_fraction > 0.0f
+        ? cfg.probe_fraction
+        : static_cast<float>(std::min(0.5, kDefaultProbeVectors / double(ctx.n)));
     manifest.adaptive_probe_gap = cfg.adaptive_probe_gap;
     manifest.median_lid = cfg.median_lid;
     manifest.pca_dims = ctx.pca_disabled ? 0 : pca_dims;  // search-side PCA

@@ -31,6 +31,7 @@
 #include "sextant/schema.hpp"
 #include <sextant/vector_source.hpp>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -109,7 +110,8 @@ public:
         uint16_t n_probe_l0 = 0;       // probe count at level 0 (0 = auto)
         uint16_t n_probe_ln = 0;       // probe count at deeper levels (0 = auto)
         float probe_fraction = 0.0f;   // corpus-fraction probe budget to bake
-                                       // into the manifest (0 = default 0.5)
+                                       // into the manifest (0 = scaled default:
+                                       // min(0.5, 500K vecs/query ÷ n))
         ResolvedParams params;         // PQ/PRQ config
         float adaptive_probe_gap = 0.0f;  // geometric gap pruning (0=off default;
                                           // see ResolvedParams note — 1.5 silently
@@ -339,6 +341,20 @@ public:
     uint32_t n_probe_ln_default() const { return manifest_.n_probe_ln; }
     float probe_fraction_default() const { return manifest_.probe_fraction; }
     uint32_t pca_dims_default() const { return manifest_.pca_dims; }
+    // Read-only routing-structure views (benchmark/spike use): project a
+    // query with proj_view()/proj_mean_view() then dot against the
+    // centroid views to reproduce search-time routing scores.
+    uint32_t pca_dims_view() const { return pca_dims_; }
+    const float* pca_proj_view() const { return pca_proj_.data(); }
+    const float* pca_proj_mean_view() const { return pca_mean_proj_.data(); }
+    const float* pca_root_centroids_view() const { return pca_root_centroids_.data(); }
+    uint32_t pca_root_centroid_count_view() const {
+        return static_cast<uint32_t>(pca_root_centroids_.size() / std::max(1u, pca_dims_));
+    }
+    const float* pca_leaf_centroids_view() const { return pca_leaf_centroids_.data(); }
+    uint32_t pca_leaf_centroid_count_view() const {
+        return static_cast<uint32_t>(pca_leaf_centroids_.size() / std::max(1u, pca_dims_));
+    }
     const std::string& quantizer_type() const { return manifest_.quantizer_type; }
     /// Global PQ quantizer view (global-codebook families only). Callers
     /// must not invoke this on local/scalar families.
@@ -501,6 +517,13 @@ private:
     // untouched and may overlap a sweep freely — they never read leaf
     // pages, only the (mmap'd) plane extent and centroids.
     mutable std::mutex scan_stream_mu_;
+    // One-shot guard for the oversized-manifest-probe-budget stderr note.
+    mutable std::atomic<bool> probe_budget_warned_ = false;
+
+    /// Warn (once) when the manifest's baked probe_fraction implies an
+    /// extreme vectors-probed-per-query budget and no caller override is
+    /// present. Called at every search()/search_batch() entry.
+    bool maybe_warn_probe_budget_(const SearchConfig& config) const;
     int fd_ = -1;
     const uint8_t* mmap_base_ = nullptr;  // mmap'd file base (read-only)
     uint64_t mmap_size_ = 0;

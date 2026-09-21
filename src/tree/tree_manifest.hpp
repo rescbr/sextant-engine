@@ -65,7 +65,8 @@ struct TreeManifest {
     uint32_t pca_dims = 0;            // PCA routing dims (0 = no PCA routing)
     float probe_fraction = 0.0f;      // default probe budget as a corpus
                                      // fraction (0 = count routing; new
-                                     // builds persist 0.5)
+                                     // builds persist min(0.5, 500K/n) —
+                                     // fixed vectors-probed-per-query)
 
     // [partition]
     float balance_factor = 4.0f;

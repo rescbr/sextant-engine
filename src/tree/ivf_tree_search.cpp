@@ -23,6 +23,7 @@
 #include <ctpl/ctpl_stl_tls.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -314,6 +315,29 @@ void IVFTreeIndex::expand_probe_(const ProbeEntry& e, bool use_pca_leaves,
     }
 }
 
+bool IVFTreeIndex::maybe_warn_probe_budget_(const SearchConfig& config) const {
+    // Migration guard for oversized baked probe budgets: trees built before
+    // the scaled default persist a flat 0.5, which at large n implies
+    // millions of vectors probed per query (measured: 23M-row corpus, 0.5 →
+    // 11.5M vecs/query → ~10 QPS vs ~210 at the iso-recall knee f=0.02).
+    // Fires only when the MANIFEST default is in effect (no caller
+    // override); new builds bake min(0.5, 500K/n).
+    if (config.probe_fraction > 0.0f || config.n_probe != 0) return false;
+    if (manifest_.probe_fraction <= 0.0f) return false;
+    if (probe_budget_warned_.exchange(true)) return false;
+    if (manifest_.probe_fraction * double(manifest_.n_vectors) <= 5.0e6)
+        return false;
+    std::fprintf(stderr,
+        "sextant: manifest probe_fraction=%.3f over %llu vectors probes "
+        "~%.1fM vectors/query; consider --probe-fraction ~%.4f "
+        "(500K vecs/query target) or rebuilding the tree\n",
+        manifest_.probe_fraction,
+        static_cast<unsigned long long>(manifest_.n_vectors),
+        manifest_.probe_fraction * double(manifest_.n_vectors) / 1.0e6,
+        std::min(0.5, 5.0e5 / double(manifest_.n_vectors)));
+    return true;
+}
+
 IVFTreeIndex::RouteStatus IVFTreeIndex::route_query_(
         const float* query, const SearchConfig& config,
         SearchScratch& scratch,
@@ -366,6 +390,7 @@ IVFTreeIndex::RouteStatus IVFTreeIndex::route_query_(
         probe_frac = manifest_.probe_fraction;
     }
     const bool fraction_routing = probe_frac > 0.0f && config.n_probe == 0;
+
 
     // Scan-feedback probing (FeedbackProbe): root children probed in
     // routing order one subtree block at a time, stopping on scan feedback
@@ -627,6 +652,7 @@ std::vector<Candidate> IVFTreeIndex::search(const float* query, uint32_t k,
     const std::vector<uint32_t>* sweep_Ws,
     std::vector<std::vector<Candidate>>* sweep_out,
     std::vector<PageId>* visited_leaf_pages) const {
+    maybe_warn_probe_budget_(config);
     // Per-query observability (SearchStats, config.hpp): wall/leaves/bytes
     // recorded on EVERY exit path via the guard destructor. Fields are
     // assigned (not accumulated) once the candidate set is final below.
@@ -1881,6 +1907,7 @@ void IVFTreeIndex::search_batch(
         const std::vector<std::vector<Predicate>>* per_query_predicates,
         const std::vector<float>* per_query_probe_fraction)
         const {
+    maybe_warn_probe_budget_(config);
     const auto t0 = std::chrono::steady_clock::now();
     results.clear();
     results.resize(nq);

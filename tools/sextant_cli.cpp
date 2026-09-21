@@ -634,7 +634,8 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("n-probe", 0, "Root probe count (0=manifest default)", false, 0);
     p.add<uint32_t>("n-probe-ln", 0, "Leaf probe count per root child (0=manifest)", false, 0);
     p.add<float>("probe-fraction", 0,
-        "Probe budget as a corpus fraction (0=manifest default, new trees 0.5): "
+        "Probe budget as a corpus fraction (0=manifest default, baked at "
+        "build as min(0.5, 500K/n) vectors/query): "
         "select root children nearest-first until their cumulative subtree "
         "extent reaches this fraction, then probe all their leaves. "
         "Scale-stable where counts are not (measured dbpedia 100K→933K: "
@@ -643,7 +644,11 @@ int cmd_tree_search(int argc, char* argv[]) {
     p.add<uint32_t>("fastscan-w", 0, "Rerank shortlist per shard (0=300)", false, 0);
     p.add("no-plane", 0,
         "Disable stage-1 plane routing (legacy centroid descent) even "
-        "when the index carries a routing plane");
+        "when the index carries a routing plane. WARNING: the plane is "
+        "also routing precision under probe starvation — on hard query "
+        "tiers at low probe fractions, disabling it can more than halve "
+        "recall (measured 23M geocoder corpus, no-city tier: 0.59 → 0.26 "
+        "recall@10 at f=0.02). Only disable for easy, warm workloads.");
     p.add<float>("plane-pre-prune", 0,
         "Two-stage routing: fraction of leaves (by PCA centroid "
         "distance, page-weighted) surviving to the plane sweep "
