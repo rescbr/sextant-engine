@@ -117,6 +117,12 @@ spike_routing_ceiling = executable('spike_routing_ceiling',
     dependencies: sextant_dep,
 )
 
+spike_dispersion = executable('spike_dispersion',
+    'spike_dispersion.cpp',
+    include_directories: [engine_inc, src_inc, third_party_inc],
+    dependencies: sextant_dep,
+)
+
 plane_selftest = executable('plane_selftest',
     'plane_selftest.cpp',
     include_directories: [engine_inc, src_inc, third_party_inc],
