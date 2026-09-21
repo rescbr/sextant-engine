@@ -868,6 +868,45 @@ TEST_F(CApiTest, SchedulerLifecycleAndParity) {
     sextant_scheduler_stop(nullptr);
 }
 
+// (h) Quality-contract defaults: adaptive-W tau AUTO + plane pre-prune at
+// CLI parity (geocoder validation 2026-09-21: gap-0 default cost ~10pp
+// recall@10 on the 23M corpus).
+TEST_F(CApiTest, DefaultSearchOptsQualityContract) {
+    const sextant_search_opts o = sextant_default_search_opts();
+    EXPECT_EQ(o.adaptive_w_gap, -1.0f);  // AUTO, resolved per code size
+    EXPECT_EQ(o.plane_pre_prune, 0.25f);
+    EXPECT_EQ(o.rerank, 1);
+
+    // AUTO resolves through search without error (and the scheduler
+    // inherits the same resolution via its base opts).
+    sextant_search_opts opts = o;
+    opts.k = 5;
+    uint64_t ids[5];
+    float d[5];
+    char err[512] = {0};
+    const float* q = corpus.centers[0].data();
+    ASSERT_GE(sextant_search(index, q, &opts, ids, d, 5, err, sizeof(err)),
+              0)
+        << err;
+
+    sextant_scheduler_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.base = &opts;
+    void* sched = sextant_scheduler_create(index, &cfg, err, sizeof(err));
+    ASSERT_NE(sched, nullptr) << err;
+    uint64_t sids[5];
+    float sd[5];
+    const int32_t n = sextant_scheduler_submit(
+        sched, q, 5, nullptr, 0, 0, 0.0f, sids, sd, 5, err, sizeof(err));
+    ASSERT_GE(n, 0) << err;
+    EXPECT_EQ(n, 5);
+    for (int32_t i = 0; i < n; ++i) {
+        EXPECT_EQ(sids[i], ids[i]);
+        EXPECT_EQ(sd[i], d[i]);
+    }
+    sextant_scheduler_stop(sched);
+}
+
 // (g2) Scheduler validation: null handles / arguments rejected; NULL cfg
 // means all-default config and must succeed.
 TEST_F(CApiTest, SchedulerNullArgs) {

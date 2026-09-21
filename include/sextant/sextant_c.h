@@ -88,11 +88,18 @@ typedef struct sextant_search_opts {
     uint32_t fastscan_W;       ///< shortlist width (0 = index default)
     float adaptive_probe_gap;  ///< <0 = off, 0 = index default, >1 = explicit
     int rerank;                ///< 0/1 (rerank top-W by decoded distance)
-    float adaptive_w_gap;      ///< tau: post-rerank shortlist cut (0 = off).
-                               ///< With it, search returns up to W>k ids whose
+    float adaptive_w_gap;      ///< tau: post-rerank shortlist cut (0 = off,
+                               ///< -1 = AUTO: tau per scan-code size
+                               ///< (>=288B -> 2.5, else 5.0), CLI parity —
+                               ///< the default from
+                               ///< sextant_default_search_opts and the
+                               ///< quality contract on near-dup corpora
+                               ///< (measured 0.89 -> 0.99 recall@10 on a
+                               ///< 23M geocoder corpus vs off)). With it,
+                               ///< search returns up to W>k ids whose
                                ///< reranked distance stays within gap of the
                                ///< k-th — the adaptive-W contract the bench
-                               ///  grades recall over. Requires rerank.
+                               ///< grades recall over. Requires rerank.
     uint32_t search_threads;   ///< within-query leaf-parallel scan (0 = serial)
     int int8_scan;             ///< 1 = i8 SDOT kernel (uniform scalar codes).
                                ///< 3-4x faster, NOT score-bit-identical:
@@ -114,10 +121,18 @@ typedef struct sextant_search_opts {
                                ///< passing smaller structs read as NULL via
                                ///< designated-init zero fill.
     float probe_fraction;     ///< corpus-fraction probe budget (0 = index
-                               ///< default; 0.25/0.5 measured ~0.96/~0.99
-                               ///< recall@10 on dbpedia, scale-stable).
-                               ///< Ignored when n_probe > 0 or exhaustive.
-                               ///< ABI: added at struct tail.
+                               ///<  default; 0.25/0.5 measured ~0.96/~0.99
+                               ///<  recall@10 on dbpedia, scale-stable).
+                               ///<  Ignored when n_probe > 0 or exhaustive.
+                               ///<  ABI: added at struct tail.
+    float plane_pre_prune;    ///< Two-stage plane routing: fraction of
+                               ///<  leaves (PCA centroid distance,
+                               ///<  page-weighted) surviving to the plane
+                               ///<  sweep. 0 (incl. legacy zero-fill) =
+                               ///<  engine default 0.25 (recall-neutral,
+                               ///<  QPS-positive); <0 = off; >0 = explicit.
+                               ///<  Ignored for plane-less trees.
+                               ///<  ABI: added at struct tail.
 } sextant_search_opts;
 
 sextant_search_opts sextant_default_search_opts(void);

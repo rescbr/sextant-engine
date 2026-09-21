@@ -43,8 +43,9 @@ void set_err(char* err, size_t err_len, const char* msg) {
 using sextant::tree::IVFTreeIndex;
 
 /// Translate sextant_search_opts into the engine SearchConfig (shared by
-/// sextant_search / _filtered / search2 / search_batch).
-void fill_search_config(const sextant_search_opts* opts,
+/// sextant_search / _filtered / search2 / search_batch / scheduler).
+/// `idx` resolves AUTO adaptive_w_gap (tau by scan-code size, CLI parity).
+void fill_search_config(const IVFTreeIndex* idx, const sextant_search_opts* opts,
                          sextant::SearchConfig& cfg) {
     cfg.k = opts->k;
     if (opts->exhaustive) {
@@ -64,7 +65,20 @@ void fill_search_config(const sextant_search_opts* opts,
     cfg.rerank = opts->rerank != 0;
     cfg.exact_rerank_base = opts->exact_rerank_base;
     cfg.adaptive_w_gap = opts->adaptive_w_gap;
+    if (opts->adaptive_w_gap < 0.0f) {
+        // AUTO: tau calibrated per scan-code size (CLI parity — tau 2-3
+        // for 384B codes; 5-10 for the low-byte tiers).
+        const uint32_t cs = idx ? idx->coder().code_size() : 0;
+        cfg.adaptive_w_gap = cs >= 288 ? 2.5f : 5.0f;
+    }
     cfg.search_threads = opts->search_threads;
+    // plane_pre_prune: 0 (incl. legacy zero-fill) keeps the engine
+    // default (0.25, recall-neutral QPS-positive); <0 disables; >0 is
+    // the explicit surviving fraction.
+    if (opts->plane_pre_prune != 0.0f)
+        cfg.plane_pre_prune = opts->plane_pre_prune < 0.0f
+                                  ? 0.0f
+                                  : opts->plane_pre_prune;
     // The scan kernel mode is a process-wide setting with a per-thread
     // override the scan reads (set below).
     sextant::tree::set_scan_i8_override(opts->int8_scan);
@@ -376,6 +390,13 @@ sextant_search_opts sextant_default_search_opts(void) {
                         // force-disabled the i8 kernel for default callers
     o.exhaustive = 0;
     o.probe_fraction = 0.0f;
+    // Adaptive-W tau: -1 = AUTO (per scan-code size, CLI parity). This
+    // is the quality contract on near-dup corpora — off (0) measured
+    // 0.89 vs 0.99 recall@10 on the 23M geocoder corpus.
+    o.adaptive_w_gap = -1.0f;
+    // Two-stage plane routing default (CLI parity: recall-neutral,
+    // QPS-positive on plane-bearing trees).
+    o.plane_pre_prune = 0.25f;
     return o;
 }
 
@@ -393,7 +414,7 @@ int32_t sextant_search(void* index, const float* query,
     }
     try {
         sextant::SearchConfig cfg;
-        fill_search_config(opts, cfg);
+        fill_search_config(idx, opts, cfg);
         auto results = idx->search(query, opts->k, cfg);
         // Under the adaptive-W contract (adaptive_w_gap > 0) the engine may
         // return more than k ids. The caller's arrays are sized k, so clamp;
@@ -442,7 +463,7 @@ int32_t sextant_search2(void* index, const float* query,
     }
     try {
         sextant::SearchConfig cfg;
-        fill_search_config(opts, cfg);
+        fill_search_config(idx, opts, cfg);
         if (n_preds) {
             if (int rc = translate_predicates(preds, n_preds,
                                              cfg.predicates, err, err_len))
@@ -491,7 +512,7 @@ int sextant_search_batch(void* index, const float* queries,
     }
     try {
         sextant::SearchConfig cfg;
-        fill_search_config(opts, cfg);
+        fill_search_config(idx, opts, cfg);
         if (n_preds) {
             if (int rc = translate_predicates(preds, n_preds,
                                              cfg.predicates, err, err_len))
@@ -985,7 +1006,7 @@ void* sextant_scheduler_create(const void* index,
         const sextant_search_opts* base =
                 (cfg && cfg->base) ? cfg->base : &defaults;
         sextant::SearchConfig sc;
-        fill_search_config(base, sc);
+        fill_search_config(idx, base, sc);
 
         sextant::tree::BatchScheduler::Config c;
         if (cfg) {
