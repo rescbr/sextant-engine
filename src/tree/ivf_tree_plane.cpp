@@ -22,6 +22,8 @@
 #include <ctpl/ctpl_stl_tls.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 #include <array>
 #include <atomic>
 #include <random>
@@ -367,6 +369,17 @@ void IVFTreeIndex::plane_route_batch_(
     uint64_t total = 0;
     for (const auto& e : leaf_table_)
         if (e.page != kInvalidPage) total += e.pages;
+    // F3 signal study: optional dump of per-query FULL leaf-score shape
+    // (pre-budget). Env-gated, benchmark-only — production path untouched.
+    // Columns: qid,gap12z,nent,top10_pg,top100_pg,half_pg — all computed
+    // from z-scored finite scores; top/half page fractions are the
+    // page-weighted share of the top-N / score-mass-50% leaf sets.
+    const char* plane_dump = std::getenv("SEXTANT_PLANE_DUMP");
+    std::ofstream plane_dump_f;
+    if (plane_dump) {
+        plane_dump_f.open(plane_dump, std::ios::app);
+        if (!plane_dump_f) plane_dump = nullptr;
+    }
     out.resize(nq);
     {
         // Query-parallel selection (each query's full leaf-score sort is
@@ -427,6 +440,74 @@ void IVFTreeIndex::plane_route_batch_(
                                       q0, q1));
         }
         for (auto& f : futs) f.get();
+    }
+
+    if (plane_dump && plane_dump_f.is_open()) {
+        // Serial over queries (scores grid is [l][qi], leaf-major).
+        std::vector<uint32_t> order(n_leaves);
+        for (uint32_t qi = 0; qi < nq; ++qi) {
+            double mu = 0; uint32_t nf = 0;
+            for (uint32_t l = 0; l < n_leaves; ++l) {
+                const float s = scores[static_cast<size_t>(l) * nq + qi];
+                if (std::isfinite(s)) { mu += s; ++nf; }
+            }
+            if (nf < 2) continue;
+            mu /= double(nf);
+            double var = 0;
+            for (uint32_t l = 0; l < n_leaves; ++l) {
+                const float s = scores[static_cast<size_t>(l) * nq + qi];
+                if (std::isfinite(s)) var += (s - mu) * (s - mu);
+            }
+            const double sd = std::sqrt(var / double(nf));
+            std::vector<double> z(n_leaves,
+                                  -std::numeric_limits<double>::infinity());
+            for (uint32_t l = 0; l < n_leaves; ++l) {
+                const float s = scores[static_cast<size_t>(l) * nq + qi];
+                if (std::isfinite(s))
+                    z[l] = (double(s) - mu) / (sd > 1e-9 ? sd : 1.0);
+            }
+            std::iota(order.begin(), order.end(), 0u);
+            std::sort(order.begin(), order.end(),
+                      [&](uint32_t a, uint32_t b) { return z[a] > z[b]; });
+            const double gap12 = z[order[0]] - z[order[1]];
+            // softmax entropy over finite leaves
+            double mx = z[order[0]], tot = 0, h = 0;
+            std::vector<double> p;
+            p.reserve(nf);
+            for (uint32_t l = 0; l < n_leaves; ++l)
+                if (std::isfinite(z[l])) {
+                    p.push_back(std::exp(z[l] - mx));
+                    tot += p.back();
+                }
+            for (double w : p) { w /= tot; if (w > 0) h -= w * std::log(w); }
+            const double nent = h / std::log(double(nf));
+            // page-weighted shares of top-10 / top-100 leaves, and the
+            // page fraction covering 50% of softmax mass
+            auto pg = [&](uint32_t l) -> double {
+                return leaf_table_[l].page == kInvalidPage
+                    ? 0.0 : double(leaf_table_[l].pages);
+            };
+            double top10 = 0, top100 = 0;
+            for (uint32_t i = 0; i < std::min<uint32_t>(10, nf); ++i)
+                top10 += pg(order[i]);
+            for (uint32_t i = 0; i < std::min<uint32_t>(100, nf); ++i)
+                top100 += pg(order[i]);
+            double half = 0, acc = 0;
+            {
+                uint32_t i = 0;
+                std::sort(p.begin(), p.end(), std::greater<double>());
+                for (double w : p) {
+                    acc += w / tot;
+                    if (acc >= 0.5) break;
+                    ++i;
+                    if (i < nf) half += pg(order[i - 1]);
+                }
+            }
+            plane_dump_f << qi << ',' << gap12 << ',' << nent << ','
+                         << top10 / double(total) << ','
+                         << top100 / double(total) << ','
+                         << half / double(total) << '\n';
+        }
     }
 }
 
