@@ -808,6 +808,42 @@ TEST(BatchSearch, SubmitAfterStopRejected) {
     EXPECT_FALSE(fut.valid());
 }
 
+TEST(BatchSearch, SchedulerPassesAdaptiveShortlist) {
+    // Adaptive-W contract through the scheduler: with tau > 0 the
+    // resolved future carries the gap-truncated SHORTLIST (up to W>k
+    // ids), not a fixed top-k — dispatch_ must not truncate to e.k
+    // (that silently downgraded scheduler consumers by ~10pp recall@10
+    // on near-dup corpora). Parity with search_batch per query.
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::SearchConfig sc = base_config();
+    sc.rerank = true;
+    sc.adaptive_w_gap = 2.5f;
+    sc.fastscan_W = 1000;
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.search_threads = 1;
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+
+    const uint32_t nq = 4;
+    const auto queries = fx.make_queries(nq);
+    std::vector<std::vector<sextant::Candidate>> ref;
+    idx->search_batch(queries.data(), nq, 10, sc, ref);
+    size_t shortlist_excess = 0;  // ids past k across the fixture
+    for (uint32_t i = 0; i < nq; ++i) {
+        auto got = sched.submit(queries.data() + i * fx.dim, 10).get();
+        ASSERT_EQ(got.size(), ref[i].size()) << "query " << i;
+        if (got.size() > 10) shortlist_excess += got.size() - 10;
+        for (size_t j = 0; j < got.size(); ++j) {
+            EXPECT_EQ(got[j].row_id, ref[i][j].row_id)
+                << "query " << i << " position " << j;
+        }
+    }
+    // The test is only meaningful if the shortlist contract actually
+    // exceeds k somewhere on this fixture (else it can't distinguish
+    // truncation from parity).
+    EXPECT_GT(shortlist_excess, 0u);
+}
+
 TEST(BatchSearch, PerQueryProbeFractionParity) {
     // Recall-depth overrides: per-query fraction must match a per-query
     // search with the same config, and a deeper query must return a

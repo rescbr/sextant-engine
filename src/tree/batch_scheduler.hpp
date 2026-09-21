@@ -96,7 +96,10 @@ public:
     BatchScheduler& operator=(const BatchScheduler&) = delete;
 
     /// Submit one query (dim() floats, copied). The returned future
-    /// resolves with the query's top-k after its window's sweep.
+    /// resolves with the query's results after its window's sweep —
+    /// under the adaptive-W contract (base config tau > 0) that is the
+    /// gap-truncated SHORTLIST, up to W>k ids, not a fixed top-k
+    /// (consumers clamp; the CAPI clamps to out_capacity).
     /// Optional per-request settings (all default to the scheduler's
     /// base config): predicates (empty vector = unfiltered query),
     /// max_delay_us (latency tolerance — see the deadline-class docs

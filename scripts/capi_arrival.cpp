@@ -79,6 +79,15 @@ int main(int argc, char** argv) {
     Fbin q = load_f32(argv[2]);
     const uint32_t T = argc > 3 ? atoi(argv[3]) : 16;
     const uint32_t k = argc > 4 ? atoi(argv[4]) : 10;
+    // out_capacity for submits: adaptive-W shortlists can exceed k;
+    // ARR_CAP covers grading (must be >= k, <= 512).
+    const uint32_t kOut = [] { const char* v = getenv("ARR_CAP");
+                               return v ? (uint32_t)atoi(v) : 64u; }();
+    constexpr uint32_t kMaxOut = 512;
+    if (kOut < k || kOut > kMaxOut) {
+        fprintf(stderr, "ARR_CAP must satisfy k <= ARR_CAP <= %u\n", kMaxOut);
+        return 1;
+    }
     std::vector<uint32_t> gt;
     bool have_gt = false;
     if (argc > 5 && strcmp(argv[5], "-") != 0) {
@@ -162,12 +171,16 @@ int main(int argc, char** argv) {
                     const uint64_t qi = next.fetch_add(1) % q.n;
                     const uint64_t delay = (mix_pct > 0 &&
                         (int)((i * 997) % 100) < mix_pct) ? 1000 : 0;
-                    uint64_t ids[64]; float d[64];
-                    if (k > 64) return;
+                    // Result capacity is kOut (>= k, default 64), NOT k:
+                    // adaptive-W shortlists return up to W>k ids and
+                    // grading must see the whole shortlist — fixed
+                    // capacity=k silently truncates to the fixed-top-k
+                    // contract (~-10pp recall@10 on near-dup corpora).
+                    uint64_t ids[kMaxOut]; float d[kMaxOut];
                     char e[512] = {0};
                     const int32_t n = sextant_scheduler_submit(
                         sched, &q.vecs[(size_t)qi * q.dim], k,
-                        nullptr, 0, delay, 0.0f, ids, d, k, e, sizeof(e));
+                        nullptr, 0, delay, 0.0f, ids, d, kOut, e, sizeof(e));
                     if (n < 0) { fprintf(stderr, "submit: %s\n", e); return; }
                     if (have_gt) {
                         uint32_t h = 0;

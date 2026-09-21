@@ -258,6 +258,7 @@ void BatchScheduler::dispatch_(std::deque<Entry> window) {
         any_frac ? &win_frac : nullptr);
     const auto t1 = std::chrono::steady_clock::now();
 
+    const auto adaptive = search_config_.adaptive_w_gap > 0.0f;
     std::lock_guard<std::mutex> lk(mu_);
     stats_.windows += 1;
     stats_.queries += nq;
@@ -286,7 +287,16 @@ void BatchScheduler::dispatch_(std::deque<Entry> window) {
             if (ce.results.size() > e.k) ce.results.resize(e.k);
             cache_.push_front(std::move(ce));
         }
-        if (results[i].size() > e.k) results[i].resize(e.k);
+        // Adaptive-W contract: with tau > 0, search_batch may return up
+        // to W>k ids (gap-truncated past k); pass the shortlist through
+        // untouched — consumers clamp to their own capacity (the CAPI
+        // clamps to out_capacity). Truncating to e.k here silently
+        // downgraded scheduler consumers to fixed-top-k (measured SP 23M
+        // typo tier: 0.9946 shortlist vs 0.8966 top-k recall@10).
+        // Without tau there is no shortlist contract: prefix-cut each
+        // query to its own k (the sweep ran at the window's k_eff max).
+        if (!adaptive && results[i].size() > e.k)
+            results[i].resize(e.k);
         e.promise.set_value(std::move(results[i]));
     }
 }
