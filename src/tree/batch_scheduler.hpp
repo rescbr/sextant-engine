@@ -101,7 +101,8 @@ public:
     /// base config): predicates (empty vector = unfiltered query),
     /// max_delay_us (latency tolerance — see the deadline-class docs
     /// at the full overload), probe_fraction (recall depth — a
-    /// bytes-priced quality knob). Thread-safe.
+    /// bytes-priced quality knob). Thread-safe. Returns an INVALID future
+    /// when the scheduler has been stopped (check future::valid()).
 
     /// Full overload with per-request latency tolerance (deadline
     /// class).

@@ -10,6 +10,7 @@
 
 #include "fbin_source.hpp"
 #include "mem_source.hpp"
+#include "tree/batch_scheduler.hpp"
 #include "tree/ivf_tree_index.hpp"
 #include "tree/scan_pool.hpp"
 
@@ -967,6 +968,130 @@ int sextant_build_finish(void* builder, const char* out_path,
 
 void sextant_build_abort(void* builder) {
     delete reinterpret_cast<PushBuilder*>(builder);
+}
+
+// --- Request scheduler -------------------------------------------------------
+
+void* sextant_scheduler_create(const void* index,
+                               const sextant_scheduler_config_t* cfg,
+                               char* err, size_t err_len) {
+    auto* idx = reinterpret_cast<const IVFTreeIndex*>(index);
+    if (!idx) {
+        set_err(err, err_len, "sextant_scheduler_create: null index");
+        return nullptr;
+    }
+    try {
+        const sextant_search_opts defaults = sextant_default_search_opts();
+        const sextant_search_opts* base =
+                (cfg && cfg->base) ? cfg->base : &defaults;
+        sextant::SearchConfig sc;
+        fill_search_config(base, sc);
+
+        sextant::tree::BatchScheduler::Config c;
+        if (cfg) {
+            c.window_max_us = cfg->window_max_us;
+            c.idle_close_us = cfg->idle_close_us;
+            c.max_window_queries = cfg->max_window_queries;
+            c.result_cache_entries = cfg->result_cache_entries;
+            c.search_threads = cfg->search_threads;
+            c.max_inflight_windows = cfg->max_inflight_windows;
+        }
+        // 0-remap: the engine already defaults window_max_us /
+        // max_window_queries / max_inflight_windows, but idle_close_us == 0
+        // DISABLES idle close and search_threads == 0 is serial there —
+        // the C contract is "0 = documented default".
+        if (c.idle_close_us == 0) c.idle_close_us = 200;
+        if (c.search_threads == 0) c.search_threads = 1;
+
+        return new sextant::tree::BatchScheduler(idx, std::move(sc), c);
+    } catch (const std::exception& e) {
+        set_err(err, err_len, e.what());
+        return nullptr;
+    } catch (...) {
+        set_err(err, err_len, "sextant_scheduler_create: unknown exception");
+        return nullptr;
+    }
+}
+
+int32_t sextant_scheduler_submit(void* sched, const float* query,
+                                 uint32_t k,
+                                 const sextant_predicate* preds,
+                                 uint32_t n_preds,
+                                 uint64_t max_delay_us,
+                                 float probe_fraction,
+                                 uint64_t* out_row_ids, float* out_dists,
+                                 uint32_t out_capacity,
+                                 char* err, size_t err_len) {
+    auto* s =
+            reinterpret_cast<sextant::tree::BatchScheduler*>(sched);
+    if (!s || !query || !out_row_ids || !out_dists || k == 0
+        || out_capacity < k) {
+        set_err(err, err_len,
+                "sextant_scheduler_submit: null argument, k==0 or "
+                "out_capacity < k");
+        return -1;
+    }
+    try {
+        std::vector<sextant::Predicate> epreds;
+        if (n_preds) {
+            if (int rc = translate_predicates(preds, n_preds, epreds,
+                                              err, err_len))
+                return rc;
+        }
+        auto fut = s->submit(query, k,
+                             n_preds ? &epreds : nullptr,
+                             max_delay_us, probe_fraction);
+        if (!fut.valid()) {
+            set_err(err, err_len,
+                    "sextant_scheduler_submit: scheduler is stopped");
+            return -1;
+        }
+        auto results = fut.get();
+        const int32_t n = std::min<int32_t>(
+                static_cast<int32_t>(results.size()),
+                static_cast<int32_t>(out_capacity));
+        for (int32_t i = 0; i < n; ++i) {
+            out_row_ids[i] = static_cast<uint64_t>(results[i].row_id);
+            out_dists[i] = results[i].dist;
+        }
+        return n;
+    } catch (const std::exception& e) {
+        set_err(err, err_len, e.what());
+        return -2;
+    } catch (...) {
+        set_err(err, err_len, "sextant_scheduler_submit: unknown exception");
+        return -3;
+    }
+}
+
+int sextant_scheduler_stats(void* sched, sextant_scheduler_stats_t* out) {
+    auto* s =
+            reinterpret_cast<sextant::tree::BatchScheduler*>(sched);
+    if (!s || !out) return -1;
+    auto st = s->stats();
+    out->windows = st.windows;
+    out->queries = st.queries;
+    out->cache_hits = st.cache_hits;
+    out->sweep_ns = st.sweep_ns;
+    out->peak_inflight = st.peak_inflight;
+    out->delay_p50_ns = 0;
+    out->delay_p99_ns = 0;
+    if (!st.delay_ns.empty()) {
+        auto& d = st.delay_ns;
+        const auto pct = [&d](size_t numer) {
+            const size_t idx = std::min(d.size() - 1, d.size() * numer / 100);
+            std::nth_element(d.begin(), d.begin() + idx, d.end());
+            return d[idx];
+        };
+        out->delay_p50_ns = pct(50);
+        out->delay_p99_ns = pct(99);
+    }
+    return 0;
+}
+
+void sextant_scheduler_stop(void* sched) {
+    // The destructor drains and stops; the handle dies with it.
+    delete reinterpret_cast<sextant::tree::BatchScheduler*>(sched);
 }
 
 }  // extern "C"

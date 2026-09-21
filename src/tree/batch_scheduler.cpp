@@ -71,6 +71,9 @@ std::future<std::vector<Candidate>> BatchScheduler::submit(
                            e.query.begin())) {
                 auto results = it->results;  // copy for this caller
                 ++stats_.cache_hits;
+                // Cache hits are served queries too (stats contract:
+                // `queries` counts everything submit() resolved).
+                ++stats_.queries;
                 std::rotate(cache_.begin(), it, it + 1);  // LRU bump
                 e.promise.set_value(std::move(results));
                 return fut;  // resolved without queuing
@@ -80,6 +83,9 @@ std::future<std::vector<Candidate>> BatchScheduler::submit(
 
     {
         std::lock_guard<std::mutex> lk(mu_);
+        // Post-stop submits would never be swept — reject instead of
+        // handing out a future that never resolves.
+        if (stopped_) return {};
         // Deadline-sorted insert (stable: equal deadlines keep arrival
         // order) — urgent requests jump ahead of patient ones.
         auto it = queue_.begin();
@@ -106,10 +112,14 @@ void BatchScheduler::stop() {
 }
 
 BatchScheduler::Stats BatchScheduler::stats() {
-    std::lock_guard<std::mutex> lk(mu_);
-    Stats s = stats_;
+    Stats s;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        s = stats_;
+        stats_ = Stats{};
+    }
+    // Sort the private copy, not under the sweeper's lock.
     std::sort(s.delay_ns.begin(), s.delay_ns.end());
-    stats_ = Stats{};
     return s;
 }
 

@@ -406,6 +406,82 @@ int sextant_build_finish(void* builder, const char* out_path,
 /// Abort a push build and free the builder. No file is written.
 void sextant_build_abort(void* builder);
 
+// ===========================================================================
+// Request scheduler: serving-layer windowing over search (v1 extension).
+// Manufactures the batches that make cold batch-window throughput available
+// to single-request arrival streams. ABI: structs evolve by tail-append
+// only.
+// ===========================================================================
+
+/// Scheduler configuration. `base` supplies the search settings every
+/// submitted query inherits (k, probe depth, rerank, int8_scan, ...);
+/// per-submit arguments override k / predicates / probe depth / latency
+/// tolerance. NULL = sextant_default_search_opts(). The struct is copied
+/// at create time, except `base->exact_rerank_base`, which keeps the
+/// sextant_search contract: caller owns that memory for the scheduler's
+/// lifetime. Zero-valued knobs keep their documented defaults.
+typedef struct sextant_scheduler_config {
+    const sextant_search_opts* base;  ///< NULL = defaults
+    uint64_t window_max_us;           ///< 0 = 100 ms (deadline bound)
+    uint64_t idle_close_us;           ///< 0 = 200 us
+    uint32_t max_window_queries;      ///< 0 = 4096
+    uint32_t result_cache_entries;    ///< 0 = off
+    uint32_t search_threads;          ///< 0 = 1
+    uint32_t max_inflight_windows;    ///< 0 = 1, scheduler default 2
+} sextant_scheduler_config_t;
+
+/// Delta snapshot since the previous call (counters RESET on every
+/// snapshot — a metrics loop owns these numbers after reading them).
+/// Delay percentiles come from the submit→dispatch-delay samples of the
+/// period (capped internally); p50/p99 are 0 when no query dispatched.
+typedef struct sextant_scheduler_stats {
+    uint64_t windows;        ///< windows dispatched
+    uint64_t queries;        ///< queries served (incl. cache hits)
+    uint64_t cache_hits;     ///< exact-repeat cache resolutions
+    uint64_t sweep_ns;       ///< total search_batch wall time
+    uint32_t peak_inflight;  ///< max concurrent sweeps observed
+    // --- tail-appended fields (ABI: old callers read them as zeroed) ---
+    uint64_t delay_p50_ns;   ///< submit→dispatch delay, median
+    uint64_t delay_p99_ns;   ///< submit→dispatch delay, 99th pct
+} sextant_scheduler_stats_t;
+
+/// Create a scheduler on an open index handle. The index must outlive the
+/// scheduler: call sextant_scheduler_stop() before sextant_close_index().
+/// Starts the sweeper thread immediately. Returns NULL on failure (err set).
+void* sextant_scheduler_create(const void* index,
+                               const sextant_scheduler_config_t* cfg,
+                               char* err, size_t err_len);
+
+/// Submit one query (dim() floats, copied) and BLOCK until its window
+/// has been swept and its results are ready — the deadline bound is the
+/// latency contract, not the return time. Writes up to `k` (row_id, dist)
+/// pairs, ascending distance; returns the number written, or a negative
+/// error (in particular, submitting to a stopped scheduler fails without
+/// blocking). `preds` may be NULL/0 for unfiltered. `max_delay_us` is the
+/// queueing delay the request accepts (0 = the scheduler's window_max_us);
+/// `probe_fraction` (0 = base) is the per-request recall-depth knob.
+/// Thread-safe.
+int32_t sextant_scheduler_submit(void* sched, const float* query,
+                                 uint32_t k,
+                                 const sextant_predicate* preds,
+                                 uint32_t n_preds,
+                                 uint64_t max_delay_us,
+                                 float probe_fraction,
+                                 uint64_t* out_row_ids, float* out_dists,
+                                 uint32_t out_capacity,
+                                 char* err, size_t err_len);
+
+/// Snapshot stats into `out` (resets counters; see the struct docs).
+/// Returns 0 on success, negative on bad arguments.
+int sextant_scheduler_stats(void* sched, sextant_scheduler_stats_t* out);
+
+/// Drain the queue, stop the sweeper, resolve pending futures, and FREE
+/// the scheduler — the handle must not be used again (call
+/// sextant_scheduler_create for a new one). NULL is a no-op. Submits
+/// blocked in-flight when another thread stops resolve normally; submits
+/// after stop fail without blocking.
+void sextant_scheduler_stop(void* sched);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -792,6 +792,22 @@ TEST(BatchScheduler, BatchClassDefaultMatchesWindow) {
     EXPECT_LT(dt.count(), 500);  // window_max bound honored loosely
 }
 
+TEST(BatchSearch, SubmitAfterStopRejected) {
+    // Post-stop submits return an INVALID future instead of one that
+    // would never resolve (the CAPI blocks on future.get()).
+    const auto& fx = fixture();
+    auto idx = sextant::tree::IVFTreeIndex::open(fx.tree_path);
+    sextant::tree::BatchScheduler::Config cfg;
+    cfg.search_threads = 1;
+    sextant::SearchConfig sc = base_config();
+    sextant::tree::BatchScheduler sched(idx.get(), sc, cfg);
+    const auto queries = fx.make_queries(1);
+    (void)sched.submit(queries.data(), 10).get();
+    sched.stop();
+    auto fut = sched.submit(queries.data(), 10);
+    EXPECT_FALSE(fut.valid());
+}
+
 TEST(BatchSearch, PerQueryProbeFractionParity) {
     // Recall-depth overrides: per-query fraction must match a per-query
     // search with the same config, and a deeper query must return a

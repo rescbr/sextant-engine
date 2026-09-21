@@ -794,6 +794,229 @@ TEST_F(CApiTest, BatchMatchesPerQuery) {
     }
 }
 
+// (g) Request scheduler: lifecycle, per-query parity with sextant_search,
+// stats reset semantics, and submit-after-stop rejection.
+TEST_F(CApiTest, SchedulerLifecycleAndParity) {
+    sextant_search_opts base = sextant_default_search_opts();
+    base.k = 10;
+
+    sextant_scheduler_config_t cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.base = &base;
+    cfg.result_cache_entries = 4;
+
+    char err[512] = {0};
+    void* sched = sextant_scheduler_create(index, &cfg, err, sizeof(err));
+    ASSERT_NE(sched, nullptr) << err;
+
+    for (uint32_t trial = 0; trial < 4; ++trial) {
+        const float* query = corpus.centers[trial % kClusters].data();
+        uint64_t ref_ids[10];
+        float ref_d[10];
+        const int32_t nref = sextant_search(
+            index, query, &base, ref_ids, ref_d, 10, err, sizeof(err));
+        ASSERT_GE(nref, 0) << err;
+
+        uint64_t ids[10];
+        float d[10];
+        const int32_t n = sextant_scheduler_submit(
+            sched, query, 10, nullptr, 0, 0, 0.0f, ids, d, 10,
+            err, sizeof(err));
+        ASSERT_GE(n, 0) << err;
+        EXPECT_EQ(n, nref);
+        for (int32_t i = 0; i < n; ++i) {
+            EXPECT_EQ(ids[i], ref_ids[i]) << "trial " << trial << " hit " << i;
+            EXPECT_EQ(d[i], ref_d[i]);
+        }
+    }
+
+    // Same query twice: exact-repeat cache hit, identical results.
+    const float* q0 = corpus.centers[0].data();
+    uint64_t a_ids[10], b_ids[10];
+    float a_d[10], b_d[10];
+    ASSERT_GE(sextant_scheduler_submit(sched, q0, 10, nullptr, 0, 0, 0.0f,
+                                       a_ids, a_d, 10, err, sizeof(err)),
+              0)
+        << err;
+    ASSERT_GE(sextant_scheduler_submit(sched, q0, 10, nullptr, 0, 0, 0.0f,
+                                       b_ids, b_d, 10, err, sizeof(err)),
+              0)
+        << err;
+    EXPECT_EQ(0, std::memcmp(a_ids, b_ids, sizeof(a_ids)));
+    EXPECT_EQ(0, std::memcmp(a_d, b_d, sizeof(a_d)));
+
+    // Snapshot: queries counted, at least one cache hit, percentiles sane;
+    // a second snapshot with no traffic in between is all zeros (reset).
+    sextant_scheduler_stats_t st;
+    ASSERT_EQ(sextant_scheduler_stats(sched, &st), 0);
+    EXPECT_GE(st.queries, 6u);
+    EXPECT_GE(st.cache_hits, 1u);
+    EXPECT_GE(st.windows, 1u);
+    EXPECT_GE(st.delay_p50_ns, 0u);
+    EXPECT_GE(st.delay_p99_ns, st.delay_p50_ns);
+
+    sextant_scheduler_stats_t st2;
+    ASSERT_EQ(sextant_scheduler_stats(sched, &st2), 0);
+    EXPECT_EQ(st2.queries, 0u);
+    EXPECT_EQ(st2.windows, 0u);
+    EXPECT_EQ(st2.delay_p50_ns, 0u);
+
+    sextant_scheduler_stop(sched);
+    // The handle is freed by stop() — post-stop submit rejection is a
+    // BatchScheduler contract, covered in test_batch_search.
+    // NULL stop is a no-op.
+    sextant_scheduler_stop(nullptr);
+}
+
+// (g2) Scheduler validation: null handles / arguments rejected; NULL cfg
+// means all-default config and must succeed.
+TEST_F(CApiTest, SchedulerNullArgs) {
+    char err[512] = {0};
+    EXPECT_EQ(sextant_scheduler_create(nullptr, nullptr, err, sizeof(err)),
+              nullptr);
+
+    sextant_scheduler_config_t cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    void* sched = sextant_scheduler_create(index, &cfg, err, sizeof(err));
+    ASSERT_NE(sched, nullptr) << err;  // NULL fields = defaults
+
+    float q[kDim];
+    std::copy(corpus.centers[0].begin(), corpus.centers[0].end(), q);
+    uint64_t ids[10];
+    float d[10];
+    EXPECT_LT(sextant_scheduler_submit(nullptr, q, 10, nullptr, 0, 0, 0.0f,
+                                       ids, d, 10, err, sizeof(err)),
+              0);
+    EXPECT_LT(sextant_scheduler_submit(sched, nullptr, 10, nullptr, 0, 0,
+                                       0.0f, ids, d, 10, err, sizeof(err)),
+              0);
+    EXPECT_LT(sextant_scheduler_submit(sched, q, 10, nullptr, 0, 0, 0.0f,
+                                       nullptr, d, 10, err, sizeof(err)),
+              0);
+    EXPECT_LT(sextant_scheduler_submit(sched, q, 0, nullptr, 0, 0, 0.0f,
+                                       ids, d, 10, err, sizeof(err)),
+              0);  // k == 0
+    EXPECT_LT(sextant_scheduler_submit(sched, q, 10, nullptr, 0, 0, 0.0f,
+                                       ids, d, 3, err, sizeof(err)),
+              0);  // capacity < k
+    sextant_scheduler_stats_t st;
+    EXPECT_LT(sextant_scheduler_stats(sched, nullptr), 0);
+    EXPECT_LT(sextant_scheduler_stats(nullptr, &st), 0);
+    sextant_scheduler_stop(sched);
+}
+
+// (g3) Scheduler predicates: parity with sextant_search_filtered.
+TEST_F(CApiTest, SchedulerPredicateParity) {
+    sextant_search_opts base = sextant_default_search_opts();
+    base.k = 10;
+
+    sextant_scheduler_config_t cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.base = &base;
+    cfg.idle_close_us = 5000;  // give the window a moment to gather
+
+    char err[512] = {0};
+    void* sched = sextant_scheduler_create(index, &cfg, err, sizeof(err));
+    ASSERT_NE(sched, nullptr) << err;
+
+    sextant_predicate pred;
+    std::memset(&pred, 0, sizeof(pred));
+    pred.column = "year";
+    pred.op = SEXTANT_PRED_GE;
+    pred.value = 2007;
+
+    for (uint32_t trial = 0; trial < 3; ++trial) {
+        const float* query = corpus.centers[trial % kClusters].data();
+        uint64_t ref_ids[10];
+        float ref_d[10];
+        const int32_t nref = sextant_search_filtered(
+            index, query, &base, &pred, 1, ref_ids, ref_d, 10,
+            err, sizeof(err));
+        ASSERT_GE(nref, 0) << err;
+
+        uint64_t ids[10];
+        float d[10];
+        const int32_t n = sextant_scheduler_submit(
+            sched, query, 10, &pred, 1, 0, 0.0f, ids, d, 10,
+            err, sizeof(err));
+        ASSERT_GE(n, 0) << err;
+        ASSERT_EQ(n, nref);
+        for (int32_t i = 0; i < n; ++i) {
+            EXPECT_EQ(ids[i], ref_ids[i]) << "trial " << trial;
+            EXPECT_EQ(d[i], ref_d[i]);
+        }
+    }
+    sextant_scheduler_stop(sched);
+}
+
+// (g4) Concurrent submits with mixed latency classes and per-request probe
+// depth: every result matches its single-query reference; urgent (small
+// max_delay_us) requests still resolve.
+TEST_F(CApiTest, SchedulerConcurrentMixed) {
+    sextant_search_opts base = sextant_default_search_opts();
+    base.k = 5;
+
+    sextant_scheduler_config_t cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.base = &base;
+    cfg.max_inflight_windows = 2;
+
+    char err[512] = {0};
+    void* sched = sextant_scheduler_create(index, &cfg, err, sizeof(err));
+    ASSERT_NE(sched, nullptr) << err;
+
+    // Reference results for each center (default probe depth).
+    constexpr uint32_t kQ = 12;
+    std::vector<std::vector<uint64_t>> ref(kQ);
+    for (uint32_t q = 0; q < kQ; ++q) {
+        uint64_t ids[5];
+        float d[5];
+        const int32_t n = sextant_search(
+            index, corpus.centers[q % kClusters].data(), &base,
+            ids, d, 5, err, sizeof(err));
+        ASSERT_GE(n, 0) << err;
+        ref[q].assign(ids, ids + n);
+    }
+
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    for (uint32_t t = 0; t < 6; ++t) {
+        threads.emplace_back([&, t] {
+            for (uint32_t i = 0; i < kQ; ++i) {
+                const uint32_t q = (t * kQ + i) % kQ;
+                const uint64_t delay = (i % 2 == 0) ? 1000 : 50'000;
+                uint64_t ids[5];
+                float d[5];
+                char e[512] = {0};
+                const int32_t n = sextant_scheduler_submit(
+                    sched, corpus.centers[q % kClusters].data(), 5,
+                    nullptr, 0, delay, 0.0f, ids, d, 5, e, sizeof(e));
+                if (n < 0 || static_cast<uint32_t>(n) != ref[q].size()) {
+                    ++failures;
+                    return;
+                }
+                for (int32_t j = 0; j < n; ++j) {
+                    if (ids[j] != ref[q][j]
+                        || (j > 0 && d[j - 1] > d[j])) {
+                        ++failures;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(failures.load(), 0);
+
+    sextant_scheduler_stats_t st;
+    ASSERT_EQ(sextant_scheduler_stats(sched, &st), 0);
+    EXPECT_EQ(st.queries, 6u * kQ);
+    EXPECT_GE(st.windows, 1u);
+    EXPECT_LE(st.delay_p99_ns, 60ull * 1000 * 1000);  // < window_max default
+
+    sextant_scheduler_stop(sched);
+}
+
 // (e) + (f) Payload fetch round-trip + vector fetch within fp16 tolerance.
 TEST_F(CApiTest, PayloadAndVectorFetchRoundTrip) {
     sextant_search_opts opts = sextant_default_search_opts();

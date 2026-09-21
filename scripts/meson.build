@@ -159,6 +159,12 @@ capi_qps = executable('capi_qps',
     link_with: [sextant_lib, sextant_sources_lib, sextant_c_lib],
 )
 
+capi_arrival = executable('capi_arrival',
+    'capi_arrival.cpp',
+    include_directories: [engine_inc, src_inc, sources_inc],
+    link_with: [sextant_lib, sextant_sources_lib, sextant_c_lib],
+)
+
 spike_bits_elbow = executable('spike_bits_elbow',
     'spike_bits_elbow.cpp',
     dependencies: sextant_dep,
